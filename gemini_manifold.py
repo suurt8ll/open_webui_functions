@@ -6,11 +6,10 @@ funding_url: https://github.com/suurt8ll/open_webui_functions
 version: 0.1.0
 """
 
-import os
 import re
-from typing import Iterator, List, Union
+from typing import Iterator, List, Union, Dict, Tuple, Optional
 from google import genai
-from google.genai import _api_client
+from google.genai import types, _api_client
 from pydantic import BaseModel, Field
 
 DEBUG = True
@@ -114,7 +113,86 @@ class Pipe:
                 print("[pipes] Completed pipes method.")
 
     async def pipe(self, body: dict) -> Union[str, Iterator[str]]:
+
+        def pop_system_prompt(messages: List[Dict]) -> Tuple[Optional[str], List[Dict]]:
+            """
+            Extracts and removes the system message from a list of messages.
+
+            Args:
+                messages: A list of message dictionaries, where each dictionary has a 'role' and 'content' key.
+
+            Returns:
+                A tuple containing:
+                    - The content of the system message (str) if found, otherwise None.
+                    - The list of messages (List[Dict]) with the system message removed (if it existed).
+            """
+            system_message_content = None
+            messages_without_system = []
+            for message in messages:
+                if message.get("role") == "system":
+                    system_message_content = message.get("content")
+                else:
+                    messages_without_system.append(message)
+            return system_message_content, messages_without_system
+
+        def transform_messages_to_contents(messages: List[Dict]) -> List[types.Content]:
+            """
+            Transforms a list of messages into the 'contents' parameter structure for google-genai, for text-only conversations.
+
+            Args:
+                messages: A list of message dictionaries, where each dictionary has a 'role' and 'content' key.
+
+            Returns:
+                A list of types.Content objects, suitable for the 'contents' parameter in google-genai.
+            """
+            contents: List[types.Content] = []
+            for message in messages:
+                role = message.get("role")
+                content = message.get("content", "")
+                if isinstance(content, list):
+                    parts = []
+                    for item in content:
+                        if item.get("type") == "text":
+                            parts.append(types.Part.from_text(item.get("text", "")))
+                        # TODO: Add image handling logic here in the future
+                        # elif item.get("type") == "image_url":
+                        #     # Image handling logic
+                    contents.append(types.Content(role=role, parts=parts))
+                else:
+                    contents.append(
+                        types.Content(role=role, parts=[types.Part.from_text(content)])
+                    )
+            return contents
+
         """Main pipe method to process incoming requests."""
+
+        messages = body.get("messages", [])
+
+        # Assuming 'messages' is your original list of messages from body.get("messages", [])
+
+        # 1. Extract the system prompt
+        system_prompt, remaining_messages = pop_system_prompt(messages)
+
+        # 2. Transform the remaining messages into 'contents'
+        contents = transform_messages_to_contents(remaining_messages)
+
+        # Now 'contents' is ready to be used with client.models.generate_content()
+
+        last_user_message = next(
+            (
+                message["content"]
+                for message in reversed(messages)
+                if message["role"] == "user"
+            ),
+            None,
+        )
         if DEBUG:
             print(f"[pipe] Received request: {body}")
-        return "AMOGUS"
+            print(f"[pipe] Received user message: {last_user_message}")
+            print(f"[pipe] System prompt: {system_prompt}")
+            print(f"[pipe] Contents: {contents}")
+
+        if last_user_message is None:
+            return "Hello World!"
+
+        return last_user_message
