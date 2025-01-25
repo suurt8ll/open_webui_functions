@@ -8,6 +8,7 @@ version: 0.2.0
 
 # NB! This is currently work in progress and not yet fully functional.
 
+import json
 import re
 from typing import Iterator, List, Union, Dict, Tuple, Optional
 from google import genai
@@ -140,7 +141,7 @@ class Pipe:
 
         def transform_messages_to_contents(
             messages: List[Dict],
-        ) -> types.ContentListUnion:
+        ) -> List[types.ContentUnion]:  # Ensure the return type is a list
             """
             Transforms a list of messages into the 'contents' parameter structure for google-genai, for text-only conversations.
 
@@ -188,13 +189,18 @@ class Pipe:
         # Now 'contents' is ready to be used with client.models.generate_content()
 
         if DEBUG:
-            print(f"[pipe] Received request: {body}")
+            print(f"[pipe] Received request:")
+            print(json.dumps(body, indent=4))
             print(f"[pipe] System prompt: {system_prompt}")
-            print(f"[pipe] Contents: {contents}")
+            print(f"[pipe] Contents: [")
+            for i, content in enumerate(contents):
+                print(f"    {content},")
+            print("]")
 
         # TODO Support streaming thoughts.
         # TODO Add logic to handle thinking models.
         # TODO Support streaming regular responses.
+        # TODO When stream_options: { include_usage: true } is enabled, the response will contain usage information.
         try:
             config = types.GenerateContentConfig(
                 system_instruction=system_prompt,
