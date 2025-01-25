@@ -47,14 +47,18 @@ def update_function(
             update_url, data=json.dumps(request_body), headers=headers
         )
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-        print(f"Function '{function_id}' updated successfully.")
+        print(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Function '{function_id}' updated successfully."
+        )
 
     except FileNotFoundError:
-        print(f"Error: File not found at '{filepath}'")
+        print(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Error: File not found at '{filepath}'"
+        )
     except requests.exceptions.RequestException as e:
-        print(f"API request failed: {e}")
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - API request failed: {e}")
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - An error occurred: {e}")
 
 
 if __name__ == "__main__":
