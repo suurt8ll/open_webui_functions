@@ -6,6 +6,8 @@ funding_url: https://github.com/suurt8ll/open_webui_functions
 version: 0.1.0
 """
 
+# NB! This is currently work in progress and not yet fully functional.
+
 import re
 from typing import Iterator, List, Union, Dict, Tuple, Optional
 from google import genai
@@ -191,6 +193,32 @@ class Pipe:
             print(f"[pipe] Received user message: {last_user_message}")
             print(f"[pipe] System prompt: {system_prompt}")
             print(f"[pipe] Contents: {contents}")
+
+        config = types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=body.get("temperature", 0.7),
+            top_p=body.get("top_p", 0.9),
+            top_k=body.get("top_k", 40),
+            max_output_tokens=body.get("max_tokens", 8192),
+            stop_sequences=body.get("stop", []),
+            thinking_config=types.ThinkingConfig(include_thoughts=True),
+        )
+
+        # TODO - Add logic here to process the user message and generate a response
+        # For now, we're just returning the last user message
+
+        """
+        # Example usage of client.models.generate_content()
+        response = client.models.generate_content(
+            model="MODEL_NAME",
+            contents="CONTENTS",
+            config=types.GenerateContentConfig(
+                system_instruction="I say high, you say low",
+                temperature=0.3,
+                thinking_config=types.ThinkingConfig(include_thoughts=True),
+            ),
+        )
+        """
 
         if last_user_message is None:
             return "Hello World!"
