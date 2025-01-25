@@ -3,7 +3,7 @@ title: Gemini Manifold (google-genai)
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
-version: 0.3.0
+version: 0.4.0
 """
 
 # NB! This is currently work in progress and not yet fully functional.
@@ -119,17 +119,7 @@ class Pipe:
     async def pipe(self, body: dict) -> Union[str, Iterator[str]]:
 
         def pop_system_prompt(messages: List[Dict]) -> Tuple[Optional[str], List[Dict]]:
-            """
-            Extracts and removes the system message from a list of messages.
-
-            Args:
-                messages: A list of message dictionaries, where each dictionary has a 'role' and 'content' key.
-
-            Returns:
-                A tuple containing:
-                    - The content of the system message (str) if found, otherwise None.
-                    - The list of messages (List[Dict]) with the system message removed (if it existed).
-            """
+            """Extracts system message from messages."""
             system_message_content = None
             messages_without_system = []
             for message in messages:
@@ -141,16 +131,8 @@ class Pipe:
 
         def transform_messages_to_contents(
             messages: List[Dict],
-        ) -> List[types.ContentUnion]:  # Ensure the return type is a list
-            """
-            Transforms a list of messages into the 'contents' parameter structure for google-genai, for text-only conversations.
-
-            Args:
-                messages: A list of message dictionaries, where each dictionary has a 'role' and 'content' key.
-
-            Returns:
-                A list of types.Content objects, suitable for the 'contents' parameter in google-genai.
-            """
+        ) -> List[types.ContentUnion]:
+            """Transforms messages to google-genai contents."""
             contents: List[types.ContentUnion] = []
             for message in messages:
                 role = (
@@ -164,9 +146,6 @@ class Pipe:
                     for item in content:
                         if item.get("type") == "text":
                             parts.append(types.Part.from_text(item.get("text", "")))
-                        # TODO: Add image handling logic here in the future
-                        # elif item.get("type") == "image_url":
-                        #     # Image handling logic
                     contents.append(types.Content(role=role, parts=parts))
                 else:
                     contents.append(
@@ -177,9 +156,7 @@ class Pipe:
         def generate_content_stream_text(
             self, model, contents, config
         ) -> Iterator[str]:
-            """
-            Wraps generate_content_stream to yield text only.
-            """
+            """Wraps generate_content_stream for text only."""
             return (
                 response.text
                 for response in self.client.models.generate_content_stream(
@@ -188,30 +165,36 @@ class Pipe:
                 if response.text is not None
             )
 
-        def generate_content_text(self, model, contents, config) -> str:
-            """
-            Wraps generate_content to yield text only.
-            """
-            response = self.client.models.generate_content(
-                model=model, contents=contents, config=config
-            )
-            if response.text:
-                return response.text
-            return "Failed to generate content. No response text."
+        def extract_thoughts(response: types.GenerateContentResponse) -> str:
+            """Extracts and concatenates thought parts from response."""
+            if (
+                not response.candidates
+                or not response.candidates[0].content
+                or not response.candidates[0].content.parts
+            ):
+                return ""
+            if len(response.candidates) > 1:
+                print(f"More than one candidate found, using thoughts from the first.")
+            thoughts = ""
+            for part in response.candidates[0].content.parts:
+                if (
+                    isinstance(part.text, str)
+                    and isinstance(part.thought, bool)
+                    and part.thought
+                ):
+                    thoughts += part.text
+            return thoughts
 
-        """Main pipe method to process incoming requests."""
+        """Main pipe method."""
+
+        # TODO Support streaming thoughts.
+        # TODO Add logic to handle thinking models.
+        # TODO When stream_options: { include_usage: true } is enabled, the response will contain usage information.
+        # TODO Image support.
 
         messages = body.get("messages", [])
-
-        # Assuming 'messages' is your original list of messages from body.get("messages", [])
-
-        # 1. Extract the system prompt
         system_prompt, remaining_messages = pop_system_prompt(messages)
-
-        # 2. Transform the remaining messages into 'contents'
         contents = transform_messages_to_contents(remaining_messages)
-
-        # Now 'contents' is ready to be used with client.models.generate_content()
 
         if DEBUG:
             print(f"[pipe] Received request:")
@@ -222,50 +205,66 @@ class Pipe:
                 print(f"    {content},")
             print("]")
 
-        # TODO Support streaming thoughts.
-        # TODO Add logic to handle thinking models.
-        # TODO Support streaming regular responses.
-        # TODO When stream_options: { include_usage: true } is enabled, the response will contain usage information.
-        # TODO Image support.
-        try:
-            config = types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                temperature=body.get("temperature", 0.7),
-                top_p=body.get("top_p", 0.9),
-                top_k=body.get("top_k", 40),
-                max_output_tokens=body.get("max_tokens", 8192),
-                stop_sequences=body.get("stop", []),
-                # TODO Non-thinking models do not support this, add logic to handle this.
-                # thinking_config=types.ThinkingConfig(include_thoughts=True),
+        model_name = self.__strip_prefix(body.get("model", ""))
+        is_thinking_model = "thinking" in model_name.lower()
+
+        config_params = {
+            "system_instruction": system_prompt,
+            "temperature": body.get("temperature", 0.7),
+            "top_p": body.get("top_p", 0.9),
+            "top_k": body.get("top_k", 40),
+            "max_output_tokens": body.get("max_tokens", 8192),
+            "stop_sequences": body.get("stop", []),
+        }
+        if is_thinking_model:
+            config_params["thinking_config"] = types.ThinkingConfig(
+                include_thoughts=True
             )
+        config = types.GenerateContentConfig(**config_params)
 
-            model_name = self.__strip_prefix(body.get("model", ""))
-            gen_content_args = {
-                "model": model_name,
-                "contents": contents,
-                "config": config,
-            }
+        gen_content_args = {
+            "model": model_name,
+            "contents": contents,
+            "config": config,
+        }
 
+        try:
             if body.get("stream", False):
                 if DEBUG:
-                    print("[pipe] Streaming is enabled. Returning generator response.")
-                response = generate_content_stream_text(self, **gen_content_args)
-            else:
-                if DEBUG:
-                    print(
-                        "[pipe] Streaming is disabled. Returning simple string response."
+                    print("[pipe] Streaming enabled.")
+                if is_thinking_model:
+                    # TODO Add support for thinking models with streaming.
+                    raise ValueError("Thinking models do not support streaming.")
+                else:  # handle regular streaming without thoughts
+                    response_generator = generate_content_stream_text(
+                        self, **gen_content_args
                     )
-                response = generate_content_text(self, **gen_content_args)
+                    return response_generator
+            else:  # streaming is disabled
+                if DEBUG:
+                    print("[pipe] Streaming disabled.")
+                response = self.client.models.generate_content(**gen_content_args)
+                response_text = response.text if response.text else "No response text."
 
-            if response:
-                return response
-            else:
-                return "Failed to generate content. No response text."
+                if is_thinking_model:
+                    thoughts = extract_thoughts(response)
+                    tagged_thoughts = (
+                        f"<Thought>{thoughts}</Thought>" if thoughts else ""
+                    )
+                    final_response = tagged_thoughts + response_text
+                    if DEBUG:
+                        print(f"[pipe] Response: {final_response}")
+                    return final_response
+                else:  # handle regular response without thoughts
+                    if DEBUG:
+                        print(f"[pipe] Response: {response_text}")
+                    return response_text
 
         except Exception as e:
+            error_message = f"Content generation error: {str(e)}"
             if DEBUG:
-                print(f"[pipe] Error generating content: {e}")
-            return f"Failed to generate content. Error details: {str(e)}"
+                print(f"[pipe] {error_message}")
+            return error_message
         finally:
             if DEBUG:
-                print("[pipe] Completed content generation.")
+                print("[pipe] Content generation completed.")
