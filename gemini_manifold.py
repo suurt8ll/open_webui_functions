@@ -3,7 +3,7 @@ title: Gemini Manifold (google-genai)
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
-version: 0.1.0
+version: 0.2.0
 """
 
 # NB! This is currently work in progress and not yet fully functional.
@@ -98,6 +98,7 @@ class Pipe:
             if not self.valves.GEMINI_API_KEY:
                 raise ValueError("GEMINI_API_KEY is not set.")
             # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here
+            # FIXME We need better way to ensure that the client is initialized at all times.
             self.client = genai.Client(
                 api_key=self.valves.GEMINI_API_KEY,
                 http_options=_api_client.HttpOptions(api_version="v1alpha"),
@@ -137,7 +138,9 @@ class Pipe:
                     messages_without_system.append(message)
             return system_message_content, messages_without_system
 
-        def transform_messages_to_contents(messages: List[Dict]) -> List[types.Content]:
+        def transform_messages_to_contents(
+            messages: List[Dict],
+        ) -> types.ContentListUnion:
             """
             Transforms a list of messages into the 'contents' parameter structure for google-genai, for text-only conversations.
 
@@ -147,9 +150,13 @@ class Pipe:
             Returns:
                 A list of types.Content objects, suitable for the 'contents' parameter in google-genai.
             """
-            contents: List[types.Content] = []
+            contents: List[types.ContentUnion] = []
             for message in messages:
-                role = message.get("role")
+                role = (
+                    "model"
+                    if message.get("role") == "assistant"
+                    else message.get("role")
+                )
                 content = message.get("content", "")
                 if isinstance(content, list):
                     parts = []
@@ -180,47 +187,42 @@ class Pipe:
 
         # Now 'contents' is ready to be used with client.models.generate_content()
 
-        last_user_message = next(
-            (
-                message["content"]
-                for message in reversed(messages)
-                if message["role"] == "user"
-            ),
-            None,
-        )
         if DEBUG:
             print(f"[pipe] Received request: {body}")
-            print(f"[pipe] Received user message: {last_user_message}")
             print(f"[pipe] System prompt: {system_prompt}")
             print(f"[pipe] Contents: {contents}")
 
-        config = types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=body.get("temperature", 0.7),
-            top_p=body.get("top_p", 0.9),
-            top_k=body.get("top_k", 40),
-            max_output_tokens=body.get("max_tokens", 8192),
-            stop_sequences=body.get("stop", []),
-            thinking_config=types.ThinkingConfig(include_thoughts=True),
-        )
+        # TODO Support streaming thoughts.
+        # TODO Add logic to handle thinking models.
+        # TODO Support streaming regular responses.
+        try:
+            config = types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=body.get("temperature", 0.7),
+                top_p=body.get("top_p", 0.9),
+                top_k=body.get("top_k", 40),
+                max_output_tokens=body.get("max_tokens", 8192),
+                stop_sequences=body.get("stop", []),
+                # TODO Non-thinking models do not support this, add logic to handle this.
+                # thinking_config=types.ThinkingConfig(include_thoughts=True),
+            )
 
-        # TODO - Add logic here to process the user message and generate a response
-        # For now, we're just returning the last user message
+            response = self.client.models.generate_content(
+                # FIXME This is a placeholder model name, replace with the actual model name.
+                model=self.__strip_prefix(body.get("model", "")),
+                contents=contents,
+                config=config,
+            )
 
-        """
-        # Example usage of client.models.generate_content()
-        response = client.models.generate_content(
-            model="MODEL_NAME",
-            contents="CONTENTS",
-            config=types.GenerateContentConfig(
-                system_instruction="I say high, you say low",
-                temperature=0.3,
-                thinking_config=types.ThinkingConfig(include_thoughts=True),
-            ),
-        )
-        """
+            if response and response.text:
+                return response.text
+            else:
+                return "Failed to generate content. No response text."
 
-        if last_user_message is None:
-            return "Hello World!"
-
-        return last_user_message
+        except Exception as e:
+            if DEBUG:
+                print(f"[pipe] Error generating content: {e}")
+            return f"Failed to generate content. Error details: {str(e)}"
+        finally:
+            if DEBUG:
+                print("[pipe] Completed content generation.")
