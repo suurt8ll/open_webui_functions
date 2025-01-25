@@ -3,7 +3,7 @@ title: Gemini Manifold (google-genai)
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
-version: 0.2.0
+version: 0.3.0
 """
 
 # NB! This is currently work in progress and not yet fully functional.
@@ -174,6 +174,31 @@ class Pipe:
                     )
             return contents
 
+        def generate_content_stream_text(
+            self, model, contents, config
+        ) -> Iterator[str]:
+            """
+            Wraps generate_content_stream to yield text only.
+            """
+            return (
+                response.text
+                for response in self.client.models.generate_content_stream(
+                    model=model, contents=contents, config=config
+                )
+                if response.text is not None
+            )
+
+        def generate_content_text(self, model, contents, config) -> str:
+            """
+            Wraps generate_content to yield text only.
+            """
+            response = self.client.models.generate_content(
+                model=model, contents=contents, config=config
+            )
+            if response.text:
+                return response.text
+            return "Failed to generate content. No response text."
+
         """Main pipe method to process incoming requests."""
 
         messages = body.get("messages", [])
@@ -201,6 +226,7 @@ class Pipe:
         # TODO Add logic to handle thinking models.
         # TODO Support streaming regular responses.
         # TODO When stream_options: { include_usage: true } is enabled, the response will contain usage information.
+        # TODO Image support.
         try:
             config = types.GenerateContentConfig(
                 system_instruction=system_prompt,
@@ -213,15 +239,26 @@ class Pipe:
                 # thinking_config=types.ThinkingConfig(include_thoughts=True),
             )
 
-            response = self.client.models.generate_content(
-                # FIXME This is a placeholder model name, replace with the actual model name.
-                model=self.__strip_prefix(body.get("model", "")),
-                contents=contents,
-                config=config,
-            )
+            model_name = self.__strip_prefix(body.get("model", ""))
+            gen_content_args = {
+                "model": model_name,
+                "contents": contents,
+                "config": config,
+            }
 
-            if response and response.text:
-                return response.text
+            if body.get("stream", False):
+                if DEBUG:
+                    print("[pipe] Streaming is enabled. Returning generator response.")
+                response = generate_content_stream_text(self, **gen_content_args)
+            else:
+                if DEBUG:
+                    print(
+                        "[pipe] Streaming is disabled. Returning simple string response."
+                    )
+                response = generate_content_text(self, **gen_content_args)
+
+            if response:
+                return response
             else:
                 return "Failed to generate content. No response text."
 
