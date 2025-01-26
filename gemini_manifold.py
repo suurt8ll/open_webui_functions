@@ -3,11 +3,16 @@ title: Gemini Manifold (google-genai)
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
-version: 0.5.0
+version: 0.6.0
 """
 
-# NB! This is currently work in progress and not yet fully functional.
+"""
+- NB! This function is not yet fully functional and is currently work in progress.
+- Open WebUI v0.5.5 is required for this function to work properly.
+- google-genai must be installed in the Open WebUI environment. Currently it's not by default.
+"""
 
+import base64
 import json
 import re
 from typing import AsyncGenerator, AsyncIterator, List, Union, Dict, Tuple, Optional
@@ -129,12 +134,32 @@ class Pipe:
                     messages_without_system.append(message)
             return system_message_content, messages_without_system
 
+        def get_mime_type(file_uri: str) -> str:
+            """
+            Utility function to determine MIME type based on file extension.
+            Extend this function to support more MIME types as needed.
+            """
+            if file_uri.endswith(".jpg") or file_uri.endswith(".jpeg"):
+                return "image/jpeg"
+            elif file_uri.endswith(".png"):
+                return "image/png"
+            elif file_uri.endswith(".gif"):
+                return "image/gif"
+            elif file_uri.endswith(".bmp"):
+                return "image/bmp"
+            elif file_uri.endswith(".webp"):
+                return "image/webp"
+            else:
+                # Default MIME type if unknown
+                return "application/octet-stream"
+
         def transform_messages_to_contents(
             messages: List[Dict],
-        ) -> List[types.ContentUnion]:
-            """Transforms messages to google-genai contents."""
-            contents: List[types.ContentUnion] = []
+        ) -> List[types.Content]:
+            """Transforms messages to google-genai contents, supporting both text and images."""
+            contents: List[types.Content] = []
             for message in messages:
+                # Determine the role: "model" if assistant, else the provided role
                 role = (
                     "model"
                     if message.get("role") == "assistant"
@@ -144,10 +169,73 @@ class Pipe:
                 if isinstance(content, list):
                     parts = []
                     for item in content:
-                        if item.get("type") == "text":
-                            parts.append(types.Part.from_text(item.get("text", "")))
+                        item_type = item.get("type")
+                        if item_type == "text":
+                            # Handle text parts
+                            text = item.get("text", "")
+                            part = types.Part.from_text(text)
+                            parts.append(part)
+                        elif item_type == "image_url":
+                            # Handle image parts
+                            image_url_dict = item.get("image_url", {})
+                            image_url = image_url_dict.get(
+                                "url", ""
+                            )  # Safely get url, default to empty string if not found or image_url is not a dict
+
+                            if isinstance(
+                                image_url, str
+                            ):  # Ensure image_url is a string before calling startswith
+                                if image_url.startswith("gs://"):
+                                    # Image is stored in Google Cloud Storage
+                                    part = types.Part.from_uri(
+                                        file_uri=image_url,
+                                        mime_type=get_mime_type(image_url),
+                                    )
+                                    parts.append(part)
+                                elif image_url.startswith("data:image"):
+                                    # Image is embedded as a data URI (Base64)
+                                    try:
+                                        # Extract the Base64 data and MIME type using regex
+                                        match = re.match(
+                                            r"data:(image/\w+);base64,(.+)", image_url
+                                        )
+                                        if match:
+                                            mime_type = match.group(1)
+                                            base64_data = match.group(2)
+                                            part = types.Part.from_bytes(
+                                                data=base64.b64decode(base64_data),
+                                                mime_type=mime_type,
+                                            )
+                                            parts.append(part)
+                                        else:
+                                            # Invalid data URI format
+                                            raise ValueError(
+                                                "Invalid data URI for image."
+                                            )
+                                    except Exception as e:
+                                        # Handle invalid image data
+                                        raise ValueError(
+                                            f"Error processing image data: {e}"
+                                        )
+                                else:
+                                    # Assume it's a standard URL (HTTP/HTTPS)
+                                    part = types.Part.from_uri(
+                                        file_uri=image_url,
+                                        mime_type=get_mime_type(image_url),
+                                    )
+                                    parts.append(part)
+                            else:
+                                print(
+                                    f"Warning: Unexpected image_url format: {image_url_dict}. Skipping image part."
+                                )  # Handle case where image_url is not a string
+                                continue  # Skip this image part and continue to the next item
+                        else:
+                            # Handle other types if necessary
+                            # For now, ignore unsupported types
+                            continue
                     contents.append(types.Content(role=role, parts=parts))
                 else:
+                    # Handle content that is a simple string (text only)
                     contents.append(
                         types.Content(role=role, parts=[types.Part.from_text(content)])
                     )
@@ -225,7 +313,6 @@ class Pipe:
         """Main pipe method."""
 
         # TODO When stream_options: { include_usage: true } is enabled, the response will contain usage information.
-        # TODO Image support.
 
         messages = body.get("messages", [])
         system_prompt, remaining_messages = pop_system_prompt(messages)
