@@ -4,6 +4,8 @@ This repository contains a collection of helper scripts and enhancement function
 
 ## `gemini_manifold.py`
 
+[Open WebUI Community](https://openwebui.com/f/suurt8ll/gemini_manifold)
+
 ### Description
 
 `gemini_manifold.py` is a comprehensive tool for interacting with Google's Gemini Studio API. It supports:
@@ -14,7 +16,7 @@ This repository contains a collection of helper scripts and enhancement function
 -   Special handling for thinking models, including thought encapsulation.
 -   Model name prefix stripping for generic adaptability.
 
-**Important Note:** `gemini_manifold.py` requires the `google-genai` library to be installed in the Open WebUI environment. This library is not currently included in the Open WebUI repository, so users must install it manually.
+**Important Note:** `gemini_manifold.py` requires the `google-genai` library to be installed in the Open WebUI environment. This library is not currently included in the Open WebUI repository, so users must install it manually. See [this discussion](https://github.com/open-webui/open-webui/discussions/8951) that is related to this.
 
 **Installation Instructions for `google-genai`:**
 
@@ -44,7 +46,7 @@ Set `DEBUG = True` for detailed logging output, useful for development and troub
 
 ## Additional Scripts
 
--   `thinking_gemini.py`: An outdated script, initially developed for `gemini-2.0-flash-thinking-exp` model interactions. Superseded by `gemini_manifold.py`.
+-   `thinking_gemini.py`: [Open WebUI Community](https://openwebui.com/f/suurt8ll/thinking_gemini) An outdated script, initially developed for `gemini-2.0-flash-thinking-exp` model interactions. Superseded by `gemini_manifold.py`.
 -   `function_updater.py`: Automates updating functions on a server via a REST API, streamlining development.
 
 ## Contributing
