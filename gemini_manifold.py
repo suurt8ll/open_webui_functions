@@ -3,18 +3,18 @@ title: Gemini Manifold (google-genai)
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
-version: 0.6.0
+version: 0.7.0
 """
 
-"""
-- NB! This function is not yet fully functional and is currently work in progress.
-- Open WebUI v0.5.5 is required for this function to work properly.
-- google-genai must be installed in the Open WebUI environment. Currently it's not by default.
-"""
+# This is a helper function that provides a manifold for Google's Gemini Studio API. Complete with thinking support.
+# Open WebUI v0.5.5 is required for this function to work properly.
+# google-genai must be installed in the Open WebUI environment. Currently it's not by default.
+
 
 import base64
 import json
 import re
+import fnmatch
 from typing import AsyncGenerator, AsyncIterator, List, Union, Dict, Tuple, Optional
 from google import genai
 from google.genai import types, _api_client
@@ -28,7 +28,8 @@ class Pipe:
     class Valves(BaseModel):
         GEMINI_API_KEY: str = Field(default="")
         MODEL_WHITELIST: str = Field(
-            default="", description="Comma-separated list of allowed model names"
+            default="",
+            description="Comma-separated list of allowed model names. Supports wildcards (*).",
         )
 
     def __init__(self):
@@ -49,7 +50,7 @@ class Pipe:
             whitelist = (
                 self.valves.MODEL_WHITELIST.split(",")
                 if self.valves.MODEL_WHITELIST
-                else []
+                else ["*"]
             )
             models = self.client.models.list(config={"query_base": True})
             if DEBUG:
@@ -62,7 +63,8 @@ class Pipe:
                     "name": model.display_name,
                 }
                 for model in models
-                if not whitelist or model.name in [f"models/{w}" for w in whitelist]
+                if model.name
+                and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
                 if model.supported_actions
                 and "generateContent" in model.supported_actions
                 if model.name and model.name.startswith("models/")
