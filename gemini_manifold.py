@@ -3,14 +3,14 @@ title: Gemini Manifold (google-genai)
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
-version: 0.4.0
+version: 0.5.0
 """
 
 # NB! This is currently work in progress and not yet fully functional.
 
 import json
 import re
-from typing import Iterator, List, Union, Dict, Tuple, Optional
+from typing import AsyncGenerator, AsyncIterator, List, Union, Dict, Tuple, Optional
 from google import genai
 from google.genai import types, _api_client
 from pydantic import BaseModel, Field
@@ -116,7 +116,7 @@ class Pipe:
             if DEBUG:
                 print("[pipes] Completed pipes method.")
 
-    async def pipe(self, body: dict) -> Union[str, Iterator[str]]:
+    async def pipe(self, body: dict) -> Union[str, AsyncGenerator[str, None]]:
 
         def pop_system_prompt(messages: List[Dict]) -> Tuple[Optional[str], List[Dict]]:
             """Extracts system message from messages."""
@@ -153,17 +153,54 @@ class Pipe:
                     )
             return contents
 
-        def generate_content_stream_text(
+        async def generate_content_stream_text(
             self, model, contents, config
-        ) -> Iterator[str]:
-            """Wraps generate_content_stream for text only."""
-            return (
-                response.text
-                for response in self.client.models.generate_content_stream(
+        ) -> AsyncGenerator[str, None]:
+            """Wraps generate_content_stream for text only, wrapping thoughts in <think> tags.
+            Defaults to the first candidate if multiple candidates are present and prints a warning in DEBUG mode.
+            """
+            response_stream: AsyncIterator[types.GenerateContentResponse] = (
+                self.client.aio.models.generate_content_stream(
                     model=model, contents=contents, config=config
                 )
-                if response.text is not None
             )
+            is_thinking = False
+            async for response in response_stream:
+                if response.candidates:
+                    if len(response.candidates) > 1:
+                        if DEBUG:
+                            print(
+                                "WARNING: Multiple candidates found in response, defaulting to the first candidate."
+                            )
+                    candidate = response.candidates[0]  # Default to the first candidate
+                    if candidate.content and candidate.content.parts:
+                        for part in candidate.content.parts:
+                            text_part = getattr(
+                                part, "text", None
+                            )  # use getattr to avoid AttributeError if 'text' does not exist
+                            thought_part = getattr(
+                                part, "thought", False
+                            )  # use getattr to avoid AttributeError if 'thought' does not exist, default to False
+
+                            if thought_part:
+                                if not is_thinking:
+                                    yield "<think>"
+                                    yield "\n"
+                                    is_thinking = True
+                                if text_part is not None:
+                                    yield text_part
+                            else:
+                                if is_thinking:
+                                    # Interesting note: yielding "</think>\n" all at once will mess up the formatting.
+                                    yield "</think>"
+                                    yield "\n"
+                                    is_thinking = False
+                                if text_part is not None:
+                                    yield text_part
+            if (
+                is_thinking
+            ):  # in case the stream ends while still in a thinking block, close tag
+                yield "</think>\n"
 
         def extract_thoughts(response: types.GenerateContentResponse) -> str:
             """Extracts and concatenates thought parts from response."""
@@ -187,8 +224,6 @@ class Pipe:
 
         """Main pipe method."""
 
-        # TODO Support streaming thoughts.
-        # TODO Add logic to handle thinking models.
         # TODO When stream_options: { include_usage: true } is enabled, the response will contain usage information.
         # TODO Image support.
 
@@ -201,7 +236,7 @@ class Pipe:
             print(json.dumps(body, indent=4))
             print(f"[pipe] System prompt: {system_prompt}")
             print(f"[pipe] Contents: [")
-            for i, content in enumerate(contents):
+            for content in enumerate(contents):
                 print(f"    {content},")
             print("]")
 
@@ -232,14 +267,10 @@ class Pipe:
             if body.get("stream", False):
                 if DEBUG:
                     print("[pipe] Streaming enabled.")
-                if is_thinking_model:
-                    # TODO Add support for thinking models with streaming.
-                    raise ValueError("Thinking models do not support streaming.")
-                else:  # handle regular streaming without thoughts
-                    response_generator = generate_content_stream_text(
-                        self, **gen_content_args
-                    )
-                    return response_generator
+                response_generator = generate_content_stream_text(
+                    self, **gen_content_args
+                )
+                return response_generator
             else:  # streaming is disabled
                 if DEBUG:
                     print("[pipe] Streaming disabled.")
@@ -247,17 +278,18 @@ class Pipe:
                 response_text = response.text if response.text else "No response text."
 
                 if is_thinking_model:
+                    # TODO Handle formatting of thoughts in non-streaming mode.
                     thoughts = extract_thoughts(response)
                     tagged_thoughts = (
-                        f"<Thought>{thoughts}</Thought>" if thoughts else ""
+                        f"<think>\n{thoughts}</think>\n" if thoughts else ""
                     )
                     final_response = tagged_thoughts + response_text
                     if DEBUG:
-                        print(f"[pipe] Response: {final_response}")
+                        print(
+                            f"[pipe] Currently formatting does not work when streaming is off. See https://github.com/open-webui/open-webui/discussions/8936 for more."
+                        )
                     return final_response
-                else:  # handle regular response without thoughts
-                    if DEBUG:
-                        print(f"[pipe] Response: {response_text}")
+                else:  # handle regular response without thoughts.
                     return response_text
 
         except Exception as e:
