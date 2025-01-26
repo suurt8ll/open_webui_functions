@@ -3,12 +3,14 @@ title: Gemini Manifold (google-genai)
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
-version: 0.7.0
+license: MIT
+version: 1.0.0
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API. Complete with thinking support.
 # Open WebUI v0.5.5 is required for this function to work properly.
-# google-genai must be installed in the Open WebUI environment. Currently it's not by default.
+# NB! google-genai must be installed in the Open WebUI environment. Currently it's not by default.
+# Be sure to check out my GitHub repository for more information! Feel free to contribute and post questions.
 
 
 import base64
@@ -20,7 +22,7 @@ from google import genai
 from google.genai import types, _api_client
 from pydantic import BaseModel, Field
 
-DEBUG = True
+DEBUG = False  # Set to True to enable debug output. Use `docker logs -f open-webui` to view logs.
 
 
 class Pipe:
