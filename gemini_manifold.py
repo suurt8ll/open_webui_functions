@@ -1,5 +1,5 @@
 """
-title: Gemini Manifold (google-genai)
+title: Gemini Manifold google_genai
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
