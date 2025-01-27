@@ -3,10 +3,11 @@ import json
 import requests
 import hashlib
 import argparse
+import os
+from dotenv import load_dotenv
 
 
 def file_hash(filename):
-    """Calculate SHA256 hash of a file."""
     hasher = hashlib.sha256()
     with open(filename, "rb") as file:
         while True:
@@ -17,40 +18,65 @@ def file_hash(filename):
     return hasher.hexdigest()
 
 
+def extract_metadata_from_file(filepath):
+    metadata = {}
+    try:
+        with open(filepath, "r") as file:
+            lines = file.readlines()
+            in_docstring = False
+            for line in lines:
+                line = line.strip()
+                if line == '"""':
+                    if in_docstring:
+                        in_docstring = False
+                        break
+                    else:
+                        in_docstring = True
+                    continue
+                if in_docstring:
+                    if ":" in line:
+                        key, value = line.split(":", 1)
+                        metadata[key.strip()] = value.strip()
+    except FileNotFoundError:
+        print(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Warning: Metadata file not found at '{filepath}' while trying to extract metadata."
+        )
+    except Exception as e:
+        print(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Warning: Error extracting metadata from file: {e}"
+        )
+    return metadata
+
+
 def update_function(
     filepath,
     api_endpoint,
     function_id,
     function_name,
     function_description,
-    manifest,
     api_key,
 ):
-    """Read file, format JSON, and POST to API with API key."""
     try:
         with open(filepath, "r") as file:
             code_content = file.read()
-
         request_body = {
             "id": function_id,
             "name": function_name,
             "content": code_content,
-            "meta": {"description": function_description, "manifest": manifest},
+            "meta": {"description": function_description, "manifest": {}},
         }
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",  # Add API key to headers - adjust header name if needed
+            "Authorization": f"Bearer {api_key}",
         }
         update_url = f"{api_endpoint}/functions/id/{function_id}/update"
-
         response = requests.post(
             update_url, data=json.dumps(request_body), headers=headers
         )
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+        response.raise_for_status()
         print(
             f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Function '{function_id}' updated successfully."
         )
-
     except FileNotFoundError:
         print(
             f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Error: File not found at '{filepath}'"
@@ -62,43 +88,34 @@ def update_function(
 
 
 if __name__ == "__main__":
+    load_dotenv()
+
     parser = argparse.ArgumentParser(
         description="Monitors a Python file and updates a function via API on changes."
     )
-    parser.add_argument("filepath", help="Path to the Python code file")
+
     parser.add_argument(
-        "api_endpoint",
-        help="Base API endpoint URL (e.g., http://localhost:8080/api/v1)",
+        "--filepath", help="Path to the Python code file", default=os.getenv("FILEPATH")
     )
-    parser.add_argument("function_id", help="ID of the function to update")
-    parser.add_argument("api_key", help="Your API Key")  # Added API Key argument
+    parser.add_argument(
+        "--api_endpoint",
+        help="Base API endpoint URL (e.g., http://localhost:8080/api/v1)",
+        default=os.getenv("API_ENDPOINT"),
+    )
+    parser.add_argument(
+        "--function_id",
+        help="ID of the function to update",
+        default=os.getenv("FUNCTION_ID"),
+    )
+    parser.add_argument("--api_key", help="Your API Key", default=os.getenv("API_KEY"))
     parser.add_argument(
         "--name",
-        default="Gemini Manifold (google-genai)",
-        help="Function name (default: Gemini Manifold (google-genai))",
+        help="Function name (default: from file metadata 'title')",
     )
     parser.add_argument(
         "--description",
-        default="Manifold function for Gemini Developer API. Uses google-genai, supports thinking models.",
-        help="Function description",
+        help="Function description (default: from file metadata 'description')",
     )
-    parser.add_argument(
-        "--manifest_title",
-        default="Gemini Manifold (google-genai)",
-        help="Manifest title",
-    )
-    parser.add_argument("--manifest_author", default="suurt8ll", help="Manifest author")
-    parser.add_argument(
-        "--manifest_author_url",
-        default="https://github.com/suurt8ll",
-        help="Manifest author_url",
-    )
-    parser.add_argument(
-        "--manifest_funding_url",
-        default="https://github.com/suurt8ll/open_webui_functions",
-        help="Manifest funding_url",
-    )
-    parser.add_argument("--manifest_version", default="0.1.0", help="Manifest version")
     parser.add_argument(
         "--polling_interval",
         type=int,
@@ -108,29 +125,54 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    previous_hash = None
+    missing_args = []
+    if not args.filepath:
+        missing_args.append("filepath")
+    if not args.api_endpoint:
+        missing_args.append("api_endpoint")
+    if not args.function_id:
+        missing_args.append("function_id")
+    if not args.api_key:
+        missing_args.append("api_key")
+    if missing_args:
+        print(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Error: Missing required arguments: {', '.join(missing_args)}"
+        )
+        print("Please provide them via command line or .env file.")
+        exit(1)
 
+    metadata_from_file = extract_metadata_from_file(args.filepath)
+
+    function_name = args.name or metadata_from_file.get("title")
+    function_description = args.description or metadata_from_file.get("description")
+
+    missing_metadata = []
+    if not function_name:
+        missing_metadata.append("name")
+    if not function_description:
+        missing_metadata.append("description")
+
+    if missing_metadata:
+        print(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Error: Missing function metadata: {', '.join(missing_metadata)}"
+        )
+        print(
+            "Please provide them via command line, .env file or in function file docstring."
+        )
+        exit(1)
+
+    previous_hash = None
     while True:
         current_hash = file_hash(args.filepath)
         if current_hash != previous_hash:
-            if (
-                previous_hash is not None
-            ):  # Avoid updating on initial run if file exists
-                manifest_data = {
-                    "title": args.manifest_title,
-                    "author": args.manifest_author,
-                    "author_url": args.manifest_author_url,
-                    "funding_url": args.manifest_funding_url,
-                    "version": args.manifest_version,
-                }
+            if previous_hash is not None:
                 update_function(
                     args.filepath,
                     args.api_endpoint,
                     args.function_id,
-                    args.name,
-                    args.description,
-                    manifest_data,
-                    args.api_key,  # Pass API Key to update_function
+                    function_name,
+                    function_description,
+                    args.api_key,
                 )
             previous_hash = current_hash
         time.sleep(args.polling_interval)

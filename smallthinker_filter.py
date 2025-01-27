@@ -1,5 +1,6 @@
 """
 title: Smallthinker Filter
+description: Manifold function for Gemini Developer API. Uses google-genai, supports thinking models.
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
@@ -9,6 +10,11 @@ version: 0.3.0
 from pydantic import BaseModel, Field
 import json
 from time import time
+
+
+# TODO Remove box formatting in the final response if it's too long.
+# TODO Add ablity to define keywords that split the message content but will still be included in the final response.
+# TODO Remove Valve class and use hardcoded values instead.
 
 
 class Filter:
