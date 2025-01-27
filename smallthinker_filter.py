@@ -12,12 +12,11 @@ import json
 from time import time
 
 
-# TODO Remove box formatting in the final response if it's too long.
-# TODO Remove Valve class and use hardcoded values instead.
-
-
 class Filter:
     class Valves(BaseModel):
+        # TODO Add reasonable default values to the Valve fields.
+        # TODO Allow user to define custom tags for thinking models.
+        # TODO Allow user to define whitelist of models that will be filtered.
         ENABLE_FORMATTING: bool = Field(default=True)
         SPLIT_KEYWORDS_REMOVE: str = Field(
             default="**Final Answer**",
@@ -37,8 +36,10 @@ class Filter:
         return body
 
     def outlet(self, body: dict, **kwargs) -> dict:
-        print("`body` object before filtering:")
-        print(json.dumps(body, indent=4))
+        # TODO Reformat function to be very general, not just for smallthinker:3b.
+        # TODO Check if streaming is enabled and if so, dont filter the response if the model has thinking tags.
+        # print("`body` object before filtering:")
+        # print(json.dumps(body, indent=4))
         if self.valves.ENABLE_FORMATTING:
             for message in body["messages"]:
                 if message["role"] == "assistant":
@@ -94,14 +95,12 @@ class Filter:
                                 )
                             ]
                             split_index_keep = -1
-                            keyword_kept_used = None
                             for keyword in split_keywords_keep:
                                 index = final_response.rfind(keyword)
                                 if (
                                     index != -1
                                 ):  # Find first occurence for keywords to keep.
                                     split_index_keep = index
-                                    keyword_kept_used = keyword
                                     break  # Stop at the first match for keywords to keep
 
                             if split_index_keep != -1:
@@ -111,17 +110,19 @@ class Filter:
                                 ].strip()
 
                     if thoughts:
+                        # TODO Use the exact same formatting as Open WebUI.
                         formatted_content += (
-                            "<details>\n<summary>💭 Thought for {:.0f} seconds</summary>\n".format(
+                            "<details>\n<summary>Thought for {:.0f} seconds</summary>\n".format(
                                 time() - self.start_time
                             )
-                            + thoughts
-                            + "\n</details>\n"  # Added newline for better separation
+                            + "".join([f"> {line}\n" for line in thoughts.splitlines()])
+                            + "</details>\n"  # Added newline for better separation
                         )
                     if final_response:
                         formatted_content += final_response.strip()
                     message["content"] = formatted_content.strip()
 
-        print("`body` object after filtering:")
-        print(json.dumps(body, indent=4))
+        # print("`body` object after filtering:")
+        # print(json.dumps(body, indent=4))
+        # TODO Remove box formatting in the final response if it's too long.
         return body
