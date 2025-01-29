@@ -1,5 +1,6 @@
 """
 title: Gemini Manifold google_genai
+description: Manifold function for Gemini Developer API. Uses google-genai, supports thinking models and streaming.
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
@@ -8,8 +9,8 @@ version: 1.0.0
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API. Complete with thinking support.
-# Open WebUI v0.5.5 is required for this function to work properly.
-# NB! google-genai must be installed in the Open WebUI environment. Currently it's not by default.
+# Open WebUI v0.5.5 or greater is required for this function to work properly.
+# NB! google-genai==0.7.0 must be installed in the Open WebUI environment. Currently it's not by default.
 # Be sure to check out my GitHub repository for more information! Feel free to contribute and post questions.
 
 
@@ -17,9 +18,18 @@ import base64
 import json
 import re
 import fnmatch
-from typing import AsyncGenerator, AsyncIterator, List, Union, Dict, Tuple, Optional
+from typing import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    List,
+    Union,
+    Dict,
+    Tuple,
+    Optional,
+)
 from google import genai
-from google.genai import types, _api_client
+from google.genai import types
 from pydantic import BaseModel, Field
 
 DEBUG = False  # Set to True to enable debug output. Use `docker logs -f open-webui` to view logs.
@@ -59,7 +69,7 @@ class Pipe:
                 print(
                     f"[get_google_models] Retrieved {len(models)} models from Gemini Developer API."
                 )
-            return [
+            model_list = [
                 {
                     "id": self.__strip_prefix(model.name),
                     "name": model.display_name,
@@ -71,6 +81,16 @@ class Pipe:
                 and "generateContent" in model.supported_actions
                 if model.name and model.name.startswith("models/")
             ]
+            if not model_list:
+                if DEBUG:
+                    print("[get_google_models] No models found matching whitelist.")
+                return [
+                    {
+                        "id": "no_models_found",
+                        "name": "No models found matching whitelist.",
+                    }
+                ]
+            return model_list
         except Exception as e:
             if DEBUG:
                 print(f"[get_google_models] Error retrieving models: {e}")
@@ -107,20 +127,41 @@ class Pipe:
         try:
             if not self.valves.GEMINI_API_KEY:
                 raise ValueError("GEMINI_API_KEY is not set.")
-            # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here
+            # Version Check
+            import google.genai
+
+            installed_version = google.genai.__version__
+            required_version = "0.7.0"
+
+            if required_version:
+                if installed_version != required_version:
+                    error_message = f"google-genai version mismatch. Required: {required_version}, Installed: {installed_version}"
+                    if DEBUG:
+                        print(f"[pipes] {error_message}")
+                    return [{"id": "version_error", "name": error_message}]
+
+            # GEMINI_API_KEY is not available inside **init** for whatever reason so we initialize the client here
             # FIXME We need better way to ensure that the client is initialized at all times.
             self.client = genai.Client(
                 api_key=self.valves.GEMINI_API_KEY,
-                http_options=_api_client.HttpOptions(api_version="v1alpha"),
+                http_options=types.HttpOptions(api_version="v1alpha"),
             )
             models = self.__get_google_models()
+            if models and models[0].get("id") == "error":
+                return models  # Propagate error model from __get_google_models
+            if models and models[0].get("id") == "no_models_found":
+                return models  # Propagate no_models_found model
             if DEBUG:
                 print(f"[pipes] Registered models: {models}")
-            return models
+            return (
+                models
+                if models
+                else [{"id": "no_models", "name": "No models available"}]
+            )
         except Exception as e:
             if DEBUG:
                 print(f"[pipes] Error in pipes method: {e}")
-            return []
+            return [{"id": "error", "name": f"Error initializing models: {e}"}]
         finally:
             if DEBUG:
                 print("[pipes] Completed pipes method.")
@@ -177,7 +218,7 @@ class Pipe:
                         if item_type == "text":
                             # Handle text parts
                             text = item.get("text", "")
-                            part = types.Part.from_text(text)
+                            part = types.Part.from_text(text=text)
                             parts.append(part)
                         elif item_type == "image_url":
                             # Handle image parts
@@ -241,7 +282,9 @@ class Pipe:
                 else:
                     # Handle content that is a simple string (text only)
                     contents.append(
-                        types.Content(role=role, parts=[types.Part.from_text(content)])
+                        types.Content(
+                            role=role, parts=[types.Part.from_text(text=content)]
+                        )
                     )
             return contents
 
@@ -251,13 +294,13 @@ class Pipe:
             """Wraps generate_content_stream for text only, wrapping thoughts in <think> tags.
             Defaults to the first candidate if multiple candidates are present and prints a warning in DEBUG mode.
             """
-            response_stream: AsyncIterator[types.GenerateContentResponse] = (
+            response_stream: Awaitable[AsyncIterator[types.GenerateContentResponse]] = (
                 self.client.aio.models.generate_content_stream(
                     model=model, contents=contents, config=config
                 )
             )
             is_thinking = False
-            async for response in response_stream:
+            async for response in await response_stream:
                 if response.candidates:
                     if len(response.candidates) > 1:
                         if DEBUG:
@@ -332,6 +375,8 @@ class Pipe:
             print("]")
 
         model_name = self.__strip_prefix(body.get("model", ""))
+        if model_name in ["no_models_found", "error", "version_error", "no_models"]:
+            return f"Error: {model_name.replace('_', ' ')}"
         is_thinking_model = "thinking" in model_name.lower()
 
         config_params = {
