@@ -7,6 +7,23 @@ funding_url: https://github.com/suurt8ll/open_webui_functions
 version: 0.6.0
 """
 
+# The injection must follow this format (without triple quotes).
+"""
+**###INJECT_START###**
+
+prompt_title:{{prompt_title}}
+
+system_prompt:{{system_prompt}}
+
+temperature:{{temperature}}
+
+**###INJECT_END###**
+
+***
+
+{{content}}
+"""
+
 from pydantic import BaseModel
 from typing import Optional
 import json
@@ -31,8 +48,8 @@ class Filter:
         print("\n--- Inlet Filter ---")
         print("Original User Input Body:")
         print(json.dumps(body, indent=4))
-        inject_start_tag = "###INJECT_START###"
-        inject_end_tag = "###INJECT_END###"
+        inject_start_tag = "**###INJECT_START###**\n"
+        inject_end_tag = "**###INJECT_END###**\n* * *\n"
         latest_system_prompt = None
         latest_temperature = None
         modified_messages = []
