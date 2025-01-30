@@ -26,14 +26,9 @@ Requires Open WebUI v0.5.5 or later. **NB!** `gemini_manifold.py` requires the `
     pip install google-genai==0.7.0
     ```
 -   **Docker Container:**
-    1. Enter the running Open WebUI container:
-        ```bash
-        docker exec -it open-webui /bin/bash
-        ```
-    2. Install the library inside the container:
-        ```bash
-        pip install google-genai==0.7.0
-        ```
+    ```bash
+    docker exec open-webui pip install google-genai==0.7.0
+    ```
 
 **Warning:** Currently, Open WebUI updates may overwrite the manual installation of `google-genai`. You may need to reinstall it after each update.
 
