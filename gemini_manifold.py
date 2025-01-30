@@ -5,7 +5,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.0.1
+version: 1.0.2
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API. Complete with thinking support.
@@ -294,48 +294,58 @@ class Pipe:
             """Wraps generate_content_stream for text only, wrapping thoughts in <think> tags.
             Defaults to the first candidate if multiple candidates are present and prints a warning in DEBUG mode.
             """
-            response_stream: Awaitable[AsyncIterator[types.GenerateContentResponse]] = (
-                self.client.aio.models.generate_content_stream(
+            # FIXME Catch this error: google.genai.errors.ServerError:
+            # 503 UNAVAILABLE. {'error': {'code': 503, 'message': 'The model is overloaded. Please try again later.', 'status': 'UNAVAILABLE'}}
+            try:
+                response_stream: Awaitable[
+                    AsyncIterator[types.GenerateContentResponse]
+                ] = self.client.aio.models.generate_content_stream(
                     model=model, contents=contents, config=config
                 )
-            )
-            is_thinking = False
-            async for response in await response_stream:
-                if response.candidates:
-                    if len(response.candidates) > 1:
-                        if DEBUG:
-                            print(
-                                "WARNING: Multiple candidates found in response, defaulting to the first candidate."
-                            )
-                    candidate = response.candidates[0]  # Default to the first candidate
-                    if candidate.content and candidate.content.parts:
-                        for part in candidate.content.parts:
-                            text_part = getattr(
-                                part, "text", None
-                            )  # use getattr to avoid AttributeError if 'text' does not exist
-                            thought_part = getattr(
-                                part, "thought", False
-                            )  # use getattr to avoid AttributeError if 'thought' does not exist, default to False
+                is_thinking = False
+                async for response in await response_stream:
+                    if response.candidates:
+                        if len(response.candidates) > 1:
+                            if DEBUG:
+                                print(
+                                    "WARNING: Multiple candidates found in response, defaulting to the first candidate."
+                                )
+                        candidate = response.candidates[
+                            0
+                        ]  # Default to the first candidate
+                        if candidate.content and candidate.content.parts:
+                            for part in candidate.content.parts:
+                                text_part = getattr(
+                                    part, "text", None
+                                )  # use getattr to avoid AttributeError if 'text' does not exist
+                                thought_part = getattr(
+                                    part, "thought", False
+                                )  # use getattr to avoid AttributeError if 'thought' does not exist, default to False
 
-                            if thought_part:
-                                if not is_thinking:
-                                    yield "<think>"
-                                    yield "\n"
-                                    is_thinking = True
-                                if text_part is not None:
-                                    yield text_part
-                            else:
-                                if is_thinking:
-                                    # Interesting note: yielding "</think>\n" all at once will mess up the formatting.
-                                    yield "</think>"
-                                    yield "\n"
-                                    is_thinking = False
-                                if text_part is not None:
-                                    yield text_part
-            if (
-                is_thinking
-            ):  # in case the stream ends while still in a thinking block, close tag
-                yield "</think>\n"
+                                if thought_part:
+                                    if not is_thinking:
+                                        yield "<think>"
+                                        yield "\n"
+                                        is_thinking = True
+                                    if text_part is not None:
+                                        yield text_part
+                                else:
+                                    if is_thinking:
+                                        # Interesting note: yielding "</think>\n" all at once will mess up the formatting.
+                                        yield "</think>"
+                                        yield "\n"
+                                        is_thinking = False
+                                    if text_part is not None:
+                                        yield text_part
+                if (
+                    is_thinking
+                ):  # in case the stream ends while still in a thinking block, close tag
+                    yield "</think>\n"
+            except Exception as e:
+                error_message = f"Content generation error: {str(e)}"
+                if DEBUG:
+                    print(f"[pipe] {error_message}")
+                yield error_message
 
         def extract_thoughts(response: types.GenerateContentResponse) -> str:
             """Extracts and concatenates thought parts from response."""
@@ -410,23 +420,31 @@ class Pipe:
             else:  # streaming is disabled
                 if DEBUG:
                     print("[pipe] Streaming disabled.")
-                response = self.client.models.generate_content(**gen_content_args)
-                response_text = response.text if response.text else "No response text."
-
-                if is_thinking_model:
-                    # TODO Handle formatting of thoughts in non-streaming mode.
-                    thoughts = extract_thoughts(response)
-                    tagged_thoughts = (
-                        f"<think>\n{thoughts}</think>\n" if thoughts else ""
+                try:
+                    response = self.client.models.generate_content(**gen_content_args)
+                    response_text = (
+                        response.text if response.text else "No response text."
                     )
-                    final_response = tagged_thoughts + response_text
-                    if DEBUG:
-                        print(
-                            f"[pipe] Currently formatting does not work when streaming is off. See https://github.com/open-webui/open-webui/discussions/8936 for more."
+
+                    if is_thinking_model:
+                        # TODO Handle formatting of thoughts in non-streaming mode.
+                        thoughts = extract_thoughts(response)
+                        tagged_thoughts = (
+                            f"<think>\n{thoughts}</think>\n" if thoughts else ""
                         )
-                    return final_response
-                else:  # handle regular response without thoughts.
-                    return response_text
+                        final_response = tagged_thoughts + response_text
+                        if DEBUG:
+                            print(
+                                f"[pipe] Currently formatting does not work when streaming is off. See https://github.com/open-webui/open-webui/discussions/8936 for more."
+                            )
+                        return final_response
+                    else:  # handle regular response without thoughts.
+                        return response_text
+                except Exception as e:
+                    error_message = f"Content generation error: {str(e)}"
+                    if DEBUG:
+                        print(f"[pipe] {error_message}")
+                    return error_message
 
         except Exception as e:
             error_message = f"Content generation error: {str(e)}"
