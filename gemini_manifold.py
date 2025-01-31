@@ -1,5 +1,6 @@
 """
 title: Gemini Manifold google_genai
+id: gemini_manifold_google_genai
 description: Manifold function for Gemini Developer API. Uses google-genai, supports thinking models and streaming.
 author: suurt8ll
 author_url: https://github.com/suurt8ll
@@ -10,7 +11,7 @@ version: 1.0.2
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API. Complete with thinking support.
 # Open WebUI v0.5.5 or greater is required for this function to work properly.
-# NB! google-genai==0.7.0 must be installed in the Open WebUI environment. Currently it's not by default.
+# NB! google-genai==0.8.0 must be installed in the Open WebUI environment. Currently it's not by default.
 # Be sure to check out my GitHub repository for more information! Feel free to contribute and post questions.
 
 
@@ -32,7 +33,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
-DEBUG = False  # Set to True to enable debug output. Use `docker logs -f open-webui` to view logs.
+DEBUG = True  # Set to True to enable debug output. Use `docker logs -f open-webui` to view logs.
 
 
 class Pipe:
@@ -131,7 +132,9 @@ class Pipe:
             import google.genai
 
             installed_version = google.genai.__version__
-            required_version = "0.7.0"
+            required_version = "0.8.0"
+
+            # FIXME Handle google-genai missing entirely also.
 
             if required_version:
                 if installed_version != required_version:
@@ -294,8 +297,6 @@ class Pipe:
             """Wraps generate_content_stream for text only, wrapping thoughts in <think> tags.
             Defaults to the first candidate if multiple candidates are present and prints a warning in DEBUG mode.
             """
-            # FIXME Catch this error: google.genai.errors.ServerError:
-            # 503 UNAVAILABLE. {'error': {'code': 503, 'message': 'The model is overloaded. Please try again later.', 'status': 'UNAVAILABLE'}}
             try:
                 response_stream: Awaitable[
                     AsyncIterator[types.GenerateContentResponse]
@@ -304,6 +305,8 @@ class Pipe:
                 )
                 is_thinking = False
                 async for response in await response_stream:
+                    if DEBUG:
+                        print(f"[generate_content_stream_text] Response: {response}")
                     if response.candidates:
                         if len(response.candidates) > 1:
                             if DEBUG:
@@ -388,6 +391,9 @@ class Pipe:
         if model_name in ["no_models_found", "error", "version_error", "no_models"]:
             return f"Error: {model_name.replace('_', ' ')}"
         is_thinking_model = "thinking" in model_name.lower()
+        if DEBUG:
+            print(f"[pipe] Model name: {model_name}")
+            print(f"[pipe] Is thinking model: {is_thinking_model}")
 
         config_params = {
             "system_instruction": system_prompt,
