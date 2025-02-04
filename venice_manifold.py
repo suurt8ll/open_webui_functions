@@ -4,6 +4,7 @@ import os
 import base64
 from io import BytesIO
 from PIL import Image
+import re
 
 load_dotenv()
 
@@ -80,14 +81,26 @@ def generate_image(prompt, model, width=512, height=512, negative_prompt=""):
         return None
 
 
-def display_and_save_image(image_data, filename="generated_image.png"):
+def sanitize_filename(filename):
+    """Sanitizes a string to be safe for use as a filename."""
+    return re.sub(r"[^\w\s-]", "", filename).strip()
+
+
+def display_and_save_image(image_data, model, prompt):
     """Displays and saves the generated image."""
     if image_data and "images" in image_data:
+        images_dir = "./images"
+        os.makedirs(images_dir, exist_ok=True)
+        sanitized_prompt = sanitize_filename(prompt)
         for i, image_str in enumerate(image_data["images"]):
             image_bytes = base64.b64decode(image_str)
             image = Image.open(BytesIO(image_bytes))
             image.show()
-            image.save(f"{filename.split('.')[0]}_{i}.{filename.split('.')[1]}")
+            filename = (
+                f"{images_dir}/{sanitize_filename(model)}_{sanitized_prompt}_{i}.png"
+            )
+            image.save(filename)
+            print(f"Image saved to {filename}")
     else:
         print("No image data found.")
 
@@ -96,6 +109,6 @@ def display_and_save_image(image_data, filename="generated_image.png"):
 if __name__ == "__main__":
     models = get_models()
     selected_model = choose_model(models)
-    prompt = "a cat wearing a hat"
+    prompt = input("Enter your prompt: ")
     image_data = generate_image(prompt, selected_model)
-    display_and_save_image(image_data)
+    display_and_save_image(image_data, selected_model, prompt)
