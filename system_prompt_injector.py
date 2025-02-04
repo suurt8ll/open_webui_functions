@@ -1,6 +1,7 @@
 """
 title: Advanced Prompt Injector
 description: Filter that will detect and inject prompt configurations from user input.
+id: system_prompt_injector
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
@@ -130,6 +131,8 @@ class Filter:
         latest_temperature = None
         modified_messages = []
 
+        # Loop throught messages to extract injection tags and remove them.
+        # Also removes the prompt title headers from assistant messages.
         for message in body["messages"]:
             if message["role"] == "user":
                 system_prompt, temperature, injection_block, modified_content = (
@@ -157,7 +160,9 @@ class Filter:
 
         body["messages"] = modified_messages
 
+        # TODO If the system prompt exists but is empty string, then start using the default system prompt that is set in the frontend.
         self._apply_system_prompt(body, latest_system_prompt)
+        # FIXME Groq models break if temperature is set like this.
         if latest_temperature is not None:
             self._update_options(body, "temperature", latest_temperature)
         if not latest_system_prompt and latest_temperature is None:
@@ -171,20 +176,13 @@ class Filter:
 
     def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
 
-        # TODO Reasoning model support
+        # TODO Reasoning model support, put the prompt title before the collapsible reasoning content.
 
-        if DEBUG:
-            print("\n--- Outlet Filter ---")
-            print("Original User Output Body:")
-            print(json.dumps(body, indent=4))
-
+        # Add prompt title to the latest assistant message, indicating which preset was used in the response.
         for message in reversed(body["messages"]):
             if message["role"] == "assistant" and self.prompt_title:
                 message["content"] = (
                     f"*{self.prompt_title}*\n\n***\n\n{message['content']}"
                 )
                 break
-        if DEBUG:
-            print("\nModified User Output Body:")
-            print(json.dumps(body, indent=4))
         return body
