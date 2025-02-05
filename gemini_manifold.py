@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.0.2
+version: 1.0.3
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API. Complete with thinking support.
@@ -48,8 +48,11 @@ class Pipe:
     def __init__(self):
         try:
             self.valves = self.Valves()
+            self.models = []
+            self.client = None
             if DEBUG:
                 print("[INIT] Initialized Pipe with Valves configuration.")
+                print(f"[INIT] Valves: {self.valves}")
         except Exception as e:
             if DEBUG:
                 print(f"[INIT] Error during initialization: {e}")
@@ -59,6 +62,15 @@ class Pipe:
 
     def __get_google_models(self):
         """Retrieve Google models with prefix stripping."""
+        if not self.client:
+            if DEBUG:
+                print("[get_google_models] Client not initialized.")
+            return [
+                {
+                    "id": "error",
+                    "name": "Client not initialized. Please check the logs.",
+                }
+            ]
         try:
             whitelist = (
                 self.valves.MODEL_WHITELIST.split(",")
@@ -145,22 +157,32 @@ class Pipe:
 
             # GEMINI_API_KEY is not available inside **init** for whatever reason so we initialize the client here
             # FIXME We need better way to ensure that the client is initialized at all times.
-            self.client = genai.Client(
-                api_key=self.valves.GEMINI_API_KEY,
-                http_options=types.HttpOptions(api_version="v1alpha"),
-            )
-            models = self.__get_google_models()
-            if models and models[0].get("id") == "error":
-                return models  # Propagate error model from __get_google_models
-            if models and models[0].get("id") == "no_models_found":
-                return models  # Propagate no_models_found model
-            if DEBUG:
-                print(f"[pipes] Registered models: {models}")
-            return (
-                models
-                if models
-                else [{"id": "no_models", "name": "No models available"}]
-            )
+            if not self.client:
+                self.client = genai.Client(
+                    api_key=self.valves.GEMINI_API_KEY,
+                    http_options=types.HttpOptions(api_version="v1alpha"),
+                )
+            else:
+                if DEBUG:
+                    print("[pipes] Client already initialized.")
+            if not self.models:
+                models = self.__get_google_models()
+                if models and models[0].get("id") == "error":
+                    return models  # Propagate error model from __get_google_models
+                if models and models[0].get("id") == "no_models_found":
+                    return models  # Propagate no_models_found model
+                if DEBUG:
+                    print(f"[pipes] Registered models: {models}")
+                self.models = models
+                return (
+                    models
+                    if models
+                    else [{"id": "no_models", "name": "No models available"}]
+                )
+            else:
+                if DEBUG:
+                    print("[pipes] Models already initialized.")
+                return self.models
         except Exception as e:
             if DEBUG:
                 print(f"[pipes] Error in pipes method: {e}")
@@ -427,6 +449,8 @@ class Pipe:
                 if DEBUG:
                     print("[pipe] Streaming disabled.")
                 try:
+                    if not self.client:
+                        return "Error: Client not initialized."
                     response = self.client.models.generate_content(**gen_content_args)
                     response_text = (
                         response.text if response.text else "No response text."
