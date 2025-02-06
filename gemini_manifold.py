@@ -6,8 +6,10 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.0.4
+version: 1.0.5
 """
+
+# TODO Gemini Developer API stopped providing thoughts in the response.
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API. Complete with thinking support.
 # Open WebUI v0.5.5 or greater is required for this function to work properly.
@@ -38,10 +40,9 @@ if importlib.util.find_spec("google.genai"):
     from google import genai
     from google.genai import types
 else:
+    # FIXME Think of a cleaner way to handle this without causing the Python linter to freak out.
     genai = None
     types = None
-if TYPE_CHECKING:
-    from google.genai import types as GenaiTypes
 
 
 DEBUG = True  # Set to True to enable debug output. Use `docker logs -f open-webui` to view logs.
@@ -248,13 +249,13 @@ class Pipe:
 
         def transform_messages_to_contents(
             messages: List[Dict],
-        ) -> List[GenaiTypes.Content]:
+        ) -> List[types.Content]:
             """Transforms messages to google-genai contents, supporting both text and images."""
             if not genai or not types:
                 raise ValueError(
                     "google-genai is not installed. Please install it to proceed."
                 )
-            contents: List[GenaiTypes.Content] = []
+            contents: List[types.Content] = []
             for message in messages:
                 # Determine the role: "model" if assistant, else the provided role
                 role = (
@@ -348,7 +349,7 @@ class Pipe:
             """
             try:
                 response_stream: Awaitable[
-                    AsyncIterator[GenaiTypes.GenerateContentResponse]
+                    AsyncIterator[types.GenerateContentResponse]
                 ] = self.client.aio.models.generate_content_stream(
                     model=model, contents=contents, config=config
                 )
@@ -399,7 +400,7 @@ class Pipe:
                     print(f"[pipe] {error_message}")
                 yield error_message
 
-        def extract_thoughts(response: GenaiTypes.GenerateContentResponse) -> str:
+        def extract_thoughts(response: types.GenerateContentResponse) -> str:
             """Extracts and concatenates thought parts from response."""
             if (
                 not response.candidates
