@@ -6,12 +6,12 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.0.3
+version: 1.0.4
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API. Complete with thinking support.
 # Open WebUI v0.5.5 or greater is required for this function to work properly.
-# NB! google-genai==0.8.0 must be installed in the Open WebUI environment. Currently it's not by default.
+# NB! google-genai==1.0.0 must be installed in the Open WebUI environment. Currently it's not by default.
 # Be sure to check out my GitHub repository for more information! Feel free to contribute and post questions.
 
 
@@ -19,6 +19,7 @@ import base64
 import json
 import re
 import fnmatch
+from pydantic import BaseModel, Field
 from typing import (
     AsyncGenerator,
     AsyncIterator,
@@ -29,9 +30,19 @@ from typing import (
     Tuple,
     Optional,
 )
-from google import genai
-from google.genai import types
-from pydantic import BaseModel, Field
+
+import importlib.util
+from typing import TYPE_CHECKING
+
+if importlib.util.find_spec("google.genai"):
+    from google import genai
+    from google.genai import types
+else:
+    genai = None
+    types = None
+if TYPE_CHECKING:
+    from google.genai import types as GenaiTypes
+
 
 DEBUG = True  # Set to True to enable debug output. Use `docker logs -f open-webui` to view logs.
 
@@ -62,6 +73,8 @@ class Pipe:
 
     def __get_google_models(self):
         """Retrieve Google models with prefix stripping."""
+
+        # Check if client is initialized and return error if not.
         if not self.client:
             if DEBUG:
                 print("[get_google_models] Client not initialized.")
@@ -71,6 +84,7 @@ class Pipe:
                     "name": "Client not initialized. Please check the logs.",
                 }
             ]
+
         try:
             whitelist = (
                 self.valves.MODEL_WHITELIST.split(",")
@@ -137,16 +151,21 @@ class Pipe:
 
     def pipes(self) -> List[dict]:
         """Register all available Google models."""
+
+        if not genai or not types:
+            error_message = (
+                "google-genai is not installed. Please install it to proceed."
+            )
+            if DEBUG:
+                print(f"[pipes] {error_message}")
+            return [{"id": "import_error", "name": error_message}]
+
         try:
             if not self.valves.GEMINI_API_KEY:
                 raise ValueError("GEMINI_API_KEY is not set.")
-            # Version Check
-            import google.genai
 
-            installed_version = google.genai.__version__
-            required_version = "0.8.0"
-
-            # FIXME Handle google-genai missing entirely also.
+            installed_version = genai.__version__
+            required_version = "1.0.0"
 
             if required_version:
                 if installed_version != required_version:
@@ -155,8 +174,7 @@ class Pipe:
                         print(f"[pipes] {error_message}")
                     return [{"id": "version_error", "name": error_message}]
 
-            # GEMINI_API_KEY is not available inside **init** for whatever reason so we initialize the client here
-            # FIXME We need better way to ensure that the client is initialized at all times.
+            # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
             if not self.client:
                 self.client = genai.Client(
                     api_key=self.valves.GEMINI_API_KEY,
@@ -193,6 +211,11 @@ class Pipe:
 
     async def pipe(self, body: dict) -> Union[str, AsyncGenerator[str, None]]:
 
+        # TODO Return errors as correctly formatted error types for the frontend to handle.
+
+        if not genai or not types:
+            return "Error: google-genai is not installed. Please install it to proceed."
+
         def pop_system_prompt(messages: List[Dict]) -> Tuple[Optional[str], List[Dict]]:
             """Extracts system message from messages."""
             system_message_content = None
@@ -225,9 +248,13 @@ class Pipe:
 
         def transform_messages_to_contents(
             messages: List[Dict],
-        ) -> List[types.Content]:
+        ) -> List[GenaiTypes.Content]:
             """Transforms messages to google-genai contents, supporting both text and images."""
-            contents: List[types.Content] = []
+            if not genai or not types:
+                raise ValueError(
+                    "google-genai is not installed. Please install it to proceed."
+                )
+            contents: List[GenaiTypes.Content] = []
             for message in messages:
                 # Determine the role: "model" if assistant, else the provided role
                 role = (
@@ -321,7 +348,7 @@ class Pipe:
             """
             try:
                 response_stream: Awaitable[
-                    AsyncIterator[types.GenerateContentResponse]
+                    AsyncIterator[GenaiTypes.GenerateContentResponse]
                 ] = self.client.aio.models.generate_content_stream(
                     model=model, contents=contents, config=config
                 )
@@ -372,7 +399,7 @@ class Pipe:
                     print(f"[pipe] {error_message}")
                 yield error_message
 
-        def extract_thoughts(response: types.GenerateContentResponse) -> str:
+        def extract_thoughts(response: GenaiTypes.GenerateContentResponse) -> str:
             """Extracts and concatenates thought parts from response."""
             if (
                 not response.candidates
@@ -410,7 +437,13 @@ class Pipe:
             print("]")
 
         model_name = self.__strip_prefix(body.get("model", ""))
-        if model_name in ["no_models_found", "error", "version_error", "no_models"]:
+        if model_name in [
+            "no_models_found",
+            "error",
+            "version_error",
+            "no_models",
+            "import_error",
+        ]:
             return f"Error: {model_name.replace('_', ' ')}"
         is_thinking_model = "thinking" in model_name.lower()
         if DEBUG:
