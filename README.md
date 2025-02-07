@@ -13,7 +13,8 @@ This is a manifold pipe function that adds support for Google's Gemini Studio AP
 -   Whitelist based model retrieval and registration.
 -   Support for text and image input.
 -   Streaming and non-streaming content generation.
--   Special handling for thinking models, including thought encapsulation.
+-   ~~Special handling for thinking models, including thought encapsulation.~~ API stopped providing thoughts :(
+-   Support for [Grounding with Google Search](https://ai.google.dev/gemini-api/docs/grounding?lang=python)
 
 ### Usage
 
@@ -23,11 +24,11 @@ Requires Open WebUI v0.5.5 or later. **NB!** `gemini_manifold.py` requires the `
 
 -   **Python Environment:**
     ```bash
-    pip install google-genai==0.7.0
+    pip install google-genai==1.0.0
     ```
 -   **Docker Container:**
     ```bash
-    docker exec open-webui pip install google-genai==0.7.0
+    docker exec open-webui pip install google-genai==1.0.0
     ```
 
 **Warning:** Currently, Open WebUI updates may overwrite the manual installation of `google-genai`. You may need to reinstall it after each update.
