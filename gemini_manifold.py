@@ -10,6 +10,7 @@ version: 1.0.6
 """
 
 # TODO Gemini Developer API stopped providing thoughts in the response.
+# TODO Add a list of supported features here and also exiting features that can be coded in theory.
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API. Complete with thinking support.
 # Open WebUI v0.5.5 or greater is required for this function to work properly.
@@ -53,10 +54,6 @@ ALLOWED_GROUNDING_MODELS = [
 ]
 
 
-# TODO Handle this in Valve configuration.
-DEBUG = False  # Set to True to enable debug output. Use `docker logs -f open-webui` to view logs.
-
-
 class Pipe:
     class Valves(BaseModel):
         GEMINI_API_KEY: str = Field(default="")
@@ -68,9 +65,14 @@ class Pipe:
             default=False,
             description="Whether to use Grounding with Google Search. For more info: https://ai.google.dev/gemini-api/docs/grounding",
         )
+        # FIXME Show this only when USE_GROUNDING_SEARCH is True
         GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD: float = Field(
             default=0.3,
             description="See Google AI docs for more information. Only supported for 1.0 and 1.5 models",
+        )
+        DEBUG: bool = Field(
+            default=False,
+            description="Enable debug output. Use `docker logs -f open-webui` to view logs.",
         )
 
     def __init__(self):
@@ -78,14 +80,14 @@ class Pipe:
             self.valves = self.Valves()
             self.models = []
             self.client = None
-            if DEBUG:
+            if self.valves.DEBUG:
                 print("[INIT] Initialized Pipe with Valves configuration.")
                 print(f"[INIT] Valves: {self.valves}")
         except Exception as e:
-            if DEBUG:
+            if self.valves.DEBUG:
                 print(f"[INIT] Error during initialization: {e}")
         finally:
-            if DEBUG:
+            if self.valves.DEBUG:
                 print("[INIT] Initialization complete.")
 
     def __get_google_models(self):
@@ -93,7 +95,7 @@ class Pipe:
 
         # Check if client is initialized and return error if not.
         if not self.client:
-            if DEBUG:
+            if self.valves.DEBUG:
                 print("[get_google_models] Client not initialized.")
             return [
                 {
@@ -109,7 +111,7 @@ class Pipe:
                 else ["*"]
             )
             models = self.client.models.list(config={"query_base": True})
-            if DEBUG:
+            if self.valves.DEBUG:
                 print(
                     f"[get_google_models] Retrieved {len(models)} models from Gemini Developer API."
                 )
@@ -126,7 +128,7 @@ class Pipe:
                 if model.name and model.name.startswith("models/")
             ]
             if not model_list:
-                if DEBUG:
+                if self.valves.DEBUG:
                     print("[get_google_models] No models found matching whitelist.")
                 return [
                     {
@@ -136,7 +138,7 @@ class Pipe:
                 ]
             return model_list
         except Exception as e:
-            if DEBUG:
+            if self.valves.DEBUG:
                 print(f"[get_google_models] Error retrieving models: {e}")
             return [
                 {
@@ -153,17 +155,17 @@ class Pipe:
         try:
             # Use non-greedy regex to remove everything up to and including the first '.' or '/'
             stripped = re.sub(r"^.*?[./]", "", model_name)
-            if DEBUG:
+            if self.valves.DEBUG:
                 print(
                     f"[strip_prefix] Stripped prefix: '{stripped}' from '{model_name}'"
                 )
             return stripped
         except Exception as e:
-            if DEBUG:
+            if self.valves.DEBUG:
                 print(f"[strip_prefix] Error stripping prefix: {e}")
             return model_name  # Return original if stripping fails
         finally:
-            if DEBUG:
+            if self.valves.DEBUG:
                 print("[strip_prefix] Completed prefix stripping.")
 
     def pipes(self) -> List[dict]:
@@ -173,7 +175,7 @@ class Pipe:
             error_message = (
                 "google-genai is not installed. Please install it to proceed."
             )
-            if DEBUG:
+            if self.valves.DEBUG:
                 print(f"[pipes] {error_message}")
             return [{"id": "import_error", "name": error_message}]
 
@@ -187,7 +189,7 @@ class Pipe:
             if required_version:
                 if installed_version != required_version:
                     error_message = f"google-genai version mismatch. Required: {required_version}, Installed: {installed_version}"
-                    if DEBUG:
+                    if self.valves.DEBUG:
                         print(f"[pipes] {error_message}")
                     return [{"id": "version_error", "name": error_message}]
 
@@ -198,7 +200,7 @@ class Pipe:
                     http_options=types.HttpOptions(api_version="v1alpha"),
                 )
             else:
-                if DEBUG:
+                if self.valves.DEBUG:
                     print("[pipes] Client already initialized.")
             # TODO Allow user to choose if they want to fetch models only during function initialization or every time pipes is called.
             if not self.models:
@@ -207,7 +209,7 @@ class Pipe:
                     return models  # Propagate error model from __get_google_models
                 if models and models[0].get("id") == "no_models_found":
                     return models  # Propagate no_models_found model
-                if DEBUG:
+                if self.valves.DEBUG:
                     print(f"[pipes] Registered models: {models}")
                 self.models = models
                 return (
@@ -216,15 +218,15 @@ class Pipe:
                     else [{"id": "no_models", "name": "No models available"}]
                 )
             else:
-                if DEBUG:
+                if self.valves.DEBUG:
                     print("[pipes] Models already initialized.")
                 return self.models
         except Exception as e:
-            if DEBUG:
+            if self.valves.DEBUG:
                 print(f"[pipes] Error in pipes method: {e}")
             return [{"id": "error", "name": f"Error initializing models: {e}"}]
         finally:
-            if DEBUG:
+            if self.valves.DEBUG:
                 print("[pipes] Completed pipes method.")
 
     async def pipe(self, body: dict) -> Union[str, AsyncGenerator[str, None]]:
@@ -371,11 +373,11 @@ class Pipe:
                 )
                 is_thinking = False
                 async for response in await response_stream:
-                    if DEBUG:
+                    if self.valves.DEBUG:
                         print(f"[generate_content_stream_text] Response: {response}")
                     if response.candidates:
                         if len(response.candidates) > 1:
-                            if DEBUG:
+                            if self.valves.DEBUG:
                                 print(
                                     "WARNING: Multiple candidates found in response, defaulting to the first candidate."
                                 )
@@ -412,7 +414,7 @@ class Pipe:
                     yield "</think>\n"
             except Exception as e:
                 error_message = f"Content generation error: {str(e)}"
-                if DEBUG:
+                if self.valves.DEBUG:
                     print(f"[pipe] {error_message}")
                 yield error_message
 
@@ -444,7 +446,7 @@ class Pipe:
         system_prompt, remaining_messages = pop_system_prompt(messages)
         contents = transform_messages_to_contents(remaining_messages)
 
-        if DEBUG:
+        if self.valves.DEBUG:
             print(f"[pipe] Received request:")
             print(json.dumps(body, indent=4))
             print(f"[pipe] System prompt: {system_prompt}")
@@ -463,7 +465,7 @@ class Pipe:
         ]:
             return f"Error: {model_name.replace('_', ' ')}"
         is_thinking_model = "thinking" in model_name.lower()
-        if DEBUG:
+        if self.valves.DEBUG:
             print(f"[pipe] Model name: {model_name}")
             print(f"[pipe] Is thinking model: {is_thinking_model}")
 
@@ -509,14 +511,14 @@ class Pipe:
 
         try:
             if body.get("stream", False):
-                if DEBUG:
+                if self.valves.DEBUG:
                     print("[pipe] Streaming enabled.")
                 response_generator = generate_content_stream_text(
                     self, **gen_content_args
                 )
                 return response_generator
             else:  # streaming is disabled
-                if DEBUG:
+                if self.valves.DEBUG:
                     print("[pipe] Streaming disabled.")
                 try:
                     if not self.client:
@@ -533,7 +535,7 @@ class Pipe:
                             f"<think>\n{thoughts}</think>\n" if thoughts else ""
                         )
                         final_response = tagged_thoughts + response_text
-                        if DEBUG:
+                        if self.valves.DEBUG:
                             print(
                                 f"[pipe] Currently formatting does not work when streaming is off. See https://github.com/open-webui/open-webui/discussions/8936 for more."
                             )
@@ -542,15 +544,15 @@ class Pipe:
                         return response_text
                 except Exception as e:
                     error_message = f"Content generation error: {str(e)}"
-                    if DEBUG:
+                    if self.valves.DEBUG:
                         print(f"[pipe] {error_message}")
                     return error_message
 
         except Exception as e:
             error_message = f"Content generation error: {str(e)}"
-            if DEBUG:
+            if self.valves.DEBUG:
                 print(f"[pipe] {error_message}")
             return error_message
         finally:
-            if DEBUG:
+            if self.valves.DEBUG:
                 print("[pipe] Content generation completed.")
