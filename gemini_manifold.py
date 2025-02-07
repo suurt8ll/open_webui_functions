@@ -16,7 +16,6 @@ version: 1.0.5
 # NB! google-genai==1.0.0 must be installed in the Open WebUI environment. Currently it's not by default.
 # Be sure to check out my GitHub repository for more information! Feel free to contribute and post questions.
 
-
 import base64
 import json
 import re
@@ -45,16 +44,32 @@ else:
     types = None
 
 
+# according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
+ALLOWED_GROUNDING_MODELS = [
+    "gemini-2.0-flash",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash",
+    "gemini-1.0-pro",
+]
+
+
 DEBUG = True  # Set to True to enable debug output. Use `docker logs -f open-webui` to view logs.
 
 
 class Pipe:
-
     class Valves(BaseModel):
         GEMINI_API_KEY: str = Field(default="")
         MODEL_WHITELIST: str = Field(
             default="",
             description="Comma-separated list of allowed model names. Supports wildcards (*).",
+        )
+        USE_GROUNDING_SEARCH: bool = Field(
+            default=False,
+            description="Whether to use Grounding with Google Search. For more info: https://ai.google.dev/gemini-api/docs/grounding",
+        )
+        GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD: float = Field(
+            default=0.3,
+            description="See Google AI docs for more information. Only supported for 1.0 and 1.5 models",
         )
 
     def __init__(self):
@@ -211,7 +226,6 @@ class Pipe:
                 print("[pipes] Completed pipes method.")
 
     async def pipe(self, body: dict) -> Union[str, AsyncGenerator[str, None]]:
-
         # TODO Return errors as correctly formatted error types for the frontend to handle.
 
         if not genai or not types:
@@ -459,6 +473,25 @@ class Pipe:
             "max_output_tokens": body.get("max_tokens", 8192),
             "stop_sequences": body.get("stop", []),
         }
+
+        if self.valves.USE_GROUNDING_SEARCH:
+            if model_name in ALLOWED_GROUNDING_MODELS:
+                print("[pipe] Using grounding search.")
+                gs = None
+                # Dynamic retrieval only supported for 1.0 and 1.5 models currently
+                if "1.0" in model_name or "1.5" in model_name:
+                    gs = types.GoogleSearchRetrieval(
+                        dynamic_retrieval_config=types.DynamicRetrievalConfig(
+                            dynamic_threshold=self.valves.GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD
+                        )
+                    )
+                else:
+                    gs = types.GoogleSearchRetrieval()
+
+                config_params["tools"] = [types.Tool(google_search=gs)]
+            else:
+                print(f"[pipe] model {model_name} doesn't support grounding search")
+
         if is_thinking_model:
             config_params["thinking_config"] = types.ThinkingConfig(
                 include_thoughts=True
