@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.0.5
+version: 1.0.6
 """
 
 # TODO Gemini Developer API stopped providing thoughts in the response.
@@ -53,7 +53,8 @@ ALLOWED_GROUNDING_MODELS = [
 ]
 
 
-DEBUG = True  # Set to True to enable debug output. Use `docker logs -f open-webui` to view logs.
+# TODO Handle this in Valve configuration.
+DEBUG = False  # Set to True to enable debug output. Use `docker logs -f open-webui` to view logs.
 
 
 class Pipe:
@@ -199,6 +200,7 @@ class Pipe:
             else:
                 if DEBUG:
                     print("[pipes] Client already initialized.")
+            # TODO Allow user to choose if they want to fetch models only during function initialization or every time pipes is called.
             if not self.models:
                 models = self.__get_google_models()
                 if models and models[0].get("id") == "error":
@@ -226,7 +228,7 @@ class Pipe:
                 print("[pipes] Completed pipes method.")
 
     async def pipe(self, body: dict) -> Union[str, AsyncGenerator[str, None]]:
-        # TODO Return errors as correctly formatted error types for the frontend to handle.
+        # TODO Return errors as correctly formatted error types for the frontend to handle (red text in the front-end).
 
         if not genai or not types:
             return "Error: google-genai is not installed. Please install it to proceed."
@@ -474,6 +476,7 @@ class Pipe:
             "stop_sequences": body.get("stop", []),
         }
 
+        # TODO Display the citations in the frontend response somehow.
         if self.valves.USE_GROUNDING_SEARCH:
             if model_name in ALLOWED_GROUNDING_MODELS:
                 print("[pipe] Using grounding search.")
