@@ -6,14 +6,12 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.1.0
+version: 0.2.0
 """
 
 # NB! This is work in progress and not yet fully featured.
 # Feel free to contribute to the development of this function in my GitHub repository!
 # Currently it takes the last user message as prompt and generates an image using the selected model and returns it as a markdown image.
-# Hard-coded parameters are used for image generation, but these will be configurable in the future.
-# Parameters: width=512, height=512, hide_watermark=True, steps=16, cfg_scale=4, safe_mode=False
 
 from typing import AsyncGenerator, Generator, Iterator, Union
 from pydantic import BaseModel, Field
@@ -24,8 +22,11 @@ import requests
 
 class Pipe:
     class Valves(BaseModel):
-        # TODO Allow user to set image generation parameters here.
         VENICE_API_TOKEN: str = Field(default="", description="Venice.ai API Token")
+        HEIGHT: int = Field(default=1024, description="Image height")
+        WIDTH: int = Field(default=1024, description="Image width")
+        STEPS: int = Field(default=16, description="Image generation steps")
+        CFG_SCALE: int = Field(default=4, description="Image generation scale")
         DEBUG: bool = Field(default=False, description="Enable debug logging")
 
     def __init__(self):
@@ -110,12 +111,12 @@ class Pipe:
                 json={
                     "model": model,
                     "prompt": prompt,
-                    "width": 512,
-                    "height": 512,
-                    "steps": 16,
+                    "width": self.valves.WIDTH,
+                    "height": self.valves.HEIGHT,
+                    "steps": self.valves.STEPS,
                     "hide_watermark": True,
                     "return_binary": False,
-                    "cfg_scale": 4,
+                    "cfg_scale": self.valves.CFG_SCALE,
                     "safe_mode": False,
                 },
             )
