@@ -3,3 +3,5 @@
 google_genai_with_thinking.py
 docs/
 images/
+open_webui/
+.vscode/

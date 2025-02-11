@@ -64,7 +64,12 @@ class Pipe:
         """
         print("[pipe] body object:")
         print(json.dumps(body, indent=4))
-        model = body.get("model", "")
-        # Simple example of how to respond to user, this will make the assistant respond with a blue square.
-        response = f"{model}\n\n![Hi](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAaUlEQVR4nOzPUQkAIQDA0OMwkZnNZwZD+PEQ9hJsY679vezXAbca0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0E4AAAD//wN6Akf5tCRQAAAAAElFTkSuQmCC)"
-        return response
+
+        # Simple example of how to respond to user, this will make the assistant respond with a blue square or text.
+        response_text = "Hello World!"
+        response_img = "![Hi](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAaUlEQVR4nOzPUQkAIQDA0OMwkZnNZwZD+PEQ9hJsY679vezXAbca0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0E4AAAD//wN6Akf5tCRQAAAAAElFTkSuQmCC)"
+        user_messages = [msg for msg in body["messages"] if msg["role"] == "user"]
+        if len(user_messages) % 2 == 0:
+            return response_text
+        else:
+            return response_img
