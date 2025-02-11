@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.2.0
+version: 0.2.1
 """
 
 # NB! This is work in progress and not yet fully featured.
@@ -42,7 +42,7 @@ class Pipe:
         if not self.valves.VENICE_API_TOKEN:
             return "Error: Missing VENICE_API_TOKEN in valves configuration"
 
-        model = body.get("model", "").split(".")[-1]
+        model = body.get("model", "").split(".", 1)[-1]
         # TODO Allow piping the prompt to another LLM that generates the full image generation prompt?
         prompt = next(
             (
