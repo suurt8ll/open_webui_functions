@@ -1,114 +1,133 @@
+"""
+title: Venice Image Generation
+id: venice_image_generation
+description: Generate images using Venice.ai's API.
+author: suurt8ll
+author_url: https://github.com/suurt8ll
+funding_url: https://github.com/suurt8ll/open_webui_functions
+license: MIT
+version: 0.1.0
+"""
+
+# NB! This is work in progress and not yet fully featured.
+# Feel free to contribute to the development of this function in my GitHub repository!
+# Currently it takes the last user message as prompt and generates an image using the selected model and returns it as a markdown image.
+# Hard-coded parameters are used for image generation, but these will be configurable in the future.
+# Parameters: width=512, height=512, hide_watermark=True, steps=16, cfg_scale=4, safe_mode=False
+
+from typing import AsyncGenerator, Generator, Iterator, Union
+from pydantic import BaseModel, Field
+from starlette.responses import StreamingResponse
+import json
 import requests
-from dotenv import load_dotenv
-import os
-import base64
-from io import BytesIO
-from PIL import Image
-import re
-
-load_dotenv()
-
-api_token = os.getenv("VENICE_API_TOKEN")
-headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
 
 
-def get_models_from_env():
-    """Retrieves models from the VENICE_MODELS environment variable."""
-    models_str = os.getenv("VENICE_MODELS")
-    if models_str:
-        model_ids = [model_id.strip() for model_id in models_str.split(",")]
-        return [{"id": model_id, "type": "image"} for model_id in model_ids]
-    else:
-        return []
+class Pipe:
+    class Valves(BaseModel):
+        # TODO Allow user to set image generation parameters here.
+        VENICE_API_TOKEN: str = Field(default="", description="Venice.ai API Token")
+        DEBUG: bool = Field(default=False, description="Enable debug logging")
 
+    def __init__(self):
+        self.valves = self.Valves()
 
-def get_models_from_api():
-    """Retrieves available models from the Venice.ai API."""
-    url = "https://api.venice.ai/api/v1/models"
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json()["data"]
-    else:
-        print(f"Failed to retrieve models from API: {response.status_code}")
-        return []
+    def pipes(self) -> list[dict]:
+        models = self._get_models()
+        return [{"id": model["id"], "name": model["id"]} for model in models]
 
+    def pipe(
+        self, body: dict
+    ) -> Union[str, dict, StreamingResponse, Iterator, AsyncGenerator, Generator]:
+        if not self.valves.VENICE_API_TOKEN:
+            return "Error: Missing VENICE_API_TOKEN in valves configuration"
 
-def get_models():
-    """Gets models from ENV or API, prioritizing ENV."""
-    models = get_models_from_env()
-    if not models:
-        models = get_models_from_api()
-    return models
+        model = body.get("model", "").split(".")[-1]
+        # TODO Allow piping the prompt to another LLM that generates the full image generation prompt?
+        prompt = next(
+            (
+                msg["content"]
+                for msg in reversed(body["messages"])
+                if msg["role"] == "user"
+            ),
+            "",
+        )
 
+        if not prompt:
+            return "Error: No prompt found in user message"
 
-def choose_model(models):
-    """Allows the user to select a model from the available list."""
-    print("Available models:")
-    image_models = [model for model in models if model.get("type") == "image"]
-    for i, model in enumerate(image_models):
-        print(f"{i + 1}. {model['id']}")
-    while True:
+        if self.valves.DEBUG:
+            print(f"[pipe] Model: {model}, Prompt: {prompt}")
+
+        image_data = self._generate_image(model, prompt)
+
+        if image_data and image_data.get("images"):
+            if self.valves.DEBUG:
+                print(f"[pipe] Image generated successfully")
+            base64_image = image_data["images"][0]
+            return f"![Generated Image](data:image/png;base64,{base64_image})"
+
+        if self.valves.DEBUG:
+            print(f"[pipe] Image generation failed.")
+
+        return "Error: Failed to generate image"
+
+    def _get_models(self) -> list:
         try:
-            choice = int(input("Select a model by its number: "))
-            if 1 <= choice <= len(image_models):
-                return image_models[choice - 1]["id"]
-            else:
-                print("Invalid choice. Please enter a number from the list.")
-        except ValueError:
-            print("Invalid input. Please enter a number.")
-
-
-def generate_image(prompt, model, width=512, height=512, negative_prompt=""):
-    """Generates an image using the Venice.ai API."""
-    url = "https://api.venice.ai/api/v1/image/generate"
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "width": width,
-        "height": height,
-        "steps": 16,
-        "hide_watermark": True,
-        "return_binary": False,
-        "cfg_scale": 4,
-        "negative_prompt": negative_prompt,
-        "safe_mode": False,
-    }
-    response = requests.post(url, json=payload, headers=headers)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        print(f"Image generation failed: {response.status_code}")
-        return None
-
-
-def sanitize_filename(filename):
-    """Sanitizes a string to be safe for use as a filename."""
-    return re.sub(r"[^\w\s-]", "", filename).strip()
-
-
-def display_and_save_image(image_data, model, prompt):
-    """Displays and saves the generated image."""
-    if image_data and "images" in image_data:
-        images_dir = "./images"
-        os.makedirs(images_dir, exist_ok=True)
-        sanitized_prompt = sanitize_filename(prompt)
-        for i, image_str in enumerate(image_data["images"]):
-            image_bytes = base64.b64decode(image_str)
-            image = Image.open(BytesIO(image_bytes))
-            image.show()
-            filename = (
-                f"{images_dir}/{sanitize_filename(model)}_{sanitized_prompt}_{i}.png"
+            response = requests.get(
+                "https://api.venice.ai/api/v1/models?type=image",
+                headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},
             )
-            image.save(filename)
-            print(f"Image saved to {filename}")
-    else:
-        print("No image data found.")
 
+            if response.status_code == 200:
+                image_models = response.json().get("data", [])
 
-# Example usage:
-if __name__ == "__main__":
-    models = get_models()
-    selected_model = choose_model(models)
-    prompt = input("Enter your prompt: ")
-    image_data = generate_image(prompt, selected_model)
-    display_and_save_image(image_data, selected_model, prompt)
+                if self.valves.DEBUG:
+                    print(
+                        f"[_get_models] Retrieved {len(image_models)} image models from API"
+                    )
+                    print(
+                        f"[_get_models] Raw model data: {json.dumps(image_models, indent=2)}"
+                    )
+
+                return image_models
+
+            if self.valves.DEBUG:
+                print(
+                    f"[_get_models] Model retrieval failed: {response.status_code} - {response.text}"
+                )
+            return []
+
+        except Exception as e:
+            if self.valves.DEBUG:
+                print(f"[_get_models] Model retrieval error: {str(e)}")
+            return []
+
+    def _generate_image(self, model: str, prompt: str) -> Union[dict, None]:
+        try:
+            response = requests.post(
+                "https://api.venice.ai/api/v1/image/generate",
+                headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "width": 512,
+                    "height": 512,
+                    "steps": 16,
+                    "hide_watermark": True,
+                    "return_binary": False,
+                    "cfg_scale": 4,
+                    "safe_mode": False,
+                },
+            )
+
+            if self.valves.DEBUG:
+                print(
+                    f"[_generate_image] Generation response: {response.status_code} - {response.text[:200]}..."
+                )
+
+            return response.json() if response.status_code == 200 else None
+
+        except Exception as e:
+            if self.valves.DEBUG:
+                print(f"[_generate_image] Generation error: {str(e)}")
+            return None
