@@ -18,20 +18,7 @@ This is a manifold pipe function that adds support for Google's Gemini Studio AP
 
 ### Usage
 
-Requires Open WebUI v0.5.5 or later. **NB!** `gemini_manifold.py` requires the `google-genai` library to be installed in the Open WebUI environment. This library is not currently included in the Open WebUI repository, so users must install it manually. See [this discussion](https://github.com/open-webui/open-webui/discussions/8951) that is related to this.
-
-### Installation Instructions for `google-genai`:
-
--   **Python Environment:**
-    ```bash
-    pip install google-genai==1.0.0
-    ```
--   **Docker Container:**
-    ```bash
-    docker exec open-webui pip install google-genai==1.0.0
-    ```
-
-**Warning:** Currently, Open WebUI updates may overwrite the manual installation of `google-genai`. You may need to reinstall it after each update.
+Requires Open WebUI v0.5.5 or later.
 
 ## Additional Scripts
 
