@@ -16,19 +16,21 @@ from starlette.responses import StreamingResponse
 from starlette.requests import Request
 import json
 
+# You can import any module from the Open WebUI backend itself.
+from open_webui.models.files import Files
+
 
 class Pipe:
-    # Values here appear in the front-end as user input fields.
     class Valves(BaseModel):
         EXAMPLE_STRING: str = Field(default="")
+
+    class UserValves(BaseModel):
+        EXAMPLE_STRING_USER: str = Field(default="")
 
     def __init__(self):
         self.valves = self.Valves()
 
-    # This function is not required, but can be used to create more than one model in the front-end.
     def pipes(self) -> list[dict]:
-        print("[pipes] Returning models")
-        # This will register 2 models in the front-end. Their full model names will be [function_id].[model_id].
         return [
             {"id": "model_id_1", "name": "model_1"},
             {"id": "model_id_2", "name": "model_2"},
@@ -39,6 +41,7 @@ class Pipe:
         body: dict,
         __user__: dict,
         __request__: Request,
+        # FIXME Figure out how to type hint the event emitter and event call.
         __event_emitter__,
         __event_call__,
         __task__: str,
@@ -47,11 +50,16 @@ class Pipe:
         __metadata__: dict,
         __tools__: list,
     ) -> Union[str, dict, StreamingResponse, Iterator, AsyncGenerator, Generator]:
-        """
-        Pipe function that captures all possible injected parameters and returns them as a JSON string.
-        """
 
-        # Create a dictionary to hold all parameters (including body, __user__, etc.)
+        string_from_valve = self.valves.EXAMPLE_STRING
+        string_from_user_valve = __user__["valves"].EXAMPLE_STRING_USER
+
+        print("[pipe] String from valve: ", string_from_valve)
+        print("[pipe] String from user valve: ", string_from_user_valve)
+
+        stored_files = Files.get_files()
+        print("[pipe] Stored files: ", stored_files)
+
         all_params = {
             "body": body,
             "__user__": __user__,
@@ -65,12 +73,9 @@ class Pipe:
             "__tools__": __tools__,
         }
 
-        # Convert the dictionary to a JSON string
-        all_params_json = json.dumps(
-            all_params, indent=2, default=str
-        )  # Using default=str for non-serializable objects
+        all_params_json = json.dumps(all_params, indent=2, default=str)
 
-        print("[pipe] Returning all parameters as JSON")
+        print("[pipe] Returning all parameters as JSON:")
         print(all_params_json)
 
         return "Hello from pipe function!"
