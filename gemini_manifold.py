@@ -6,7 +6,8 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.0.6
+version: 1.1.0
+requirements: google-genai==1.2.0
 """
 
 # TODO Gemini Developer API stopped providing thoughts in the response.
@@ -14,7 +15,6 @@ version: 1.0.6
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API. Complete with thinking support.
 # Open WebUI v0.5.5 or greater is required for this function to work properly.
-# NB! google-genai==1.0.0 must be installed in the Open WebUI environment. Currently it's not by default.
 # Be sure to check out my GitHub repository for more information! Feel free to contribute and post questions.
 
 import base64
@@ -32,17 +32,8 @@ from typing import (
     Tuple,
     Optional,
 )
-
-import importlib.util
-from typing import TYPE_CHECKING
-
-if importlib.util.find_spec("google.genai"):
-    from google import genai
-    from google.genai import types
-else:
-    # FIXME Think of a cleaner way to handle this without causing the Python linter to freak out.
-    genai = None
-    types = None
+from google import genai
+from google.genai import types
 
 
 # according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
@@ -182,16 +173,6 @@ class Pipe:
         try:
             if not self.valves.GEMINI_API_KEY:
                 raise ValueError("GEMINI_API_KEY is not set.")
-
-            installed_version = genai.__version__
-            required_version = "1.0.0"
-
-            if required_version:
-                if installed_version != required_version:
-                    error_message = f"google-genai version mismatch. Required: {required_version}, Installed: {installed_version}"
-                    if self.valves.DEBUG:
-                        print(f"[pipes] {error_message}")
-                    return [{"id": "version_error", "name": error_message}]
 
             # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
             if not self.client:
@@ -492,7 +473,7 @@ class Pipe:
                     )
                 else:
                     gs = types.GoogleSearchRetrieval()
-
+                # FIXME Typecheker is not happy with this line.
                 config_params["tools"] = [types.Tool(google_search=gs)]
             else:
                 print(f"[pipe] model {model_name} doesn't support grounding search")
