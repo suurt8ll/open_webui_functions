@@ -7,52 +7,14 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 0.0.0
+requirements:
 """
 
-from typing import (
-    AsyncGenerator,
-    Generator,
-    Iterator,
-    Union,
-    Callable,
-    Awaitable,
-    Dict,
-    Any,
-    TypedDict,
-)
+from typing import AsyncGenerator, Generator, Iterator, Union
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 from starlette.requests import Request
 import json
-
-
-# Define TypedDict for each possible structure of event_data
-class StatusEventData(TypedDict):
-    type: str  # Required: "status"
-    data: Dict[
-        str, Union[int, float, str, None]
-    ]  # Status-specific data (e.g., progress)
-
-
-class MessageEventData(TypedDict):
-    type: str  # Required: "message"
-    data: Dict[str, str]  # Message-specific data (e.g., content)
-
-
-class ReplaceEventData(TypedDict):
-    type: str  # Required: "replace"
-    data: Dict[str, str]  # Replace-specific data (e.g., content)
-
-
-# Define a general EventData type that is a Union of all the specific types
-EventData = Union[StatusEventData, MessageEventData, ReplaceEventData]
-
-
-# Type alias for the event emitter
-AsyncEventCallback = Callable[[EventData], Awaitable[None]]
-
-# Type alias for the event caller
-AsyncEventCaller = Callable[[EventData], Awaitable[Any]]
 
 
 class Pipe:
@@ -77,8 +39,8 @@ class Pipe:
         body: dict,
         __user__: dict,
         __request__: Request,
-        __event_emitter__: AsyncEventCallback,
-        __event_call__: AsyncEventCaller,
+        __event_emitter__,
+        __event_call__,
         __task__: str,
         __task_body__: dict,
         __files__: list,
