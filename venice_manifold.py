@@ -6,14 +6,13 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.4.0
+version: 0.5.0
 """
 
 # NB! This is work in progress and not yet fully featured.
 # Feel free to contribute to the development of this function in my GitHub repository!
 # Currently it takes the last user message as prompt and generates an image using the selected model and returns it as a markdown image.
 
-# TODO Improve logging by using something better than print statements.
 # TODO Use another LLM model to generate the image prompt?
 # TODO Option to save the generated images onto disk, bypassing database?
 
@@ -99,6 +98,7 @@ class Pipe:
         self,
         body: dict,
         __event_emitter__: Callable[[ChatEventData], Awaitable[None]],
+        __task__: str,
     ) -> Union[str, dict, StreamingResponse, Iterator, AsyncGenerator, Generator]:
         if not self.valves.VENICE_API_TOKEN:
             return "Error: Missing VENICE_API_TOKEN in valves configuration"
@@ -115,6 +115,19 @@ class Pipe:
 
         if not prompt:
             return "Error: No prompt found in user message"
+
+        if __task__ == "title_generation":
+            print_colored(
+                "Detected title generation task! I do not know how to handle this so I'm returning something generic.",
+                "WARNING",
+            )
+            return '{"title": "🖼️ Image Generation"}'
+        if __task__ == "tags_generation":
+            print_colored(
+                "Detected tag generation task! I do not know how to handle this so I'm returning an empty list.",
+                "WARNING",
+            )
+            return '{"tags": []}'
 
         if self.valves.DEBUG:
             print_colored(f"Model: {model}, Prompt: {prompt}", "DEBUG")
