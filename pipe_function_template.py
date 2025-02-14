@@ -10,7 +10,7 @@ version: 0.0.0
 requirements:
 """
 
-from typing import AsyncGenerator, Generator, Iterator, Union
+from typing import AsyncGenerator, Awaitable, Generator, Iterator, Callable, Any
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 from starlette.requests import Request
@@ -63,42 +63,45 @@ class Pipe:
 
     async def pipe(
         self,
-        body: dict,
-        __user__: dict,
+        body: dict[str, Any],
+        __user__: dict[str, Any],
         __request__: Request,
         # FIXME: Figure out how to type hint the event emitter and event call. See Open WebUI documentation for more information.
-        __event_emitter__,
-        __event_call__,
+        __event_emitter__: Callable[[dict[str, Any]], Awaitable[None]],
+        __event_call__: Callable[[dict[str, Any]], Awaitable[Any]],
         __task__: str,
-        __task_body__: dict,
-        __files__: list[dict],
-        __metadata__: dict,
-        __tools__: list,
-    ) -> Union[str, dict, StreamingResponse, Iterator, AsyncGenerator, Generator]:
+        __task_body__: dict[str, Any],
+        __files__: list[dict[str, Any]],
+        __metadata__: dict[str, Any],
+        __tools__: list[Any],
+    ) -> (
+        str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
+    ):
         """
         The core logic of the Pipe function.
 
         Args:
-            body (dict): The main request payload.
-            __user__ (dict): User information (ID, email, name, role) and user-specific valves ( __user__["valves"]).
+            body (dict[str, Any]): The main request payload.
+            __user__ (dict[str, Any]): User information (ID, email, name, role) and user-specific valves ( __user__["valves"]).
             __request__: The FastAPI request object.
             __event_emitter__:  Event emitter for sending events.
             __event_call__: Event call object.
             __task__ (str): Task ID.
-            __task_body__ (dict): Task body.
-            __files__ (list[dict]): A list of uploaded files.
-            __metadata__ (dict): Metadata associated with the chat session or message.
-            __tools__ (list): A list of available tools.
+            __task_body__ (dict[str, Any]): Task body.
+            __files__ (list[dict[str, Any]]): A list of uploaded files.
+            __metadata__ (dict[str, Any]): Metadata associated with the chat session or message.
+            __tools__ (list[Any]): A list of available tools.
 
         Returns:
-            Union[str, dict, StreamingResponse, Iterator, AsyncGenerator, Generator]: The response from the pipe function.
+            str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator: The response from the pipe function.
         """
         try:
             string_from_valve = self.valves.EXAMPLE_STRING
             string_from_user_valve = __user__["valves"].EXAMPLE_STRING_USER
 
             print("[pipe] String from valve: ", string_from_valve)
-            print("[pipe] String from user valve: ", string_from_user_valve)
+            if string_from_user_valve:
+                print("[pipe] String from user valve: ", string_from_user_valve)
 
             stored_files = Files.get_files()
             print("[pipe] Stored files: ", stored_files)
