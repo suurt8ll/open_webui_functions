@@ -112,32 +112,6 @@ class Pipe:
                 print_colored("Detected tag generation task!", "INFO")
                 return '{"tags": ["tag1", "tag2", "tag3"]}'
 
-            string_from_valve = self.valves.EXAMPLE_STRING
-            string_from_user_valve = __user__["valves"].EXAMPLE_STRING_USER
-
-            print_colored(f"String from valve: {string_from_valve}", "INFO")
-            print_colored(f"String from user valve: {string_from_user_valve}", "INFO")
-
-            stored_files = Files.get_files()
-            print_colored(f"Stored files: {stored_files}", "DEBUG")
-
-            all_params = {
-                "body": body,
-                "__user__": __user__,
-                "__request__": __request__,
-                "__event_emitter__": __event_emitter__,
-                "__event_call__": __event_call__,
-                "__task__": __task__,
-                "__task_body__": __task_body__,
-                "__files__": __files__,
-                "__metadata__": __metadata__,
-                "__tools__": __tools__,
-            }
-
-            all_params_json = json.dumps(all_params, indent=2, default=str)
-            print_colored("Returning all parameters as JSON:", "DEBUG")
-            print(all_params_json)
-
             async def countdown():
                 for i in range(5, 0, -1):
                     await __event_emitter__(
@@ -163,6 +137,32 @@ class Pipe:
                 )
 
             asyncio.create_task(countdown())
+
+            string_from_valve = self.valves.EXAMPLE_STRING
+            string_from_user_valve = __user__["valves"].EXAMPLE_STRING_USER
+
+            print_colored(f"String from valve: {string_from_valve}", "INFO")
+            print_colored(f"String from user valve: {string_from_user_valve}", "INFO")
+
+            # stored_files = Files.get_files()
+            # print_colored(f"Stored files: {stored_files}", "DEBUG")
+
+            all_params = {
+                "body": body,
+                "__user__": __user__,
+                "__request__": __request__,
+                "__event_emitter__": __event_emitter__,
+                "__event_call__": __event_call__,
+                "__task__": __task__,
+                "__task_body__": __task_body__,
+                "__files__": __files__,
+                "__metadata__": __metadata__,
+                "__tools__": __tools__,
+            }
+
+            all_params_json = json.dumps(all_params, indent=2, default=str)
+            print_colored("Returning all parameters as JSON:", "DEBUG")
+            print(all_params_json)
 
             return "Instant response sent!"
 
