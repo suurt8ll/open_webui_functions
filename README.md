@@ -13,7 +13,8 @@ This is a manifold pipe function that adds support for Google's Gemini Studio AP
 -   Whitelist based model retrieval and registration.
 -   Support for text and image input.
 -   Streaming and non-streaming content generation.
--   ~~Special handling for thinking models, including thought encapsulation.~~ API stopped providing thoughts :(
+-   ~~Special handling for thinking models, including thought encapsulation.~~  
+    API stopped providing thoughts https://github.com/googleapis/python-genai/issues/226 :(
 -   Support for [Grounding with Google Search](https://ai.google.dev/gemini-api/docs/grounding?lang=python)
 
 ### Usage
