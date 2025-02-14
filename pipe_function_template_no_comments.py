@@ -105,6 +105,13 @@ class Pipe:
         str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
     ):
         try:
+            if __task__ == "title_generation":
+                print_colored("Detected title generation task!", "INFO")
+                return '{"title": "Example Title"}'
+            if __task__ == "tags_generation":
+                print_colored("Detected tag generation task!", "INFO")
+                return '{"tags": ["tag1", "tag2", "tag3"]}'
+
             string_from_valve = self.valves.EXAMPLE_STRING
             string_from_user_valve = __user__["valves"].EXAMPLE_STRING_USER
 
