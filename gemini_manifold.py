@@ -16,6 +16,7 @@ requirements: google-genai==1.2.0
 # TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 # TODO Better debug output (colors, more info)
 # TODO Better type checking.
+# TODO Return errors as correctly formatted error types for the frontend to handle (red text in the front-end).
 
 # ^ Open WebUI front-end throws error when trying to upload videos or audios,
 # but the file still gets uploaded to database and is passed to the pipe function.
@@ -90,80 +91,6 @@ class Pipe:
             if self.valves.DEBUG:
                 print("[INIT] Initialization complete.")
 
-    def _get_google_models(self):
-        """Retrieve Google models with prefix stripping."""
-
-        # Check if client is initialized and return error if not.
-        if not self.client:
-            if self.valves.DEBUG:
-                print("[get_google_models] Client not initialized.")
-            return [
-                {
-                    "id": "error",
-                    "name": "Client not initialized. Please check the logs.",
-                }
-            ]
-
-        try:
-            whitelist = (
-                self.valves.MODEL_WHITELIST.split(",")
-                if self.valves.MODEL_WHITELIST
-                else ["*"]
-            )
-            models = self.client.models.list(config={"query_base": True})
-            if self.valves.DEBUG:
-                print(
-                    f"[get_google_models] Retrieved {len(models)} models from Gemini Developer API."
-                )
-            model_list = [
-                {
-                    "id": self._strip_prefix(model.name),
-                    "name": model.display_name,
-                }
-                for model in models
-                if model.name
-                and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
-                if model.supported_actions
-                and "generateContent" in model.supported_actions
-                if model.name and model.name.startswith("models/")
-            ]
-            if not model_list:
-                if self.valves.DEBUG:
-                    print("[get_google_models] No models found matching whitelist.")
-                return [
-                    {
-                        "id": "no_models_found",
-                        "name": "No models found matching whitelist.",
-                    }
-                ]
-            return model_list
-        except Exception as e:
-            if self.valves.DEBUG:
-                print(f"[get_google_models] Error retrieving models: {e}")
-            return [
-                {
-                    "id": "error",
-                    "name": "Error retrieving models. Please check the logs.",
-                }
-            ]
-
-    def _strip_prefix(self, model_name: str) -> str:
-        """
-        Strip any prefix from the model name up to and including the first '.' or '/'.
-        This makes the method generic and adaptable to varying prefixes.
-        """
-        try:
-            # Use non-greedy regex to remove everything up to and including the first '.' or '/'
-            stripped = re.sub(r"^.*?[./]", "", model_name)
-            return stripped
-        except Exception as e:
-            if self.valves.DEBUG:
-                print(f"[strip_prefix] Error stripping prefix: {e}")
-            return model_name  # Return original if stripping fails
-        finally:
-            if self.valves.DEBUG:
-                print("[strip_prefix] Completed prefix stripping.")
-
     def pipes(self) -> List[dict]:
         """Register all available Google models."""
         try:
@@ -212,10 +139,6 @@ class Pipe:
     ) -> (
         str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
     ):
-        # TODO Return errors as correctly formatted error types for the frontend to handle (red text in the front-end).
-
-        if not genai or not types:
-            return "Error: google-genai is not installed. Please install it to proceed."
 
         def _pop_system_prompt(
             messages: List[dict],
@@ -466,3 +389,77 @@ class Pipe:
         finally:
             if self.valves.DEBUG:
                 print("[pipe] Content generation completed.")
+
+    def _get_google_models(self):
+        """Retrieve Google models with prefix stripping."""
+
+        # Check if client is initialized and return error if not.
+        if not self.client:
+            if self.valves.DEBUG:
+                print("[get_google_models] Client not initialized.")
+            return [
+                {
+                    "id": "error",
+                    "name": "Client not initialized. Please check the logs.",
+                }
+            ]
+
+        try:
+            whitelist = (
+                self.valves.MODEL_WHITELIST.split(",")
+                if self.valves.MODEL_WHITELIST
+                else ["*"]
+            )
+            models = self.client.models.list(config={"query_base": True})
+            if self.valves.DEBUG:
+                print(
+                    f"[get_google_models] Retrieved {len(models)} models from Gemini Developer API."
+                )
+            model_list = [
+                {
+                    "id": self._strip_prefix(model.name),
+                    "name": model.display_name,
+                }
+                for model in models
+                if model.name
+                and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
+                if model.supported_actions
+                and "generateContent" in model.supported_actions
+                if model.name and model.name.startswith("models/")
+            ]
+            if not model_list:
+                if self.valves.DEBUG:
+                    print("[get_google_models] No models found matching whitelist.")
+                return [
+                    {
+                        "id": "no_models_found",
+                        "name": "No models found matching whitelist.",
+                    }
+                ]
+            return model_list
+        except Exception as e:
+            if self.valves.DEBUG:
+                print(f"[get_google_models] Error retrieving models: {e}")
+            return [
+                {
+                    "id": "error",
+                    "name": "Error retrieving models. Please check the logs.",
+                }
+            ]
+
+    def _strip_prefix(self, model_name: str) -> str:
+        """
+        Strip any prefix from the model name up to and including the first '.' or '/'.
+        This makes the method generic and adaptable to varying prefixes.
+        """
+        try:
+            # Use non-greedy regex to remove everything up to and including the first '.' or '/'
+            stripped = re.sub(r"^.*?[./]", "", model_name)
+            return stripped
+        except Exception as e:
+            if self.valves.DEBUG:
+                print(f"[strip_prefix] Error stripping prefix: {e}")
+            return model_name  # Return original if stripping fails
+        finally:
+            if self.valves.DEBUG:
+                print("[strip_prefix] Completed prefix stripping.")
