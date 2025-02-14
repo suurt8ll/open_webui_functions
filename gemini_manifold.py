@@ -12,6 +12,13 @@ requirements: google-genai==1.2.0
 
 # TODO Gemini Developer API stopped providing thoughts in the response.
 # TODO Add a list of supported features here and also exiting features that can be coded in theory.
+# TODO Audio input support.
+# TODO Video input support.
+# TODO PDF (other documents?) input support.
+
+# ^ Open WebUI front-end throws error when trying to upload videos or audios,
+# but the file still gets uploaded to database and is passed to the pipe function.
+# We can use this fact to implement audio and video input support.
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API. Complete with thinking support.
 # Open WebUI v0.5.5 or greater is required for this function to work properly.
@@ -146,10 +153,6 @@ class Pipe:
         try:
             # Use non-greedy regex to remove everything up to and including the first '.' or '/'
             stripped = re.sub(r"^.*?[./]", "", model_name)
-            if self.valves.DEBUG:
-                print(
-                    f"[strip_prefix] Stripped prefix: '{stripped}' from '{model_name}'"
-                )
             return stripped
         except Exception as e:
             if self.valves.DEBUG:
@@ -464,17 +467,19 @@ class Pipe:
             if model_name in ALLOWED_GROUNDING_MODELS:
                 print("[pipe] Using grounding search.")
                 gs = None
-                # Dynamic retrieval only supported for 1.0 and 1.5 models currently
+                # Dynamic retrieval only supported for 1.0 and 1.5 models
                 if "1.0" in model_name or "1.5" in model_name:
                     gs = types.GoogleSearchRetrieval(
                         dynamic_retrieval_config=types.DynamicRetrievalConfig(
                             dynamic_threshold=self.valves.GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD
                         )
                     )
+                    config_params["tools"] = [types.Tool(google_search_retrieval=gs)]
                 else:
                     gs = types.GoogleSearchRetrieval()
-                # FIXME Typecheker is not happy with this line.
-                config_params["tools"] = [types.Tool(google_search=gs)]
+                    config_params["tools"] = [
+                        types.Tool(google_search=types.GoogleSearch())
+                    ]
             else:
                 print(f"[pipe] model {model_name} doesn't support grounding search")
 
