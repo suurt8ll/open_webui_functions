@@ -1,5 +1,5 @@
 """
-title: Pipe Function Skeletion
+title: Lean Pipe Function Skeleton
 id: pipe_function_skeleton
 description: Good starting point for creating new pipe functions for Open WebUI.
 author: suurt8ll
@@ -15,8 +15,37 @@ from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 from starlette.requests import Request
 import json
-
+import traceback
+import inspect
 from open_webui.models.files import Files
+
+COLORS = {
+    "RED": "\033[91m",
+    "GREEN": "\033[92m",
+    "YELLOW": "\033[93m",
+    "BLUE": "\033[94m",
+    "MAGENTA": "\033[95m",
+    "CYAN": "\033[96m",
+    "WHITE": "\033[97m",
+    "RESET": "\033[0m",
+}
+
+
+def print_colored(message: str, level: str = "INFO") -> None:
+    color_map = {
+        "INFO": COLORS["GREEN"],
+        "WARNING": COLORS["YELLOW"],
+        "ERROR": COLORS["RED"],
+        "DEBUG": COLORS["BLUE"],
+    }
+    color = color_map.get(level, COLORS["WHITE"])
+    frame = inspect.currentframe()
+    if frame:
+        frame = frame.f_back
+    method_name = frame.f_code.co_name if frame else "<unknown>"
+    print(
+        f"{color}[{level}][pipe_function_skeleton][{method_name}]{COLORS['RESET']} {message}"
+    )
 
 
 class Pipe:
@@ -44,7 +73,6 @@ class Pipe:
         body: dict[str, Any],
         __user__: dict[str, Any],
         __request__: Request,
-        # FIXME: Figure out how to type hint the event emitter and event call. See Open WebUI documentation for more information.
         __event_emitter__: Callable[[dict[str, Any]], Awaitable[None]],
         __event_call__: Callable[[dict[str, Any]], Awaitable[Any]],
         __task__: str,
@@ -59,12 +87,11 @@ class Pipe:
             string_from_valve = self.valves.EXAMPLE_STRING
             string_from_user_valve = __user__["valves"].EXAMPLE_STRING_USER
 
-            print("[pipe] String from valve: ", string_from_valve)
-            if string_from_user_valve:
-                print("[pipe] String from user valve: ", string_from_user_valve)
+            print_colored(f"String from valve: {string_from_valve}", "INFO")
+            print_colored(f"String from user valve: {string_from_user_valve}", "INFO")
 
             stored_files = Files.get_files()
-            print("[pipe] Stored files: ", stored_files)
+            print_colored(f"Stored files: {stored_files}", "DEBUG")
 
             all_params = {
                 "body": body,
@@ -80,12 +107,12 @@ class Pipe:
             }
 
             all_params_json = json.dumps(all_params, indent=2, default=str)
-
-            print("[pipe] Returning all parameters as JSON:")
+            print_colored("Returning all parameters as JSON:", "DEBUG")
             print(all_params_json)
 
             return "Hello from pipe function!"
 
         except Exception as e:
-            print(f"An error occurred: {e}")
-            return f"Error: {e}"
+            error_msg = f"Pipe function error: {str(e)}\n{traceback.format_exc()}"
+            print_colored(error_msg, "ERROR")
+            return error_msg
