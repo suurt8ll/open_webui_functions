@@ -10,7 +10,17 @@ version: 0.0.0
 requirements:
 """
 
-from typing import AsyncGenerator, Awaitable, Generator, Iterator, Callable, Any
+import asyncio
+from typing import (
+    AsyncGenerator,
+    Awaitable,
+    Generator,
+    Iterator,
+    Callable,
+    Any,
+    Literal,
+    TypedDict,
+)
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 from starlette.requests import Request
@@ -48,6 +58,17 @@ def print_colored(message: str, level: str = "INFO") -> None:
     )
 
 
+class StatusEventData(TypedDict):
+    description: str
+    done: bool
+    hidden: bool
+
+
+class ChatEventData(TypedDict):
+    type: Literal["status"]
+    data: StatusEventData
+
+
 class Pipe:
     class Valves(BaseModel):
         EXAMPLE_STRING: str = Field(
@@ -73,7 +94,7 @@ class Pipe:
         body: dict[str, Any],
         __user__: dict[str, Any],
         __request__: Request,
-        __event_emitter__: Callable[[dict[str, Any]], Awaitable[None]],
+        __event_emitter__: Callable[[ChatEventData], Awaitable[None]],
         __event_call__: Callable[[dict[str, Any]], Awaitable[Any]],
         __task__: str,
         __task_body__: dict[str, Any],
@@ -110,7 +131,33 @@ class Pipe:
             print_colored("Returning all parameters as JSON:", "DEBUG")
             print(all_params_json)
 
-            return "Hello from pipe function!"
+            async def countdown():
+                for i in range(5, 0, -1):
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"Time remaining: {i}s",
+                                "done": False,
+                                "hidden": False,
+                            },
+                        }
+                    )
+                    await asyncio.sleep(1)
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "Process complete!",
+                            "done": True,
+                            "hidden": False,
+                        },
+                    }
+                )
+
+            asyncio.create_task(countdown())
+
+            return "Instant response sent!"
 
         except Exception as e:
             error_msg = f"Pipe function error: {str(e)}\n{traceback.format_exc()}"
