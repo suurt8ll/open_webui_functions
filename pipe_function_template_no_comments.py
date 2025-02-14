@@ -164,6 +164,11 @@ class Pipe:
             print_colored("Returning all parameters as JSON:", "DEBUG")
             print(all_params_json)
 
+            if __files__ and len(__files__) > 0:
+                print_colored(
+                    f'Detected a file upload! {__files__[0]["file"]["path"]}', "INFO"
+                )
+
             return "Instant response sent!"
 
         except Exception as e:
