@@ -58,7 +58,7 @@ class Pipe:
             default="", title="Admin String", description="String configurable by admin"
         )
         LOG_LEVEL: Literal["INFO", "WARNING", "ERROR", "DEBUG", "OFF"] = Field(
-            default="OFF",
+            default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
 
@@ -69,8 +69,10 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
+        self._print_colored("Function has been initialized!", "INFO")
 
     def pipes(self) -> list[dict]:
+        self._print_colored("Registering models.", "INFO")
         return [
             {"id": "model_id_1", "name": "model_1"},
             {"id": "model_id_2", "name": "model_2"},
