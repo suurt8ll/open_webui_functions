@@ -32,7 +32,28 @@ Requires Open WebUI v0.5.5 or later.
 
 ## Contributing
 
-Contributions are welcome. Fork the repository, create a feature branch, commit your changes, and open a pull request.
+Contributions are welcome! Here's how to contribute:
+
+1.  **Fork the repository** to your own GitHub account.
+2.  **Create a feature branch** based on the `dev` branch.  Name your branch something descriptive, like `feature/add-new-functionality` or `fix/bug-description`.
+
+    ```bash
+    git checkout dev
+    git checkout -b feature/your-feature-name
+    ```
+
+3.  **Commit your changes** with clear and informative commit messages.
+4.  **Push your feature branch** to your forked repository.
+
+    ```bash
+    git push origin feature/your-feature-name
+    ```
+
+5.  **Open a pull request** on GitHub, targeting the **`dev` branch** of the main repository.
+
+**Important:** Please ensure your pull request targets the `dev` branch. Pull requests targeting `master` will not be accepted.
+
+**Note:** The `dev` branch is where active development happens. The `master` branch contains stable releases.
 
 ## License
 
