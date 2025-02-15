@@ -17,8 +17,10 @@ version: 0.5.0
 # TODO Option to save the generated images onto disk, bypassing database?
 
 import asyncio
+import json
 import traceback
 from typing import (
+    Any,
     AsyncGenerator,
     Generator,
     Iterator,
@@ -76,6 +78,9 @@ class Pipe:
     def pipes(self) -> list[dict]:
         try:
             models = self._get_models()
+            self._print_colored("Got models:", "DEBUG")
+            if self.valves.LOG_LEVEL == "DEBUG":
+                print(json.dumps(models, indent=2, default=str))
             return [{"id": model["id"], "name": model["id"]} for model in models]
         except Exception as e:
             error_msg = f"Error getting models: {str(e)}\n{traceback.format_exc()}"
@@ -184,7 +189,7 @@ class Pipe:
         )
         return "Error: Failed to generate image"
 
-    def _get_models(self) -> list:
+    def _get_models(self) -> list[dict[str, Any]]:
         try:
             response = requests.get(
                 "https://api.venice.ai/api/v1/models?type=image",
@@ -230,7 +235,6 @@ class Pipe:
                         "INFO",
                     )
                     response.raise_for_status()
-                    # FIXME Mimetype error
                     return await response.json()
 
         except aiohttp.ClientResponseError as e:
@@ -268,5 +272,5 @@ class Pipe:
                 frame = frame.f_back
             method_name = frame.f_code.co_name if frame else "<unknown>"
             print(
-                f"{color}[{level}][pipe_function_skeleton][{method_name}]{COLORS['RESET']} {message}"
+                f"{color}[{level}][venice_manifold][{method_name}]{COLORS['RESET']} {message}"
             )
