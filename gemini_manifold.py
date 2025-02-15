@@ -38,7 +38,6 @@ from typing import (
     AsyncIterator,
     Generator,
     Iterator,
-    List,
     Literal,
     Tuple,
     Optional,
@@ -99,7 +98,7 @@ class Pipe:
         finally:
             self._print_colored("Initialization complete.", "INFO")
 
-    def pipes(self) -> List[dict]:
+    def pipes(self) -> list[dict[str, str]]:
         """Register all available Google models."""
         try:
             if not self.valves.GEMINI_API_KEY:
@@ -143,15 +142,15 @@ class Pipe:
             self._print_colored("Completed pipes method.", "DEBUG")
 
     async def pipe(
-        self, body: dict
+        self, body: dict[str, Any]
     ) -> (
         str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
     ):
         """Helper functions inside the pipe() method"""
 
         def _pop_system_prompt(
-            messages: List[dict],
-        ) -> Tuple[Optional[str], List[dict]]:
+            messages: list[dict[str, str]],
+        ) -> Tuple[Optional[str], list[dict[str, str]]]:
             """Extracts system message from messages."""
             system_message_content = None
             messages_without_system = []
@@ -182,14 +181,14 @@ class Pipe:
                 return "application/octet-stream"
 
         def _transform_messages_to_contents(
-            messages: List[dict],
-        ) -> List[types.Content]:
+            messages: list[dict],
+        ) -> list[types.Content]:
             """Transforms messages to google-genai contents, supporting both text and images."""
             if not genai or not types:
                 raise ValueError(
                     "google-genai is not installed. Please install it to proceed."
                 )
-            contents: List[types.Content] = []
+            contents: list[types.Content] = []
             for message in messages:
                 # Determine the role: "model" if assistant, else the provided role
                 role = (
@@ -278,14 +277,7 @@ class Pipe:
         async def _process_stream(
             self, gen_content_args: dict[str, Any]
         ) -> AsyncGenerator[str, None]:
-            """Helper function to process the stream and yield text chunks.
-
-            Args:
-                gen_content_args: The arguments to pass to generate_content_stream.
-
-            Yields:
-                str: Text chunks from the response.
-            """
+            """Helper function to process the stream and yield text chunks."""
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
                 await self.client.aio.models.generate_content_stream(**gen_content_args)
             )
@@ -423,7 +415,7 @@ class Pipe:
                 f"{color}[{level}][gemini_manifold][{method_name}]{COLORS['RESET']} {message}"
             )
 
-    def _get_google_models(self):
+    def _get_google_models(self) -> list[dict[str, str]]:
         """Retrieve Google models with prefix stripping."""
 
         # Check if client is initialized and return error if not.
