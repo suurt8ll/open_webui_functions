@@ -191,6 +191,9 @@ class Pipe:
             messages: list[dict],
         ) -> list[types.Content]:
             """Transforms messages to google-genai contents, supporting both text and images."""
+
+            # TODO Remove the file tracker (stuff between <details> tags) from the final input to the model.
+
             if not genai or not types:
                 raise ValueError(
                     "google-genai is not installed. Please install it to proceed."
@@ -282,9 +285,14 @@ class Pipe:
             return contents
 
         async def _process_stream(
-            gen_content_args: dict[str, Any]
+            gen_content_args: dict[str, Any], first_yield: Optional[str] = None
         ) -> AsyncGenerator[str, None]:
             """Helper function to process the stream and yield text chunks."""
+
+            if first_yield:
+                # TODO Keep track of uploaded files here.
+                yield first_yield
+
             # FIXME Figure out why type checker freaks out here.
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
                 await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
@@ -325,16 +333,26 @@ class Pipe:
         self._print_colored("Received request:", "DEBUG")
         if self.valves.LOG_LEVEL == "DEBUG":
             print(json.dumps(body, indent=2))
-        self._print_colored(f"System prompt: {system_prompt}", "DEBUG")
+        self._print_colored(f"System prompt:\n{system_prompt}", "DEBUG")
         self._print_colored("Contents: [", "DEBUG")
         if self.valves.LOG_LEVEL == "DEBUG":
             for content in enumerate(contents):
                 print(f"    {content},")
             print("]")
-        if len(__files__) > 0:
+        if __files__ and len(__files__) > 0:
+            # TODO If this list contains a file that is not in the files context (between <details> tags), then we can assume that user just uploaded a new file.
+            # We can infer from the growing files context, when the file was uploaded in the chat history.
             self._print_colored("You have uploaded files to this chat:", "DEBUG")
             if self.valves.LOG_LEVEL == "DEBUG":
                 print(json.dumps(__files__, indent=2))
+            if system_prompt:
+                # TODO This assumes the RAG prompt ends with this tag, always. Splitting is needed to keep the user's own system prompt.
+                if "</user_query>" in system_prompt:
+                    system_prompt = system_prompt.split("</user_query>", 1)[1].strip()
+                    self._print_colored(
+                        "Removed everything before </user_query> from system prompt.",
+                        "DEBUG",
+                    )
 
         model_name = self._strip_prefix(body.get("model", ""))
         if model_name in [
@@ -377,6 +395,11 @@ class Pipe:
             else:
                 print(f"[pipe] model {model_name} doesn't support grounding search")
 
+        self._print_colored(
+            "Creating GenerateContentConfig object with following values:"
+        )
+        if self.valves.LOG_LEVEL == "DEBUG":
+            print(json.dumps(config_params, indent=2, default=str))
         config = types.GenerateContentConfig(**config_params)
 
         gen_content_args = {
@@ -391,8 +414,13 @@ class Pipe:
 
             self._print_colored(f'Streaming is {body.get("stream", False)}', "DEBUG")
 
+            files_context = "<details>\n<summary>Files in the context window</summary>\n> file1\n> file2\n</details>\n\n"
+
             # Backend is able to handle AsyncGenerator object if streming is set to False.
-            return _process_stream(gen_content_args)
+            return _process_stream(
+                gen_content_args,
+                files_context,
+            )
         except Exception as e:
             error_msg = f"Content generation error: {str(e)}\n{traceback.format_exc()}"
             self._print_colored(error_msg, "ERROR")
