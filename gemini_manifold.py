@@ -14,7 +14,6 @@ requirements: google-genai==1.2.0
 # TODO Audio input support.
 # TODO Video input support.
 # TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
-# TODO Better debug output (colors, more info)
 # TODO Better type checking.
 # TODO Return errors as correctly formatted error types for the frontend to handle (red text in the front-end).
 
@@ -27,9 +26,11 @@ requirements: google-genai==1.2.0
 # Be sure to check out my GitHub repository for more information! Feel free to contribute and post questions.
 
 import base64
+import inspect
 import json
 import re
 import fnmatch
+import traceback
 from pydantic import BaseModel, Field
 from typing import (
     Any,
@@ -38,6 +39,7 @@ from typing import (
     Generator,
     Iterator,
     List,
+    Literal,
     Tuple,
     Optional,
 )
@@ -45,6 +47,16 @@ from starlette.responses import StreamingResponse
 from google import genai
 from google.genai import types
 
+COLORS = {
+    "RED": "\033[91m",
+    "GREEN": "\033[92m",
+    "YELLOW": "\033[93m",
+    "BLUE": "\033[94m",
+    "MAGENTA": "\033[95m",
+    "CYAN": "\033[96m",
+    "WHITE": "\033[97m",
+    "RESET": "\033[0m",
+}
 
 # according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
 ALLOWED_GROUNDING_MODELS = [
@@ -71,25 +83,21 @@ class Pipe:
             default=0.3,
             description="See Google AI docs for more information. Only supported for 1.0 and 1.5 models",
         )
-        DEBUG: bool = Field(
-            default=False,
-            description="Enable debug output. Use `docker logs -f open-webui` to view logs.",
+        LOG_LEVEL: Literal["INFO", "WARNING", "ERROR", "DEBUG", "OFF"] = Field(
+            default="INFO",
+            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
 
     def __init__(self):
         try:
             self.valves = self.Valves()
+            self._print_colored(f"Valves: {self.valves}", "DEBUG")
             self.models = []
             self.client = None
-            if self.valves.DEBUG:
-                print("[INIT] Initialized Pipe with Valves configuration.")
-                print(f"[INIT] Valves: {self.valves}")
         except Exception as e:
-            if self.valves.DEBUG:
-                print(f"[INIT] Error during initialization: {e}")
+            self._print_colored(f"Error during initialization: {e}", "ERROR")
         finally:
-            if self.valves.DEBUG:
-                print("[INIT] Initialization complete.")
+            self._print_colored("Initialization complete.", "INFO")
 
     def pipes(self) -> List[dict]:
         """Register all available Google models."""
@@ -98,47 +106,48 @@ class Pipe:
                 raise ValueError("GEMINI_API_KEY is not set.")
 
             # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
+            # TODO Allow user to choose if they want to fetch models only during function initialization or every time pipes is called.
             if not self.client:
                 self.client = genai.Client(
                     api_key=self.valves.GEMINI_API_KEY,
                     http_options=types.HttpOptions(api_version="v1alpha"),
                 )
             else:
-                if self.valves.DEBUG:
-                    print("[pipes] Client already initialized.")
-            # TODO Allow user to choose if they want to fetch models only during function initialization or every time pipes is called.
+                self._print_colored("Client already initialized.", "INFO")
 
-            if not self.models:
-                models = self._get_google_models()
-                if models and models[0].get("id") == "error":
-                    return models  # Propagate error model from _get_google_models
-                if models and models[0].get("id") == "no_models_found":
-                    return models  # Propagate no_models_found model
-                if self.valves.DEBUG:
-                    print(f"[pipes] Registered models: {models}")
-                self.models = models
-                return (
-                    models
-                    if models
-                    else [{"id": "no_models", "name": "No models available"}]
-                )
-            else:
-                if self.valves.DEBUG:
-                    print("[pipes] Models already initialized.")
+            # Return existing models if already initialized
+            if self.models:
+                self._print_colored("Models already initialized.", "INFO")
                 return self.models
+
+            # Get and process new models
+            models = self._get_google_models()
+
+            # Handle error cases
+            if models and models[0].get("id") in ["error", "no_models_found"]:
+                return models
+
+            self._print_colored(f"Registered models: {models}", "DEBUG")
+            self.models = models
+            return (
+                models
+                if models
+                else [{"id": "no_models", "name": "No models available"}]
+            )
+
         except Exception as e:
-            if self.valves.DEBUG:
-                print(f"[pipes] Error in pipes method: {e}")
+            error_msg = f"Error in pipes method: {str(e)}\n{traceback.format_exc()}"
+            self._print_colored(error_msg, "ERROR")
             return [{"id": "error", "name": f"Error initializing models: {e}"}]
         finally:
-            if self.valves.DEBUG:
-                print("[pipes] Completed pipes method.")
+            self._print_colored("Completed pipes method.", "DEBUG")
 
     async def pipe(
         self, body: dict
     ) -> (
         str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
     ):
+        """Helper functions inside the pipe() method"""
 
         def _pop_system_prompt(
             messages: List[dict],
@@ -282,14 +291,14 @@ class Pipe:
             )
 
             async for chunk in response_stream:
-                if self.valves.DEBUG:
-                    print(f"[_process_stream] Response: {chunk.text}", end="")
+                if self.valves.LOG_LEVEL == "DEBUG":
+                    print(chunk.text, end="")
                 if chunk.candidates:
                     if len(chunk.candidates) > 1:
-                        if self.valves.DEBUG:
-                            print(
-                                "WARNING: Multiple candidates found in response, defaulting to the first candidate."
-                            )
+                        self._print_colored(
+                            "Multiple candidates found in response, defaulting to the first candidate.",
+                            "WARNING",
+                        )
                     candidate = chunk.candidates[0]  # Default to the first candidate
                     if candidate.content and candidate.content.parts:
                         for part in candidate.content.parts:
@@ -307,11 +316,12 @@ class Pipe:
         system_prompt, remaining_messages = _pop_system_prompt(messages)
         contents = _transform_messages_to_contents(remaining_messages)
 
-        if self.valves.DEBUG:
-            print(f"[pipe] Received request:")
+        self._print_colored("Received request:", "DEBUG")
+        if self.valves.LOG_LEVEL == "DEBUG":
             print(json.dumps(body, indent=2))
-            print(f"[pipe] System prompt: {system_prompt}")
-            print(f"[pipe] Contents: [")
+        self._print_colored(f"System prompt: {system_prompt}", "DEBUG")
+        self._print_colored("Contents: [", "DEBUG")
+        if self.valves.LOG_LEVEL == "DEBUG":
             for content in enumerate(contents):
                 print(f"    {content},")
             print("]")
@@ -325,8 +335,7 @@ class Pipe:
             "import_error",
         ]:
             return f"Error: {model_name.replace('_', ' ')}"
-        if self.valves.DEBUG:
-            print(f"[pipe] Model name: {model_name}")
+        self._print_colored(f"Model name: {model_name}", "DEBUG")
 
         config_params = {
             "system_instruction": system_prompt,
@@ -367,13 +376,10 @@ class Pipe:
         }
 
         try:
+            self._print_colored(f'Streaming is {body.get("stream", False)}', "DEBUG")
             if body.get("stream", False):
-                if self.valves.DEBUG:
-                    print("[pipe] Streaming enabled.")
                 return _process_stream(self, gen_content_args)
             else:  # streaming is disabled
-                if self.valves.DEBUG:
-                    print("[pipe] Streaming disabled.")
                 if not self.client:
                     return "Error: Client not initialized."
                 # FIXME Make it async?
@@ -382,21 +388,47 @@ class Pipe:
                 return response_text
 
         except Exception as e:
-            error_message = f"Content generation error: {str(e)}"
-            if self.valves.DEBUG:
-                print(f"[pipe] {error_message}")
-            return error_message
+            error_msg = f"Content generation error: {str(e)}\n{traceback.format_exc()}"
+            self._print_colored(error_msg, "ERROR")
+            return error_msg
         finally:
-            if self.valves.DEBUG:
-                print("[pipe] Content generation completed.")
+            self._print_colored("Content generation completed.", "INFO")
+
+    """Helper functions inside the Pipe class."""
+
+    def _print_colored(self, message: str, level: str = "INFO") -> None:
+        """
+        Prints a colored log message to the console, respecting the configured log level.
+        """
+        if not hasattr(self, "valves") or self.valves.LOG_LEVEL == "OFF":
+            return
+
+        # Define log level hierarchy
+        level_priority = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3}
+
+        # Only print if message level is >= configured level
+        if level_priority.get(level, 0) >= level_priority.get(self.valves.LOG_LEVEL, 0):
+            color_map = {
+                "INFO": COLORS["GREEN"],
+                "WARNING": COLORS["YELLOW"],
+                "ERROR": COLORS["RED"],
+                "DEBUG": COLORS["BLUE"],
+            }
+            color = color_map.get(level, COLORS["WHITE"])
+            frame = inspect.currentframe()
+            if frame:
+                frame = frame.f_back
+            method_name = frame.f_code.co_name if frame else "<unknown>"
+            print(
+                f"{color}[{level}][gemini_manifold][{method_name}]{COLORS['RESET']} {message}"
+            )
 
     def _get_google_models(self):
         """Retrieve Google models with prefix stripping."""
 
         # Check if client is initialized and return error if not.
         if not self.client:
-            if self.valves.DEBUG:
-                print("[get_google_models] Client not initialized.")
+            self._print_colored("Client not initialized.", "ERROR")
             return [
                 {
                     "id": "error",
@@ -411,10 +443,10 @@ class Pipe:
                 else ["*"]
             )
             models = self.client.models.list(config={"query_base": True})
-            if self.valves.DEBUG:
-                print(
-                    f"[get_google_models] Retrieved {len(models)} models from Gemini Developer API."
-                )
+            self._print_colored(
+                f"[get_google_models] Retrieved {len(models)} models from Gemini Developer API.",
+                "INFO",
+            )
             model_list = [
                 {
                     "id": self._strip_prefix(model.name),
@@ -428,8 +460,7 @@ class Pipe:
                 if model.name and model.name.startswith("models/")
             ]
             if not model_list:
-                if self.valves.DEBUG:
-                    print("[get_google_models] No models found matching whitelist.")
+                self._print_colored("No models found matching whitelist.", "WARNING")
                 return [
                     {
                         "id": "no_models_found",
@@ -438,8 +469,8 @@ class Pipe:
                 ]
             return model_list
         except Exception as e:
-            if self.valves.DEBUG:
-                print(f"[get_google_models] Error retrieving models: {e}")
+            error_msg = f"Error retrieving models: {str(e)}\n{traceback.format_exc()}"
+            self._print_colored(error_msg, "ERROR")
             return [
                 {
                     "id": "error",
@@ -457,9 +488,9 @@ class Pipe:
             stripped = re.sub(r"^.*?[./]", "", model_name)
             return stripped
         except Exception as e:
-            if self.valves.DEBUG:
-                print(f"[strip_prefix] Error stripping prefix: {e}")
+            error_msg = f"Error stripping prefix: {str(e)}\n{traceback.format_exc()}"
+            self._print_colored(error_msg, "WARNING")
+            # FIXME OR should it error out??
             return model_name  # Return original if stripping fails
         finally:
-            if self.valves.DEBUG:
-                print("[strip_prefix] Completed prefix stripping.")
+            self._print_colored("Completed prefix stripping.", "DEBUG")

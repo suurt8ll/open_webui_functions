@@ -17,7 +17,10 @@ version: 0.5.0
 # TODO Option to save the generated images onto disk, bypassing database?
 
 import asyncio
+import json
+import traceback
 from typing import (
+    Any,
     AsyncGenerator,
     Generator,
     Iterator,
@@ -46,23 +49,6 @@ COLORS = {
 }
 
 
-def print_colored(message: str, level: str = "INFO") -> None:
-    color_map = {
-        "INFO": COLORS["GREEN"],
-        "WARNING": COLORS["YELLOW"],
-        "ERROR": COLORS["RED"],
-        "DEBUG": COLORS["BLUE"],
-    }
-    color = color_map.get(level, COLORS["WHITE"])
-    frame = inspect.currentframe()
-    if frame:
-        frame = frame.f_back
-    method_name = frame.f_code.co_name if frame else "<unknown>"
-    print(
-        f"{color}[{level}][venice_image_generation][{method_name}]{COLORS['RESET']} {message}"
-    )
-
-
 class StatusEventData(TypedDict):
     description: str
     done: bool
@@ -81,7 +67,10 @@ class Pipe:
         WIDTH: int = Field(default=1024, description="Image width")
         STEPS: int = Field(default=16, description="Image generation steps")
         CFG_SCALE: int = Field(default=4, description="Image generation scale")
-        DEBUG: bool = Field(default=False, description="Enable debug logging")
+        LOG_LEVEL: Literal["INFO", "WARNING", "ERROR", "DEBUG", "OFF"] = Field(
+            default="INFO",
+            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -89,9 +78,13 @@ class Pipe:
     def pipes(self) -> list[dict]:
         try:
             models = self._get_models()
+            self._print_colored("Got models:", "DEBUG")
+            if self.valves.LOG_LEVEL == "DEBUG":
+                print(json.dumps(models, indent=2, default=str))
             return [{"id": model["id"], "name": model["id"]} for model in models]
         except Exception as e:
-            print_colored(f"Error getting models: {e}", "ERROR")
+            error_msg = f"Error getting models: {str(e)}\n{traceback.format_exc()}"
+            self._print_colored(error_msg, "ERROR")
             return []
 
     async def pipe(
@@ -100,6 +93,7 @@ class Pipe:
         __event_emitter__: Callable[[ChatEventData], Awaitable[None]],
         __task__: str,
     ) -> Union[str, dict, StreamingResponse, Iterator, AsyncGenerator, Generator]:
+
         if not self.valves.VENICE_API_TOKEN:
             return "Error: Missing VENICE_API_TOKEN in valves configuration"
 
@@ -117,20 +111,19 @@ class Pipe:
             return "Error: No prompt found in user message"
 
         if __task__ == "title_generation":
-            print_colored(
+            self._print_colored(
                 "Detected title generation task! I do not know how to handle this so I'm returning something generic.",
                 "WARNING",
             )
             return '{"title": "🖼️ Image Generation"}'
         if __task__ == "tags_generation":
-            print_colored(
+            self._print_colored(
                 "Detected tag generation task! I do not know how to handle this so I'm returning an empty list.",
                 "WARNING",
             )
             return '{"tags": []}'
 
-        if self.valves.DEBUG:
-            print_colored(f"Model: {model}, Prompt: {prompt}", "DEBUG")
+        self._print_colored(f"Model: {model}, Prompt: {prompt}", "DEBUG")
 
         async def timer_task(start_time: float):
             """Counts up and emits status updates."""
@@ -149,7 +142,7 @@ class Pipe:
                     )
                     await asyncio.sleep(1)  # Update every second
             except asyncio.CancelledError:
-                print_colored("Timer task cancelled.", "DEBUG")
+                self._print_colored("Timer task cancelled.", "DEBUG")
 
         start_time = time.time()
         timer = asyncio.create_task(timer_task(start_time))
@@ -164,8 +157,7 @@ class Pipe:
                 pass  # Expected, already handled
 
         if image_data and image_data.get("images"):
-            if self.valves.DEBUG:
-                print_colored("Image generated successfully", "INFO")
+            self._print_colored("Image generated successfully", "INFO")
             base64_image = image_data["images"][0]
 
             total_time = time.time() - start_time
@@ -182,8 +174,7 @@ class Pipe:
 
             return f"![Generated Image](data:image/png;base64,{base64_image})"
 
-        if self.valves.DEBUG:
-            print_colored("Image generation failed.", "ERROR")
+        self._print_colored("Image generation failed.", "ERROR")
 
         total_time = time.time() - start_time
         await __event_emitter__(
@@ -198,7 +189,7 @@ class Pipe:
         )
         return "Error: Failed to generate image"
 
-    def _get_models(self) -> list:
+    def _get_models(self) -> list[dict[str, Any]]:
         try:
             response = requests.get(
                 "https://api.venice.ai/api/v1/models?type=image",
@@ -207,16 +198,20 @@ class Pipe:
             response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
             return response.json().get("data", [])
         except requests.exceptions.RequestException as e:
-            print_colored(f"Error getting models: {e}", "ERROR")
+            error_msg = f"Error getting models: {str(e)}\n{traceback.format_exc()}"
+            self._print_colored(error_msg, "ERROR")
             return []
         except Exception as e:
-            print_colored(f"An unexpected error occurred: {e}", "ERROR")
+            error_msg = (
+                f"An unexpected error occurred: {str(e)}\n{traceback.format_exc()}"
+            )
+            self._print_colored(error_msg, "ERROR")
             return []
 
     async def _generate_image(self, model: str, prompt: str) -> Union[dict, None]:
         try:
             async with aiohttp.ClientSession() as session:
-                print_colored(
+                self._print_colored(
                     f"Sending image generation request to Venice.ai for model: {model}",
                     "INFO",
                 )
@@ -235,7 +230,7 @@ class Pipe:
                         "safe_mode": False,
                     },
                 ) as response:
-                    print_colored(
+                    self._print_colored(
                         f"Received response from Venice.ai with status: {response.status}",
                         "INFO",
                     )
@@ -243,10 +238,39 @@ class Pipe:
                     return await response.json()
 
         except aiohttp.ClientResponseError as e:
-            print_colored(
-                f"Image generation failed with status: {e.status}. Error: {e}", "ERROR"
-            )
+            error_msg = f"Image generation failed with status: {str(e.status)}. Error: {str(e)}\n{traceback.format_exc()}"
+            self._print_colored(error_msg, "ERROR")
             return None
         except Exception as e:
-            print_colored(f"Generation error: {str(e)}", "ERROR")
+            error_msg = f"Generation error: {str(e)}\n{traceback.format_exc()}"
+            self._print_colored(error_msg, "ERROR")
             return None
+
+    """Helper functions inside the Pipe class."""
+
+    def _print_colored(self, message: str, level: str = "INFO") -> None:
+        """
+        Prints a colored log message to the console, respecting the configured log level.
+        """
+        if not hasattr(self, "valves") or self.valves.LOG_LEVEL == "OFF":
+            return
+
+        # Define log level hierarchy
+        level_priority = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3}
+
+        # Only print if message level is >= configured level
+        if level_priority.get(level, 0) >= level_priority.get(self.valves.LOG_LEVEL, 0):
+            color_map = {
+                "INFO": COLORS["GREEN"],
+                "WARNING": COLORS["YELLOW"],
+                "ERROR": COLORS["RED"],
+                "DEBUG": COLORS["BLUE"],
+            }
+            color = color_map.get(level, COLORS["WHITE"])
+            frame = inspect.currentframe()
+            if frame:
+                frame = frame.f_back
+            method_name = frame.f_code.co_name if frame else "<unknown>"
+            print(
+                f"{color}[{level}][venice_manifold][{method_name}]{COLORS['RESET']} {message}"
+            )
