@@ -143,7 +143,9 @@ class Pipe:
             self._print_colored("Completed pipes method.", "DEBUG")
 
     async def pipe(
-        self, body: dict[str, Any]
+        self,
+        body: dict[str, Any],
+        __files__: list[dict[str, Any]],
     ) -> (
         str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
     ):
@@ -329,6 +331,10 @@ class Pipe:
             for content in enumerate(contents):
                 print(f"    {content},")
             print("]")
+        if len(__files__) > 0:
+            self._print_colored("You have uploaded files to this chat:", "DEBUG")
+            if self.valves.LOG_LEVEL == "DEBUG":
+                print(json.dumps(__files__, indent=2))
 
         model_name = self._strip_prefix(body.get("model", ""))
         if model_name in [
