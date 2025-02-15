@@ -41,36 +41,6 @@ COLORS = {
 }
 
 
-def _print_colored(self, message: str, level: str = "INFO") -> None:
-    if not hasattr(self, 'valves') or self.valves.LOG_LEVEL == "OFF":
-        return
-        
-    # Define log level hierarchy
-    level_priority = {
-        "DEBUG": 0,
-        "INFO": 1,
-        "WARNING": 2,
-        "ERROR": 3
-    }
-    
-    # Only print if message level is >= configured level
-    if level_priority.get(level, 0) >= level_priority.get(self.valves.LOG_LEVEL, 0):
-        color_map = {
-            "INFO": COLORS["GREEN"],
-            "WARNING": COLORS["YELLOW"],
-            "ERROR": COLORS["RED"],
-            "DEBUG": COLORS["BLUE"],
-        }
-        color = color_map.get(level, COLORS["WHITE"])
-        frame = inspect.currentframe()
-        if frame:
-            frame = frame.f_back
-        method_name = frame.f_code.co_name if frame else "<unknown>"
-        print(
-            f"{color}[{level}][pipe_function_skeleton][{method_name}]{COLORS['RESET']} {message}"
-        )
-
-
 class StatusEventData(TypedDict):
     description: str
     done: bool
@@ -123,10 +93,11 @@ class Pipe:
     ):
         try:
             if __task__ == "title_generation":
-                _print_colored("Detected title generation task!", "INFO")
+                self._print_colored("Detected title generation task!", "INFO")
                 return '{"title": "Example Title"}'
+
             if __task__ == "tags_generation":
-                _print_colored("Detected tag generation task!", "INFO")
+                self._print_colored("Detected tag generation task!", "INFO")
                 return '{"tags": ["tag1", "tag2", "tag3"]}'
 
             async def countdown():
@@ -142,6 +113,7 @@ class Pipe:
                         }
                     )
                     await asyncio.sleep(1)
+
                 await __event_emitter__(
                     {
                         "type": "status",
@@ -158,11 +130,13 @@ class Pipe:
             string_from_valve = self.valves.EXAMPLE_STRING
             string_from_user_valve = __user__["valves"].EXAMPLE_STRING_USER
 
-            _print_colored(f"String from valve: {string_from_valve}", "INFO")
-            _print_colored(f"String from user valve: {string_from_user_valve}", "INFO")
+            self._print_colored(f"String from valve: {string_from_valve}", "INFO")
+            self._print_colored(
+                f"String from user valve: {string_from_user_valve}", "INFO"
+            )
 
             # stored_files = Files.get_files()
-            # _print_colored(f"Stored files: {stored_files}", "DEBUG")
+            # self._print_colored(f"Stored files: {stored_files}", "DEBUG")
 
             all_params = {
                 "body": body,
@@ -178,11 +152,11 @@ class Pipe:
             }
 
             all_params_json = json.dumps(all_params, indent=2, default=str)
-            _print_colored("Returning all parameters as JSON:", "DEBUG")
+            self._print_colored("Returning all parameters as JSON:", "DEBUG")
             print(all_params_json)
 
             if __files__ and len(__files__) > 0:
-                _print_colored(
+                self._print_colored(
                     f'Detected a file upload! {__files__[0]["file"]["path"]}', "INFO"
                 )
 
@@ -190,5 +164,34 @@ class Pipe:
 
         except Exception as e:
             error_msg = f"Pipe function error: {str(e)}\n{traceback.format_exc()}"
-            _print_colored(error_msg, "ERROR")
+            self._print_colored(error_msg, "ERROR")
             return error_msg
+
+    """Helper functions inside the Pipe class."""
+
+    def _print_colored(self, message: str, level: str = "INFO") -> None:
+        """
+        Prints a colored log message to the console, respecting the configured log level.
+        """
+        if not hasattr(self, "valves") or self.valves.LOG_LEVEL == "OFF":
+            return
+
+        # Define log level hierarchy
+        level_priority = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3}
+
+        # Only print if message level is >= configured level
+        if level_priority.get(level, 0) >= level_priority.get(self.valves.LOG_LEVEL, 0):
+            color_map = {
+                "INFO": COLORS["GREEN"],
+                "WARNING": COLORS["YELLOW"],
+                "ERROR": COLORS["RED"],
+                "DEBUG": COLORS["BLUE"],
+            }
+            color = color_map.get(level, COLORS["WHITE"])
+            frame = inspect.currentframe()
+            if frame:
+                frame = frame.f_back
+            method_name = frame.f_code.co_name if frame else "<unknown>"
+            print(
+                f"{color}[{level}][pipe_function_skeleton][{method_name}]{COLORS['RESET']} {message}"
+            )
