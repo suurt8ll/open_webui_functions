@@ -68,7 +68,7 @@ ALLOWED_GROUNDING_MODELS = [
 
 FILES_HEADER_TEMPLATE = """<details>
 <summary>Files in the context window</summary>
-JSON_PLACEHOLDER
+PLACEHOLDER
 </details>
 """
 
@@ -163,7 +163,7 @@ class Pipe:
 
         def _process_messages_object(
             messages: list[dict[str, str]],
-        ) -> Tuple[Optional[str], Optional[dict[str, int]], list[dict[str, str]]]:
+        ) -> Tuple[Optional[str], Optional[str], list[dict[str, str]]]:
             """Extracts system message and files context from messages."""
 
             system_message_content = None
@@ -187,12 +187,8 @@ class Pipe:
                         content = message.get("content", "")
 
                         # Check if content starts with our template format
-                        template_start = FILES_HEADER_TEMPLATE.split(
-                            "JSON_PLACEHOLDER"
-                        )[0]
-                        template_end = FILES_HEADER_TEMPLATE.split("JSON_PLACEHOLDER")[
-                            1
-                        ]
+                        template_start = FILES_HEADER_TEMPLATE.split("PLACEHOLDER")[0]
+                        template_end = FILES_HEADER_TEMPLATE.split("PLACEHOLDER")[1]
 
                         if (
                             content.startswith(template_start)
@@ -201,22 +197,13 @@ class Pipe:
                             # Extract everything between the template parts
                             start_idx = len(template_start)
                             end_idx = content.find(template_end)
-                            json_str = content[start_idx:end_idx]
+                            latest_files = content[start_idx:end_idx]
 
-                            try:
-                                # Parse the JSON string to get the files dictionary
-                                latest_files = json.loads(json_str)
-
-                                # Remove the header from the message
-                                clean_content = content[
-                                    end_idx + len(template_end) :
-                                ].strip()
-                                message["content"] = clean_content
-                            except json.JSONDecodeError:
-                                self._print_colored(
-                                    f"Failed to parse files JSON: {json_str}",
-                                    "WARNING",
-                                )
+                            # Remove the header from the message
+                            clean_content = content[
+                                end_idx + len(template_end) :
+                            ].strip()
+                            message["content"] = clean_content
 
                         processed_messages.append(message)
                     case _:
@@ -481,17 +468,15 @@ class Pipe:
                 if self.valves.LOG_LEVEL == "DEBUG":
                     print(json.dumps(__files__, indent=2))
                 # TODO This can also be a list I think, we do not need the position value.
-                files_dict = {}
+                files_str = ""
                 for f in __files__:
-                    files_dict[f.get("name", "unknown")] = 1
-                self._print_colored("Lean file dict:", "DEBUG")
+                    files_str += f'{f.get("name", "missing")}\n'
+                self._print_colored("Lean file list:", "DEBUG")
                 if self.valves.LOG_LEVEL == "DEBUG":
-                    print(json.dumps(files_dict, indent=2))
+                    print(files_str)
                 # TODO Add "> " in the begging of each line inside the collapsible.
-                files_context = FILES_HEADER_TEMPLATE.replace(
-                    "JSON_PLACEHOLDER", json.dumps(files_dict, indent=2)
-                )
-                files_dict = {}
+                files_context = FILES_HEADER_TEMPLATE.replace("PLACEHOLDER", files_str)
+                files_str = ""
 
             # Backend is able to handle AsyncGenerator object if streming is set to False.
             return _process_stream(
