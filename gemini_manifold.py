@@ -66,6 +66,12 @@ ALLOWED_GROUNDING_MODELS = [
     "gemini-1.0-pro",
 ]
 
+FILES_HEADER_TEMPLATE = """<details>
+<summary>Files in the context window</summary>
+JSON_PLACEHOLDER
+</details>
+"""
+
 
 class Pipe:
     class Valves(BaseModel):
@@ -447,9 +453,10 @@ class Pipe:
                 self._print_colored("Lean file dict:", "DEBUG")
                 if self.valves.LOG_LEVEL == "DEBUG":
                     print(json.dumps(files_dict, indent=2))
-                # TODO Use a more modular template string.
                 # TODO Add "> " in the begging of each line inside the collapsible.
-                files_context = f"<details>\n<summary>Files in the context window</summary>\n{json.dumps(files_dict, indent=2)}\n</details>\n\n"
+                files_context = FILES_HEADER_TEMPLATE.replace(
+                    "JSON_PLACEHOLDER", json.dumps(files_dict, indent=2)
+                )
                 files_dict = {}
 
             # Backend is able to handle AsyncGenerator object if streming is set to False.
