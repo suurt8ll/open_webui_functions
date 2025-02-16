@@ -163,38 +163,70 @@ class Pipe:
 
         def _process_messages_object(
             messages: list[dict[str, str]],
-        ) -> Tuple[Optional[str], list[dict[str, str]]]:
-            """Extracts system message from messages."""
-
-            # TODO Remove uploaded files lists from the user messages and return the last files list as third value.
+        ) -> Tuple[Optional[str], Optional[dict[str, int]], list[dict[str, str]]]:
+            """Extracts system message and files context from messages."""
 
             system_message_content = None
-            messages_without_system = []
+            processed_messages = []
             user_message_index = -1
             assistant_message_index = -1
+            latest_files = None
+
             for message in messages:
                 match message.get("role"):
                     case "system":
                         system_message_content = message.get("content")
                     case "user":
-                        # Add "files" key to the message object, if we detect that file(s) where uploaded with this prompt.
                         user_message_index += 1
                         self._print_colored(
                             f"Processing user message {user_message_index}...", "DEBUG"
                         )
-                        messages_without_system.append(message)
+                        processed_messages.append(message)
                     case "assistant":
-                        # TODO Extract and keep track of the latest file list (from the assistant message collapsible)
                         assistant_message_index += 1
-                        messages_without_system.append(message)
+                        content = message.get("content", "")
+
+                        # Check if content starts with our template format
+                        template_start = FILES_HEADER_TEMPLATE.split(
+                            "JSON_PLACEHOLDER"
+                        )[0]
+                        template_end = FILES_HEADER_TEMPLATE.split("JSON_PLACEHOLDER")[
+                            1
+                        ]
+
+                        if (
+                            content.startswith(template_start)
+                            and template_end in content
+                        ):
+                            # Extract everything between the template parts
+                            start_idx = len(template_start)
+                            end_idx = content.find(template_end)
+                            json_str = content[start_idx:end_idx]
+
+                            try:
+                                # Parse the JSON string to get the files dictionary
+                                latest_files = json.loads(json_str)
+
+                                # Remove the header from the message
+                                clean_content = content[
+                                    end_idx + len(template_end) :
+                                ].strip()
+                                message["content"] = clean_content
+                            except json.JSONDecodeError:
+                                self._print_colored(
+                                    f"Failed to parse files JSON: {json_str}",
+                                    "WARNING",
+                                )
+
+                        processed_messages.append(message)
                     case _:
                         self._print_colored(
                             f'Ran into weird role while processing messages: {message.get("role")}',
                             "WARNING",
                         )
-                        # Handle any other roles by treating them as regular messages
-                        messages_without_system.append(message)
-            return system_message_content, messages_without_system
+                        processed_messages.append(message)
+
+            return system_message_content, latest_files, processed_messages
 
         def _get_mime_type(file_uri: str) -> str:
             """
@@ -357,7 +389,9 @@ class Pipe:
             print(json.dumps(body, indent=2))
 
         # Split the message object into different parts that are easier to work with.
-        system_prompt, remaining_messages = _process_messages_object(messages)
+        system_prompt, file_header, remaining_messages = _process_messages_object(
+            messages
+        )
         self._print_colored(f"Original system prompt:\n{system_prompt}", "DEBUG")
         if system_prompt:
             # TODO This assumes the RAG prompt ends with this tag, always. Splitting is needed to keep the user's own system prompt.
