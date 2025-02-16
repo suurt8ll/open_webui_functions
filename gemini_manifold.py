@@ -11,7 +11,7 @@ requirements: google-genai==1.2.0
 """
 
 # TODO Add a list of supported features here and also exiting features that can be coded in theory.
-# TODO Audio input support.
+# TODO Audio input support (currently in development). https://ai.google.dev/gemini-api/docs/audio?lang=python
 # TODO Video input support.
 # TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 # TODO Better type checking.
@@ -155,17 +155,39 @@ class Pipe:
 
         """Helper functions inside the pipe() method"""
 
-        def _pop_system_prompt(
+        def _process_messages_object(
             messages: list[dict[str, str]],
         ) -> Tuple[Optional[str], list[dict[str, str]]]:
             """Extracts system message from messages."""
+
+            # TODO Remove uploaded files lists from the user messages and return the last files list as third value.
+
             system_message_content = None
             messages_without_system = []
+            user_message_index = -1
+            assistant_message_index = -1
             for message in messages:
-                if message.get("role") == "system":
-                    system_message_content = message.get("content")
-                else:
-                    messages_without_system.append(message)
+                match message.get("role"):
+                    case "system":
+                        system_message_content = message.get("content")
+                    case "user":
+                        # Add "files" key to the message object, if we detect that file(s) where uploaded with this prompt.
+                        user_message_index += 1
+                        self._print_colored(
+                            f"Processing user message {user_message_index}...", "DEBUG"
+                        )
+                        messages_without_system.append(message)
+                    case "assistant":
+                        # TODO Extract and keep track of the latest file list (from the assistant message collapsible)
+                        assistant_message_index += 1
+                        messages_without_system.append(message)
+                    case _:
+                        self._print_colored(
+                            f'Ran into weird role while processing messages: {message.get("role")}',
+                            "WARNING",
+                        )
+                        # Handle any other roles by treating them as regular messages
+                        messages_without_system.append(message)
             return system_message_content, messages_without_system
 
         def _get_mime_type(file_uri: str) -> str:
@@ -191,9 +213,6 @@ class Pipe:
             messages: list[dict],
         ) -> list[types.Content]:
             """Transforms messages to google-genai contents, supporting both text and images."""
-
-            # TODO Remove the file tracker (stuff between <details> tags) from the final input to the model.
-
             if not genai or not types:
                 raise ValueError(
                     "google-genai is not installed. Please install it to proceed."
@@ -327,33 +346,33 @@ class Pipe:
         # TODO When stream_options: { include_usage: true } is enabled, the response will contain usage information.
 
         messages = body.get("messages", [])
-        system_prompt, remaining_messages = _pop_system_prompt(messages)
-        contents = _transform_messages_to_contents(remaining_messages)
-
         self._print_colored("Received request:", "DEBUG")
         if self.valves.LOG_LEVEL == "DEBUG":
             print(json.dumps(body, indent=2))
-        self._print_colored(f"System prompt:\n{system_prompt}", "DEBUG")
+
+        # Split the message object into different parts that are easier to work with.
+        system_prompt, remaining_messages = _process_messages_object(messages)
+        self._print_colored(f"Original system prompt:\n{system_prompt}", "DEBUG")
+        if system_prompt:
+            # TODO This assumes the RAG prompt ends with this tag, always. Splitting is needed to keep the user's own system prompt.
+            if "</user_query>" in system_prompt:
+                system_prompt = system_prompt.split("</user_query>", 1)[1].strip()
+                if not system_prompt:
+                    system_prompt = None
+                self._print_colored(
+                    "Removed everything before </user_query> from system prompt.",
+                    "DEBUG",
+                )
+
+        # Convert the sanitized message object into list of type.Content objects that google-genai understands.
+        contents = _transform_messages_to_contents(remaining_messages)
         self._print_colored("Contents: [", "DEBUG")
         if self.valves.LOG_LEVEL == "DEBUG":
             for content in enumerate(contents):
                 print(f"    {content},")
             print("]")
-        if __files__ and len(__files__) > 0:
-            # TODO If this list contains a file that is not in the files context (between <details> tags), then we can assume that user just uploaded a new file.
-            # We can infer from the growing files context, when the file was uploaded in the chat history.
-            self._print_colored("You have uploaded files to this chat:", "DEBUG")
-            if self.valves.LOG_LEVEL == "DEBUG":
-                print(json.dumps(__files__, indent=2))
-            if system_prompt:
-                # TODO This assumes the RAG prompt ends with this tag, always. Splitting is needed to keep the user's own system prompt.
-                if "</user_query>" in system_prompt:
-                    system_prompt = system_prompt.split("</user_query>", 1)[1].strip()
-                    self._print_colored(
-                        "Removed everything before </user_query> from system prompt.",
-                        "DEBUG",
-                    )
 
+        # Get the current model name from the body object.
         model_name = self._strip_prefix(body.get("model", ""))
         if model_name in [
             "no_models_found",
@@ -414,7 +433,24 @@ class Pipe:
 
             self._print_colored(f'Streaming is {body.get("stream", False)}', "DEBUG")
 
-            files_context = "<details>\n<summary>Files in the context window</summary>\n> file1\n> file2\n</details>\n\n"
+            files_context = None
+            if __files__:
+                # TODO If this list contains a file that is not in the files context (between <details> tags), then we can assume that user just uploaded a new file.
+                # We can infer from the growing files context, when the file was uploaded in the chat history.
+                self._print_colored("You have uploaded files to this chat:", "DEBUG")
+                if self.valves.LOG_LEVEL == "DEBUG":
+                    print(json.dumps(__files__, indent=2))
+                # TODO This can also be a list I think, we do not need the position value.
+                files_dict = {}
+                for f in __files__:
+                    files_dict[f.get("name", "unknown")] = 1
+                self._print_colored("Lean file dict:", "DEBUG")
+                if self.valves.LOG_LEVEL == "DEBUG":
+                    print(json.dumps(files_dict, indent=2))
+                # TODO Use a more modular template string.
+                # TODO Add "> " in the begging of each line inside the collapsible.
+                files_context = f"<details>\n<summary>Files in the context window</summary>\n{json.dumps(files_dict, indent=2)}\n</details>\n\n"
+                files_dict = {}
 
             # Backend is able to handle AsyncGenerator object if streming is set to False.
             return _process_stream(
