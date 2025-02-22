@@ -482,6 +482,18 @@ class Pipe:
                 print(f"    {content},")
             print("]")
 
+        if system_prompt:
+            # TODO Do this only when the chat has files in it.
+            # TODO This assumes the RAG prompt ends with this tag, always. Splitting is needed to keep the user's own system prompt.
+            if "</user_query>" in system_prompt:
+                system_prompt = system_prompt.split("</user_query>", 1)[1].strip()
+                if system_prompt == "":
+                    system_prompt = None
+                self._print_colored(
+                    "Removed everything before </user_query> from system prompt.",
+                    "DEBUG",
+                )
+
         model_name = self._strip_prefix(body.get("model", ""))
         if model_name in [
             "no_models_found",
@@ -523,6 +535,10 @@ class Pipe:
             else:
                 print(f"[pipe] model {model_name} doesn't support grounding search")
 
+        self._print_colored(
+            f"Creating GenerateContentConfig object with following values:\n{json.dumps(config_params, indent=2)}",
+            "DEBUG",
+        )
         config = types.GenerateContentConfig(**config_params)
 
         gen_content_args = {
