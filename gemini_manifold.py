@@ -187,45 +187,10 @@ class Pipe:
     ) -> (
         str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
     ):
+        # TODO When stream_options: { include_usage: true } is enabled, the response will contain usage information.
 
         pipe_start_time = time.time()
         self._print_colored(f"I have started! Time is {pipe_start_time}.", "DEBUG")
-
-        """Helper functions inside the pipe() method"""
-
-        async def _process_chat_messages(chat: ChatModel) -> list[dict[str, Any]]:
-            """Turns the Open WebUI's ChatModel object into more lean dict object that contains only the messages."""
-            self._print_colored(
-                f"Printing the raw ChatModel object:\n{json.dumps(chat.model_dump(), indent=2)}",
-                "DEBUG",
-            )
-            messages: list[Message] = chat.chat.get("messages", [])
-            result = []
-            for message in messages:
-                role = message.get("role")
-                content = message.get("content", "")
-                files = []
-                if role == "user":
-                    files_for_message = message.get("files", [])
-                    if files_for_message:
-                        files = [
-                            file_data.get("name", "") for file_data in files_for_message
-                        ]
-                elif role == "assistant":
-                    if not hasattr(message, "done"):
-                        continue
-                result.append(
-                    {
-                        "role": role,
-                        "content": content,
-                        "files": files,
-                    }
-                )
-            return result
-
-        """Main pipe method."""
-
-        # TODO When stream_options: { include_usage: true } is enabled, the response will contain usage information.
 
         messages = body.get("messages", [])
         system_prompt, remaining_messages = self._pop_system_prompt(messages)
@@ -242,7 +207,7 @@ class Pipe:
         chat = Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=__user__["id"])
 
         if chat:
-            result = await _process_chat_messages(chat)
+            result = await self._process_chat_messages(chat)
             self._print_colored(
                 f"Printing the processed messages:\n{json.dumps(result, indent=2)}",
                 "DEBUG",
@@ -596,3 +561,33 @@ class Pipe:
                 f"Content generation completed. Time is {pipe_end_time}, took {pipe_end_time - pipe_start_time} seconds.",
                 "DEBUG",
             )
+
+    async def _process_chat_messages(self, chat: ChatModel) -> list[dict[str, Any]]:
+        """Turns the Open WebUI's ChatModel object into more lean dict object that contains only the messages."""
+        self._print_colored(
+            f"Printing the raw ChatModel object:\n{json.dumps(chat.model_dump(), indent=2)}",
+            "DEBUG",
+        )
+        messages: list[Message] = chat.chat.get("messages", [])
+        result = []
+        for message in messages:
+            role = message.get("role")
+            content = message.get("content", "")
+            files = []
+            if role == "user":
+                files_for_message = message.get("files", [])
+                if files_for_message:
+                    files = [
+                        file_data.get("name", "") for file_data in files_for_message
+                    ]
+            elif role == "assistant":
+                if not hasattr(message, "done"):
+                    continue
+            result.append(
+                {
+                    "role": role,
+                    "content": content,
+                    "files": files,
+                }
+            )
+        return result
