@@ -139,73 +139,11 @@ class Pipe:
     def pipes(self) -> list[dict[str, str]]:
         """Register all available Google models."""
 
-        def _get_google_models() -> list[dict[str, str]]:
-            """Retrieve Google models with prefix stripping."""
-
-            # Check if client is initialized and return error if not.
-            if not self.client:
-                self._print_colored("Client not initialized.", "ERROR")
-                return [
-                    {
-                        "id": "error",
-                        "name": "Client not initialized. Please check the logs.",
-                    }
-                ]
-
-            try:
-                whitelist = (
-                    self.valves.MODEL_WHITELIST.split(",")
-                    if self.valves.MODEL_WHITELIST
-                    else ["*"]
-                )
-                models = self.client.models.list(config={"query_base": True})
-                self._print_colored(
-                    f"[get_google_models] Retrieved {len(models)} models from Gemini Developer API.",
-                    "INFO",
-                )
-                model_list = [
-                    {
-                        "id": self._strip_prefix(model.name),
-                        "name": model.display_name,
-                    }
-                    for model in models
-                    if model.name
-                    and any(
-                        fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist
-                    )
-                    if model.supported_actions
-                    and "generateContent" in model.supported_actions
-                    if model.name and model.name.startswith("models/")
-                ]
-                if not model_list:
-                    self._print_colored(
-                        "No models found matching whitelist.", "WARNING"
-                    )
-                    return [
-                        {
-                            "id": "no_models_found",
-                            "name": "No models found matching whitelist.",
-                        }
-                    ]
-                return model_list
-            except Exception as e:
-                error_msg = (
-                    f"Error retrieving models: {str(e)}\n{traceback.format_exc()}"
-                )
-                self._print_colored(error_msg, "ERROR")
-                return [
-                    {
-                        "id": "error",
-                        "name": "Error retrieving models. Please check the logs.",
-                    }
-                ]
-
         try:
             if not self.valves.GEMINI_API_KEY:
                 raise ValueError("GEMINI_API_KEY is not set.")
 
-            # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
-            # TODO Allow user to choose if they want to fetch models only during function initialization or every time pipes is called.
+            # Initialize client if not already initialized
             if not self.client:
                 self.client = genai.Client(
                     api_key=self.valves.GEMINI_API_KEY,
@@ -220,7 +158,7 @@ class Pipe:
                 return self.models
 
             # Get and process new models
-            models = _get_google_models()
+            models = self._get_google_models()
 
             # Handle error cases
             if models and models[0].get("id") in ["error", "no_models_found"]:
@@ -507,7 +445,8 @@ class Pipe:
 
         config_params = {
             "system_instruction": system_prompt,
-            "temperature": body.get("temperature", 0.7),
+            # FIXME Respect user defauls here.
+            "temperature": body.get("temperature", 0.6),
             "top_p": body.get("top_p", 0.9),
             "top_k": body.get("top_k", 40),
             "max_output_tokens": body.get("max_tokens", 8192),
@@ -605,3 +544,60 @@ class Pipe:
             return model_name  # Return original if stripping fails
         finally:
             self._print_colored("Completed prefix stripping.", "DEBUG")
+
+    def _get_google_models(self) -> list[dict[str, str]]:
+        """Retrieve Google models with prefix stripping, filtering by whitelist and supported actions."""
+
+        if not self.client:
+            self._print_colored("Client not initialized.", "ERROR")
+            return [
+                {
+                    "id": "error",
+                    "name": "Client not initialized. Please check the logs.",
+                }
+            ]
+
+        try:
+            whitelist = (
+                self.valves.MODEL_WHITELIST.split(",")
+                if self.valves.MODEL_WHITELIST
+                else ["*"]
+            )
+            models = self.client.models.list(config={"query_base": True})
+            self._print_colored(
+                f"[get_google_models] Retrieved {len(models)} models from Gemini Developer API.",
+                "INFO",
+            )
+
+            model_list = [
+                {
+                    "id": self._strip_prefix(model.name),
+                    "name": model.display_name,
+                }
+                for model in models
+                if model.name
+                and model.name.startswith("models/")
+                and model.supported_actions is not None
+                and "generateContent" in model.supported_actions
+                and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
+            ]
+
+            if not model_list:
+                self._print_colored("No models found matching whitelist.", "WARNING")
+                return [
+                    {
+                        "id": "no_models_found",
+                        "name": "No models found matching whitelist.",
+                    }
+                ]
+            return model_list
+
+        except Exception as e:
+            error_msg = f"Error retrieving models: {str(e)}\n{traceback.format_exc()}"
+            self._print_colored(error_msg, "ERROR")
+            return [
+                {
+                    "id": "error",
+                    "name": "Error retrieving models. Please check the logs.",
+                }
+            ]
