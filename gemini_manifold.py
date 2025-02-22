@@ -11,7 +11,7 @@ requirements: google-genai==1.2.0
 """
 
 # TODO Add a list of supported features here and also exiting features that can be coded in theory.
-# TODO Audio input support (currently in development). https://ai.google.dev/gemini-api/docs/audio?lang=python
+# TODO Audio input support.
 # TODO Video input support.
 # TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 # TODO Better type checking.
@@ -65,12 +65,6 @@ ALLOWED_GROUNDING_MODELS = [
     "gemini-1.5-flash",
     "gemini-1.0-pro",
 ]
-
-FILES_HEADER_TEMPLATE = """<details>
-<summary>User just uploaded some file(s)</summary>
-PLACEHOLDER
-</details>
-"""
 
 
 class Pipe:
@@ -149,9 +143,7 @@ class Pipe:
             self._print_colored("Completed pipes method.", "DEBUG")
 
     async def pipe(
-        self,
-        body: dict[str, Any],
-        __files__: list[dict[str, Any]],
+        self, body: dict[str, Any]
     ) -> (
         str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
     ):
@@ -161,64 +153,18 @@ class Pipe:
 
         """Helper functions inside the pipe() method"""
 
-        def _process_messages_object(
+        def _pop_system_prompt(
             messages: list[dict[str, str]],
-        ) -> Tuple[Optional[str], Optional[list[list[str]]], list[dict[str, str]]]:
-            """Extracts system message and files context from messages."""
-
+        ) -> Tuple[Optional[str], list[dict[str, str]]]:
+            """Extracts system message from messages."""
             system_message_content = None
-            processed_messages = []
-            user_message_index = -1
-            assistant_message_index = -1
-            uploaded_files: list[list[str]] = []
-
+            messages_without_system = []
             for message in messages:
-                match message.get("role"):
-                    case "system":
-                        system_message_content = message.get("content")
-                    case "user":
-                        user_message_index += 1
-                        self._print_colored(
-                            f"Processing user message {user_message_index}...", "DEBUG"
-                        )
-                        processed_messages.append(message)
-                    case "assistant":
-                        assistant_message_index += 1
-                        content = message.get("content", "")
-
-                        # Check if content starts with our template format
-                        template_start = FILES_HEADER_TEMPLATE.split("PLACEHOLDER")[0]
-                        template_end = FILES_HEADER_TEMPLATE.split("PLACEHOLDER")[1]
-
-                        if (
-                            content.startswith(template_start)
-                            and template_end in content
-                        ):
-                            # Extract everything between the template parts
-                            start_idx = len(template_start)
-                            end_idx = content.find(template_end)
-                            # TODO Instead of this, we should now keep track, where the files header appeared and return info of where in the chat the files where uploaded.
-                            uploaded_files.append(
-                                content[start_idx:end_idx].split("\n")[:-1]
-                            )
-
-                            # Remove the header from the message
-                            clean_content = content[
-                                end_idx + len(template_end) :
-                            ].strip()
-                            message["content"] = clean_content
-                        else:
-                            uploaded_files.append([])
-
-                        processed_messages.append(message)
-                    case _:
-                        self._print_colored(
-                            f'Ran into weird role while processing messages: {message.get("role")}',
-                            "WARNING",
-                        )
-                        processed_messages.append(message)
-
-            return system_message_content, uploaded_files, processed_messages
+                if message.get("role") == "system":
+                    system_message_content = message.get("content")
+                else:
+                    messages_without_system.append(message)
+            return system_message_content, messages_without_system
 
         def _get_mime_type(file_uri: str) -> str:
             """
@@ -334,14 +280,9 @@ class Pipe:
             return contents
 
         async def _process_stream(
-            gen_content_args: dict[str, Any], first_yield: Optional[str] = None
+            gen_content_args: dict[str, Any]
         ) -> AsyncGenerator[str, None]:
             """Helper function to process the stream and yield text chunks."""
-
-            if first_yield:
-                # TODO Keep track of uploaded files here.
-                yield first_yield
-
             # FIXME Figure out why type checker freaks out here.
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
                 await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
@@ -376,40 +317,19 @@ class Pipe:
         # TODO When stream_options: { include_usage: true } is enabled, the response will contain usage information.
 
         messages = body.get("messages", [])
+        system_prompt, remaining_messages = _pop_system_prompt(messages)
+        contents = _transform_messages_to_contents(remaining_messages)
+
         self._print_colored("Received request:", "DEBUG")
         if self.valves.LOG_LEVEL == "DEBUG":
             print(json.dumps(body, indent=2))
-
-        # Split the message object into different parts that are easier to work with.
-        system_prompt, latest_files, remaining_messages = _process_messages_object(
-            messages
-        )
-        self._print_colored(f"Original system prompt:\n{system_prompt}", "DEBUG")
-        if system_prompt:
-            # TODO This assumes the RAG prompt ends with this tag, always. Splitting is needed to keep the user's own system prompt.
-            if "</user_query>" in system_prompt:
-                system_prompt = system_prompt.split("</user_query>", 1)[1].strip()
-                if not system_prompt:
-                    system_prompt = None
-                self._print_colored(
-                    "Removed everything before </user_query> from system prompt.",
-                    "DEBUG",
-                )
-
-        self._print_colored(
-            f"Files uploaded to the chat, in order of when it happened:\n{latest_files}",
-            "DEBUG",
-        )
-
-        # Convert the sanitized message object into list of type.Content objects that google-genai understands.
-        contents = _transform_messages_to_contents(remaining_messages)
+        self._print_colored(f"System prompt: {system_prompt}", "DEBUG")
         self._print_colored("Contents: [", "DEBUG")
         if self.valves.LOG_LEVEL == "DEBUG":
             for content in enumerate(contents):
                 print(f"    {content},")
             print("]")
 
-        # Get the current model name from the body object.
         model_name = self._strip_prefix(body.get("model", ""))
         if model_name in [
             "no_models_found",
@@ -451,11 +371,6 @@ class Pipe:
             else:
                 print(f"[pipe] model {model_name} doesn't support grounding search")
 
-        self._print_colored(
-            "Creating GenerateContentConfig object with following values:"
-        )
-        if self.valves.LOG_LEVEL == "DEBUG":
-            print(json.dumps(config_params, indent=2, default=str))
         config = types.GenerateContentConfig(**config_params)
 
         gen_content_args = {
@@ -470,30 +385,8 @@ class Pipe:
 
             self._print_colored(f'Streaming is {body.get("stream", False)}', "DEBUG")
 
-            files_header = None
-            # BUG If user branches from earlier point in the chat, then anything that uploaded after that is still in the __files__ variable.
-            # Maybe I should bite the bullet and just store the stuff in the memory of the function.
-            if __files__:
-                # TODO If this list contains a file that is not in the files context (between <details> tags), then we can assume that user just uploaded a new file.
-                # We can infer from the growing files context, when the file was uploaded in the chat history.
-                self._print_colored("You have uploaded files to this chat:", "DEBUG")
-                if self.valves.LOG_LEVEL == "DEBUG":
-                    print(json.dumps(__files__, indent=2))
-                files_str = ""
-                for f in __files__:
-                    files_str += f'{f.get("name", "missing")}\n'
-                # TODO Add "> " in the begging of each line inside the collapsible.
-                # TODO This does not have to be cumulative.
-                # I can just save the fact that file(s) were uploaded just in the previous user message in the assistant response.
-                # Then I can easily backward engineer chich user message included which files.
-                files_header = FILES_HEADER_TEMPLATE.replace("PLACEHOLDER", files_str)
-                files_str = ""
-
             # Backend is able to handle AsyncGenerator object if streming is set to False.
-            return _process_stream(
-                gen_content_args,
-                files_header,
-            )
+            return _process_stream(gen_content_args)
         except Exception as e:
             error_msg = f"Content generation error: {str(e)}\n{traceback.format_exc()}"
             self._print_colored(error_msg, "ERROR")
