@@ -87,19 +87,19 @@ class FileInfo(TypedDict):
     itemId: str
 
 
-class Message(BaseModel):
+class Message(TypedDict):
     id: UUID
-    parentId: Optional[UUID] = None
-    childrenIds: list[UUID] = Field(default_factory=list)
+    parentId: Optional[UUID]
+    childrenIds: list[UUID]
     role: Literal["user", "assistant"]
     content: str
     files: Optional[list[FileInfo]]
     timestamp: int
-    models: list[str] = Field(default_factory=list)
-    model: Optional[str] = None  # Only for assistant role
-    modelName: Optional[str] = None  # Only for assistant role
-    modelIdx: Optional[int] = None  # Only for assistant role
-    userContext: Optional[Any] = None  # Only for assistant role
+    models: list[str]
+    model: Optional[str]  # Only for assistant role
+    modelName: Optional[str]  # Only for assistant role
+    modelIdx: Optional[int]  # Only for assistant role
+    userContext: Optional[Any]  # Only for assistant role
     sources: Optional[list[dict[str, Any]]]  # Only for assistant role
     done: Optional[bool]  # Only for assistant role
 
@@ -242,7 +242,10 @@ class Pipe:
             self._print_colored("Completed pipes method.", "DEBUG")
 
     async def pipe(
-        self, body: dict[str, Any]
+        self,
+        body: dict[str, Any],
+        __user__: dict[str, Any],
+        __metadata__: dict[str, Any],
     ) -> (
         str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
     ):
@@ -413,19 +416,25 @@ class Pipe:
 
         async def _process_chat_messages(chat: ChatModel) -> list[dict[str, Any]]:
             """Turns the Open WebUI's ChatModel object into more lean dict object that contains only the messages."""
-            self._print_colored(f"Printing the raw ChatModel object:\n{chat}", "DEBUG")
+            self._print_colored(
+                f"Printing the raw ChatModel object:\n{json.dumps(chat.model_dump(), indent=2)}",
+                "DEBUG",
+            )
             messages: list[Message] = chat.chat.get("messages", [])
             result = []
             for message in messages:
-                role = message.role
-                content = message.content
+                role = message.get("role")
+                content = message.get("content", "")
                 files = []
                 if role == "user":
-                    files_for_message = message.files
+                    files_for_message = message.get("files", [])
                     if files_for_message:
                         files = [
                             file_data.get("name", "") for file_data in files_for_message
                         ]
+                elif role == "assistant":
+                    if not hasattr(message, "done"):
+                        continue
                 result.append(
                     {
                         "role": role,
@@ -442,6 +451,26 @@ class Pipe:
         messages = body.get("messages", [])
         system_prompt, remaining_messages = _pop_system_prompt(messages)
         contents = _transform_messages_to_contents(remaining_messages)
+
+        chat_id = __metadata__.get("chat_id")
+        if not chat_id:
+            self._print_colored(
+                "Error: Chat ID not found in request body or metadata.", "ERROR"
+            )
+            return "Error: Chat ID not found."
+
+        # Get the message history directly from the backend.
+        chat = Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=__user__["id"])
+
+        if chat:
+            result = await _process_chat_messages(chat)
+            self._print_colored(
+                f"Printing the processed messages:\n{json.dumps(result, indent=2)}",
+                "DEBUG",
+            )
+        else:
+            self._print_colored(f"Chat with ID {chat_id} not found.", "WARNING")
+            return f"Chat with ID {chat_id} not found."
 
         self._print_colored("Received request:", "DEBUG")
         if self.valves.LOG_LEVEL == "DEBUG":
