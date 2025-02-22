@@ -42,6 +42,8 @@ from typing import (
     Literal,
     Tuple,
     Optional,
+    TypedDict,
+    cast,
 )
 from starlette.responses import StreamingResponse
 from google import genai
@@ -66,6 +68,46 @@ ALLOWED_GROUNDING_MODELS = [
     "gemini-1.5-flash",
     "gemini-1.0-pro",
 ]
+
+
+class FileInfo(TypedDict):
+    type: str
+    file: dict[str, Any]
+    id: str
+    url: str
+    name: str
+    status: str
+    size: int
+    error: str
+    itemId: str
+
+
+class UserMessage(TypedDict):
+    id: str
+    parentId: Optional[str]
+    childrenIds: list[str]
+    role: Literal["user"]  # Enforce role to be "user"
+    content: str
+    files: Optional[list[FileInfo]]
+    timestamp: int
+    models: list[str]
+
+
+class GenericMessage(TypedDict, total=False):
+    id: str
+    parentId: Optional[str]
+    childrenIds: list[str]
+    role: Literal["user", "assistant"]
+    content: str
+    files: Optional[list[FileInfo]]
+    timestamp: int
+    models: list[str]
+    model: Optional[str]
+    modelName: Optional[str]
+    modelIdx: Optional[int]
+    userContext: Optional[Any]
+    sources: Optional[list[dict[str, Any]]]
+    done: Optional[bool]
 
 
 class Pipe:
@@ -378,14 +420,14 @@ class Pipe:
         async def _process_chat_messages(chat: ChatModel) -> list[dict[str, Any]]:
             """Turns the Open WebUI's ChatModel object into more lean dict object that contains only the messages."""
             self._print_colored(f"Printing the raw ChatModel object:\n{chat}", "DEBUG")
-            messages: list = chat.chat.get("messages", [])
+            messages: list[GenericMessage] = chat.chat.get("messages", [])
             result = []
             for message in messages:
                 role = message.get("role")
                 content = message.get("content", "")
                 files = []
                 if role == "user":
-                    user_message = message
+                    user_message = cast(UserMessage, message)
                     files_for_message = user_message.get("files", [])
                     if files_for_message:
                         files = [
