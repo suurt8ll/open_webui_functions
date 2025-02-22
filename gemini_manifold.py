@@ -32,6 +32,7 @@ import re
 import fnmatch
 import time
 import traceback
+from uuid import UUID
 from pydantic import BaseModel, Field
 from typing import (
     Any,
@@ -42,9 +43,13 @@ from typing import (
     Literal,
     Tuple,
     Optional,
-    TypedDict,
-    cast,
 )
+import sys
+
+if sys.version_info >= (3, 12):
+    from typing import TypedDict
+else:
+    from typing_extensions import TypedDict
 from starlette.responses import StreamingResponse
 from google import genai
 from google.genai import types
@@ -82,32 +87,21 @@ class FileInfo(TypedDict):
     itemId: str
 
 
-class UserMessage(TypedDict):
-    id: str
-    parentId: Optional[str]
-    childrenIds: list[str]
-    role: Literal["user"]  # Enforce role to be "user"
-    content: str
-    files: Optional[list[FileInfo]]
-    timestamp: int
-    models: list[str]
-
-
-class GenericMessage(TypedDict, total=False):
-    id: str
-    parentId: Optional[str]
-    childrenIds: list[str]
+class Message(BaseModel):
+    id: UUID
+    parentId: Optional[UUID] = None
+    childrenIds: list[UUID] = Field(default_factory=list)
     role: Literal["user", "assistant"]
     content: str
     files: Optional[list[FileInfo]]
     timestamp: int
-    models: list[str]
-    model: Optional[str]
-    modelName: Optional[str]
-    modelIdx: Optional[int]
-    userContext: Optional[Any]
-    sources: Optional[list[dict[str, Any]]]
-    done: Optional[bool]
+    models: list[str] = Field(default_factory=list)
+    model: Optional[str] = None  # Only for assistant role
+    modelName: Optional[str] = None  # Only for assistant role
+    modelIdx: Optional[int] = None  # Only for assistant role
+    userContext: Optional[Any] = None  # Only for assistant role
+    sources: Optional[list[dict[str, Any]]]  # Only for assistant role
+    done: Optional[bool]  # Only for assistant role
 
 
 class Pipe:
@@ -420,15 +414,14 @@ class Pipe:
         async def _process_chat_messages(chat: ChatModel) -> list[dict[str, Any]]:
             """Turns the Open WebUI's ChatModel object into more lean dict object that contains only the messages."""
             self._print_colored(f"Printing the raw ChatModel object:\n{chat}", "DEBUG")
-            messages: list[GenericMessage] = chat.chat.get("messages", [])
+            messages: list[Message] = chat.chat.get("messages", [])
             result = []
             for message in messages:
-                role = message.get("role")
-                content = message.get("content", "")
+                role = message.role
+                content = message.content
                 files = []
                 if role == "user":
-                    user_message = cast(UserMessage, message)
-                    files_for_message = user_message.get("files", [])
+                    files_for_message = message.files
                     if files_for_message:
                         files = [
                             file_data.get("name", "") for file_data in files_for_message
