@@ -67,7 +67,7 @@ ALLOWED_GROUNDING_MODELS = [
 ]
 
 FILES_HEADER_TEMPLATE = """<details>
-<summary>Files in the context window</summary>
+<summary>User just uploaded some file(s)</summary>
 PLACEHOLDER
 </details>
 """
@@ -163,14 +163,14 @@ class Pipe:
 
         def _process_messages_object(
             messages: list[dict[str, str]],
-        ) -> Tuple[Optional[str], Optional[str], list[dict[str, str]]]:
+        ) -> Tuple[Optional[str], Optional[list[list[str]]], list[dict[str, str]]]:
             """Extracts system message and files context from messages."""
 
             system_message_content = None
             processed_messages = []
             user_message_index = -1
             assistant_message_index = -1
-            latest_files = None
+            uploaded_files: list[list[str]] = []
 
             for message in messages:
                 match message.get("role"):
@@ -197,13 +197,18 @@ class Pipe:
                             # Extract everything between the template parts
                             start_idx = len(template_start)
                             end_idx = content.find(template_end)
-                            latest_files = content[start_idx:end_idx]
+                            # TODO Instead of this, we should now keep track, where the files header appeared and return info of where in the chat the files where uploaded.
+                            uploaded_files.append(
+                                content[start_idx:end_idx].split("\n")[:-1]
+                            )
 
                             # Remove the header from the message
                             clean_content = content[
                                 end_idx + len(template_end) :
                             ].strip()
                             message["content"] = clean_content
+                        else:
+                            uploaded_files.append([])
 
                         processed_messages.append(message)
                     case _:
@@ -213,7 +218,7 @@ class Pipe:
                         )
                         processed_messages.append(message)
 
-            return system_message_content, latest_files, processed_messages
+            return system_message_content, uploaded_files, processed_messages
 
         def _get_mime_type(file_uri: str) -> str:
             """
@@ -376,7 +381,7 @@ class Pipe:
             print(json.dumps(body, indent=2))
 
         # Split the message object into different parts that are easier to work with.
-        system_prompt, file_header, remaining_messages = _process_messages_object(
+        system_prompt, latest_files, remaining_messages = _process_messages_object(
             messages
         )
         self._print_colored(f"Original system prompt:\n{system_prompt}", "DEBUG")
@@ -390,6 +395,11 @@ class Pipe:
                     "Removed everything before </user_query> from system prompt.",
                     "DEBUG",
                 )
+
+        self._print_colored(
+            f"Files uploaded to the chat, in order of when it happened:\n{latest_files}",
+            "DEBUG",
+        )
 
         # Convert the sanitized message object into list of type.Content objects that google-genai understands.
         contents = _transform_messages_to_contents(remaining_messages)
@@ -460,28 +470,29 @@ class Pipe:
 
             self._print_colored(f'Streaming is {body.get("stream", False)}', "DEBUG")
 
-            files_context = None
+            files_header = None
+            # BUG If user branches from earlier point in the chat, then anything that uploaded after that is still in the __files__ variable.
+            # Maybe I should bite the bullet and just store the stuff in the memory of the function.
             if __files__:
                 # TODO If this list contains a file that is not in the files context (between <details> tags), then we can assume that user just uploaded a new file.
                 # We can infer from the growing files context, when the file was uploaded in the chat history.
                 self._print_colored("You have uploaded files to this chat:", "DEBUG")
                 if self.valves.LOG_LEVEL == "DEBUG":
                     print(json.dumps(__files__, indent=2))
-                # TODO This can also be a list I think, we do not need the position value.
                 files_str = ""
                 for f in __files__:
                     files_str += f'{f.get("name", "missing")}\n'
-                self._print_colored("Lean file list:", "DEBUG")
-                if self.valves.LOG_LEVEL == "DEBUG":
-                    print(files_str)
                 # TODO Add "> " in the begging of each line inside the collapsible.
-                files_context = FILES_HEADER_TEMPLATE.replace("PLACEHOLDER", files_str)
+                # TODO This does not have to be cumulative.
+                # I can just save the fact that file(s) were uploaded just in the previous user message in the assistant response.
+                # Then I can easily backward engineer chich user message included which files.
+                files_header = FILES_HEADER_TEMPLATE.replace("PLACEHOLDER", files_str)
                 files_str = ""
 
             # Backend is able to handle AsyncGenerator object if streming is set to False.
             return _process_stream(
                 gen_content_args,
-                files_context,
+                files_header,
             )
         except Exception as e:
             error_msg = f"Content generation error: {str(e)}\n{traceback.format_exc()}"
