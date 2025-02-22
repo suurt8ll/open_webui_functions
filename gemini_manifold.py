@@ -101,6 +101,68 @@ class Pipe:
 
     def pipes(self) -> list[dict[str, str]]:
         """Register all available Google models."""
+
+        def _get_google_models() -> list[dict[str, str]]:
+            """Retrieve Google models with prefix stripping."""
+
+            # Check if client is initialized and return error if not.
+            if not self.client:
+                self._print_colored("Client not initialized.", "ERROR")
+                return [
+                    {
+                        "id": "error",
+                        "name": "Client not initialized. Please check the logs.",
+                    }
+                ]
+
+            try:
+                whitelist = (
+                    self.valves.MODEL_WHITELIST.split(",")
+                    if self.valves.MODEL_WHITELIST
+                    else ["*"]
+                )
+                models = self.client.models.list(config={"query_base": True})
+                self._print_colored(
+                    f"[get_google_models] Retrieved {len(models)} models from Gemini Developer API.",
+                    "INFO",
+                )
+                model_list = [
+                    {
+                        "id": self._strip_prefix(model.name),
+                        "name": model.display_name,
+                    }
+                    for model in models
+                    if model.name
+                    and any(
+                        fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist
+                    )
+                    if model.supported_actions
+                    and "generateContent" in model.supported_actions
+                    if model.name and model.name.startswith("models/")
+                ]
+                if not model_list:
+                    self._print_colored(
+                        "No models found matching whitelist.", "WARNING"
+                    )
+                    return [
+                        {
+                            "id": "no_models_found",
+                            "name": "No models found matching whitelist.",
+                        }
+                    ]
+                return model_list
+            except Exception as e:
+                error_msg = (
+                    f"Error retrieving models: {str(e)}\n{traceback.format_exc()}"
+                )
+                self._print_colored(error_msg, "ERROR")
+                return [
+                    {
+                        "id": "error",
+                        "name": "Error retrieving models. Please check the logs.",
+                    }
+                ]
+
         try:
             if not self.valves.GEMINI_API_KEY:
                 raise ValueError("GEMINI_API_KEY is not set.")
@@ -121,7 +183,7 @@ class Pipe:
                 return self.models
 
             # Get and process new models
-            models = self._get_google_models()
+            models = _get_google_models()
 
             # Handle error cases
             if models and models[0].get("id") in ["error", "no_models_found"]:
@@ -420,61 +482,6 @@ class Pipe:
             print(
                 f"{color}[{level}][gemini_manifold][{method_name}]{COLORS['RESET']} {message}"
             )
-
-    def _get_google_models(self) -> list[dict[str, str]]:
-        """Retrieve Google models with prefix stripping."""
-
-        # Check if client is initialized and return error if not.
-        if not self.client:
-            self._print_colored("Client not initialized.", "ERROR")
-            return [
-                {
-                    "id": "error",
-                    "name": "Client not initialized. Please check the logs.",
-                }
-            ]
-
-        try:
-            whitelist = (
-                self.valves.MODEL_WHITELIST.split(",")
-                if self.valves.MODEL_WHITELIST
-                else ["*"]
-            )
-            models = self.client.models.list(config={"query_base": True})
-            self._print_colored(
-                f"[get_google_models] Retrieved {len(models)} models from Gemini Developer API.",
-                "INFO",
-            )
-            model_list = [
-                {
-                    "id": self._strip_prefix(model.name),
-                    "name": model.display_name,
-                }
-                for model in models
-                if model.name
-                and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
-                if model.supported_actions
-                and "generateContent" in model.supported_actions
-                if model.name and model.name.startswith("models/")
-            ]
-            if not model_list:
-                self._print_colored("No models found matching whitelist.", "WARNING")
-                return [
-                    {
-                        "id": "no_models_found",
-                        "name": "No models found matching whitelist.",
-                    }
-                ]
-            return model_list
-        except Exception as e:
-            error_msg = f"Error retrieving models: {str(e)}\n{traceback.format_exc()}"
-            self._print_colored(error_msg, "ERROR")
-            return [
-                {
-                    "id": "error",
-                    "name": "Error retrieving models. Please check the logs.",
-                }
-            ]
 
     def _strip_prefix(self, model_name: str) -> str:
         """
