@@ -46,6 +46,7 @@ from typing import (
 from starlette.responses import StreamingResponse
 from google import genai
 from google.genai import types
+from open_webui.models.chats import Chats, ChatModel
 
 COLORS = {
     "RED": "\033[91m",
@@ -373,6 +374,31 @@ class Pipe:
                     f"Content generation completed. Time is {pipe_end_time}, took {pipe_end_time - pipe_start_time} seconds.",
                     "DEBUG",
                 )
+
+        async def _process_chat_messages(chat: ChatModel) -> list[dict[str, Any]]:
+            """Turns the Open WebUI's ChatModel object into more lean dict object that contains only the messages."""
+            self._print_colored(f"Printing the raw ChatModel object:\n{chat}", "DEBUG")
+            messages: list = chat.chat.get("messages", [])
+            result = []
+            for message in messages:
+                role = message.get("role")
+                content = message.get("content", "")
+                files = []
+                if role == "user":
+                    user_message = message
+                    files_for_message = user_message.get("files", [])
+                    if files_for_message:
+                        files = [
+                            file_data.get("name", "") for file_data in files_for_message
+                        ]
+                result.append(
+                    {
+                        "role": role,
+                        "content": content,
+                        "files": files,
+                    }
+                )
+            return result
 
         """Main pipe method."""
 
