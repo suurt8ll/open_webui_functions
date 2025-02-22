@@ -193,19 +193,6 @@ class Pipe:
 
         """Helper functions inside the pipe() method"""
 
-        def _pop_system_prompt(
-            messages: list[dict[str, str]],
-        ) -> Tuple[Optional[str], list[dict[str, str]]]:
-            """Extracts system message from messages."""
-            system_message_content = None
-            messages_without_system = []
-            for message in messages:
-                if message.get("role") == "system":
-                    system_message_content = message.get("content")
-                else:
-                    messages_without_system.append(message)
-            return system_message_content, messages_without_system
-
         def _get_mime_type(file_uri: str) -> str:
             """
             Utility function to determine MIME type based on file extension.
@@ -387,7 +374,7 @@ class Pipe:
         # TODO When stream_options: { include_usage: true } is enabled, the response will contain usage information.
 
         messages = body.get("messages", [])
-        system_prompt, remaining_messages = _pop_system_prompt(messages)
+        system_prompt, remaining_messages = self._pop_system_prompt(messages)
         contents = _transform_messages_to_contents(remaining_messages)
 
         chat_id = __metadata__.get("chat_id")
@@ -601,3 +588,17 @@ class Pipe:
                     "name": "Error retrieving models. Please check the logs.",
                 }
             ]
+
+    def _pop_system_prompt(
+        self,
+        messages: list[dict[str, str]],
+    ) -> Tuple[Optional[str], list[dict[str, str]]]:
+        """Extracts system message from messages."""
+        system_message_content = None
+        messages_without_system = []
+        for message in messages:
+            if message.get("role") == "system":
+                system_message_content = message.get("content")
+            else:
+                messages_without_system.append(message)
+        return system_message_content, messages_without_system
