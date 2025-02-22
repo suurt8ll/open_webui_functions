@@ -193,39 +193,6 @@ class Pipe:
 
         """Helper functions inside the pipe() method"""
 
-        async def _process_stream(
-            gen_content_args: dict[str, Any]
-        ) -> AsyncGenerator[str, None]:
-            """Helper function to process the stream and yield text chunks."""
-            # FIXME Figure out why type checker freaks out here.
-            response_stream: AsyncIterator[types.GenerateContentResponse] = (
-                await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
-            )
-            try:
-                async for chunk in response_stream:
-                    if chunk.candidates:
-                        if len(chunk.candidates) > 1:
-                            self._print_colored(
-                                "Multiple candidates found in response, defaulting to the first candidate.",
-                                "WARNING",
-                            )
-                        candidate = chunk.candidates[
-                            0
-                        ]  # Default to the first candidate
-                        if candidate.content and candidate.content.parts:
-                            for part in candidate.content.parts:
-                                text_part = getattr(
-                                    part, "text", None
-                                )  # Safely get the text part
-                                if text_part is not None:
-                                    yield text_part
-            finally:
-                pipe_end_time = time.time()
-                self._print_colored(
-                    f"Content generation completed. Time is {pipe_end_time}, took {pipe_end_time - pipe_start_time} seconds.",
-                    "DEBUG",
-                )
-
         async def _process_chat_messages(chat: ChatModel) -> list[dict[str, Any]]:
             """Turns the Open WebUI's ChatModel object into more lean dict object that contains only the messages."""
             self._print_colored(
@@ -367,7 +334,7 @@ class Pipe:
             self._print_colored(f'Streaming is {body.get("stream", False)}', "DEBUG")
 
             # Backend is able to handle AsyncGenerator object if streming is set to False.
-            return _process_stream(gen_content_args)
+            return self._process_stream(gen_content_args, pipe_start_time)
         except Exception as e:
             error_msg = f"Content generation error: {str(e)}\n{traceback.format_exc()}"
             self._print_colored(error_msg, "ERROR")
@@ -598,3 +565,34 @@ class Pipe:
                     types.Content(role=role, parts=[types.Part.from_text(text=content)])
                 )
         return contents
+
+    async def _process_stream(
+        self, gen_content_args: dict[str, Any], pipe_start_time: float
+    ) -> AsyncGenerator[str, None]:
+        """Helper function to process the stream and yield text chunks."""
+        # FIXME Figure out why type checker freaks out here.
+        response_stream: AsyncIterator[types.GenerateContentResponse] = (
+            await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
+        )
+        try:
+            async for chunk in response_stream:
+                if chunk.candidates:
+                    if len(chunk.candidates) > 1:
+                        self._print_colored(
+                            "Multiple candidates found in response, defaulting to the first candidate.",
+                            "WARNING",
+                        )
+                    candidate = chunk.candidates[0]  # Default to the first candidate
+                    if candidate.content and candidate.content.parts:
+                        for part in candidate.content.parts:
+                            text_part = getattr(
+                                part, "text", None
+                            )  # Safely get the text part
+                            if text_part is not None:
+                                yield text_part
+        finally:
+            pipe_end_time = time.time()
+            self._print_colored(
+                f"Content generation completed. Time is {pipe_end_time}, took {pipe_end_time - pipe_start_time} seconds.",
+                "DEBUG",
+            )
