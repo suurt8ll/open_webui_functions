@@ -16,6 +16,7 @@ requirements: google-genai==1.2.0
 # TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 # TODO Better type checking.
 # TODO Return errors as correctly formatted error types for the frontend to handle (red text in the front-end).
+# TODO Citations support. (currently in development). Pretty sure we can inject face citations by diractly modifying the backend Chat object.
 
 # ^ Open WebUI front-end throws error when trying to upload videos or audios,
 # but the file still gets uploaded to database and is passed to the pipe function.
