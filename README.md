@@ -35,10 +35,10 @@ Requires Open WebUI v0.5.5 or later.
 Contributions are welcome! Here's how to contribute:
 
 1.  **Fork the repository** to your own GitHub account.
-2.  **Create a feature branch** based on the `dev` branch.  Name your branch something descriptive, like `feature/add-new-functionality` or `fix/bug-description`.
+2.  **Create a feature branch** based on the `master` branch.  Name your branch something descriptive, like `feature/add-new-functionality` or `fix/bug-description`.
 
     ```bash
-    git checkout dev
+    git checkout master
     git checkout -b feature/your-feature-name
     ```
 
@@ -49,11 +49,7 @@ Contributions are welcome! Here's how to contribute:
     git push origin feature/your-feature-name
     ```
 
-5.  **Open a pull request** on GitHub, targeting the **`dev` branch** of the main repository.
-
-**Important:** Please ensure your pull request targets the `dev` branch. Pull requests targeting `master` will not be accepted.
-
-**Note:** The `dev` branch is where active development happens. The `master` branch contains stable releases.
+5.  **Open a pull request** on GitHub, targeting the **`master` branch** of the main repository.
 
 ## License
 
