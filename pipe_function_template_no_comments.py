@@ -20,6 +20,8 @@ from typing import (
     Any,
     Literal,
     TypedDict,
+    Optional,
+    Union,
 )
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
@@ -41,17 +43,57 @@ COLORS = {
 }
 
 
+# Event Type Definitions ------------------------------------------------------
 class StatusEventData(TypedDict):
+    action: str
     description: str
     done: bool
-    hidden: bool
 
 
-class ChatEventData(TypedDict):
+class StatusEventPayload(TypedDict):
     type: Literal["status"]
     data: StatusEventData
 
 
+class MessageEventData(TypedDict):
+    content: str
+
+
+class MessageEventPayload(TypedDict):
+    type: Literal["message"]
+    data: MessageEventData
+
+
+class Source(TypedDict):
+    name: str
+
+
+class SourceMetadata(TypedDict):
+    source: str
+
+
+class SourceDocument(TypedDict):
+    source: Source
+    document: list[str]
+    metadata: list[SourceMetadata]
+
+
+class ChatCompletionEventData(TypedDict):
+    done: Optional[bool]
+    content: Optional[str]
+
+
+class ChatCompletionEventPayload(TypedDict):
+    type: Literal["chat:completion"]
+    data: ChatCompletionEventData
+
+
+EventPayload = Union[
+    StatusEventPayload, MessageEventPayload, ChatCompletionEventPayload
+]
+
+
+# Main Pipe Implementation ----------------------------------------------------
 class Pipe:
     class Valves(BaseModel):
         EXAMPLE_STRING: str = Field(
@@ -83,7 +125,7 @@ class Pipe:
         body: dict[str, Any],
         __user__: dict[str, Any],
         __request__: Request,
-        __event_emitter__: Callable[[ChatEventData], Awaitable[None]],
+        __event_emitter__: Callable[[EventPayload], Awaitable[None]],
         __event_call__: Callable[[dict[str, Any]], Awaitable[Any]],
         __task__: str,
         __task_body__: dict[str, Any],
@@ -103,26 +145,49 @@ class Pipe:
                 return '{"tags": ["tag1", "tag2", "tag3"]}'
 
             async def countdown():
+                # Status event example
                 for i in range(5, 0, -1):
                     await __event_emitter__(
                         {
                             "type": "status",
                             "data": {
+                                "action": "countdown",
                                 "description": f"Time remaining: {i}s",
                                 "done": False,
-                                "hidden": False,
                             },
                         }
                     )
                     await asyncio.sleep(1)
 
+                # Final status event
                 await __event_emitter__(
                     {
                         "type": "status",
                         "data": {
+                            "action": "countdown",
                             "description": "Process complete!",
                             "done": True,
-                            "hidden": False,
+                        },
+                    }
+                )
+
+                # Message event example
+                await __event_emitter__(
+                    {
+                        "type": "message",
+                        "data": {"content": "Countdown completed successfully! 🎉"},
+                    }
+                )
+
+                await asyncio.sleep(2)
+
+                # Chat completion event example
+                await __event_emitter__(
+                    {
+                        "type": "chat:completion",
+                        "data": {
+                            "content": "Here's your final response:",
+                            "done": True,
                         },
                     }
                 )
@@ -136,9 +201,6 @@ class Pipe:
             self._print_colored(
                 f"String from user valve: {string_from_user_valve}", "INFO"
             )
-
-            # stored_files = Files.get_files()
-            # self._print_colored(f"Stored files: {stored_files}", "DEBUG")
 
             all_params = {
                 "body": body,
