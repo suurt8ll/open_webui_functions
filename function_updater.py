@@ -1,183 +1,151 @@
 import time
-import json
 import requests
 import hashlib
-import argparse
 import os
+from typing import Optional
 from dotenv import load_dotenv
 
 
-def file_hash(filename):
+def file_hash(filename: str) -> str:
+    """Calculate SHA256 hash of a file."""
     hasher = hashlib.sha256()
     with open(filename, "rb") as file:
-        while True:
-            chunk = file.read(4096)
-            if not chunk:
-                break
+        for chunk in iter(lambda: file.read(4096), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
 
 
-def extract_metadata_from_file(filepath):
+def extract_metadata_from_file(filepath: str) -> dict[str, str]:
+    """Extract metadata from the first docstring in a Python file."""
     metadata = {}
     try:
         with open(filepath, "r") as file:
-            lines = file.readlines()
-            in_docstring = False
-            for line in lines:
-                line = line.strip()
-                if line == '"""':
-                    if in_docstring:
-                        in_docstring = False
-                        break
-                    else:
-                        in_docstring = True
-                    continue
-                if in_docstring:
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        metadata[key.strip()] = value.strip()
-    except FileNotFoundError:
-        print(
-            f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Warning: Metadata file not found at '{filepath}' while trying to extract metadata."
-        )
+            content = file.read()
+
+        # Find first docstring using basic pattern matching
+        doc_start = content.find('"""')
+        if doc_start == -1:
+            return metadata
+
+        doc_end = content.find('"""', doc_start + 3)
+        if doc_end == -1:
+            return metadata
+
+        docstring = content[doc_start + 3 : doc_end]
+        for line in docstring.splitlines():
+            line = line.strip()
+            if ":" in line:
+                key, value = line.split(":", 1)
+                metadata[key.strip()] = value.strip()
+
     except Exception as e:
-        print(
-            f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Warning: Error extracting metadata from file: {e}"
-        )
+        print(f"{timestamp()} - Warning: Metadata extraction error: {e}")
+
     return metadata
 
 
 def update_function(
-    filepath,
-    api_endpoint,
-    function_id,
-    function_name,
-    function_description,
-    api_key,
-):
+    filepath: str,
+    api_endpoint: str,
+    function_id: str,
+    function_name: str,
+    function_description: str,
+    api_key: str,
+) -> None:
+    """Update remote function via API."""
     try:
         with open(filepath, "r") as file:
             code_content = file.read()
-        request_body = {
+
+        payload = {
             "id": function_id,
             "name": function_name,
             "content": code_content,
             "meta": {"description": function_description, "manifest": {}},
         }
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
-        update_url = f"{api_endpoint}/functions/id/{function_id}/update"
+
         response = requests.post(
-            update_url, data=json.dumps(request_body), headers=headers
+            f"{api_endpoint}/functions/id/{function_id}/update",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=payload,
         )
         response.raise_for_status()
-        print(
-            f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Function '{function_id}' updated successfully from file '{filepath}'."
-        )
-    except FileNotFoundError:
-        print(
-            f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Error: File not found at '{filepath}'"
-        )
-    except requests.exceptions.RequestException as e:
-        print(
-            f"{time.strftime('%Y-%m-%d %H:%M:%S')} - API request failed for file '{filepath}': {e}"
-        )
+        print(f"{timestamp()} - Updated {function_id} from {filepath}")
+
     except Exception as e:
-        print(
-            f"{time.strftime('%Y-%m-%d %H:%M:%S')} - An error occurred for file '{filepath}': {e}"
-        )
+        print(f"{timestamp()} - Update failed for {filepath}: {type(e).__name__}: {e}")
+
+
+def timestamp() -> str:
+    """Get current timestamp in standardized format."""
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def validate_env_vars() -> dict[str, str]:
+    """Validate required environment variables."""
+    required_vars = ["API_ENDPOINT", "API_KEY", "FILEPATHS"]
+    env_vars = {}
+
+    for var in required_vars:
+        value = os.getenv(var)
+        if not value:
+            print(f"{timestamp()} - Missing required environment variable: {var}")
+            exit(1)
+        env_vars[var] = value
+
+    # Handle FILEPATHS as a comma-separated string
+    env_vars["FILEPATHS"] = [path.strip() for path in env_vars["FILEPATHS"].split(",")]
+
+    # Polling interval with default
+    env_vars["POLLING_INTERVAL"] = int(os.getenv("POLLING_INTERVAL", "5"))
+
+    return env_vars
+
+
+def main() -> None:
+    """Main monitoring loop."""
+    load_dotenv()
+    env_vars = validate_env_vars()
+
+    filepaths = env_vars["FILEPATHS"]
+    api_endpoint = env_vars["API_ENDPOINT"]
+    api_key = env_vars["API_KEY"]
+    polling_interval = env_vars["POLLING_INTERVAL"]
+
+    file_states: dict[str, Optional[str]] = {path: None for path in filepaths}
+
+    while True:
+        for path in filepaths:
+            if not os.path.exists(path):
+                print(f"{timestamp()} - Missing file: {path}")
+                continue
+
+            current_hash = file_hash(path)
+            metadata = extract_metadata_from_file(path)
+
+            # FIXME handle missing metadata better
+            function_id = metadata.get("id", "")
+            function_name = metadata.get("title", "")
+            description = metadata.get("description", "")
+
+            if not all([function_id, function_name, description]):
+                print(f"{timestamp()} - Missing metadata for {path}")
+                continue
+
+            if current_hash != file_states[path]:
+                if file_states[path] is not None:  # Skip initial state
+                    update_function(
+                        path,
+                        api_endpoint,
+                        function_id,
+                        function_name,
+                        description,
+                        api_key,
+                    )
+                file_states[path] = current_hash
+
+        time.sleep(int(polling_interval))
 
 
 if __name__ == "__main__":
-    load_dotenv()
-    parser = argparse.ArgumentParser(
-        description="Monitors Python file(s) and updates function(s) via API on changes."
-    )
-    parser.add_argument(
-        "--filepaths",
-        nargs="+",
-        help="Path to the Python code file(s)",
-    )
-    parser.add_argument(
-        "--api_endpoint",
-        help="Base API endpoint URL (e.g., http://localhost:8080/api/v1)",
-        default=os.getenv("API_ENDPOINT"),
-    )
-    # FIXME I need to support defining multiple function IDs.
-    parser.add_argument(
-        "--function_id",
-        help="ID of the function to update (default: from file metadata 'id')",
-    )
-    parser.add_argument("--api_key", help="Your API Key", default=os.getenv("API_KEY"))
-    parser.add_argument(
-        "--name",
-        help="Function name (default: from file metadata 'title')",
-    )
-    parser.add_argument(
-        "--description",
-        help="Function description (default: from file metadata 'description')",
-    )
-    parser.add_argument(
-        "--polling_interval",
-        type=int,
-        default=5,
-        help="File change polling interval in seconds (default: 5)",
-    )
-    args = parser.parse_args()
-    missing_args = []
-    if not args.filepaths:
-        missing_args.append("filepaths")
-    if not args.api_endpoint:
-        missing_args.append("api_endpoint")
-    if not args.api_key:
-        missing_args.append("api_key")
-    if not args.polling_interval:
-        missing_args.append("polling_interval")
-    if missing_args:
-        print(
-            f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Error: Missing required arguments: {', '.join(missing_args)}"
-        )
-        print("Please provide them via command line or .env file.")
-        exit(1)
-    previous_hashes = {}
-    while True:
-        for filepath in args.filepaths:
-            metadata_from_file = extract_metadata_from_file(filepath)
-            function_name = args.name or metadata_from_file.get("title")
-            function_id = args.function_id or metadata_from_file.get("id")
-            function_description = args.description or metadata_from_file.get(
-                "description"
-            )
-            missing_metadata = []
-            if not function_name:
-                missing_metadata.append("name")
-            if not function_id:
-                missing_metadata.append("id")
-            if not function_description:
-                missing_metadata.append("description")
-            if missing_metadata:
-                print(
-                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Error: Missing function metadata for '{filepath}': {', '.join(missing_metadata)}"
-                )
-                print(
-                    "Please provide them via command line, .env file or in function file docstring."
-                )
-                continue
-            current_hash = file_hash(filepath)
-            if filepath not in previous_hashes:
-                previous_hashes[filepath] = None
-            if current_hash != previous_hashes[filepath]:
-                if previous_hashes[filepath] is not None:
-                    update_function(
-                        filepath,
-                        args.api_endpoint,
-                        function_id,
-                        function_name,
-                        function_description,
-                        args.api_key,
-                    )
-                previous_hashes[filepath] = current_hash
-        time.sleep(args.polling_interval)
+    main()
