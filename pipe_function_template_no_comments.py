@@ -71,6 +71,7 @@ class Pipe:
         self.valves = self.Valves()
         self._print_colored("Function has been initialized!", "INFO")
 
+    # TODO This can also be async now it seems.
     def pipes(self) -> list[dict]:
         self._print_colored("Registering models.", "INFO")
         return [
@@ -101,6 +102,9 @@ class Pipe:
             if __task__ == "tags_generation":
                 self._print_colored("Detected tag generation task!", "INFO")
                 return '{"tags": ["tag1", "tag2", "tag3"]}'
+            if __task__ == "query_generation":
+                self._print_colored("Detected query generation task!", "INFO")
+                return '{"queries": []}'
 
             async def countdown():
                 for i in range(5, 0, -1):
@@ -127,7 +131,7 @@ class Pipe:
                     }
                 )
 
-            asyncio.create_task(countdown())
+            # asyncio.create_task(countdown())
 
             string_from_valve = self.valves.EXAMPLE_STRING
             string_from_user_valve = __user__["valves"].EXAMPLE_STRING_USER
@@ -162,7 +166,7 @@ class Pipe:
                     f'Detected a file upload! {__files__[0]["file"]["path"]}', "INFO"
                 )
 
-            return "Instant response sent!"
+            return "Hello World!"
 
         except Exception as e:
             error_msg = f"Pipe function error: {str(e)}\n{traceback.format_exc()}"
