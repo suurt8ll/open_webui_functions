@@ -11,7 +11,7 @@ requirements: google-genai==1.2.0
 """
 
 # TODO Add a list of supported features here and also exiting features that can be coded in theory.
-# TODO Audio input support.
+# TODO Audio input support. (currently in development)
 # TODO Video input support.
 # TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 # TODO Better type checking.
@@ -105,6 +105,7 @@ class Message(TypedDict):
 
 
 class Pipe:
+
     class Valves(BaseModel):
         GEMINI_API_KEY: str = Field(default="")
         MODEL_WHITELIST: str = Field(
@@ -207,7 +208,7 @@ class Pipe:
         chat = Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=__user__["id"])
 
         if chat:
-            result = await self._process_chat_messages(chat)
+            result = await self._extract_messages_from_chat(chat)
             self._print_colored(
                 f"Printing the processed messages:\n{json.dumps(result, indent=2)}",
                 "DEBUG",
@@ -305,7 +306,9 @@ class Pipe:
             self._print_colored(error_msg, "ERROR")
             return error_msg
 
-    """Helper functions inside the Pipe class."""
+    """
+    Helper functions inside the Pipe class.
+    """
 
     def _print_colored(self, message: str, level: str = "INFO") -> None:
         """
@@ -562,7 +565,9 @@ class Pipe:
                 "DEBUG",
             )
 
-    async def _process_chat_messages(self, chat: ChatModel) -> list[dict[str, Any]]:
+    async def _extract_messages_from_chat(
+        self, chat: ChatModel
+    ) -> list[dict[str, Any]]:
         """Turns the Open WebUI's ChatModel object into more lean dict object that contains only the messages."""
         self._print_colored(
             f"Printing the raw ChatModel object:\n{json.dumps(chat.model_dump(), indent=2)}",
