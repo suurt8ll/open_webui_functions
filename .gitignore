@@ -5,3 +5,4 @@ docs/
 images/
 open_webui/
 .vscode/
+associate_messages_to_files.py
