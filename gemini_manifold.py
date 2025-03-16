@@ -183,6 +183,38 @@ class Pipe:
                 # Default MIME type if unknown
                 return "application/octet-stream"
 
+        def _extract_markdown_image(text: str) -> list[types.Part]:
+            """Extracts and converts markdown images to parts, preserving text order."""
+            parts = []
+            last_pos = 0
+            for match in re.finditer(
+                r"\n*\s*!\[([^\]]*)\]\((data:image/([^;]+);base64,([^)]+))\)\s*\n*",
+                text,
+            ):
+                # Add text before the image
+                text_segment = text[last_pos : match.start()]
+                if text_segment.strip():
+                    parts.append(types.Part.from_text(text=text_segment))
+
+                # Add image part
+                try:
+                    image_part = types.Part.from_bytes(
+                        data=base64.b64decode(match.group(4)),
+                        mime_type="image/" + match.group(3),
+                    )
+                    parts.append(image_part)
+                except Exception as e:
+                    print(f"Error decoding base64 image: {e}")
+                    # Optionally, add alt text as a text part or handle the error
+
+                last_pos = match.end()
+
+            # Add remaining text
+            remaining_text = text[last_pos:]
+            if remaining_text.strip():
+                parts.append(types.Part.from_text(text=remaining_text))
+            return parts
+
         def _process_image_url(image_url: str) -> Optional[types.Part]:
             """Processes an image URL, handling GCS, data URIs, and standard URLs."""
             try:
@@ -214,7 +246,9 @@ class Pipe:
 
             if item_type == "text":
                 text = item.get("text", "")
-                parts.append(types.Part.from_text(text=text))  # Just add the text
+                parts.extend(
+                    _extract_markdown_image(text)
+                )  # Always process for markdown images
             elif item_type == "image_url":
                 image_url_dict = item.get("image_url", {})
                 image_url = image_url_dict.get("url", "")
@@ -255,9 +289,11 @@ class Pipe:
                     for item in content:
                         parts.extend(_process_content_item(item))
                 else:  # Treat as plain text
-                    parts.append(
-                        types.Part.from_text(text=content)
-                    )  # Just add the text
+                    parts.extend(
+                        _extract_markdown_image(content)
+                    )  # process markdown images
+                    if not parts:  # if there were no markdown images, add the text
+                        parts.append(types.Part.from_text(text=content))
 
                 contents.append(types.Content(role=role, parts=parts))
 
@@ -505,8 +541,8 @@ class Pipe:
 
     def truncate_long_strings(self, data: dict, max_length: int = 50) -> dict:
         """
-        Recursively truncates all string fields within a dictionary that exceed
-        the specified maximum length.
+        Recursively truncates all string and bytes fields within a dictionary that exceed
+        the specified maximum length. Bytes are converted to strings before truncation.
 
         Args:
             data: A dictionary representing the JSON data.
@@ -518,6 +554,10 @@ class Pipe:
         for key, value in data.items():
             if isinstance(value, str) and len(value) > max_length:
                 data[key] = value[:max_length] + "..."  # Truncate and add ellipsis
+            elif isinstance(value, bytes) and len(value) > max_length:
+                data[key] = (
+                    value.hex()[:max_length] + "..."
+                )  # Convert to hex, truncate, and add ellipsis
             elif isinstance(value, dict):
                 self.truncate_long_strings(
                     value, max_length
