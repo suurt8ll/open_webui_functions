@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.3.1
+version: 1.4.0
 requirements: google-genai==1.6.0
 """
 
@@ -38,7 +38,6 @@ from typing import (
     AsyncIterator,
     Generator,
     Iterator,
-    List,
     Literal,
     Tuple,
     Optional,
@@ -87,6 +86,10 @@ class Pipe:
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
+        IMAGE_OUTPUT: bool = Field(
+            default=False,
+            description="Enable image output for gemini-2.0-flash-exp.  If False, only text is returned.",
+        )
 
     def __init__(self):
         try:
@@ -99,7 +102,7 @@ class Pipe:
         finally:
             self._print_colored("Initialization complete.", "INFO")
 
-    def pipes(self) -> List[dict]:
+    def pipes(self) -> list[dict]:
         """Register all available Google models."""
         try:
             if not self.valves.GEMINI_API_KEY:
@@ -149,8 +152,8 @@ class Pipe:
         """Helper functions inside the pipe() method"""
 
         def _pop_system_prompt(
-            messages: List[dict],
-        ) -> Tuple[Optional[str], List[dict]]:
+            messages: list[dict],
+        ) -> Tuple[Optional[str], list[dict]]:
             """Extracts system message from messages."""
             system_message_content = None
             messages_without_system = []
@@ -180,98 +183,120 @@ class Pipe:
                 # Default MIME type if unknown
                 return "application/octet-stream"
 
+        def _extract_markdown_image(text: str) -> list[types.Part]:
+            """Extracts and converts markdown images to parts, preserving text order."""
+            parts = []
+            last_pos = 0
+            for match in re.finditer(
+                r"\n*\s*!\[([^\]]*)\]\((data:image/([^;]+);base64,([^)]+))\)\s*\n*",
+                text,
+            ):
+                # Add text before the image
+                text_segment = text[last_pos : match.start()]
+                if text_segment.strip():
+                    parts.append(types.Part.from_text(text=text_segment))
+
+                # Add image part
+                try:
+                    image_part = types.Part.from_bytes(
+                        data=base64.b64decode(match.group(4)),
+                        mime_type="image/" + match.group(3),
+                    )
+                    parts.append(image_part)
+                except Exception as e:
+                    print(f"Error decoding base64 image: {e}")
+                    # Optionally, add alt text as a text part or handle the error
+
+                last_pos = match.end()
+
+            # Add remaining text
+            remaining_text = text[last_pos:]
+            if remaining_text.strip():
+                parts.append(types.Part.from_text(text=remaining_text))
+            return parts
+
+        def _process_image_url(image_url: str) -> Optional[types.Part]:
+            """Processes an image URL, handling GCS, data URIs, and standard URLs."""
+            try:
+                if image_url.startswith("gs://"):
+                    return types.Part.from_uri(
+                        file_uri=image_url, mime_type=_get_mime_type(image_url)
+                    )
+                elif image_url.startswith("data:image"):
+                    match = re.match(r"data:(image/\w+);base64,(.+)", image_url)
+                    if match:
+                        return types.Part.from_bytes(
+                            data=base64.b64decode(match.group(2)),
+                            mime_type=match.group(1),
+                        )
+                    else:
+                        raise ValueError("Invalid data URI for image.")
+                else:  # Assume standard URL
+                    return types.Part.from_uri(
+                        file_uri=image_url, mime_type=_get_mime_type(image_url)
+                    )
+            except Exception as e:
+                print(f"Error processing image URL '{image_url}': {e}")
+                return None  # Return None to indicate failure
+
+        def _process_content_item(item: dict) -> list[types.Part]:
+            """Processes a single content item, handling text and image_url types."""
+            item_type = item.get("type")
+            parts = []
+
+            if item_type == "text":
+                text = item.get("text", "")
+                parts.extend(
+                    _extract_markdown_image(text)
+                )  # Always process for markdown images
+            elif item_type == "image_url":
+                image_url_dict = item.get("image_url", {})
+                image_url = image_url_dict.get("url", "")
+                if isinstance(image_url, str):
+                    part = _process_image_url(image_url)
+                    if part:
+                        parts.append(part)
+                else:
+                    print(
+                        f"Warning: Unexpected image_url format: {image_url_dict}. Skipping."
+                    )
+            else:
+                print(f"Warning: Unsupported item type: {item_type}. Skipping.")
+
+            return parts
+
         def _transform_messages_to_contents(
-            messages: List[dict],
-        ) -> List[types.Content]:
-            """Transforms messages to google-genai contents, supporting both text and images."""
+            messages: list[dict],
+        ) -> list[types.Content]:
+            """Transforms messages to google-genai contents, supporting text and images."""
             if not genai or not types:
                 raise ValueError(
                     "google-genai is not installed. Please install it to proceed."
                 )
-            contents: List[types.Content] = []
+
+            contents: list[types.Content] = []
+
             for message in messages:
-                # Determine the role: "model" if assistant, else the provided role
                 role = (
                     "model"
                     if message.get("role") == "assistant"
                     else message.get("role")
                 )
                 content = message.get("content", "")
-                if isinstance(content, list):
-                    parts = []
-                    for item in content:
-                        item_type = item.get("type")
-                        if item_type == "text":
-                            # Handle text parts
-                            text = item.get("text", "")
-                            part = types.Part.from_text(text=text)
-                            parts.append(part)
-                        elif item_type == "image_url":
-                            # Handle image parts
-                            image_url_dict = item.get("image_url", {})
-                            image_url = image_url_dict.get(
-                                "url", ""
-                            )  # Safely get url, default to empty string if not found or image_url is not a dict
+                parts = []
 
-                            if isinstance(
-                                image_url, str
-                            ):  # Ensure image_url is a string before calling startswith
-                                if image_url.startswith("gs://"):
-                                    # Image is stored in Google Cloud Storage
-                                    part = types.Part.from_uri(
-                                        file_uri=image_url,
-                                        mime_type=_get_mime_type(image_url),
-                                    )
-                                    parts.append(part)
-                                elif image_url.startswith("data:image"):
-                                    # Image is embedded as a data URI (Base64)
-                                    try:
-                                        # Extract the Base64 data and MIME type using regex
-                                        match = re.match(
-                                            r"data:(image/\w+);base64,(.+)", image_url
-                                        )
-                                        if match:
-                                            mime_type = match.group(1)
-                                            base64_data = match.group(2)
-                                            part = types.Part.from_bytes(
-                                                data=base64.b64decode(base64_data),
-                                                mime_type=mime_type,
-                                            )
-                                            parts.append(part)
-                                        else:
-                                            # Invalid data URI format
-                                            raise ValueError(
-                                                "Invalid data URI for image."
-                                            )
-                                    except Exception as e:
-                                        # Handle invalid image data
-                                        raise ValueError(
-                                            f"Error processing image data: {e}"
-                                        )
-                                else:
-                                    # Assume it's a standard URL (HTTP/HTTPS)
-                                    part = types.Part.from_uri(
-                                        file_uri=image_url,
-                                        mime_type=_get_mime_type(image_url),
-                                    )
-                                    parts.append(part)
-                            else:
-                                print(
-                                    f"Warning: Unexpected image_url format: {image_url_dict}. Skipping image part."
-                                )  # Handle case where image_url is not a string
-                                continue  # Skip this image part and continue to the next item
-                        else:
-                            # Handle other types if necessary
-                            # For now, ignore unsupported types
-                            continue
-                    contents.append(types.Content(role=role, parts=parts))
-                else:
-                    # Handle content that is a simple string (text only)
-                    contents.append(
-                        types.Content(
-                            role=role, parts=[types.Part.from_text(text=content)]
-                        )
-                    )
+                if isinstance(content, list):
+                    for item in content:
+                        parts.extend(_process_content_item(item))
+                else:  # Treat as plain text
+                    parts.extend(
+                        _extract_markdown_image(content)
+                    )  # process markdown images
+                    if not parts:  # if there were no markdown images, add the text
+                        parts.append(types.Part.from_text(text=content))
+
+                contents.append(types.Content(role=role, parts=parts))
+
             return contents
 
         async def _process_stream(
@@ -306,6 +331,17 @@ class Pipe:
                             )  # Safely get the text part
                             if text_part is not None:
                                 yield text_part
+                                continue  # Skip to the next part if it's text
+                            # --- Image Handling Logic ---
+                            inline_data = getattr(part, "inline_data", None)
+                            if inline_data is not None:
+                                mime_type = inline_data.mime_type
+                                image_data = base64.b64encode(inline_data.data).decode(
+                                    "utf-8"
+                                )
+                                # TODO Maybe use Open WebUI's Files API here? Injecting base64 strainght into the chat history could make things slow.
+                                markdown_image = f"\n\n![image](data:{mime_type};base64,{image_data})\n\n"
+                                yield markdown_image
 
         """Main pipe method."""
 
@@ -315,15 +351,19 @@ class Pipe:
         system_prompt, remaining_messages = _pop_system_prompt(messages)
         contents = _transform_messages_to_contents(remaining_messages)
 
+        max_len = 50
         self._print_colored("Received request:", "DEBUG")
         if self.valves.LOG_LEVEL == "DEBUG":
-            print(json.dumps(body, indent=2))
+            truncated_body = self.truncate_long_strings(body.copy(), max_len)
+            print(json.dumps(truncated_body, indent=2))
         self._print_colored(f"System prompt: {system_prompt}", "DEBUG")
-        self._print_colored("Contents: [", "DEBUG")
+        self._print_colored("Contents:", "DEBUG")
         if self.valves.LOG_LEVEL == "DEBUG":
-            for content in enumerate(contents):
-                print(f"    {content},")
-            print("]")
+            for content in contents:
+                truncated_content = self.truncate_long_strings(
+                    content.model_dump().copy(), max_len
+                )
+                print(json.dumps(truncated_content, indent=2))
 
         model_name = self._strip_prefix(body.get("model", ""))
         if model_name in [
@@ -344,6 +384,11 @@ class Pipe:
             "max_output_tokens": body.get("max_tokens", 8192),
             "stop_sequences": body.get("stop", []),
         }
+
+        if "gemini-2.0-flash-exp" in model_name and self.valves.IMAGE_OUTPUT:
+            config_params["response_modalities"] = ["Text", "Image"]
+        else:
+            config_params["response_modalities"] = ["Text"]
 
         # TODO Display the citations in the frontend response somehow.
         if self.valves.USE_GROUNDING_SEARCH:
@@ -493,3 +538,34 @@ class Pipe:
             return model_name  # Return original if stripping fails
         finally:
             self._print_colored("Completed prefix stripping.", "DEBUG")
+
+    def truncate_long_strings(self, data: dict, max_length: int = 50) -> dict:
+        """
+        Recursively truncates all string and bytes fields within a dictionary that exceed
+        the specified maximum length. Bytes are converted to strings before truncation.
+
+        Args:
+            data: A dictionary representing the JSON data.
+            max_length: The maximum length of strings before truncation.
+
+        Returns:
+            The modified dictionary with long strings truncated.
+        """
+        for key, value in data.items():
+            if isinstance(value, str) and len(value) > max_length:
+                data[key] = value[:max_length] + "..."  # Truncate and add ellipsis
+            elif isinstance(value, bytes) and len(value) > max_length:
+                data[key] = (
+                    value.hex()[:max_length] + "..."
+                )  # Convert to hex, truncate, and add ellipsis
+            elif isinstance(value, dict):
+                self.truncate_long_strings(
+                    value, max_length
+                )  # Recursive call for nested dictionaries
+            elif isinstance(value, list):
+                # Iterate through the list and process each element if it's a dictionary
+                for item in value:
+                    if isinstance(item, dict):
+                        self.truncate_long_strings(item, max_length)
+
+        return data
