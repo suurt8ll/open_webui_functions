@@ -12,16 +12,16 @@ requirements:
 
 import asyncio
 from typing import (
+    Any,
+    NotRequired,
     AsyncGenerator,
     Awaitable,
     Generator,
     Iterator,
     Callable,
-    Any,
     Literal,
-    TypedDict,
     Optional,
-    Union,
+    TypedDict,
 )
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
@@ -45,52 +45,49 @@ COLORS = {
 
 # Event Type Definitions ------------------------------------------------------
 class StatusEventData(TypedDict):
-    action: str
+    action: NotRequired[Optional[Literal["web_search", "knowledge_search"]]]
     description: str
-    done: bool
+    done: NotRequired[bool]
+    query: NotRequired[str]  # knowledge_search
+    urls: NotRequired[list[str]]  # web_search
+    hidden: NotRequired[bool]
 
 
-class StatusEventPayload(TypedDict):
+class Source(TypedDict):
+    source: dict[str, str]
+    document: list[str]
+    metadata: list[dict[str, str]]
+
+
+class UsageStatistics(TypedDict):
+    prompt_tokens: Optional[int]
+    completion_tokens: Optional[int]
+    total_tokens: Optional[int]
+
+
+class ChatCompletionEventData(TypedDict):
+    id: NotRequired[str]
+    done: NotRequired[bool]
+    choices: NotRequired[list[dict[str, dict[str, str]]]]
+    content: NotRequired[str]
+    sources: NotRequired[list[Source]]
+    selected_model_id: NotRequired[str]
+    error: NotRequired[dict[str, str]]
+    usage: NotRequired[UsageStatistics]
+    title: NotRequired[str]
+
+
+class StatusEvent(TypedDict):
     type: Literal["status"]
     data: StatusEventData
 
 
-class MessageEventData(TypedDict):
-    content: str
-
-
-class MessageEventPayload(TypedDict):
-    type: Literal["message"]
-    data: MessageEventData
-
-
-class Source(TypedDict):
-    name: str
-
-
-class SourceMetadata(TypedDict):
-    source: str
-
-
-class SourceDocument(TypedDict):
-    source: Source
-    document: list[str]
-    metadata: list[SourceMetadata]
-
-
-class ChatCompletionEventData(TypedDict):
-    done: Optional[bool]
-    content: Optional[str]
-
-
-class ChatCompletionEventPayload(TypedDict):
+class ChatCompletionEvent(TypedDict):
     type: Literal["chat:completion"]
     data: ChatCompletionEventData
 
 
-EventPayload = Union[
-    StatusEventPayload, MessageEventPayload, ChatCompletionEventPayload
-]
+Event = StatusEvent | ChatCompletionEvent
 
 
 # Main Pipe Implementation ----------------------------------------------------
@@ -125,7 +122,7 @@ class Pipe:
         body: dict[str, Any],
         __user__: dict[str, Any],
         __request__: Request,
-        __event_emitter__: Callable[[EventPayload], Awaitable[None]],
+        __event_emitter__: Callable[[Event], Awaitable[None]],
         __event_call__: Callable[[dict[str, Any]], Awaitable[Any]],
         __task__: str,
         __task_body__: dict[str, Any],
@@ -133,7 +130,13 @@ class Pipe:
         __metadata__: dict[str, Any],
         __tools__: list[Any],
     ) -> (
-        str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
+        str
+        | dict[str, Any]
+        | StreamingResponse
+        | Iterator
+        | AsyncGenerator
+        | Generator
+        | None
     ):
         try:
             if __task__ == "title_generation":
@@ -146,12 +149,11 @@ class Pipe:
 
             async def countdown():
                 # Status event example
-                for i in range(5, 0, -1):
+                for i in range(3, 0, -1):
                     await __event_emitter__(
                         {
                             "type": "status",
                             "data": {
-                                "action": "countdown",
                                 "description": f"Time remaining: {i}s",
                                 "done": False,
                             },
@@ -163,32 +165,7 @@ class Pipe:
                 await __event_emitter__(
                     {
                         "type": "status",
-                        "data": {
-                            "action": "countdown",
-                            "description": "Process complete!",
-                            "done": True,
-                        },
-                    }
-                )
-
-                # Message event example
-                await __event_emitter__(
-                    {
-                        "type": "message",
-                        "data": {"content": "Countdown completed successfully! 🎉"},
-                    }
-                )
-
-                await asyncio.sleep(2)
-
-                # Chat completion event example
-                await __event_emitter__(
-                    {
-                        "type": "chat:completion",
-                        "data": {
-                            "content": "Here's your final response:",
-                            "done": True,
-                        },
+                        "data": {"description": "Process complete!", "done": True},
                     }
                 )
 
@@ -224,7 +201,7 @@ class Pipe:
                     f'Detected a file upload! {__files__[0]["file"]["path"]}', "INFO"
                 )
 
-            return "Instant response sent!"
+            return "Hello World!"
 
         except Exception as e:
             error_msg = f"Pipe function error: {str(e)}\n{traceback.format_exc()}"
