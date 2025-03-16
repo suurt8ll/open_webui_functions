@@ -6,8 +6,8 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.3.0
-requirements: google-genai==1.2.0
+version: 1.3.1
+requirements: google-genai==1.6.0
 """
 
 # TODO Add a list of supported features here and also exiting features that can be coded in theory.
@@ -110,7 +110,6 @@ class Pipe:
             if not self.client:
                 self.client = genai.Client(
                     api_key=self.valves.GEMINI_API_KEY,
-                    http_options=types.HttpOptions(api_version="v1alpha"),
                 )
             else:
                 self._print_colored("Client already initialized.", "INFO")
