@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 1.3.0
-requirements: google-genai==1.2.0
+requirements: google-genai==1.6.0
 """
 
 # TODO Add a list of supported features here and also exiting features that can be coded in theory.
