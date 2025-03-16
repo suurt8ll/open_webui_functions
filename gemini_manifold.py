@@ -110,7 +110,6 @@ class Pipe:
             if not self.client:
                 self.client = genai.Client(
                     api_key=self.valves.GEMINI_API_KEY,
-                    http_options=types.HttpOptions(api_version="v1alpha"),
                 )
             else:
                 self._print_colored("Client already initialized.", "INFO")
