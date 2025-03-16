@@ -315,15 +315,19 @@ class Pipe:
         system_prompt, remaining_messages = _pop_system_prompt(messages)
         contents = _transform_messages_to_contents(remaining_messages)
 
+        max_len = 50
         self._print_colored("Received request:", "DEBUG")
         if self.valves.LOG_LEVEL == "DEBUG":
-            print(json.dumps(body, indent=2))
+            truncated_body = self.truncate_long_strings(body.copy(), max_len)
+            print(json.dumps(truncated_body, indent=2))
         self._print_colored(f"System prompt: {system_prompt}", "DEBUG")
-        self._print_colored("Contents: [", "DEBUG")
+        self._print_colored("Contents:", "DEBUG")
         if self.valves.LOG_LEVEL == "DEBUG":
-            for content in enumerate(contents):
-                print(f"    {content},")
-            print("]")
+            for content in contents:
+                truncated_content = self.truncate_long_strings(
+                    content.model_dump().copy(), max_len
+                )
+                print(json.dumps(truncated_content, indent=2))
 
         model_name = self._strip_prefix(body.get("model", ""))
         if model_name in [
@@ -498,3 +502,30 @@ class Pipe:
             return model_name  # Return original if stripping fails
         finally:
             self._print_colored("Completed prefix stripping.", "DEBUG")
+
+    def truncate_long_strings(self, data: dict, max_length: int = 50) -> dict:
+        """
+        Recursively truncates all string fields within a dictionary that exceed
+        the specified maximum length.
+
+        Args:
+            data: A dictionary representing the JSON data.
+            max_length: The maximum length of strings before truncation.
+
+        Returns:
+            The modified dictionary with long strings truncated.
+        """
+        for key, value in data.items():
+            if isinstance(value, str) and len(value) > max_length:
+                data[key] = value[:max_length] + "..."  # Truncate and add ellipsis
+            elif isinstance(value, dict):
+                self.truncate_long_strings(
+                    value, max_length
+                )  # Recursive call for nested dictionaries
+            elif isinstance(value, list):
+                # Iterate through the list and process each element if it's a dictionary
+                for item in value:
+                    if isinstance(item, dict):
+                        self.truncate_long_strings(item, max_length)
+
+        return data
