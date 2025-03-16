@@ -1,7 +1,7 @@
 """
 title: Gemini Manifold google_genai
 id: gemini_manifold_google_genai
-description: Manifold function for Gemini Developer API. Uses google-genai, supports streaming and grounding with Google Search.
+description: Manifold function for Gemini Developer API. Supports native image generation, grounding with Google Search and streaming. Uses google-genai.
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
@@ -10,20 +10,26 @@ version: 1.4.0
 requirements: google-genai==1.6.0
 """
 
-# TODO Add a list of supported features here and also exiting features that can be coded in theory.
-# TODO Audio input support.
-# TODO Video input support.
-# TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
-# TODO Better type checking.
-# TODO Return errors as correctly formatted error types for the frontend to handle (red text in the front-end).
-
-# ^ Open WebUI front-end throws error when trying to upload videos or audios,
-# but the file still gets uploaded to database and is passed to the pipe function.
-# We can use this fact to implement audio and video input support.
-
 # This is a helper function that provides a manifold for Google's Gemini Studio API.
-# Open WebUI v0.5.5 or greater is required for this function to work properly.
-# Be sure to check out my GitHub repository for more information! Feel free to contribute and post questions.
+# Be sure to check out my GitHub repository for more information! Feel free to contribute and post questions/suggestions.
+
+# Supported features:
+#   - Native image generation (image output)
+#   - Image input
+#   - Streaming
+#   - Grounding with Google Search
+
+# Features that are supported by API but not yet implemented in the manifold:
+#   TODO Audio input support.
+#   TODO Video input support.
+#   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
+#   TODO Display usage statistics (token counts)
+#   TODO Display citations in the front-end.
+
+# Other things to do:
+#   TODO Better type checking.
+#   TODO Return errors as correctly formatted error types for the frontend to handle (red text in the front-end).
+#   TODO Refactor, make this mess more readable lol.
 
 import base64
 import inspect
@@ -102,6 +108,7 @@ class Pipe:
         finally:
             self._print_colored("Initialization complete.", "INFO")
 
+    # FIXME Make it async
     def pipes(self) -> list[dict]:
         """Register all available Google models."""
         try:
@@ -345,8 +352,6 @@ class Pipe:
 
         """Main pipe method."""
 
-        # TODO When stream_options: { include_usage: true } is enabled, the response will contain usage information.
-
         messages = body.get("messages", [])
         system_prompt, remaining_messages = _pop_system_prompt(messages)
         contents = _transform_messages_to_contents(remaining_messages)
@@ -390,7 +395,6 @@ class Pipe:
         else:
             config_params["response_modalities"] = ["Text"]
 
-        # TODO Display the citations in the frontend response somehow.
         if self.valves.USE_GROUNDING_SEARCH:
             if model_name in ALLOWED_GROUNDING_MODELS:
                 print("[pipe] Using grounding search.")
@@ -426,7 +430,7 @@ class Pipe:
             else:  # streaming is disabled
                 if not self.client:
                     return "Error: Client not initialized."
-                # FIXME Make it async?
+                # FIXME Make it async
                 response = self.client.models.generate_content(**gen_content_args)
                 response_text = response.text if response.text else "No response text."
                 return response_text
