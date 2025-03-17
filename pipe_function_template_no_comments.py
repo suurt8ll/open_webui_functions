@@ -17,13 +17,14 @@ from typing import (
     Generator,
     Iterator,
     Callable,
-    Any,
     Literal,
     TypedDict,
+    Any,
+    NotRequired,
 )
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
-from starlette.requests import Request
+from fastapi import Request
 import json
 import traceback
 import inspect
@@ -50,6 +51,14 @@ class StatusEventData(TypedDict):
 class ChatEventData(TypedDict):
     type: Literal["status"]
     data: StatusEventData
+
+
+class UserData(TypedDict):
+    id: str
+    email: str
+    name: str
+    role: Literal["admin", "user", "pending"]
+    valves: NotRequired[Any]  # object of type UserValves
 
 
 class Pipe:
@@ -81,7 +90,7 @@ class Pipe:
     async def pipe(
         self,
         body: dict[str, Any],
-        __user__: dict[str, Any],
+        __user__: UserData,
         __request__: Request,
         __event_emitter__: Callable[[ChatEventData], Awaitable[None]],
         __event_call__: Callable[[dict[str, Any]], Awaitable[Any]],
@@ -130,7 +139,9 @@ class Pipe:
             asyncio.create_task(countdown())
 
             string_from_valve = self.valves.EXAMPLE_STRING
-            string_from_user_valve = __user__["valves"].EXAMPLE_STRING_USER
+            string_from_user_valve = getattr(
+                __user__.get("valves"), "EXAMPLE_STRING_USER", None
+            )
 
             self._print_colored(f"String from valve: {string_from_valve}", "INFO")
             self._print_colored(

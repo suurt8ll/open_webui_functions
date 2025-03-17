@@ -13,7 +13,7 @@ requirements:
 from typing import AsyncGenerator, Awaitable, Generator, Iterator, Callable, Any
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
-from starlette.requests import Request
+from fastapi import Request
 import json
 
 # You can import any module from the Open WebUI backend itself.  However, be mindful of security implications and code stability.

@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.6.0
+version: 0.7.0
 """
 
 # NB! This is work in progress and not yet fully featured.
@@ -14,7 +14,6 @@ version: 0.6.0
 # Currently it takes the last user message as prompt and generates an image using the selected model and returns it as a markdown image.
 
 # TODO Use another LLM model to generate the image prompt?
-# TODO Option to save the generated images onto disk, bypassing database?
 
 import asyncio
 import json
@@ -24,7 +23,7 @@ from typing import (
     AsyncGenerator,
     Generator,
     Iterator,
-    Union,
+    NotRequired,
     TypedDict,
     Literal,
     Callable,
@@ -32,10 +31,14 @@ from typing import (
 )
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
+from fastapi import Request
 import requests
 import aiohttp
 import time
 import inspect
+import base64
+from open_webui.routers.images import upload_image
+from open_webui.models.users import Users
 
 COLORS = {
     "RED": "\033[91m",
@@ -60,6 +63,14 @@ class ChatEventData(TypedDict):
     data: StatusEventData
 
 
+class UserData(TypedDict):
+    id: str
+    email: str
+    name: str
+    role: Literal["admin", "user", "pending"]
+    valves: NotRequired[Any]  # object of type UserValves
+
+
 class Pipe:
     class Valves(BaseModel):
         VENICE_API_TOKEN: str = Field(default="", description="Venice.ai API Token")
@@ -71,10 +82,16 @@ class Pipe:
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
+        USE_FILES_API: bool = Field(
+            title="Use Files API",
+            default=True,
+            description="Save the image files using Open WebUI's API for files.",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
 
+    # FIXME Make it async.
     def pipes(self) -> list[dict]:
         try:
             models = self._get_models()
@@ -90,9 +107,11 @@ class Pipe:
     async def pipe(
         self,
         body: dict,
+        __user__: UserData,
+        __request__: Request,
         __event_emitter__: Callable[[ChatEventData], Awaitable[None]],
         __task__: str,
-    ) -> Union[str, dict, StreamingResponse, Iterator, AsyncGenerator, Generator]:
+    ) -> str | dict | StreamingResponse | Iterator | AsyncGenerator | Generator:
 
         if not self.valves.VENICE_API_TOKEN:
             return "Error: Missing VENICE_API_TOKEN in valves configuration"
@@ -156,23 +175,32 @@ class Pipe:
             except asyncio.CancelledError:
                 pass  # Expected, already handled
 
+        total_time = time.time() - start_time
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {
+                    "description": f"Image generated in {total_time:.2f}s",
+                    "done": True,
+                    "hidden": False,
+                },
+            }
+        )
+
         if image_data and image_data.get("images"):
             self._print_colored("Image generated successfully", "INFO")
             base64_image = image_data["images"][0]
 
-            total_time = time.time() - start_time
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"Image generated in {total_time:.2f}s",
-                        "done": True,
-                        "hidden": False,
-                    },
-                }
-            )
-
-            return f"![Generated Image](data:image/png;base64,{base64_image})"
+            if self.valves.USE_FILES_API:
+                # Decode the base64 image data
+                image_data = base64.b64decode(base64_image)
+                # FIXME make mime type dynamic
+                image_url = self._upload_image(
+                    image_data, "image/png", model, prompt, __user__, __request__
+                )
+                return f"![Generated Image]({image_url})"
+            else:
+                return f"![Generated Image](data:image/png;base64,{base64_image})"
 
         self._print_colored("Image generation failed.", "ERROR")
 
@@ -188,6 +216,8 @@ class Pipe:
             }
         )
         return "Error: Failed to generate image"
+
+    """Helper functions inside the Pipe class."""
 
     def _get_models(self) -> list[dict[str, Any]]:
         try:
@@ -208,7 +238,7 @@ class Pipe:
             self._print_colored(error_msg, "ERROR")
             return []
 
-    async def _generate_image(self, model: str, prompt: str) -> Union[dict, None]:
+    async def _generate_image(self, model: str, prompt: str) -> dict | None:
         try:
             async with aiohttp.ClientSession() as session:
                 self._print_colored(
@@ -246,7 +276,37 @@ class Pipe:
             self._print_colored(error_msg, "ERROR")
             return None
 
-    """Helper functions inside the Pipe class."""
+    def _upload_image(
+        self,
+        image_data: bytes,
+        mime_type: str,
+        model: str,
+        prompt: str,
+        __user__: UserData,
+        __request__: Request,
+    ) -> str:
+
+        # Create metadata for the image
+        image_metadata = {
+            "model": model,
+            "prompt": prompt,
+        }
+
+        # Get the *full* user object from the database
+        user = Users.get_user_by_id(__user__["id"])
+        if user is None:
+            return "Error: User not found"
+
+        # Upload the image using the imported function
+        image_url: str = upload_image(
+            request=__request__,
+            image_metadata=image_metadata,
+            image_data=image_data,
+            content_type=mime_type,
+            user=user,
+        )
+        self._print_colored(f"Image uploaded. URL: {image_url}", "INFO")
+        return image_url
 
     def _print_colored(self, message: str, level: str = "INFO") -> None:
         """

@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.4.0
+version: 1.4.1
 requirements: google-genai==1.6.0
 """
 
@@ -37,6 +37,7 @@ import json
 import re
 import fnmatch
 import traceback
+from fastapi import Request
 from pydantic import BaseModel, Field
 from typing import (
     Any,
@@ -45,12 +46,17 @@ from typing import (
     Generator,
     Iterator,
     Literal,
+    NotRequired,
     Tuple,
     Optional,
+    TypedDict,
 )
 from starlette.responses import StreamingResponse
 from google import genai
 from google.genai import types
+from open_webui.routers.images import upload_image
+from open_webui.models.files import Files
+from open_webui.models.users import Users
 
 COLORS = {
     "RED": "\033[91m",
@@ -70,6 +76,14 @@ ALLOWED_GROUNDING_MODELS = [
     "gemini-1.5-flash",
     "gemini-1.0-pro",
 ]
+
+
+class UserData(TypedDict):
+    id: str
+    email: str
+    name: str
+    role: Literal["admin", "user", "pending"]
+    valves: NotRequired[Any]  # object of type UserValves
 
 
 class Pipe:
@@ -95,6 +109,11 @@ class Pipe:
         IMAGE_OUTPUT: bool = Field(
             default=False,
             description="Enable image output for gemini-2.0-flash-exp.  If False, only text is returned.",
+        )
+        USE_FILES_API: bool = Field(
+            title="Use Files API",
+            default=True,
+            description="Save the image files using Open WebUI's API for files.",
         )
 
     def __init__(self):
@@ -152,7 +171,10 @@ class Pipe:
             self._print_colored("Completed pipes method.", "DEBUG")
 
     async def pipe(
-        self, body: dict
+        self,
+        body: dict,
+        __user__: UserData,
+        __request__: Request,
     ) -> (
         str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
     ):
@@ -194,8 +216,9 @@ class Pipe:
             """Extracts and converts markdown images to parts, preserving text order."""
             parts = []
             last_pos = 0
+
             for match in re.finditer(
-                r"\n*\s*!\[([^\]]*)\]\((data:image/([^;]+);base64,([^)]+))\)\s*\n*",
+                r"!\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)",
                 text,
             ):
                 # Add text before the image
@@ -203,16 +226,71 @@ class Pipe:
                 if text_segment.strip():
                     parts.append(types.Part.from_text(text=text_segment))
 
-                # Add image part
-                try:
-                    image_part = types.Part.from_bytes(
-                        data=base64.b64decode(match.group(4)),
-                        mime_type="image/" + match.group(3),
+                # Determine if it's base64 or a file URL
+                if match.group(2):  # Base64 encoded image
+                    try:
+                        mime_type = match.group(2)
+                        base64_data = match.group(3)
+                        self._print_colored(
+                            f"Found base64 image link!\nmime_type: {mime_type}\nbase64_data: {match.group(3)[:50]}...",
+                            "DEBUG",
+                        )
+                        image_part = types.Part.from_bytes(
+                            data=base64.b64decode(base64_data),
+                            mime_type=mime_type,
+                        )
+                        parts.append(image_part)
+                    except Exception as e:
+                        self._print_colored(
+                            f"Error decoding base64 image: {e}", "ERROR"
+                        )
+
+                elif match.group(4):  # File URL
+                    self._print_colored(
+                        f"Found API image link!\nAPI File ID: {match.group(4)}", "DEBUG"
                     )
-                    parts.append(image_part)
-                except Exception as e:
-                    print(f"Error decoding base64 image: {e}")
-                    # Optionally, add alt text as a text part or handle the error
+                    file_id = match.group(4)
+                    file_model = Files.get_file_by_id(file_id)
+
+                    if file_model is None:
+                        self._print_colored(
+                            f"File with ID '{file_id}' not found.", "WARNING"
+                        )
+                        #  Could add placeholder text here if desired
+                        continue  # Skip to the next match
+
+                    try:
+                        # "continue" above ensures that file_model is not None
+                        content_type = file_model.meta.get("content_type")  # type: ignore
+                        if content_type is None:
+                            self._print_colored(
+                                f"Content type not found for file ID '{file_id}'.",
+                                "WARNING",
+                            )
+                            continue
+
+                        with open(file_model.path, "rb") as file:  # type: ignore
+                            image_data = file.read()
+
+                        image_part = types.Part.from_bytes(
+                            data=image_data, mime_type=content_type
+                        )
+                        parts.append(image_part)
+
+                    except FileNotFoundError:
+                        self._print_colored(
+                            f"File not found on disk for ID '{file_id}', path: {file_model.path}",
+                            "ERROR",
+                        )
+                    except KeyError:
+                        self._print_colored(
+                            f"Metadata error for file ID '{file_id}': 'content_type' missing.",
+                            "ERROR",
+                        )
+                    except Exception as e:
+                        self._print_colored(
+                            f"Error processing file with ID '{file_id}': {e}", "ERROR"
+                        )
 
                 last_pos = match.end()
 
@@ -220,6 +298,7 @@ class Pipe:
             remaining_text = text[last_pos:]
             if remaining_text.strip():
                 parts.append(types.Part.from_text(text=remaining_text))
+
             return parts
 
         def _process_image_url(image_url: str) -> Optional[types.Part]:
@@ -307,7 +386,7 @@ class Pipe:
             return contents
 
         async def _process_stream(
-            self, gen_content_args: dict[str, Any]
+            gen_content_args: dict, __request__: Request, __user__: UserData
         ) -> AsyncGenerator[str, None]:
             """Helper function to process the stream and yield text chunks.
 
@@ -317,8 +396,9 @@ class Pipe:
             Yields:
                 str: Text chunks from the response.
             """
+            # FIXME Get type checking working in here.
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
-                await self.client.aio.models.generate_content_stream(**gen_content_args)
+                await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
             )
 
             async for chunk in response_stream:
@@ -343,12 +423,24 @@ class Pipe:
                             inline_data = getattr(part, "inline_data", None)
                             if inline_data is not None:
                                 mime_type = inline_data.mime_type
-                                image_data = base64.b64encode(inline_data.data).decode(
-                                    "utf-8"
-                                )
-                                # TODO Maybe use Open WebUI's Files API here? Injecting base64 strainght into the chat history could make things slow.
-                                markdown_image = f"\n\n![image](data:{mime_type};base64,{image_data})\n\n"
-                                yield markdown_image
+                                image_data = inline_data.data
+                                if self.valves.USE_FILES_API:
+                                    image_url = self._upload_image(
+                                        image_data,
+                                        mime_type,
+                                        gen_content_args.get("model", ""),
+                                        "TAKE IT FROM gen_content_args contents",
+                                        __user__,
+                                        __request__,
+                                    )
+                                    markdown_image = f"![Generated Image]({image_url})"
+                                    yield markdown_image
+                                else:
+                                    image_data_decoded = base64.b64encode(
+                                        image_data
+                                    ).decode()
+                                    markdown_image = f"![Generated Image](data:{mime_type};base64,{image_data_decoded})"
+                                    yield markdown_image
 
         """Main pipe method."""
 
@@ -426,11 +518,18 @@ class Pipe:
         try:
             self._print_colored(f'Streaming is {body.get("stream", False)}', "DEBUG")
             if body.get("stream", False):
-                return _process_stream(self, gen_content_args)
+                return _process_stream(gen_content_args, __request__, __user__)
             else:  # streaming is disabled
                 if not self.client:
                     return "Error: Client not initialized."
-                # FIXME Make it async
+                # FIXME Make it async.
+                # FIXME Support native image gen here too.
+                if "gemini-2.0-flash-exp" in model_name and self.valves.IMAGE_OUTPUT:
+                    self._print_colored(
+                        "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming.",
+                        "WARNING",
+                    )
+                    return "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
                 response = self.client.models.generate_content(**gen_content_args)
                 response_text = response.text if response.text else "No response text."
                 return response_text
@@ -573,3 +672,35 @@ class Pipe:
                         self.truncate_long_strings(item, max_length)
 
         return data
+
+    def _upload_image(
+        self,
+        image_data: bytes,
+        mime_type: str,
+        model: str,
+        prompt: str,
+        __user__: UserData,
+        __request__: Request,
+    ) -> str:
+
+        # Create metadata for the image
+        image_metadata = {
+            "model": model,
+            "prompt": prompt,
+        }
+
+        # Get the *full* user object from the database
+        user = Users.get_user_by_id(__user__["id"])
+        if user is None:
+            return "Error: User not found"
+
+        # Upload the image using the imported function
+        image_url: str = upload_image(
+            request=__request__,
+            image_metadata=image_metadata,
+            image_data=image_data,
+            content_type=mime_type,
+            user=user,
+        )
+        self._print_colored(f"Image uploaded. URL: {image_url}", "INFO")
+        return image_url
