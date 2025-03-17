@@ -24,7 +24,7 @@ Requires Open WebUI v0.5.5 or later.
 ## Additional Scripts
 
 -   `thinking_gemini.py`: [Open WebUI Community](https://openwebui.com/f/suurt8ll/thinking_gemini) An outdated script, initially developed for `gemini-2.0-flash-thinking-exp` model interactions. Superseded by `gemini_manifold.py`.
--   `function_updater.py`: Automates updating functions on a server via a REST API, streamlining development.
+-   `function_updater.py`: Listens for file changes on selected files in `.env` file and automatically updates the functions in the backend with REST API if change is detected.
 -   `smallthinker_filter.py`: At first I wanted to code a simple filter that makes output of the `smallthinker:3b` nicer but now I'm thinking of turning it into more general reasoning model formatter.
 -   `system_prompt_injector.py`: The idea is to allow chaning chat options like system prompt and temperature from the chatbox. It would pair nicely with Prompts feature Open WebUI offers.
 -   `venice_manifold.py`: [Open WebUI Community](https://openwebui.com/f/suurt8ll/venice_image_generation) enables image creation by using any diffusion model offered by Venice.ai API.
