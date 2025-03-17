@@ -24,6 +24,7 @@ from typing import (
     AsyncGenerator,
     Generator,
     Iterator,
+    NotRequired,
     TypedDict,
     Literal,
     Callable,
@@ -60,6 +61,14 @@ class ChatEventData(TypedDict):
     data: StatusEventData
 
 
+class UserData(TypedDict):
+    id: str
+    email: str
+    name: str
+    role: Literal["admin", "user", "pending"]
+    valves: NotRequired[Any]  # object of type UserValves
+
+
 class Pipe:
     class Valves(BaseModel):
         VENICE_API_TOKEN: str = Field(default="", description="Venice.ai API Token")
@@ -91,7 +100,7 @@ class Pipe:
     async def pipe(
         self,
         body: dict,
-        __user__: dict,
+        __user__: UserData,
         __request__: Request,
         __event_emitter__: Callable[[ChatEventData], Awaitable[None]],
         __task__: str,

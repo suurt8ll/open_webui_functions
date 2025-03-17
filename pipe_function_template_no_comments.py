@@ -11,21 +11,17 @@ requirements:
 """
 
 import asyncio
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from typing import (
-        AsyncGenerator,
-        Awaitable,
-        Generator,
-        Iterator,
-        Callable,
-        Any,
-        Literal,
-        Optional,
-        TypedDict,
-        TYPE_CHECKING,
-    )
+from typing import (
+    AsyncGenerator,
+    Awaitable,
+    Generator,
+    Iterator,
+    Callable,
+    Literal,
+    TypedDict,
+    Any,
+    NotRequired,
+)
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 from fastapi import Request
@@ -61,8 +57,8 @@ class UserData(TypedDict):
     id: str
     email: str
     name: str
-    role: str
-    valves: Optional[Any]
+    role: Literal["admin", "user", "pending"]
+    valves: NotRequired[Any]  # object of type UserValves
 
 
 class Pipe:
@@ -143,7 +139,9 @@ class Pipe:
             asyncio.create_task(countdown())
 
             string_from_valve = self.valves.EXAMPLE_STRING
-            string_from_user_valve = __user__["valves"].EXAMPLE_STRING_USER
+            string_from_user_valve = getattr(
+                __user__.get("valves"), "EXAMPLE_STRING_USER", None
+            )
 
             self._print_colored(f"String from valve: {string_from_valve}", "INFO")
             self._print_colored(
