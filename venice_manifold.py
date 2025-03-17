@@ -170,6 +170,18 @@ class Pipe:
             except asyncio.CancelledError:
                 pass  # Expected, already handled
 
+        total_time = time.time() - start_time
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {
+                    "description": f"Image generated in {total_time:.2f}s",
+                    "done": True,
+                    "hidden": False,
+                },
+            }
+        )
+
         if image_data and image_data.get("images"):
             self._print_colored("Image generated successfully", "INFO")
             base64_image = image_data["images"][0]
@@ -203,18 +215,6 @@ class Pipe:
                     user=user,
                 )
                 self._print_colored(f"Image uploaded. URL: {image_url}", "INFO")
-
-                total_time = time.time() - start_time
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"Image generated and uploaded in {total_time:.2f}s",
-                            "done": True,
-                            "hidden": False,
-                        },
-                    }
-                )
                 # Return the URL in Markdown format
                 return f"![Generated Image]({image_url})\n"
 
