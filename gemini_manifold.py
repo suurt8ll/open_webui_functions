@@ -55,7 +55,7 @@ from starlette.responses import StreamingResponse
 from google import genai
 from google.genai import types
 from open_webui.routers.images import upload_image
-from open_webui.models.files import File
+from open_webui.models.files import Files
 from open_webui.models.users import Users
 
 COLORS = {
@@ -217,8 +217,9 @@ class Pipe:
             """Extracts and converts markdown images to parts, preserving text order."""
             parts = []
             last_pos = 0
+
             for match in re.finditer(
-                r"!\[.*?\]\(data:(image/[^;]+);base64,([^)]+)\)",
+                r"!\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)",
                 text,
             ):
                 # Add text before the image
@@ -226,18 +227,70 @@ class Pipe:
                 if text_segment.strip():
                     parts.append(types.Part.from_text(text=text_segment))
 
-                # Add image part
-                try:
-                    mime_type = match.group(1)  # Group 1: mime type (image/...)
-                    base64_data = match.group(2)  # Group 2: base64 data
-                    image_part = types.Part.from_bytes(
-                        data=base64.b64decode(base64_data),
-                        mime_type=mime_type,
+                # Determine if it's base64 or a file URL
+                if match.group(2):  # Base64 encoded image
+                    try:
+                        mime_type = match.group(2)
+                        base64_data = match.group(3)
+                        self._print_colored(
+                            f"Found base64 image link!\nmime_type: {mime_type}\nbase64_data: {match.group(3)[:50]}...",
+                            "DEBUG",
+                        )
+                        image_part = types.Part.from_bytes(
+                            data=base64.b64decode(base64_data),
+                            mime_type=mime_type,
+                        )
+                        parts.append(image_part)
+                    except Exception as e:
+                        self._print_colored(
+                            f"Error decoding base64 image: {e}", "ERROR"
+                        )
+
+                elif match.group(4):  # File URL
+                    self._print_colored(
+                        f"Found API image link!\nAPI File ID: {match.group(4)}", "DEBUG"
                     )
-                    parts.append(image_part)
-                except Exception as e:
-                    print(f"Error decoding base64 image: {e}")
-                    # Optionally, add alt text as a text part or handle the error
+                    file_id = match.group(4)
+                    file_model = Files.get_file_by_id(file_id)
+
+                    if file_model is None:
+                        self._print_colored(
+                            f"File with ID '{file_id}' not found.", "WARNING"
+                        )
+                        #  Could add placeholder text here if desired
+                        continue  # Skip to the next match
+
+                    try:
+                        content_type = file_model.meta.get("content_type")
+                        if content_type is None:
+                            self._print_colored(
+                                f"Content type not found for file ID '{file_id}'.",
+                                "WARNING",
+                            )
+                            continue
+
+                        with open(file_model.path, "rb") as file:
+                            image_data = file.read()
+
+                        image_part = types.Part.from_bytes(
+                            data=image_data, mime_type=content_type
+                        )
+                        parts.append(image_part)
+
+                    except FileNotFoundError:
+                        self._print_colored(
+                            f"File not found on disk for ID '{file_id}', path: {file_model.path}",
+                            "ERROR",
+                        )
+                    except KeyError:
+                        self._print_colored(
+                            f"Metadata error for file ID '{file_id}': 'content_type' missing.",
+                            "ERROR",
+                        )
+                    except Exception as e:
+                        self._print_colored(
+                            f"Error processing file with ID '{file_id}': {e}", "ERROR"
+                        )
 
                 last_pos = match.end()
 
@@ -245,6 +298,7 @@ class Pipe:
             remaining_text = text[last_pos:]
             if remaining_text.strip():
                 parts.append(types.Part.from_text(text=remaining_text))
+
             return parts
 
         def _process_image_url(image_url: str) -> Optional[types.Part]:
