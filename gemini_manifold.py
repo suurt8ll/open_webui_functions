@@ -487,6 +487,10 @@ class Pipe:
         else:
             config_params["response_modalities"] = ["Text"]
 
+        # Image Generation model does not support the system prompt message
+        if "gemini-2.0-flash-exp-image-generation" in model_name:
+            del config_params["system_instruction"]
+
         if self.valves.USE_GROUNDING_SEARCH:
             if model_name in ALLOWED_GROUNDING_MODELS:
                 print("[pipe] Using grounding search.")
