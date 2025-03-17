@@ -190,7 +190,7 @@ class Pipe:
                 image_url = self._upload_image(
                     base64_image, model, prompt, __user__, __request__
                 )
-                return f"![Generated Image]({image_url})\n"
+                return f"![Generated Image]({image_url})"
             except Exception as e:
                 error_msg = f"Error uploading image: {str(e)}\n{traceback.format_exc()}"
                 self._print_colored(error_msg, "ERROR")
@@ -301,11 +301,10 @@ class Pipe:
             request=__request__,
             image_metadata=image_metadata,
             image_data=image_bytes,
-            content_type="image/png",  # Venice.ai returns PNG images
+            content_type="image/png",
             user=user,
         )
         self._print_colored(f"Image uploaded. URL: {image_url}", "INFO")
-        # Return the URL in Markdown format
         return image_url
 
     def _print_colored(self, message: str, level: str = "INFO") -> None:

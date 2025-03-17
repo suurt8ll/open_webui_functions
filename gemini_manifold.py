@@ -37,6 +37,7 @@ import json
 import re
 import fnmatch
 import traceback
+from fastapi import Request
 from pydantic import BaseModel, Field
 from typing import (
     Any,
@@ -45,12 +46,17 @@ from typing import (
     Generator,
     Iterator,
     Literal,
+    NotRequired,
     Tuple,
     Optional,
+    TypedDict,
 )
 from starlette.responses import StreamingResponse
 from google import genai
 from google.genai import types
+from open_webui.routers.images import upload_image
+from open_webui.models.files import File
+from open_webui.models.users import Users
 
 COLORS = {
     "RED": "\033[91m",
@@ -70,6 +76,14 @@ ALLOWED_GROUNDING_MODELS = [
     "gemini-1.5-flash",
     "gemini-1.0-pro",
 ]
+
+
+class UserData(TypedDict):
+    id: str
+    email: str
+    name: str
+    role: Literal["admin", "user", "pending"]
+    valves: NotRequired[Any]  # object of type UserValves
 
 
 class Pipe:
@@ -95,6 +109,12 @@ class Pipe:
         IMAGE_OUTPUT: bool = Field(
             default=False,
             description="Enable image output for gemini-2.0-flash-exp.  If False, only text is returned.",
+        )
+        USE_FILES_API: bool = Field(
+            title="Use Files API",
+            default=True,
+            description="Enable the usage of Open WebUI's files API for image storage. \
+                If set to false then images get injected directly into the chat history using raw base64 data URI.",
         )
 
     def __init__(self):
@@ -152,7 +172,10 @@ class Pipe:
             self._print_colored("Completed pipes method.", "DEBUG")
 
     async def pipe(
-        self, body: dict
+        self,
+        body: dict,
+        __user__: UserData,
+        __request__: Request,
     ) -> (
         str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
     ):
@@ -195,7 +218,7 @@ class Pipe:
             parts = []
             last_pos = 0
             for match in re.finditer(
-                r"\n*\s*!\[([^\]]*)\]\((data:image/([^;]+);base64,([^)]+))\)\s*\n*",
+                r"!\[.*?\]\(data:(image/[^;]+);base64,([^)]+)\)",
                 text,
             ):
                 # Add text before the image
@@ -205,9 +228,11 @@ class Pipe:
 
                 # Add image part
                 try:
+                    mime_type = match.group(1)  # Group 1: mime type (image/...)
+                    base64_data = match.group(2)  # Group 2: base64 data
                     image_part = types.Part.from_bytes(
-                        data=base64.b64decode(match.group(4)),
-                        mime_type="image/" + match.group(3),
+                        data=base64.b64decode(base64_data),
+                        mime_type=mime_type,
                     )
                     parts.append(image_part)
                 except Exception as e:
@@ -307,7 +332,7 @@ class Pipe:
             return contents
 
         async def _process_stream(
-            self, gen_content_args: dict[str, Any]
+            gen_content_args: dict, __request__: Request, __user__: UserData
         ) -> AsyncGenerator[str, None]:
             """Helper function to process the stream and yield text chunks.
 
@@ -317,6 +342,7 @@ class Pipe:
             Yields:
                 str: Text chunks from the response.
             """
+            # FIXME Get type checking working in here.
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
                 await self.client.aio.models.generate_content_stream(**gen_content_args)
             )
@@ -343,12 +369,24 @@ class Pipe:
                             inline_data = getattr(part, "inline_data", None)
                             if inline_data is not None:
                                 mime_type = inline_data.mime_type
-                                image_data = base64.b64encode(inline_data.data).decode(
-                                    "utf-8"
-                                )
-                                # TODO Maybe use Open WebUI's Files API here? Injecting base64 strainght into the chat history could make things slow.
-                                markdown_image = f"\n\n![image](data:{mime_type};base64,{image_data})\n\n"
-                                yield markdown_image
+                                image_data = inline_data.data
+                                if self.valves.USE_FILES_API:
+                                    image_url = self._upload_image(
+                                        image_data,
+                                        mime_type,
+                                        gen_content_args.get("model", ""),
+                                        "TAKE IT FROM gen_content_args contents",
+                                        __user__,
+                                        __request__,
+                                    )
+                                    markdown_image = f"![Generated Image]({image_url})"
+                                    yield markdown_image
+                                else:
+                                    image_data_decoded = base64.b64encode(
+                                        image_data
+                                    ).decode()
+                                    markdown_image = f"![Generated Image](data:{mime_type};base64,{image_data_decoded})"
+                                    yield markdown_image
 
         """Main pipe method."""
 
@@ -426,11 +464,12 @@ class Pipe:
         try:
             self._print_colored(f'Streaming is {body.get("stream", False)}', "DEBUG")
             if body.get("stream", False):
-                return _process_stream(self, gen_content_args)
+                return _process_stream(gen_content_args, __request__, __user__)
             else:  # streaming is disabled
                 if not self.client:
                     return "Error: Client not initialized."
-                # FIXME Make it async
+                # FIXME Make it async.
+                # FIXME Support native image gen here too.
                 response = self.client.models.generate_content(**gen_content_args)
                 response_text = response.text if response.text else "No response text."
                 return response_text
@@ -573,3 +612,35 @@ class Pipe:
                         self.truncate_long_strings(item, max_length)
 
         return data
+
+    def _upload_image(
+        self,
+        image_data: bytes,
+        mime_type: str,
+        model: str,
+        prompt: str,
+        __user__: UserData,
+        __request__: Request,
+    ) -> str:
+
+        # Create metadata for the image
+        image_metadata = {
+            "model": model,
+            "prompt": prompt,
+        }
+
+        # Get the *full* user object from the database
+        user = Users.get_user_by_id(__user__["id"])
+        if user is None:
+            return "Error: User not found"
+
+        # Upload the image using the imported function
+        image_url: str = upload_image(
+            request=__request__,
+            image_metadata=image_metadata,
+            image_data=image_data,
+            content_type=mime_type,
+            user=user,
+        )
+        self._print_colored(f"Image uploaded. URL: {image_url}", "INFO")
+        return image_url
