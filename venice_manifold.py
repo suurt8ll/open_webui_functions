@@ -186,43 +186,15 @@ class Pipe:
             self._print_colored("Image generated successfully", "INFO")
             base64_image = image_data["images"][0]
 
-            # --- Modified section for image upload ---
             try:
-                # Decode the base64 image data
-                image_bytes = base64.b64decode(base64_image)
-
-                # Create metadata for the image
-                image_metadata = {
-                    "model": model,
-                    "prompt": prompt,
-                    "width": self.valves.WIDTH,
-                    "height": self.valves.HEIGHT,
-                    "steps": self.valves.STEPS,
-                    "cfg_scale": self.valves.CFG_SCALE,
-                }
-
-                # Get the *full* user object from the database
-                user = Users.get_user_by_id(__user__["id"])
-                if user is None:
-                    return "Error: User not found"
-
-                # Upload the image using the imported function
-                image_url = upload_image(
-                    request=__request__,
-                    image_metadata=image_metadata,
-                    image_data=image_bytes,
-                    content_type="image/png",  # Venice.ai returns PNG images
-                    user=user,
+                image_url = self._upload_image(
+                    base64_image, model, prompt, __user__, __request__
                 )
-                self._print_colored(f"Image uploaded. URL: {image_url}", "INFO")
-                # Return the URL in Markdown format
                 return f"![Generated Image]({image_url})\n"
-
             except Exception as e:
                 error_msg = f"Error uploading image: {str(e)}\n{traceback.format_exc()}"
                 self._print_colored(error_msg, "ERROR")
                 return f"Error: Failed to upload image: {str(e)}"
-            # --- End of modified section ---
 
         self._print_colored("Image generation failed.", "ERROR")
 
@@ -297,6 +269,44 @@ class Pipe:
             error_msg = f"Generation error: {str(e)}\n{traceback.format_exc()}"
             self._print_colored(error_msg, "ERROR")
             return None
+
+    def _upload_image(
+        self,
+        base64_image: str,
+        model: str,
+        prompt: str,
+        __user__: UserData,
+        __request__: Request,
+    ) -> str:
+        # Decode the base64 image data
+        image_bytes = base64.b64decode(base64_image)
+
+        # Create metadata for the image
+        image_metadata = {
+            "model": model,
+            "prompt": prompt,
+            "width": self.valves.WIDTH,
+            "height": self.valves.HEIGHT,
+            "steps": self.valves.STEPS,
+            "cfg_scale": self.valves.CFG_SCALE,
+        }
+
+        # Get the *full* user object from the database
+        user = Users.get_user_by_id(__user__["id"])
+        if user is None:
+            return "Error: User not found"
+
+        # Upload the image using the imported function
+        image_url: str = upload_image(
+            request=__request__,
+            image_metadata=image_metadata,
+            image_data=image_bytes,
+            content_type="image/png",  # Venice.ai returns PNG images
+            user=user,
+        )
+        self._print_colored(f"Image uploaded. URL: {image_url}", "INFO")
+        # Return the URL in Markdown format
+        return image_url
 
     def _print_colored(self, message: str, level: str = "INFO") -> None:
         """
