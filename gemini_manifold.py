@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.4.0
+version: 1.4.1
 requirements: google-genai==1.6.0
 """
 
@@ -113,8 +113,7 @@ class Pipe:
         USE_FILES_API: bool = Field(
             title="Use Files API",
             default=True,
-            description="Enable the usage of Open WebUI's files API for image storage. \
-                If set to false then images get injected directly into the chat history using raw base64 data URI.",
+            description="Save the image files using Open WebUI's API for files.",
         )
 
     def __init__(self):
@@ -261,7 +260,8 @@ class Pipe:
                         continue  # Skip to the next match
 
                     try:
-                        content_type = file_model.meta.get("content_type")
+                        # "continue" above ensures that file_model is not None
+                        content_type = file_model.meta.get("content_type")  # type: ignore
                         if content_type is None:
                             self._print_colored(
                                 f"Content type not found for file ID '{file_id}'.",
@@ -269,7 +269,7 @@ class Pipe:
                             )
                             continue
 
-                        with open(file_model.path, "rb") as file:
+                        with open(file_model.path, "rb") as file:  # type: ignore
                             image_data = file.read()
 
                         image_part = types.Part.from_bytes(
@@ -398,7 +398,7 @@ class Pipe:
             """
             # FIXME Get type checking working in here.
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
-                await self.client.aio.models.generate_content_stream(**gen_content_args)
+                await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
             )
 
             async for chunk in response_stream:
@@ -524,6 +524,12 @@ class Pipe:
                     return "Error: Client not initialized."
                 # FIXME Make it async.
                 # FIXME Support native image gen here too.
+                if "gemini-2.0-flash-exp" in model_name and self.valves.IMAGE_OUTPUT:
+                    self._print_colored(
+                        "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming.",
+                        "WARNING",
+                    )
+                    return "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
                 response = self.client.models.generate_content(**gen_content_args)
                 response_text = response.text if response.text else "No response text."
                 return response_text

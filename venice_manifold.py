@@ -82,6 +82,11 @@ class Pipe:
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
+        USE_FILES_API: bool = Field(
+            title="Use Files API",
+            default=True,
+            description="Save the image files using Open WebUI's API for files.",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -186,15 +191,16 @@ class Pipe:
             self._print_colored("Image generated successfully", "INFO")
             base64_image = image_data["images"][0]
 
-            try:
+            if self.valves.USE_FILES_API:
+                # Decode the base64 image data
+                image_data = base64.b64decode(base64_image)
+                # FIXME make mime type dynamic
                 image_url = self._upload_image(
-                    base64_image, model, prompt, __user__, __request__
+                    image_data, "image/png", model, prompt, __user__, __request__
                 )
                 return f"![Generated Image]({image_url})"
-            except Exception as e:
-                error_msg = f"Error uploading image: {str(e)}\n{traceback.format_exc()}"
-                self._print_colored(error_msg, "ERROR")
-                return f"Error: Failed to upload image: {str(e)}"
+            else:
+                return f"![Generated Image](data:image/png;base64,{base64_image})"
 
         self._print_colored("Image generation failed.", "ERROR")
 
@@ -272,23 +278,18 @@ class Pipe:
 
     def _upload_image(
         self,
-        base64_image: str,
+        image_data: bytes,
+        mime_type: str,
         model: str,
         prompt: str,
         __user__: UserData,
         __request__: Request,
     ) -> str:
-        # Decode the base64 image data
-        image_bytes = base64.b64decode(base64_image)
 
         # Create metadata for the image
         image_metadata = {
             "model": model,
             "prompt": prompt,
-            "width": self.valves.WIDTH,
-            "height": self.valves.HEIGHT,
-            "steps": self.valves.STEPS,
-            "cfg_scale": self.valves.CFG_SCALE,
         }
 
         # Get the *full* user object from the database
@@ -300,8 +301,8 @@ class Pipe:
         image_url: str = upload_image(
             request=__request__,
             image_metadata=image_metadata,
-            image_data=image_bytes,
-            content_type="image/png",
+            image_data=image_data,
+            content_type=mime_type,
             user=user,
         )
         self._print_colored(f"Image uploaded. URL: {image_url}", "INFO")
