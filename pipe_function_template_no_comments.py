@@ -11,19 +11,24 @@ requirements:
 """
 
 import asyncio
-from typing import (
-    AsyncGenerator,
-    Awaitable,
-    Generator,
-    Iterator,
-    Callable,
-    Any,
-    Literal,
-    TypedDict,
-)
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import (
+        AsyncGenerator,
+        Awaitable,
+        Generator,
+        Iterator,
+        Callable,
+        Any,
+        Literal,
+        Optional,
+        TypedDict,
+        TYPE_CHECKING,
+    )
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
-from starlette.requests import Request
+from fastapi import Request
 import json
 import traceback
 import inspect
@@ -50,6 +55,14 @@ class StatusEventData(TypedDict):
 class ChatEventData(TypedDict):
     type: Literal["status"]
     data: StatusEventData
+
+
+class UserData(TypedDict):
+    id: str
+    email: str
+    name: str
+    role: str
+    valves: Optional[Any]
 
 
 class Pipe:
@@ -81,7 +94,7 @@ class Pipe:
     async def pipe(
         self,
         body: dict[str, Any],
-        __user__: dict[str, Any],
+        __user__: UserData,
         __request__: Request,
         __event_emitter__: Callable[[ChatEventData], Awaitable[None]],
         __event_call__: Callable[[dict[str, Any]], Awaitable[Any]],

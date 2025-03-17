@@ -24,7 +24,6 @@ from typing import (
     AsyncGenerator,
     Generator,
     Iterator,
-    Union,
     TypedDict,
     Literal,
     Callable,
@@ -32,6 +31,7 @@ from typing import (
 )
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
+from fastapi import Request
 import requests
 import aiohttp
 import time
@@ -75,6 +75,7 @@ class Pipe:
     def __init__(self):
         self.valves = self.Valves()
 
+    # FIXME Make it async.
     def pipes(self) -> list[dict]:
         try:
             models = self._get_models()
@@ -90,9 +91,11 @@ class Pipe:
     async def pipe(
         self,
         body: dict,
+        __user__: dict,
+        __request__: Request,
         __event_emitter__: Callable[[ChatEventData], Awaitable[None]],
         __task__: str,
-    ) -> Union[str, dict, StreamingResponse, Iterator, AsyncGenerator, Generator]:
+    ) -> str | dict | StreamingResponse | Iterator | AsyncGenerator | Generator:
 
         if not self.valves.VENICE_API_TOKEN:
             return "Error: Missing VENICE_API_TOKEN in valves configuration"
@@ -189,6 +192,8 @@ class Pipe:
         )
         return "Error: Failed to generate image"
 
+    """Helper functions inside the Pipe class."""
+
     def _get_models(self) -> list[dict[str, Any]]:
         try:
             response = requests.get(
@@ -208,7 +213,7 @@ class Pipe:
             self._print_colored(error_msg, "ERROR")
             return []
 
-    async def _generate_image(self, model: str, prompt: str) -> Union[dict, None]:
+    async def _generate_image(self, model: str, prompt: str) -> dict | None:
         try:
             async with aiohttp.ClientSession() as session:
                 self._print_colored(
@@ -245,8 +250,6 @@ class Pipe:
             error_msg = f"Generation error: {str(e)}\n{traceback.format_exc()}"
             self._print_colored(error_msg, "ERROR")
             return None
-
-    """Helper functions inside the Pipe class."""
 
     def _print_colored(self, message: str, level: str = "INFO") -> None:
         """
