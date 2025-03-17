@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.6.0
+version: 0.7.0
 """
 
 # NB! This is work in progress and not yet fully featured.
@@ -14,7 +14,6 @@ version: 0.6.0
 # Currently it takes the last user message as prompt and generates an image using the selected model and returns it as a markdown image.
 
 # TODO Use another LLM model to generate the image prompt?
-# TODO Option to save the generated images onto disk, bypassing database?
 
 import asyncio
 import json
@@ -37,6 +36,9 @@ import requests
 import aiohttp
 import time
 import inspect
+import base64
+from open_webui.routers.images import upload_image
+from open_webui.models.users import Users
 
 COLORS = {
     "RED": "\033[91m",
@@ -172,19 +174,55 @@ class Pipe:
             self._print_colored("Image generated successfully", "INFO")
             base64_image = image_data["images"][0]
 
-            total_time = time.time() - start_time
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"Image generated in {total_time:.2f}s",
-                        "done": True,
-                        "hidden": False,
-                    },
-                }
-            )
+            # --- Modified section for image upload ---
+            try:
+                # Decode the base64 image data
+                image_bytes = base64.b64decode(base64_image)
 
-            return f"![Generated Image](data:image/png;base64,{base64_image})"
+                # Create metadata for the image
+                image_metadata = {
+                    "model": model,
+                    "prompt": prompt,
+                    "width": self.valves.WIDTH,
+                    "height": self.valves.HEIGHT,
+                    "steps": self.valves.STEPS,
+                    "cfg_scale": self.valves.CFG_SCALE,
+                }
+
+                # Get the *full* user object from the database
+                user = Users.get_user_by_id(__user__["id"])
+                if user is None:
+                    return "Error: User not found"
+
+                # Upload the image using the imported function
+                image_url = upload_image(
+                    request=__request__,
+                    image_metadata=image_metadata,
+                    image_data=image_bytes,
+                    content_type="image/png",  # Venice.ai returns PNG images
+                    user=user,
+                )
+                self._print_colored(f"Image uploaded. URL: {image_url}", "INFO")
+
+                total_time = time.time() - start_time
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"Image generated and uploaded in {total_time:.2f}s",
+                            "done": True,
+                            "hidden": False,
+                        },
+                    }
+                )
+                # Return the URL in Markdown format
+                return f"![Generated Image]({image_url})\n"
+
+            except Exception as e:
+                error_msg = f"Error uploading image: {str(e)}\n{traceback.format_exc()}"
+                self._print_colored(error_msg, "ERROR")
+                return f"Error: Failed to upload image: {str(e)}"
+            # --- End of modified section ---
 
         self._print_colored("Image generation failed.", "ERROR")
 
