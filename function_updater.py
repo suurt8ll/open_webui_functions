@@ -7,6 +7,49 @@ from typing import Optional, Dict
 from dotenv import load_dotenv
 import aiohttp  # For asynchronous HTTP requests
 import aiofiles  # For asynchronous file operations
+import logging
+import coloredlogs  # For colorful logs
+
+
+class CustomFormatter(logging.Formatter):
+    """Custom formatter to add thread name."""
+
+    def format(self, record):
+        if asyncio.iscoroutinefunction(record.funcName):
+            record.funcName = f"{record.funcName} [coroutine]"
+        return super().format(record)
+
+
+# Configure logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)  # Set the root logger level
+
+# Create a handler for console output
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.DEBUG)  # Set the console handler level
+
+# Create a formatter and set it for the handler
+formatter = CustomFormatter(
+    "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s - %(message)s"
+)
+console_handler.setFormatter(formatter)
+
+# Add the handler to the logger
+logger.addHandler(console_handler)
+
+# Install coloredlogs with custom format and level styles
+coloredlogs.install(
+    level="DEBUG",
+    logger=logger,
+    fmt="%(asctime)s - %(name)s - %(levelname)s - %(funcName)s - %(message)s",
+    level_styles={
+        "debug": {"color": "white"},
+        "info": {"color": "green"},
+        "warning": {"color": "yellow"},
+        "error": {"color": "red"},
+        "critical": {"color": "red", "bold": True},
+    },
+)
 
 
 async def file_hash(filename: str) -> str:
@@ -20,10 +63,12 @@ async def file_hash(filename: str) -> str:
                     break
                 hasher.update(chunk)
     except FileNotFoundError:
-        print(f"{timestamp()} - File not found: {filename}")
+        logger.error(f"File not found: {filename}")
         return ""  # Return empty string if file not found
     except Exception as e:
-        print(f"{timestamp()} - Error reading file {filename}: {e}")
+        logger.exception(
+            f"Error reading file {filename}: {e}"
+        )  # Use exception for full traceback
         return ""
     return hasher.hexdigest()
 
@@ -35,7 +80,7 @@ async def extract_metadata_from_file(filepath: str) -> Dict[str, str]:
         async with aiofiles.open(filepath, "r") as file:
             content = await file.read()
 
-        # Find first docstring using basic pattern matching
+        # Find first docstring
         doc_start = content.find('"""')
         if doc_start == -1:
             return metadata
@@ -52,9 +97,9 @@ async def extract_metadata_from_file(filepath: str) -> Dict[str, str]:
                 metadata[key.strip()] = value.strip()
 
     except FileNotFoundError:
-        print(f"{timestamp()} - File not found: {filepath}")
+        logger.error(f"File not found: {filepath}")
     except Exception as e:
-        print(f"{timestamp()} - Warning: Metadata extraction error: {e}")
+        logger.warning(f"Metadata extraction error: {e}")
 
     return metadata
 
@@ -65,12 +110,13 @@ async def check_api_availability(
     """Check if the API endpoint is available, asynchronously."""
     try:
         async with session.get(f"{api_endpoint}/health") as response:
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+            response.raise_for_status()
             return True
-    except (aiohttp.ClientError, asyncio.TimeoutError):
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.warning(f"API unavailable: {e}")
         return False
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        logger.exception(f"Unexpected error checking API: {e}")
         return False
 
 
@@ -89,10 +135,10 @@ async def function_exists(
                     return True
             return False
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        print(f"{timestamp()} - Error checking function existence: {e}")
-        return False  # Assume it doesn't exist in case of error
+        logger.error(f"Error checking function existence: {e}")
+        return False
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        logger.exception(f"Unexpected error checking function: {e}")
         return False
 
 
@@ -122,14 +168,14 @@ async def create_function(
             json=payload,
         ) as response:
             response.raise_for_status()
-            print(f"{timestamp()} - Created new function {function_id} from {filepath}")
+            logger.info(f"Created new function {function_id} from {filepath}")
 
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        print(
-            f"{timestamp()} - Creation failed for {filepath}: {type(e).__name__}: {e}. Check network connection or API status."
+        logger.error(
+            f"Creation failed for {filepath}: {type(e).__name__}: {e}. Check network/API status."
         )
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        logger.exception(f"Unexpected error creating function: {e}")
 
 
 async def update_function(
@@ -141,7 +187,7 @@ async def update_function(
     api_key: str,
     session: aiohttp.ClientSession,
 ) -> None:
-    """Update remote function via API, or create it if it doesn't exist, asynchronously."""
+    """Update remote function, or create if it doesn't exist, asynchronously."""
     try:
         async with aiofiles.open(filepath, "r") as file:
             code_content = await file.read()
@@ -159,19 +205,19 @@ async def update_function(
             json=payload,
         ) as response:
             response.raise_for_status()
-            print(f"{timestamp()} - Updated {function_id} from {filepath}")
+            logger.info(f"Updated {function_id} from {filepath}")
 
     except aiohttp.ClientResponseError as e:
-        if e.status == 400:  # Check for 400 Bad Request
+        if e.status == 400:
             if await function_exists(api_endpoint, function_id, api_key, session):
-                print(
-                    f"{timestamp()} - Update failed for {filepath}: Function exists, but update failed. Check the function in the front-end and re-enable it if necessary."
+                logger.error(
+                    f"Update failed for {filepath}: Function exists, but update failed. Check function and re-enable."
                 )
             else:
-                print(
-                    f"{timestamp()} - Function {function_id} not found (400 error). Creating a new function."
+                logger.warning(
+                    f"Function {function_id} not found (400). Creating new function."
                 )
-                await create_function(  # Create the function
+                await create_function(
                     filepath,
                     api_endpoint,
                     function_id,
@@ -181,15 +227,15 @@ async def update_function(
                     session,
                 )
         else:
-            print(
-                f"{timestamp()} - Update failed for {filepath}: {type(e).__name__}: {e}. Check the function in the front-end and re-enable it if necessary."
+            logger.error(
+                f"Update failed for {filepath}: {type(e).__name__}: {e}. Check function and re-enable."
             )
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        print(
-            f"{timestamp()} - Update failed for {filepath}: {type(e).__name__}: {e}. Check network connection or API status."
+        logger.error(
+            f"Update failed for {filepath}: {type(e).__name__}: {e}. Check network/API status."
         )
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        logger.exception(f"Unexpected error updating function: {e}")
 
 
 def timestamp() -> str:
@@ -205,14 +251,11 @@ def validate_env_vars() -> Dict[str, str]:
     for var in required_vars:
         value = os.getenv(var)
         if not value:
-            print(f"{timestamp()} - Missing required environment variable: {var}")
-            exit(1)
+            logger.critical(f"Missing required environment variable: {var}")
+            exit(1)  # Exit with a non-zero code to indicate failure
         env_vars[var] = value
 
-    # Handle FILEPATHS as a comma-separated string
     env_vars["FILEPATHS"] = [path.strip() for path in env_vars["FILEPATHS"].split(",")]
-
-    # Polling interval with default
     env_vars["POLLING_INTERVAL"] = int(os.getenv("POLLING_INTERVAL", "5"))
 
     return env_vars
@@ -225,13 +268,13 @@ async def process_file(
     file_states: Dict[str, Optional[str]],
     session: aiohttp.ClientSession,
 ):
-    """Process a single file, checking for changes and updating/creating as needed."""
+    """Process a single file, checking for changes and updating/creating."""
     if not os.path.exists(path):
-        print(f"{timestamp()} - Missing file: {path}")
+        logger.warning(f"Missing file: {path}")
         return
 
     current_hash = await file_hash(path)
-    if not current_hash:  # if file_hash returns empty string, skip
+    if not current_hash:
         return
     metadata = await extract_metadata_from_file(path)
 
@@ -240,11 +283,11 @@ async def process_file(
     description = metadata.get("description", "")
 
     if not all([function_id, function_name, description]):
-        print(f"{timestamp()} - Missing metadata for {path}")
+        logger.warning(f"Missing metadata for {path}")
         return
 
     if current_hash != file_states[path]:
-        if file_states[path] is not None:  # Skip initial state
+        if file_states[path] is not None:
             await update_function(
                 path,
                 api_endpoint,
@@ -271,19 +314,17 @@ async def main() -> None:
 
     async with aiohttp.ClientSession() as session:
         while True:
-            # Wait for API availability
             while not await check_api_availability(api_endpoint, session):
-                print(f"{timestamp()} - API unavailable. Waiting...")
-                await asyncio.sleep(polling_interval)  # Use asyncio.sleep
+                logger.info(f"API unavailable. Waiting...")
+                await asyncio.sleep(polling_interval)
 
-            # Create a list of tasks for processing each file
             tasks = [
                 process_file(
                     path, api_endpoint + "/api/v1", api_key, file_states, session
                 )
                 for path in filepaths
             ]
-            await asyncio.gather(*tasks)  # Run file processing concurrently
+            await asyncio.gather(*tasks)
 
             await asyncio.sleep(polling_interval)
 
