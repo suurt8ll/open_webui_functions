@@ -1,14 +1,13 @@
-import asyncio
-import time
-import requests
 import hashlib
 import os
-from typing import Optional, Dict
+from typing import Optional
 from dotenv import load_dotenv
 import aiohttp  # For asynchronous HTTP requests
 import aiofiles  # For asynchronous file operations
 import logging
-import coloredlogs  # For colorful logs
+import asyncio
+import coloredlogs
+import signal  # Import the signal module for handling signals
 
 
 class CustomFormatter(logging.Formatter):
@@ -49,6 +48,12 @@ coloredlogs.install(
         "error": {"color": "red"},
         "critical": {"color": "red", "bold": True},
     },
+    field_styles={
+        "asctime": {"color": "blue"},
+        "name": {"color": "cyan"},
+        "levelname": {"color": "white"},
+        "funcName": {"color": "cyan"},
+    },
 )
 
 
@@ -73,7 +78,7 @@ async def file_hash(filename: str) -> str:
     return hasher.hexdigest()
 
 
-async def extract_metadata_from_file(filepath: str) -> Dict[str, str]:
+async def extract_metadata_from_file(filepath: str) -> dict[str, str]:
     """Extract metadata from the first docstring in a Python file asynchronously."""
     metadata = {}
     try:
@@ -113,7 +118,6 @@ async def check_api_availability(
             response.raise_for_status()
             return True
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logger.warning(f"API unavailable: {e}")
         return False
     except Exception as e:
         logger.exception(f"Unexpected error checking API: {e}")
@@ -238,12 +242,7 @@ async def update_function(
         logger.exception(f"Unexpected error updating function: {e}")
 
 
-def timestamp() -> str:
-    """Get current timestamp in standardized format."""
-    return time.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def validate_env_vars() -> Dict[str, str]:
+def validate_env_vars() -> dict[str, str]:
     """Validate required environment variables."""
     required_vars = ["API_ENDPOINT", "API_KEY", "FILEPATHS"]
     env_vars = {}
@@ -265,7 +264,7 @@ async def process_file(
     path: str,
     api_endpoint: str,
     api_key: str,
-    file_states: Dict[str, Optional[str]],
+    file_states: dict[str, Optional[str]],
     session: aiohttp.ClientSession,
 ):
     """Process a single file, checking for changes and updating/creating."""
@@ -310,24 +309,56 @@ async def main() -> None:
     api_key = env_vars["API_KEY"]
     polling_interval = int(env_vars["POLLING_INTERVAL"])
 
-    file_states: Dict[str, Optional[str]] = {path: None for path in filepaths}
+    file_states: dict[str, Optional[str]] = {path: None for path in filepaths}
+
+    api_available = True  # Assume API is available at startup
+    api_unavailable_logged = False  # Flag to track if "API unavailable" has been logged
 
     async with aiohttp.ClientSession() as session:
         while True:
-            while not await check_api_availability(api_endpoint, session):
-                logger.info(f"API unavailable. Waiting...")
-                await asyncio.sleep(polling_interval)
+            if shutdown_event.is_set():  # Check for shutdown signal
+                logger.info("Exiting main loop due to shutdown signal.")
+                break
 
-            tasks = [
-                process_file(
-                    path, api_endpoint + "/api/v1", api_key, file_states, session
-                )
-                for path in filepaths
-            ]
-            await asyncio.gather(*tasks)
+            if not await check_api_availability(api_endpoint, session):
+                if api_available:  # Only log if API was previously available
+                    logger.info(f"API unavailable. Waiting...")
+                    api_available = False
+                    api_unavailable_logged = (
+                        True  # Mark that unavailable log has been made
+                    )
+            else:
+                if (
+                    not api_available and api_unavailable_logged
+                ):  # Log reconnection only if it was previously unavailable and log was made
+                    logger.info("API reconnected.")
+                    api_available = True
+                    api_unavailable_logged = False  # Reset the unavailable log flag
+
+            if api_available:  # Only process files if API is available
+                tasks = [
+                    process_file(
+                        path, api_endpoint + "/api/v1", api_key, file_states, session
+                    )
+                    for path in filepaths
+                ]
+                await asyncio.gather(*tasks)
 
             await asyncio.sleep(polling_interval)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    shutdown_event = asyncio.Event()  # Create an event for shutdown signal
+
+    def signal_handler(signum, frame):
+        logger.warning(f"Received signal {signum}. Shutting down...")
+        shutdown_event.set()
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, signal_handler, sig, None)
+
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.close()
