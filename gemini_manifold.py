@@ -6,15 +6,15 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.4.1
+version: 1.4.2
 requirements: google-genai==1.6.0
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API.
-# Be sure to check out my GitHub repository for more information! Feel free to contribute and post questions/suggestions.
+# Be sure to check out my GitHub repository for more information! Contributions, questions and suggestions are very welcome.
 
 # Supported features:
-#   - Native image generation (image output)
+#   - Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
 #   - Image input
 #   - Streaming
 #   - Grounding with Google Search
@@ -105,10 +105,6 @@ class Pipe:
         LOG_LEVEL: Literal["INFO", "WARNING", "ERROR", "DEBUG", "OFF"] = Field(
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
-        )
-        IMAGE_OUTPUT: bool = Field(
-            default=False,
-            description="Enable image output for gemini-2.0-flash-exp.  If False, only text is returned.",
         )
         USE_FILES_API: bool = Field(
             title="Use Files API",
@@ -482,8 +478,14 @@ class Pipe:
             "stop_sequences": body.get("stop", []),
         }
 
-        if "gemini-2.0-flash-exp" in model_name and self.valves.IMAGE_OUTPUT:
+        if "gemini-2.0-flash-exp-image-generation" in model_name:
             config_params["response_modalities"] = ["Text", "Image"]
+            # Image Generation model does not support the system prompt message
+            self._print_colored(
+                "Image Generation model does not support the system prompt message! Removing the system prompt.",
+                "WARNING",
+            )
+            del config_params["system_instruction"]
         else:
             config_params["response_modalities"] = ["Text"]
 
@@ -524,7 +526,7 @@ class Pipe:
                     return "Error: Client not initialized."
                 # FIXME Make it async.
                 # FIXME Support native image gen here too.
-                if "gemini-2.0-flash-exp" in model_name and self.valves.IMAGE_OUTPUT:
+                if "gemini-2.0-flash-exp-image-generation" in model_name:
                     self._print_colored(
                         "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming.",
                         "WARNING",
