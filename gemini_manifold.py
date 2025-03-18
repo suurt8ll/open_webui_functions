@@ -11,10 +11,10 @@ requirements: google-genai==1.6.0
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API.
-# Be sure to check out my GitHub repository for more information! Feel free to contribute and post questions/suggestions.
+# Be sure to check out my GitHub repository for more information! Contributions, questions and suggestions are very welcome.
 
 # Supported features:
-#   - Native image generation (image output)
+#   - Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
 #   - Image input
 #   - Streaming
 #   - Grounding with Google Search
