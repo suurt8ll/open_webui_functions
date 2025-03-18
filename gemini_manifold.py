@@ -106,10 +106,6 @@ class Pipe:
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
-        IMAGE_OUTPUT: bool = Field(
-            default=False,
-            description="Enable image output for gemini-2.0-flash-exp.  If False, only text is returned.",
-        )
         USE_FILES_API: bool = Field(
             title="Use Files API",
             default=True,
@@ -482,14 +478,16 @@ class Pipe:
             "stop_sequences": body.get("stop", []),
         }
 
-        if "gemini-2.0-flash-exp" in model_name and self.valves.IMAGE_OUTPUT:
+        if "gemini-2.0-flash-exp-image-generation" in model_name:
             config_params["response_modalities"] = ["Text", "Image"]
+            # Image Generation model does not support the system prompt message
+            self._print_colored(
+                "Image Generation model does not support the system prompt message! Removing the system prompt.",
+                "WARNING",
+            )
+            del config_params["system_instruction"]
         else:
             config_params["response_modalities"] = ["Text"]
-
-        # Image Generation model does not support the system prompt message
-        if "gemini-2.0-flash-exp-image-generation" in model_name:
-            del config_params["system_instruction"]
 
         if self.valves.USE_GROUNDING_SEARCH:
             if model_name in ALLOWED_GROUNDING_MODELS:
@@ -528,7 +526,7 @@ class Pipe:
                     return "Error: Client not initialized."
                 # FIXME Make it async.
                 # FIXME Support native image gen here too.
-                if "gemini-2.0-flash-exp" in model_name and self.valves.IMAGE_OUTPUT:
+                if "gemini-2.0-flash-exp-image-generation" in model_name:
                     self._print_colored(
                         "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming.",
                         "WARNING",
