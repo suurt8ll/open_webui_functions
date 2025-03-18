@@ -66,7 +66,7 @@ class Pipe:
         EXAMPLE_STRING: str = Field(
             default="", title="Admin String", description="String configurable by admin"
         )
-        LOG_LEVEL: Literal["INFO", "WARNING", "ERROR", "DEBUG", "OFF"] = Field(
+        LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
@@ -186,11 +186,17 @@ class Pipe:
         """
         Prints a colored log message to the console, respecting the configured log level.
         """
-        if not hasattr(self, "valves") or self.valves.LOG_LEVEL == "OFF":
+        if not hasattr(self, "valves"):
             return
 
         # Define log level hierarchy
-        level_priority = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3}
+        level_priority = {
+            "DEBUG": 0,
+            "INFO": 1,
+            "WARNING": 2,
+            "ERROR": 3,
+            "CRITICAL": 4,
+        }
 
         # Only print if message level is >= configured level
         if level_priority.get(level, 0) >= level_priority.get(self.valves.LOG_LEVEL, 0):
