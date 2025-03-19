@@ -12,7 +12,6 @@ requirements:
 
 import json
 import sys
-import inspect
 from typing import (
     Any,
     AsyncGenerator,
@@ -21,12 +20,16 @@ from typing import (
     Literal,
     NotRequired,
     TypedDict,
+    TYPE_CHECKING,
 )
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from loguru import logger
-from loguru._handler import Handler
 from open_webui.utils.logger import stdout_format
+
+if TYPE_CHECKING:
+    from loguru import Record
+    from loguru._handler import Handler
 
 
 class UserData(TypedDict):
@@ -100,24 +103,29 @@ class Pipe:
 
     def _add_log_handler(self):
         """Adds handler to the root loguru instance for this plugin if one does not exist already."""
+
+        def plugin_filter(record: "Record"):
+            """Filter function to only allow logs from this plugin (based on module name)."""
+            return record["name"] == __name__  # Filter by module name
+
         # Access the internal state of the logger
-        handlers: dict[int, Handler] = logger._core.handlers  # type: ignore
-        for key, value in handlers.items():
-            try:
-                # Returns the original str filter, can be used for duplicate detection.
-                handler_filter = (
-                    inspect.signature(value._filter).parameters["parent"].default[:-1]
-                )
-                if handler_filter == __name__:
-                    log.debug("Handler for this plugin is already present!")
-                    return
-            except Exception as e:
-                continue
+        handlers: dict[int, "Handler"] = logger._core.handlers  # type: ignore
+        for key, handler in handlers.items():
+            existing_filter = handler._filter
+            if (
+                hasattr(existing_filter, "__name__")
+                and existing_filter.__name__ == plugin_filter.__name__
+                and hasattr(existing_filter, "__module__")
+                and existing_filter.__module__ == plugin_filter.__module__
+            ):
+                log.debug("Handler for this plugin is already present!")
+                return
+
         logger.add(
             sys.stdout,
             level=self.valves.LOG_LEVEL,
             format=stdout_format,
-            filter=__name__,
+            filter=plugin_filter,
         )
         log.info(
             f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
