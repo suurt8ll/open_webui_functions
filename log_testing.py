@@ -37,6 +37,10 @@ class UserData(TypedDict):
     valves: NotRequired[Any]  # object of type UserValves
 
 
+# Setting auditable avoids duplicate output for log levels that would be printed out by the main logger too.
+log = logger.bind(auditable=False)
+
+
 class Pipe:
     class Valves(BaseModel):
         EXAMPLE_STRING: str = Field(
@@ -55,13 +59,12 @@ class Pipe:
         )
 
     def __init__(self):
-        # The actual values for self.valves get applied later for some reason, they are not corrent in __init__.
-        # Correct values do exists in pipes and pipe methods.
         self.valves = self.Valves()
-        print("Initialization done!")
+        print("[log_testing] Initialization done!")
 
     def pipes(self) -> list[dict]:
-        print("Registering models.")
+        self._add_log_handler()
+        log.info("Registering models.")
         return [
             {"id": "log_testing_1", "name": "Log Testing 1"},
             {"id": "log_testing_2", "name": "Log Testing 2"},
@@ -73,29 +76,16 @@ class Pipe:
         __user__: UserData,
     ) -> str | dict | StreamingResponse | Iterator | AsyncGenerator | Generator | None:
 
-        # FIXME Avoid duplicating handlers.
-        logger.add(
-            sys.stdout,
-            level="TRACE",
-            format=stdout_format,
-            filter=__name__,
-        )
-
-        logger.trace("DEBUG message!")
-        # Access the internal state of the logger
-        handlers: dict[int, Handler] = logger._core.handlers  # type: ignore
-        for key, value in handlers.items():
-            print("Key: ", key)
-            print(json.dumps(value.__dict__, indent=2, default=str))
-            try:
-                # Returns the original str filter, can be used for duplicate detection I think.
-                print(inspect.signature(value._filter).parameters["parent"].default)
-            except Exception:
-                print("fail")
+        log.trace("TRACE message!")
+        log.debug("DEBUG message!")
+        log.info("INFO message!")
+        log.warning("WARNING message!")
+        log.error("ERROR message!")
+        log.critical("CRITICAL message!")
 
         string_from_valve = self.valves.EXAMPLE_STRING
 
-        print(f"String from valve: {string_from_valve}")
+        log.debug(f"String from valve: {string_from_valve}")
 
         all_params = {
             "body": body,
@@ -103,7 +93,32 @@ class Pipe:
         }
 
         all_params_json = json.dumps(all_params, indent=2, default=str)
-        print("Returning all parameters as JSON:")
+        log.debug("Returning all parameters as JSON:")
         print(all_params_json)
 
         return "Hello World!"
+
+    def _add_log_handler(self):
+        """Adds handler to the root loguru instance for this plugin if one does not exist already."""
+        # Access the internal state of the logger
+        handlers: dict[int, Handler] = logger._core.handlers  # type: ignore
+        for key, value in handlers.items():
+            try:
+                # Returns the original str filter, can be used for duplicate detection.
+                handler_filter = (
+                    inspect.signature(value._filter).parameters["parent"].default[:-1]
+                )
+                if handler_filter == __name__:
+                    log.debug("Handler for this plugin is already present!")
+                    return
+            except Exception as e:
+                continue
+        logger.add(
+            sys.stdout,
+            level=self.valves.LOG_LEVEL,
+            format=stdout_format,
+            filter=__name__,
+        )
+        log.info(
+            f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
+        )
