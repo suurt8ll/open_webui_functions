@@ -124,6 +124,7 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
+        self.last_whitelist = self.valves.MODEL_WHITELIST
         self.models = []
         self.client = None
 
@@ -146,10 +147,16 @@ class Pipe:
             else:
                 log.info("Client already initialized.")
 
-            # Return existing models if already initialized
-            if self.models and self.valves.LAZY_MODEL_FETCHING:
+            # Return existing models if all conditions are met
+            if (
+                self.models
+                and self.valves.LAZY_MODEL_FETCHING
+                and self.last_whitelist == self.valves.MODEL_WHITELIST
+            ):
                 log.info("Models already initialized.")
                 return self.models
+
+            self.last_whitelist = self.valves.MODEL_WHITELIST
 
             # Get and process new models
             models = self._get_google_models()
