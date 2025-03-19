@@ -99,6 +99,10 @@ class Pipe:
             default="",
             description="Comma-separated list of allowed model names. Supports wildcards (*).",
         )
+        LAZY_MODEL_FETCHING: bool = Field(
+            default=True,
+            description="Whether to fetch models only once and reuse them. If False, models will be fetched every time model list is requested.",
+        )
         USE_GROUNDING_SEARCH: bool = Field(
             default=False,
             description="Whether to use Grounding with Google Search. For more info: https://ai.google.dev/gemini-api/docs/grounding",
@@ -133,7 +137,6 @@ class Pipe:
                 raise ValueError("GEMINI_API_KEY is not set.")
 
             # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
-            # TODO Allow user to choose if they want to fetch models only during function initialization or every time pipes is called.
             if not self.client:
                 http_options = types.HttpOptions(base_url=self.valves.GEMINI_API_BASE_URL)
                 self.client = genai.Client(
@@ -144,7 +147,7 @@ class Pipe:
                 log.info("Client already initialized.")
 
             # Return existing models if already initialized
-            if self.models:
+            if self.models and self.valves.LAZY_MODEL_FETCHING:
                 log.info("Models already initialized.")
                 return self.models
 
