@@ -91,6 +91,10 @@ log = logger.bind(auditable=False)
 class Pipe:
     class Valves(BaseModel):
         GEMINI_API_KEY: str = Field(default="")
+        GEMINI_API_BASE_URL: str = Field(
+            default="https://generativelanguage.googleapis.com",
+            description="The base URL for calling the Gemini API",
+        )
         MODEL_WHITELIST: str = Field(
             default="",
             description="Comma-separated list of allowed model names. Supports wildcards (*).",
@@ -131,8 +135,10 @@ class Pipe:
             # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
             # TODO Allow user to choose if they want to fetch models only during function initialization or every time pipes is called.
             if not self.client:
+                http_options = types.HttpOptions(base_url=self.valves.GEMINI_API_BASE_URL)
                 self.client = genai.Client(
                     api_key=self.valves.GEMINI_API_KEY,
+                    http_options=http_options,
                 )
             else:
                 log.info("Client already initialized.")
