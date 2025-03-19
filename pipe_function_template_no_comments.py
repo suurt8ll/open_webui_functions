@@ -11,6 +11,7 @@ requirements:
 """
 
 import asyncio
+import sys
 from typing import (
     AsyncGenerator,
     Awaitable,
@@ -21,25 +22,17 @@ from typing import (
     TypedDict,
     Any,
     NotRequired,
+    TYPE_CHECKING,
 )
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 from fastapi import Request
-import json
-import traceback
-import inspect
-from open_webui.models.files import Files
+from open_webui.utils.logger import stdout_format
+from loguru import logger
 
-COLORS = {
-    "RED": "\033[91m",
-    "GREEN": "\033[92m",
-    "YELLOW": "\033[93m",
-    "BLUE": "\033[94m",
-    "MAGENTA": "\033[95m",
-    "CYAN": "\033[96m",
-    "WHITE": "\033[97m",
-    "RESET": "\033[0m",
-}
+if TYPE_CHECKING:
+    from loguru import Record
+    from loguru._handler import Handler
 
 
 class StatusEventData(TypedDict):
@@ -61,12 +54,16 @@ class UserData(TypedDict):
     valves: NotRequired[Any]  # object of type UserValves
 
 
+# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
+log = logger.bind(auditable=False)
+
+
 class Pipe:
     class Valves(BaseModel):
         EXAMPLE_STRING: str = Field(
             default="", title="Admin String", description="String configurable by admin"
         )
-        LOG_LEVEL: Literal["INFO", "WARNING", "ERROR", "DEBUG", "OFF"] = Field(
+        LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
@@ -78,10 +75,11 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
-        self._print_colored("Function has been initialized!", "INFO")
+        print("[pipe_function_template_no_comments] Function has been initialized!")
 
     def pipes(self) -> list[dict]:
-        self._print_colored("Registering models.", "INFO")
+        self._add_log_handler()
+        log.info("Registering models.")
         return [
             {"id": "model_id_1", "name": "model_1"},
             {"id": "model_id_2", "name": "model_2"},
@@ -104,11 +102,11 @@ class Pipe:
     ):
         try:
             if __task__ == "title_generation":
-                self._print_colored("Detected title generation task!", "INFO")
+                log.info("Detected title generation task!")
                 return '{"title": "Example Title"}'
 
             if __task__ == "tags_generation":
-                self._print_colored("Detected tag generation task!", "INFO")
+                log.info("Detected tag generation task!")
                 return '{"tags": ["tag1", "tag2", "tag3"]}'
 
             async def countdown():
@@ -143,13 +141,8 @@ class Pipe:
                 __user__.get("valves"), "EXAMPLE_STRING_USER", None
             )
 
-            self._print_colored(f"String from valve: {string_from_valve}", "INFO")
-            self._print_colored(
-                f"String from user valve: {string_from_user_valve}", "INFO"
-            )
-
-            # stored_files = Files.get_files()
-            # self._print_colored(f"Stored files: {stored_files}", "DEBUG")
+            log.debug("String from valve:", data=string_from_valve)
+            log.debug("String from user valve:", data=string_from_user_valve)
 
             all_params = {
                 "body": body,
@@ -164,47 +157,46 @@ class Pipe:
                 "__tools__": __tools__,
             }
 
-            all_params_json = json.dumps(all_params, indent=2, default=str)
-            self._print_colored("Returning all parameters as JSON:", "DEBUG")
-            print(all_params_json)
+            log.debug(
+                "Returning all parameters as JSON:",
+                data=str(all_params),
+            )
 
-            if __files__ and len(__files__) > 0:
-                self._print_colored(
-                    f'Detected a file upload! {__files__[0]["file"]["path"]}', "INFO"
-                )
+            return "Hello World!"
 
-            return "Instant response sent!"
-
-        except Exception as e:
-            error_msg = f"Pipe function error: {str(e)}\n{traceback.format_exc()}"
-            self._print_colored(error_msg, "ERROR")
+        except Exception:
+            error_msg = "Pipe function error:"
+            log.exception(error_msg)
             return error_msg
 
     """Helper functions inside the Pipe class."""
 
-    def _print_colored(self, message: str, level: str = "INFO") -> None:
-        """
-        Prints a colored log message to the console, respecting the configured log level.
-        """
-        if not hasattr(self, "valves") or self.valves.LOG_LEVEL == "OFF":
-            return
+    def _add_log_handler(self):
+        """Adds handler to the root loguru instance for this plugin if one does not exist already."""
 
-        # Define log level hierarchy
-        level_priority = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3}
+        def plugin_filter(record: "Record"):
+            """Filter function to only allow logs from this plugin (based on module name)."""
+            return record["name"] == __name__  # Filter by module name
 
-        # Only print if message level is >= configured level
-        if level_priority.get(level, 0) >= level_priority.get(self.valves.LOG_LEVEL, 0):
-            color_map = {
-                "INFO": COLORS["GREEN"],
-                "WARNING": COLORS["YELLOW"],
-                "ERROR": COLORS["RED"],
-                "DEBUG": COLORS["BLUE"],
-            }
-            color = color_map.get(level, COLORS["WHITE"])
-            frame = inspect.currentframe()
-            if frame:
-                frame = frame.f_back
-            method_name = frame.f_code.co_name if frame else "<unknown>"
-            print(
-                f"{color}[{level}][pipe_function_skeleton][{method_name}]{COLORS['RESET']} {message}"
-            )
+        # Access the internal state of the logger
+        handlers: dict[int, "Handler"] = logger._core.handlers  # type: ignore
+        for key, handler in handlers.items():
+            existing_filter = handler._filter
+            if (
+                hasattr(existing_filter, "__name__")
+                and existing_filter.__name__ == plugin_filter.__name__
+                and hasattr(existing_filter, "__module__")
+                and existing_filter.__module__ == plugin_filter.__module__
+            ):
+                log.debug("Handler for this plugin is already present!")
+                return
+
+        logger.add(
+            sys.stdout,
+            level=self.valves.LOG_LEVEL,
+            format=stdout_format,
+            filter=plugin_filter,
+        )
+        log.info(
+            f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
+        )
