@@ -494,7 +494,7 @@ class Pipe:
 
         if self.valves.USE_GROUNDING_SEARCH:
             if model_name.endswith(SEARCH_MODEL_SUFFIX):
-                print("[pipe] Using grounding search.")
+                self._print_colored("Using grounding search.", "INFO")
                 gs = None
                 # Dynamic retrieval only supported for 1.0 and 1.5 models
                 if "1.0" in model_name or "1.5" in model_name:
@@ -612,7 +612,18 @@ class Pipe:
                 if model.name and model.name.startswith("models/")
             ]
 
-            # Add synthesis model id which support search.
+            if not model_list:
+                self._print_colored("No models found matching whitelist.", "WARNING")
+                return [
+                    {
+                        "id": "no_models_found",
+                        "name": "No models found matching whitelist.",
+                    }
+                ]
+
+            # Add synthesis model id which support search if grounding search is enabled.
+            if not self.valves.USE_GROUNDING_SEARCH:
+                return model_list
             for original_model in model_list:
                 if original_model["id"] in ALLOWED_GROUNDING_MODELS:
                     model_list.append(
@@ -622,14 +633,6 @@ class Pipe:
                         }
                     )
 
-            if not model_list:
-                self._print_colored("No models found matching whitelist.", "WARNING")
-                return [
-                    {
-                        "id": "no_models_found",
-                        "name": "No models found matching whitelist.",
-                    }
-                ]
             return model_list
         except Exception as e:
             error_msg = f"Error retrieving models: {str(e)}\n{traceback.format_exc()}"
