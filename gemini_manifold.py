@@ -99,9 +99,9 @@ class Pipe:
             default="",
             description="Comma-separated list of allowed model names. Supports wildcards (*).",
         )
-        LAZY_MODEL_FETCHING: bool = Field(
+        CACHE_MODELS: bool = Field(
             default=True,
-            description="Whether to fetch models only once and reuse them. If False, models will be fetched every time model list is requested.",
+            description="Whether to request models only on first load and when whitelist changes.",
         )
         USE_GROUNDING_SEARCH: bool = Field(
             default=False,
@@ -153,7 +153,7 @@ class Pipe:
             # Return existing models if all conditions are met
             if (
                 self.models
-                and self.valves.LAZY_MODEL_FETCHING
+                and self.valves.CACHE_MODELS
                 and self.last_whitelist == self.valves.MODEL_WHITELIST
             ):
                 log.info("Models already initialized.")
