@@ -592,7 +592,7 @@ class Pipe:
 
         try:
             whitelist = (
-                self.valves.MODEL_WHITELIST.split(",")
+                self.valves.MODEL_WHITELIST.replace(" ", "").split(",")
                 if self.valves.MODEL_WHITELIST
                 else ["*"]
             )
