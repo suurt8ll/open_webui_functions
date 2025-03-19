@@ -31,12 +31,12 @@ requirements: google-genai==1.6.0
 #   TODO Return errors as correctly formatted error types for the frontend to handle (red text in the front-end).
 #   TODO Refactor, make this mess more readable lol.
 
+from google import genai
+from google.genai import types
 import base64
-import inspect
-import json
 import re
 import fnmatch
-import traceback
+import sys
 from fastapi import Request
 from pydantic import BaseModel, Field
 from typing import (
@@ -50,25 +50,20 @@ from typing import (
     Tuple,
     Optional,
     TypedDict,
+    TYPE_CHECKING,
 )
 from starlette.responses import StreamingResponse
-from google import genai
-from google.genai import types
 from open_webui.routers.images import upload_image
 from open_webui.models.files import Files
 from open_webui.models.users import Users
+from open_webui.utils.logger import stdout_format
+from loguru import logger
 
-COLORS = {
-    "RED": "\033[91m",
-    "GREEN": "\033[92m",
-    "YELLOW": "\033[93m",
-    "BLUE": "\033[94m",
-    "MAGENTA": "\033[95m",
-    "CYAN": "\033[96m",
-    "WHITE": "\033[97m",
-    "RESET": "\033[0m",
-}
+if TYPE_CHECKING:
+    from loguru import Record
+    from loguru._handler import Handler
 
+# FIXME What about other 2.0 models?
 # according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
 ALLOWED_GROUNDING_MODELS = [
     "gemini-2.0-flash",
@@ -84,6 +79,10 @@ class UserData(TypedDict):
     name: str
     role: Literal["admin", "user", "pending"]
     valves: NotRequired[Any]  # object of type UserValves
+
+
+# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
+log = logger.bind(auditable=False)
 
 
 class Pipe:
@@ -113,19 +112,15 @@ class Pipe:
         )
 
     def __init__(self):
-        try:
-            self.valves = self.Valves()
-            self._print_colored(f"Valves: {self.valves}", "DEBUG")
-            self.models = []
-            self.client = None
-        except Exception as e:
-            self._print_colored(f"Error during initialization: {e}", "ERROR")
-        finally:
-            self._print_colored("Initialization complete.", "INFO")
+        self.valves = self.Valves()
+        self.models = []
+        self.client = None
 
     # FIXME Make it async
     def pipes(self) -> list[dict]:
         """Register all available Google models."""
+        self._add_log_handler()
+        # FIXME Don't wrap everything like that with try block.
         try:
             if not self.valves.GEMINI_API_KEY:
                 raise ValueError("GEMINI_API_KEY is not set.")
@@ -137,11 +132,11 @@ class Pipe:
                     api_key=self.valves.GEMINI_API_KEY,
                 )
             else:
-                self._print_colored("Client already initialized.", "INFO")
+                log.info("Client already initialized.")
 
             # Return existing models if already initialized
             if self.models:
-                self._print_colored("Models already initialized.", "INFO")
+                log.info("Models already initialized.")
                 return self.models
 
             # Get and process new models
@@ -151,7 +146,7 @@ class Pipe:
             if models and models[0].get("id") in ["error", "no_models_found"]:
                 return models
 
-            self._print_colored(f"Registered models: {models}", "DEBUG")
+            log.debug("Registered models:", data=models)
             self.models = models
             return (
                 models
@@ -160,11 +155,9 @@ class Pipe:
             )
 
         except Exception as e:
-            error_msg = f"Error in pipes method: {str(e)}\n{traceback.format_exc()}"
-            self._print_colored(error_msg, "ERROR")
+            error_msg = "Error in pipes method:"
+            log.exception(error_msg)
             return [{"id": "error", "name": f"Error initializing models: {e}"}]
-        finally:
-            self._print_colored("Completed pipes method.", "DEBUG")
 
     async def pipe(
         self,
@@ -227,31 +220,26 @@ class Pipe:
                     try:
                         mime_type = match.group(2)
                         base64_data = match.group(3)
-                        self._print_colored(
-                            f"Found base64 image link!\nmime_type: {mime_type}\nbase64_data: {match.group(3)[:50]}...",
-                            "DEBUG",
+                        log.debug(
+                            "Found base64 image link!",
+                            mime_type=mime_type,
+                            base64_data=match.group(3)[:50] + "...",
                         )
                         image_part = types.Part.from_bytes(
                             data=base64.b64decode(base64_data),
                             mime_type=mime_type,
                         )
                         parts.append(image_part)
-                    except Exception as e:
-                        self._print_colored(
-                            f"Error decoding base64 image: {e}", "ERROR"
-                        )
+                    except Exception:
+                        log.exception("Error decoding base64 image:")
 
                 elif match.group(4):  # File URL
-                    self._print_colored(
-                        f"Found API image link!\nAPI File ID: {match.group(4)}", "DEBUG"
-                    )
+                    log.debug("Found API image link!", id=match.group(4))
                     file_id = match.group(4)
                     file_model = Files.get_file_by_id(file_id)
 
                     if file_model is None:
-                        self._print_colored(
-                            f"File with ID '{file_id}' not found.", "WARNING"
-                        )
+                        log.warning("File with this ID not found.", id=file_id)
                         #  Could add placeholder text here if desired
                         continue  # Skip to the next match
 
@@ -259,9 +247,9 @@ class Pipe:
                         # "continue" above ensures that file_model is not None
                         content_type = file_model.meta.get("content_type")  # type: ignore
                         if content_type is None:
-                            self._print_colored(
-                                f"Content type not found for file ID '{file_id}'.",
-                                "WARNING",
+                            log.warning(
+                                "Content type not found for this file ID.",
+                                id=file_id,
                             )
                             continue
 
@@ -274,19 +262,18 @@ class Pipe:
                         parts.append(image_part)
 
                     except FileNotFoundError:
-                        self._print_colored(
-                            f"File not found on disk for ID '{file_id}', path: {file_model.path}",
-                            "ERROR",
+                        log.exception(
+                            "File not found on disk for this ID.",
+                            id=file_id,
+                            path=file_model.path,
                         )
                     except KeyError:
-                        self._print_colored(
-                            f"Metadata error for file ID '{file_id}': 'content_type' missing.",
-                            "ERROR",
+                        log.exception(
+                            "Metadata error for this file ID: 'content_type' missing.",
+                            id=file_id,
                         )
-                    except Exception as e:
-                        self._print_colored(
-                            f"Error processing file with ID '{file_id}': {e}", "ERROR"
-                        )
+                    except Exception:
+                        log.exception("Error processing file with this ID", id=file_id)
 
                 last_pos = match.end()
 
@@ -402,9 +389,8 @@ class Pipe:
                     print(chunk.text, end="")
                 if chunk.candidates:
                     if len(chunk.candidates) > 1:
-                        self._print_colored(
-                            "Multiple candidates found in response, defaulting to the first candidate.",
-                            "WARNING",
+                        log.warning(
+                            "Multiple candidates found in response, defaulting to the first candidate."
                         )
                     candidate = chunk.candidates[0]  # Default to the first candidate
                     if candidate.content and candidate.content.parts:
@@ -445,18 +431,18 @@ class Pipe:
         contents = _transform_messages_to_contents(remaining_messages)
 
         max_len = 50
-        self._print_colored("Received request:", "DEBUG")
-        if self.valves.LOG_LEVEL == "DEBUG":
-            truncated_body = self.truncate_long_strings(body.copy(), max_len)
-            print(json.dumps(truncated_body, indent=2))
-        self._print_colored(f"System prompt: {system_prompt}", "DEBUG")
-        self._print_colored("Contents:", "DEBUG")
-        if self.valves.LOG_LEVEL == "DEBUG":
-            for content in contents:
-                truncated_content = self.truncate_long_strings(
-                    content.model_dump().copy(), max_len
-                )
-                print(json.dumps(truncated_content, indent=2))
+        log.debug(
+            "Received body:", body=str(self.truncate_long_strings(body.copy(), max_len))
+        )
+        log.debug(f"System prompt: {system_prompt}")
+        for content in contents:
+            truncated_content = self.truncate_long_strings(
+                content.model_dump().copy(), max_len
+            )
+            # FIXME log this better.
+            log.debug(
+                "google.genai.types.Content object:", content=str(truncated_content)
+            )
 
         model_name = self._strip_prefix(body.get("model", ""))
         if model_name in [
@@ -467,7 +453,7 @@ class Pipe:
             "import_error",
         ]:
             return f"Error: {model_name.replace('_', ' ')}"
-        self._print_colored(f"Model name: {model_name}", "DEBUG")
+        log.debug(f"Model name: {model_name}")
 
         config_params = {
             "system_instruction": system_prompt,
@@ -481,9 +467,9 @@ class Pipe:
         if "gemini-2.0-flash-exp-image-generation" in model_name:
             config_params["response_modalities"] = ["Text", "Image"]
             # Image Generation model does not support the system prompt message
-            self._print_colored(
-                "Image Generation model does not support the system prompt message! Removing the system prompt.",
-                "WARNING",
+            # FIXME log only when system prompt is actually present.
+            log.warning(
+                "Image Generation model does not support the system prompt message! Removing the system prompt."
             )
             del config_params["system_instruction"]
         else:
@@ -518,7 +504,6 @@ class Pipe:
         }
 
         try:
-            self._print_colored(f'Streaming is {body.get("stream", False)}', "DEBUG")
             if body.get("stream", False):
                 return _process_stream(gen_content_args, __request__, __user__)
             else:  # streaming is disabled
@@ -527,9 +512,8 @@ class Pipe:
                 # FIXME Make it async.
                 # FIXME Support native image gen here too.
                 if "gemini-2.0-flash-exp-image-generation" in model_name:
-                    self._print_colored(
-                        "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming.",
-                        "WARNING",
+                    log.warning(
+                        "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
                     )
                     return "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
                 response = self.client.models.generate_content(**gen_content_args)
@@ -537,47 +521,49 @@ class Pipe:
                 return response_text
 
         except Exception as e:
-            error_msg = f"Content generation error: {str(e)}\n{traceback.format_exc()}"
-            self._print_colored(error_msg, "ERROR")
-            return error_msg
-        finally:
-            self._print_colored("Content generation completed.", "INFO")
+            error_msg = f"Content generation error:"
+            log.exception(error_msg)
+            return error_msg + " " + str(e)
 
     """Helper functions inside the Pipe class."""
 
-    def _print_colored(self, message: str, level: str = "INFO") -> None:
-        """
-        Prints a colored log message to the console, respecting the configured log level.
-        """
-        if not hasattr(self, "valves") or self.valves.LOG_LEVEL == "OFF":
-            return
+    def _add_log_handler(self):
+        """Adds handler to the root loguru instance for this plugin if one does not exist already."""
 
-        # Define log level hierarchy
-        level_priority = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3}
+        def plugin_filter(record: "Record"):
+            """Filter function to only allow logs from this plugin (based on module name)."""
+            return record["name"] == __name__  # Filter by module name
 
-        # Only print if message level is >= configured level
-        if level_priority.get(level, 0) >= level_priority.get(self.valves.LOG_LEVEL, 0):
-            color_map = {
-                "INFO": COLORS["GREEN"],
-                "WARNING": COLORS["YELLOW"],
-                "ERROR": COLORS["RED"],
-                "DEBUG": COLORS["BLUE"],
-            }
-            color = color_map.get(level, COLORS["WHITE"])
-            frame = inspect.currentframe()
-            if frame:
-                frame = frame.f_back
-            method_name = frame.f_code.co_name if frame else "<unknown>"
-            print(
-                f"{color}[{level}][gemini_manifold][{method_name}]{COLORS['RESET']} {message}"
-            )
+        # Access the internal state of the logger
+        handlers: dict[int, "Handler"] = logger._core.handlers  # type: ignore
+        for key, handler in handlers.items():
+            existing_filter = handler._filter
+            if (
+                hasattr(existing_filter, "__name__")
+                and existing_filter.__name__ == plugin_filter.__name__
+                and hasattr(existing_filter, "__module__")
+                and existing_filter.__module__ == plugin_filter.__module__
+            ):
+                log.debug("Handler for this plugin is already present!")
+                return
+
+        logger.add(
+            sys.stdout,
+            level=self.valves.LOG_LEVEL,
+            format=stdout_format,
+            filter=plugin_filter,
+        )
+        log.info(
+            f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
+        )
 
     def _get_google_models(self):
         """Retrieve Google models with prefix stripping."""
 
         # Check if client is initialized and return error if not.
+        # FIXME Use raise.
         if not self.client:
-            self._print_colored("Client not initialized.", "ERROR")
+            log.error("Client not initialized.")
             return [
                 {
                     "id": "error",
@@ -592,9 +578,8 @@ class Pipe:
                 else ["*"]
             )
             models = self.client.models.list(config={"query_base": True})
-            self._print_colored(
-                f"[get_google_models] Retrieved {len(models)} models from Gemini Developer API.",
-                "INFO",
+            log.info(
+                f"[get_google_models] Retrieved {len(models)} models from Gemini Developer API."
             )
             model_list = [
                 {
@@ -609,7 +594,7 @@ class Pipe:
                 if model.name and model.name.startswith("models/")
             ]
             if not model_list:
-                self._print_colored("No models found matching whitelist.", "WARNING")
+                log.warning("No models found matching whitelist.")
                 return [
                     {
                         "id": "no_models_found",
@@ -617,9 +602,9 @@ class Pipe:
                     }
                 ]
             return model_list
-        except Exception as e:
-            error_msg = f"Error retrieving models: {str(e)}\n{traceback.format_exc()}"
-            self._print_colored(error_msg, "ERROR")
+        except Exception:
+            error_msg = "Error retrieving models:"
+            log.exception(error_msg)
             return [
                 {
                     "id": "error",
@@ -636,13 +621,11 @@ class Pipe:
             # Use non-greedy regex to remove everything up to and including the first '.' or '/'
             stripped = re.sub(r"^.*?[./]", "", model_name)
             return stripped
-        except Exception as e:
-            error_msg = f"Error stripping prefix: {str(e)}\n{traceback.format_exc()}"
-            self._print_colored(error_msg, "WARNING")
+        except Exception:
+            error_msg = "Error stripping prefix:"
+            log.exception(error_msg)
             # FIXME OR should it error out??
             return model_name  # Return original if stripping fails
-        finally:
-            self._print_colored("Completed prefix stripping.", "DEBUG")
 
     def truncate_long_strings(self, data: dict, max_length: int = 50) -> dict:
         """
@@ -704,5 +687,5 @@ class Pipe:
             content_type=mime_type,
             user=user,
         )
-        self._print_colored(f"Image uploaded. URL: {image_url}", "INFO")
+        log.info("Image uploaded.", image_url=image_url)
         return image_url
