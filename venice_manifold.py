@@ -17,7 +17,6 @@ version: 0.7.0
 
 import asyncio
 import sys
-import traceback
 from typing import (
     Any,
     AsyncGenerator,
@@ -66,7 +65,7 @@ class UserData(TypedDict):
     valves: NotRequired[Any]  # object of type UserValves
 
 
-# Setting auditable avoids duplicate output for log levels that would be printed out by the main logger too.
+# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
 log = logger.bind(auditable=False)
 
 
@@ -99,9 +98,9 @@ class Pipe:
             models = self._get_models()
             log.debug("Got models:", models=models)
             return [{"id": model["id"], "name": model["id"]} for model in models]
-        except Exception as e:
-            error_msg = f"Error getting models: {str(e)}\n{traceback.format_exc()}"
-            log.error(error_msg)
+        except Exception:
+            error_msg = "Error getting models:"
+            log.exception(error_msg)
             return []
 
     async def pipe(
@@ -225,15 +224,13 @@ class Pipe:
             )
             response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
             return response.json().get("data", [])
-        except requests.exceptions.RequestException as e:
-            error_msg = f"Error getting models: {str(e)}\n{traceback.format_exc()}"
-            log.error(error_msg)
+        except requests.exceptions.RequestException:
+            error_msg = "Error getting models:"
+            log.exception(error_msg)
             return []
-        except Exception as e:
-            error_msg = (
-                f"An unexpected error occurred: {str(e)}\n{traceback.format_exc()}"
-            )
-            log.error(error_msg)
+        except Exception:
+            error_msg = "An unexpected error occurred:"
+            log.exception(error_msg)
             return []
 
     async def _generate_image(self, model: str, prompt: str) -> dict | None:
@@ -263,13 +260,13 @@ class Pipe:
                     response.raise_for_status()
                     return await response.json()
 
-        except aiohttp.ClientResponseError as e:
-            error_msg = f"Image generation failed with status: {str(e.status)}. Error: {str(e)}\n{traceback.format_exc()}"
-            log.error(error_msg)
+        except aiohttp.ClientResponseError:
+            error_msg = "Image generation failed:"
+            log.exception(error_msg)
             return None
-        except Exception as e:
-            error_msg = f"Generation error: {str(e)}\n{traceback.format_exc()}"
-            log.error(error_msg)
+        except Exception:
+            error_msg = "Generation error:"
+            log.exception(error_msg)
             return None
 
     def _upload_image(

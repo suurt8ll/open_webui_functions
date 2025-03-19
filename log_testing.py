@@ -40,7 +40,7 @@ class UserData(TypedDict):
     valves: NotRequired[Any]  # object of type UserValves
 
 
-# Setting auditable avoids duplicate output for log levels that would be printed out by the main logger too.
+# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
 log = logger.bind(auditable=False)
 
 
@@ -95,9 +95,7 @@ class Pipe:
             "__user__": __user__,
         }
 
-        all_params_json = json.dumps(all_params, indent=2, default=str)
-        log.debug("Returning all parameters as JSON:")
-        print(all_params_json)
+        log.debug("Returning all parameters as JSON:", data=str(all_params))
 
         return "Hello World!"
 

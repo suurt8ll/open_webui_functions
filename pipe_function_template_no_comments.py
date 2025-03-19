@@ -27,8 +27,6 @@ from typing import (
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 from fastapi import Request
-import json
-import traceback
 from open_webui.utils.logger import stdout_format
 from loguru import logger
 
@@ -56,6 +54,7 @@ class UserData(TypedDict):
     valves: NotRequired[Any]  # object of type UserValves
 
 
+# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
 log = logger.bind(auditable=False)
 
 
@@ -165,9 +164,9 @@ class Pipe:
 
             return "Hello World!"
 
-        except Exception as e:
-            error_msg = f"Pipe function error: {str(e)}\n{traceback.format_exc()}"
-            log.error(error_msg)
+        except Exception:
+            error_msg = "Pipe function error:"
+            log.exception(error_msg)
             return error_msg
 
     """Helper functions inside the Pipe class."""
