@@ -112,6 +112,9 @@ class Pipe:
             default=0.3,
             description="See Google AI docs for more information. Only supported for 1.0 and 1.5 models",
         )
+        USE_PERMISSIVE_SAFETY: bool = Field(
+            default=False, description="Whether to request relaxed safety filtering"
+        )
         LOG_LEVEL: Literal["INFO", "WARNING", "ERROR", "DEBUG", "OFF"] = Field(
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
@@ -481,6 +484,7 @@ class Pipe:
             "top_k": body.get("top_k", 40),
             "max_output_tokens": body.get("max_tokens", 8192),
             "stop_sequences": body.get("stop", []),
+            "safety_settings": self._get_safety_settings(model_name),
         }
 
         if "gemini-2.0-flash-exp-image-generation" in model_name:
@@ -644,6 +648,55 @@ class Pipe:
                     "name": "Error retrieving models. Please check the logs.",
                 }
             ]
+    
+    def _get_safety_settings(self, model_name: str):
+        """Get safety settings based on model name and permissive setting."""
+
+        if not self.valves.USE_PERMISSIVE_SAFETY:
+            return []
+
+        # Settings supported by most models
+        category_threshold_map = {
+            types.HarmCategory.HARM_CATEGORY_HARASSMENT: types.HarmBlockThreshold.OFF,
+            types.HarmCategory.HARM_CATEGORY_HATE_SPEECH: types.HarmBlockThreshold.OFF,
+            types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: types.HarmBlockThreshold.OFF,
+            types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: types.HarmBlockThreshold.OFF,
+            types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY: types.HarmBlockThreshold.BLOCK_NONE,
+        }
+
+        # Older models use BLOCK_NONE
+        if model_name in [
+            "gemini-1.5-pro-001",
+            "gemini-1.5-flash-001",
+            "gemini-1.5-flash-8b-exp-0827",
+            "gemini-1.5-flash-8b-exp-0924",
+            "gemini-pro",
+            "gemini-1.0-pro",
+            "gemini-1.0-pro-001",
+        ]:
+            for category in category_threshold_map:
+                category_threshold_map[category] = (
+                    types.HarmBlockThreshold.BLOCK_NONE
+                )
+
+        # Gemini 2.0 Flash supports CIVIC_INTEGRITY OFF
+        if model_name in [
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-001",
+            "gemini-2.0-flash-exp",
+        ]:
+            category_threshold_map[
+                types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY
+            ] = types.HarmBlockThreshold.OFF
+
+        log.debug(f"Safety settings: {str({k.value: v.value for k, v in category_threshold_map.items()})}")
+
+        safety_settings = [
+            types.SafetySetting(category=category, threshold=threshold)
+            for category, threshold in category_threshold_map.items()
+        ]
+        return safety_settings
+
 
     def _strip_prefix(self, model_name: str) -> str:
         """
