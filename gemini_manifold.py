@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.4.2
+version: 1.4.3
 requirements: google-genai==1.6.0
 """
 
@@ -76,6 +76,9 @@ ALLOWED_GROUNDING_MODELS = [
     "gemini-1.5-flash",
     "gemini-1.0-pro",
 ]
+
+# To avoid conflict name in the future, here use suffix not in gemini naming pattern.
+SEARCH_MODEL_SUFFIX = "++SEARCH"
 
 
 class UserData(TypedDict):
@@ -490,8 +493,8 @@ class Pipe:
             config_params["response_modalities"] = ["Text"]
 
         if self.valves.USE_GROUNDING_SEARCH:
-            if model_name in ALLOWED_GROUNDING_MODELS:
-                print("[pipe] Using grounding search.")
+            if model_name.endswith(SEARCH_MODEL_SUFFIX):
+                self._print_colored("Using grounding search.", "INFO")
                 gs = None
                 # Dynamic retrieval only supported for 1.0 and 1.5 models
                 if "1.0" in model_name or "1.5" in model_name:
@@ -512,7 +515,7 @@ class Pipe:
         config = types.GenerateContentConfig(**config_params)
 
         gen_content_args = {
-            "model": model_name,
+            "model": model_name.replace(SEARCH_MODEL_SUFFIX, ""),
             "contents": contents,
             "config": config,
         }
@@ -608,6 +611,7 @@ class Pipe:
                 and "generateContent" in model.supported_actions
                 if model.name and model.name.startswith("models/")
             ]
+
             if not model_list:
                 self._print_colored("No models found matching whitelist.", "WARNING")
                 return [
@@ -616,6 +620,19 @@ class Pipe:
                         "name": "No models found matching whitelist.",
                     }
                 ]
+
+            # Add synthesis model id which support search if grounding search is enabled.
+            if not self.valves.USE_GROUNDING_SEARCH:
+                return model_list
+            for original_model in model_list:
+                if original_model["id"] in ALLOWED_GROUNDING_MODELS:
+                    model_list.append(
+                        {
+                            "id": original_model["id"] + SEARCH_MODEL_SUFFIX,
+                            "name": original_model["name"] + " with Search",
+                        }
+                    )
+
             return model_list
         except Exception as e:
             error_msg = f"Error retrieving models: {str(e)}\n{traceback.format_exc()}"
