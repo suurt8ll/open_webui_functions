@@ -77,6 +77,9 @@ ALLOWED_GROUNDING_MODELS = [
     "gemini-1.0-pro",
 ]
 
+# To avoid conflict name in the future, here use suffix not in gemini naming pattern.
+SEARCH_MODEL_SUFFIX = "++SEARCH"
+
 
 class UserData(TypedDict):
     id: str
@@ -490,7 +493,7 @@ class Pipe:
             config_params["response_modalities"] = ["Text"]
 
         if self.valves.USE_GROUNDING_SEARCH:
-            if model_name in ALLOWED_GROUNDING_MODELS:
+            if model_name.endswith(SEARCH_MODEL_SUFFIX):
                 print("[pipe] Using grounding search.")
                 gs = None
                 # Dynamic retrieval only supported for 1.0 and 1.5 models
@@ -512,7 +515,7 @@ class Pipe:
         config = types.GenerateContentConfig(**config_params)
 
         gen_content_args = {
-            "model": model_name,
+            "model": model_name.replace(SEARCH_MODEL_SUFFIX, ""),
             "contents": contents,
             "config": config,
         }
@@ -608,6 +611,17 @@ class Pipe:
                 and "generateContent" in model.supported_actions
                 if model.name and model.name.startswith("models/")
             ]
+
+            # Add synthesis model id which support search.
+            for original_model in model_list:
+                if original_model["id"] in ALLOWED_GROUNDING_MODELS:
+                    model_list.append(
+                        {
+                            "id": original_model["id"] + SEARCH_MODEL_SUFFIX,
+                            "name": original_model["name"] + " with Search",
+                        }
+                    )
+
             if not model_list:
                 self._print_colored("No models found matching whitelist.", "WARNING")
                 return [
