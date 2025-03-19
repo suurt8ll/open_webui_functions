@@ -24,8 +24,8 @@ from typing import (
 )
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from loguru import logger
 from open_webui.utils.logger import stdout_format
+from loguru import logger
 
 if TYPE_CHECKING:
     from loguru import Record

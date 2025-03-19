@@ -16,7 +16,7 @@ version: 0.7.0
 # TODO Use another LLM model to generate the image prompt?
 
 import asyncio
-import json
+import sys
 import traceback
 from typing import (
     Any,
@@ -28,6 +28,7 @@ from typing import (
     Literal,
     Callable,
     Awaitable,
+    TYPE_CHECKING,
 )
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
@@ -35,21 +36,15 @@ from fastapi import Request
 import requests
 import aiohttp
 import time
-import inspect
 import base64
 from open_webui.routers.images import upload_image
 from open_webui.models.users import Users
+from open_webui.utils.logger import stdout_format
+from loguru import logger
 
-COLORS = {
-    "RED": "\033[91m",
-    "GREEN": "\033[92m",
-    "YELLOW": "\033[93m",
-    "BLUE": "\033[94m",
-    "MAGENTA": "\033[95m",
-    "CYAN": "\033[96m",
-    "WHITE": "\033[97m",
-    "RESET": "\033[0m",
-}
+if TYPE_CHECKING:
+    from loguru import Record
+    from loguru._handler import Handler
 
 
 class StatusEventData(TypedDict):
@@ -71,6 +66,10 @@ class UserData(TypedDict):
     valves: NotRequired[Any]  # object of type UserValves
 
 
+# Setting auditable avoids duplicate output for log levels that would be printed out by the main logger too.
+log = logger.bind(auditable=False)
+
+
 class Pipe:
     class Valves(BaseModel):
         VENICE_API_TOKEN: str = Field(default="", description="Venice.ai API Token")
@@ -78,7 +77,9 @@ class Pipe:
         WIDTH: int = Field(default=1024, description="Image width")
         STEPS: int = Field(default=16, description="Image generation steps")
         CFG_SCALE: int = Field(default=4, description="Image generation scale")
-        LOG_LEVEL: Literal["INFO", "WARNING", "ERROR", "DEBUG", "OFF"] = Field(
+        LOG_LEVEL: Literal[
+            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
+        ] = Field(
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
@@ -93,15 +94,14 @@ class Pipe:
 
     # FIXME Make it async.
     def pipes(self) -> list[dict]:
+        self._add_log_handler()
         try:
             models = self._get_models()
-            self._print_colored("Got models:", "DEBUG")
-            if self.valves.LOG_LEVEL == "DEBUG":
-                print(json.dumps(models, indent=2, default=str))
+            log.debug("Got models:", models=models)
             return [{"id": model["id"], "name": model["id"]} for model in models]
         except Exception as e:
             error_msg = f"Error getting models: {str(e)}\n{traceback.format_exc()}"
-            self._print_colored(error_msg, "ERROR")
+            log.error(error_msg)
             return []
 
     async def pipe(
@@ -130,19 +130,17 @@ class Pipe:
             return "Error: No prompt found in user message"
 
         if __task__ == "title_generation":
-            self._print_colored(
-                "Detected title generation task! I do not know how to handle this so I'm returning something generic.",
-                "WARNING",
+            log.warning(
+                "Detected title generation task! I do not know how to handle this so I'm returning something generic."
             )
             return '{"title": "🖼️ Image Generation"}'
         if __task__ == "tags_generation":
-            self._print_colored(
-                "Detected tag generation task! I do not know how to handle this so I'm returning an empty list.",
-                "WARNING",
+            log.warning(
+                "Detected tag generation task! I do not know how to handle this so I'm returning an empty list."
             )
             return '{"tags": []}'
 
-        self._print_colored(f"Model: {model}, Prompt: {prompt}", "DEBUG")
+        log.debug(f"Model: {model}, Prompt: {prompt}")
 
         async def timer_task(start_time: float):
             """Counts up and emits status updates."""
@@ -161,7 +159,7 @@ class Pipe:
                     )
                     await asyncio.sleep(1)  # Update every second
             except asyncio.CancelledError:
-                self._print_colored("Timer task cancelled.", "DEBUG")
+                log.debug("Timer task cancelled.")
 
         start_time = time.time()
         timer = asyncio.create_task(timer_task(start_time))
@@ -188,7 +186,7 @@ class Pipe:
         )
 
         if image_data and image_data.get("images"):
-            self._print_colored("Image generated successfully", "INFO")
+            log.info("Image generated successfully!")
             base64_image = image_data["images"][0]
 
             if self.valves.USE_FILES_API:
@@ -202,7 +200,7 @@ class Pipe:
             else:
                 return f"![Generated Image](data:image/png;base64,{base64_image})"
 
-        self._print_colored("Image generation failed.", "ERROR")
+        log.error("Image generation failed.")
 
         total_time = time.time() - start_time
         await __event_emitter__(
@@ -229,21 +227,20 @@ class Pipe:
             return response.json().get("data", [])
         except requests.exceptions.RequestException as e:
             error_msg = f"Error getting models: {str(e)}\n{traceback.format_exc()}"
-            self._print_colored(error_msg, "ERROR")
+            log.error(error_msg)
             return []
         except Exception as e:
             error_msg = (
                 f"An unexpected error occurred: {str(e)}\n{traceback.format_exc()}"
             )
-            self._print_colored(error_msg, "ERROR")
+            log.error(error_msg)
             return []
 
     async def _generate_image(self, model: str, prompt: str) -> dict | None:
         try:
             async with aiohttp.ClientSession() as session:
-                self._print_colored(
-                    f"Sending image generation request to Venice.ai for model: {model}",
-                    "INFO",
+                log.info(
+                    f"Sending image generation request to Venice.ai for model: {model}"
                 )
                 async with session.post(
                     "https://api.venice.ai/api/v1/image/generate",
@@ -260,20 +257,19 @@ class Pipe:
                         "safe_mode": False,
                     },
                 ) as response:
-                    self._print_colored(
-                        f"Received response from Venice.ai with status: {response.status}",
-                        "INFO",
+                    log.info(
+                        f"Received response from Venice.ai with status: {response.status}"
                     )
                     response.raise_for_status()
                     return await response.json()
 
         except aiohttp.ClientResponseError as e:
             error_msg = f"Image generation failed with status: {str(e.status)}. Error: {str(e)}\n{traceback.format_exc()}"
-            self._print_colored(error_msg, "ERROR")
+            log.error(error_msg)
             return None
         except Exception as e:
             error_msg = f"Generation error: {str(e)}\n{traceback.format_exc()}"
-            self._print_colored(error_msg, "ERROR")
+            log.error(error_msg)
             return None
 
     def _upload_image(
@@ -305,32 +301,35 @@ class Pipe:
             content_type=mime_type,
             user=user,
         )
-        self._print_colored(f"Image uploaded. URL: {image_url}", "INFO")
+        log.info(f"Image uploaded. URL: {image_url}")
         return image_url
 
-    def _print_colored(self, message: str, level: str = "INFO") -> None:
-        """
-        Prints a colored log message to the console, respecting the configured log level.
-        """
-        if not hasattr(self, "valves") or self.valves.LOG_LEVEL == "OFF":
-            return
+    def _add_log_handler(self):
+        """Adds handler to the root loguru instance for this plugin if one does not exist already."""
 
-        # Define log level hierarchy
-        level_priority = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3}
+        def plugin_filter(record: "Record"):
+            """Filter function to only allow logs from this plugin (based on module name)."""
+            return record["name"] == __name__  # Filter by module name
 
-        # Only print if message level is >= configured level
-        if level_priority.get(level, 0) >= level_priority.get(self.valves.LOG_LEVEL, 0):
-            color_map = {
-                "INFO": COLORS["GREEN"],
-                "WARNING": COLORS["YELLOW"],
-                "ERROR": COLORS["RED"],
-                "DEBUG": COLORS["BLUE"],
-            }
-            color = color_map.get(level, COLORS["WHITE"])
-            frame = inspect.currentframe()
-            if frame:
-                frame = frame.f_back
-            method_name = frame.f_code.co_name if frame else "<unknown>"
-            print(
-                f"{color}[{level}][venice_manifold][{method_name}]{COLORS['RESET']} {message}"
-            )
+        # Access the internal state of the logger
+        handlers: dict[int, "Handler"] = logger._core.handlers  # type: ignore
+        for key, handler in handlers.items():
+            existing_filter = handler._filter
+            if (
+                hasattr(existing_filter, "__name__")
+                and existing_filter.__name__ == plugin_filter.__name__
+                and hasattr(existing_filter, "__module__")
+                and existing_filter.__module__ == plugin_filter.__module__
+            ):
+                log.debug("Handler for this plugin is already present!")
+                return
+
+        logger.add(
+            sys.stdout,
+            level=self.valves.LOG_LEVEL,
+            format=stdout_format,
+            filter=plugin_filter,
+        )
+        log.info(
+            f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
+        )
