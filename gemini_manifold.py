@@ -480,7 +480,7 @@ class Pipe:
 
         if self.valves.USE_GROUNDING_SEARCH:
             if model_name.endswith(SEARCH_MODEL_SUFFIX):
-                self._print_colored("Using grounding search.", "INFO")
+                log.info("Using grounding search.")
                 gs = None
                 # Dynamic retrieval only supported for 1.0 and 1.5 models
                 if "1.0" in model_name or "1.5" in model_name:
