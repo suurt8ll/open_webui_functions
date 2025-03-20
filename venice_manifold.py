@@ -132,14 +132,19 @@ class Pipe:
         __metadata__: dict[str, Any],
     ) -> str | dict | StreamingResponse | Iterator | AsyncGenerator | Generator | None:
 
+        self.__event_emitter__ = __event_emitter__
+
         if "error" in __metadata__["model"]["id"]:
             error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
-            log.exception(error_msg)
-            await _emit_error(error_msg, __event_emitter__)
+            log.error(error_msg)
+            await self._emit_error(error_msg)
             return
 
         if not self.valves.VENICE_API_TOKEN:
-            return "Error: Missing VENICE_API_TOKEN in valves configuration"
+            error_msg = "Missing VENICE_API_TOKEN in valves configuration."
+            log.error(error_msg)
+            await self._emit_error(error_msg)
+            return
 
         model = body.get("model", "").split(".", 1)[-1]
         prompt = next(
@@ -152,7 +157,10 @@ class Pipe:
         )
 
         if not prompt:
-            return "Error: No prompt found in user message"
+            error_msg = "No prompt found in user message."
+            log.error(error_msg)
+            await self._emit_error(error_msg)
+            return
 
         # FIXME move these to the beginning.
         if __task__ == "title_generation":
@@ -227,8 +235,7 @@ class Pipe:
             else:
                 return f"![Generated Image](data:image/png;base64,{base64_image})"
 
-        log.error("Image generation failed.")
-
+        # If we arrive here then image generation failed.
         total_time = time.time() - start_time
         await __event_emitter__(
             {
@@ -240,7 +247,11 @@ class Pipe:
                 },
             }
         )
-        return "Error: Failed to generate image"
+
+        error_msg = "Failed to generate image, look into logs for more info."
+        log.error(error_msg)
+        await self._emit_error(error_msg)
+        return
 
     """Helper functions inside the Pipe class."""
 
@@ -295,11 +306,13 @@ class Pipe:
         except aiohttp.ClientResponseError:
             error_msg = "Image generation failed:"
             log.exception(error_msg)
-            return None
+            await self._emit_error(error_msg)
+            return
         except Exception:
             error_msg = "Generation error:"
             log.exception(error_msg)
-            return None
+            await self._emit_error(error_msg)
+            return
 
     def _upload_image(
         self,
@@ -363,20 +376,17 @@ class Pipe:
             f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
         )
 
-
-async def _emit_error(
-    error_msg: str, __event_emitter__: Callable[[Event], Awaitable[None]]
-) -> None:
-    """Emits an event to the front-end that causes it to display a nice red error message."""
-    error: ChatCompletionEvent = {
-        "type": "chat:completion",
-        "data": {
-            "content": None,
-            "done": True,
-            "error": {"detail": error_msg},
-        },
-    }
-    await __event_emitter__(error)
+    async def _emit_error(self, error_msg: str) -> None:
+        """Emits an event to the front-end that causes it to display a nice red error message."""
+        error: ChatCompletionEvent = {
+            "type": "chat:completion",
+            "data": {
+                "content": None,
+                "done": True,
+                "error": {"detail": error_msg},
+            },
+        }
+        await self.__event_emitter__(error)
 
 
 def _return_error_model(error_msg: str) -> ModelData:

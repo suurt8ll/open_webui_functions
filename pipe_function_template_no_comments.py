@@ -136,10 +136,13 @@ class Pipe:
         | Generator
         | None
     ):
+
+        self.__event_emitter__ = __event_emitter__
+
         if "error" in __metadata__["model"]["id"]:
             error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
             log.exception(error_msg)
-            await _emit_error(error_msg, __event_emitter__)
+            await self._emit_error(error_msg)
             return
 
         if __task__ == "title_generation":
@@ -207,7 +210,7 @@ class Pipe:
         except Exception:
             error_msg = "Error happened inside the pipe function."
             log.exception(error_msg)
-            await _emit_error(error_msg, __event_emitter__)
+            await self._emit_error(error_msg)
             return
 
         return "Hello World!"
@@ -244,20 +247,17 @@ class Pipe:
             f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
         )
 
-
-async def _emit_error(
-    error_msg: str, __event_emitter__: Callable[[Event], Awaitable[None]]
-) -> None:
-    """Emits an event to the front-end that causes it to display a nice red error message."""
-    error: ChatCompletionEvent = {
-        "type": "chat:completion",
-        "data": {
-            "content": None,
-            "done": True,
-            "error": {"detail": error_msg},
-        },
-    }
-    await __event_emitter__(error)
+    async def _emit_error(self, error_msg: str) -> None:
+        """Emits an event to the front-end that causes it to display a nice red error message."""
+        error: ChatCompletionEvent = {
+            "type": "chat:completion",
+            "data": {
+                "content": None,
+                "done": True,
+                "error": {"detail": error_msg},
+            },
+        }
+        await self.__event_emitter__(error)
 
 
 def _return_error_model(error_msg: str) -> ModelData:
