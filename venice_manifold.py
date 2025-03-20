@@ -23,6 +23,7 @@ from typing import (
     Generator,
     Iterator,
     NotRequired,
+    Optional,
     TypedDict,
     Literal,
     Callable,
@@ -46,15 +47,38 @@ if TYPE_CHECKING:
     from loguru._handler import Handler
 
 
+class ModelData(TypedDict):
+    id: str
+    name: NotRequired[str]
+
+
+class ErrorData(TypedDict):
+    detail: str
+
+
+class ChatCompletionEventData(TypedDict):
+    content: Optional[str]
+    done: bool
+    error: NotRequired[ErrorData]
+
+
 class StatusEventData(TypedDict):
     description: str
     done: bool
     hidden: bool
 
 
-class ChatEventData(TypedDict):
+class StatusEvent(TypedDict):
     type: Literal["status"]
     data: StatusEventData
+
+
+class ChatCompletionEvent(TypedDict):
+    type: Literal["chat:completion"]
+    data: ChatCompletionEventData
+
+
+Event = StatusEvent | ChatCompletionEvent
 
 
 class UserData(TypedDict):
@@ -90,25 +114,20 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
+        print("[venice_manifold] Function has been initialized!")
 
     # FIXME Make it async.
-    def pipes(self) -> list[dict]:
+    def pipes(self) -> list[ModelData]:
+        # I'm adding the handler here because LOG_LEVEL is not set inside __init__ sadly.
         self._add_log_handler()
-        try:
-            models = self._get_models()
-            log.debug("Got models:", models=models)
-            return [{"id": model["id"], "name": model["id"]} for model in models]
-        except Exception:
-            error_msg = "Error getting models:"
-            log.exception(error_msg)
-            return []
+        return self._get_models()
 
     async def pipe(
         self,
         body: dict,
         __user__: UserData,
         __request__: Request,
-        __event_emitter__: Callable[[ChatEventData], Awaitable[None]],
+        __event_emitter__: Callable[[Event], Awaitable[None]],
         __task__: str,
     ) -> str | dict | StreamingResponse | Iterator | AsyncGenerator | Generator:
 
@@ -216,22 +235,25 @@ class Pipe:
 
     """Helper functions inside the Pipe class."""
 
-    def _get_models(self) -> list[dict[str, Any]]:
+    def _get_models(self) -> list[ModelData]:
         try:
             response = requests.get(
                 "https://api.venice.ai/api/v1/models?type=image",
                 headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},
             )
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-            return response.json().get("data", [])
+            response.raise_for_status()
+            raw_models = response.json().get("data", [])
+            if not raw_models:
+                log.warning("Venice API returned no models.")
+            return [{"id": model["id"], "name": model["id"]} for model in raw_models]
         except requests.exceptions.RequestException:
             error_msg = "Error getting models:"
             log.exception(error_msg)
-            return []
-        except Exception:
-            error_msg = "An unexpected error occurred:"
+            return [_return_error_model(error_msg)]
+        except Exception as e:
+            error_msg = "An unexpected error occurred: "
             log.exception(error_msg)
-            return []
+            return [_return_error_model(error_msg + str(e))]
 
     async def _generate_image(self, model: str, prompt: str) -> dict | None:
         try:
@@ -330,3 +352,26 @@ class Pipe:
         log.info(
             f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
         )
+
+
+async def _emit_error(
+    error_msg: str, __event_emitter__: Callable[[Event], Awaitable[None]]
+) -> None:
+    """Emits an event to the front-end that causes it to display a nice red error message."""
+    error: ChatCompletionEvent = {
+        "type": "chat:completion",
+        "data": {
+            "content": None,
+            "done": True,
+            "error": {"detail": error_msg},
+        },
+    }
+    await __event_emitter__(error)
+
+
+def _return_error_model(error_msg: str) -> ModelData:
+    """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+    return {
+        "id": "error",
+        "name": "[venice_manifold] " + error_msg,
+    }
