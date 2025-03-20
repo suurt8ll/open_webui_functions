@@ -19,6 +19,7 @@ from typing import (
     Iterator,
     Callable,
     Literal,
+    Optional,
     TypedDict,
     Any,
     NotRequired,
@@ -41,9 +42,27 @@ class StatusEventData(TypedDict):
     hidden: bool
 
 
-class ChatEventData(TypedDict):
+class ErrorData(TypedDict):
+    detail: str
+
+
+class ChatCompletionEventData(TypedDict):
+    content: Optional[str]
+    done: bool
+    error: NotRequired[ErrorData]
+
+
+class StatusEvent(TypedDict):
     type: Literal["status"]
     data: StatusEventData
+
+
+class ChatCompletionEvent(TypedDict):
+    type: Literal["chat:completion"]
+    data: ChatCompletionEventData
+
+
+Event = StatusEvent | ChatCompletionEvent
 
 
 class UserData(TypedDict):
@@ -90,7 +109,7 @@ class Pipe:
         body: dict[str, Any],
         __user__: UserData,
         __request__: Request,
-        __event_emitter__: Callable[[ChatEventData], Awaitable[None]],
+        __event_emitter__: Callable[[Event], Awaitable[None]],
         __event_call__: Callable[[dict[str, Any]], Awaitable[Any]],
         __task__: str,
         __task_body__: dict[str, Any],
@@ -98,7 +117,13 @@ class Pipe:
         __metadata__: dict[str, Any],
         __tools__: list[Any],
     ) -> (
-        str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
+        str
+        | dict[str, Any]
+        | StreamingResponse
+        | Iterator
+        | AsyncGenerator
+        | Generator
+        | None
     ):
         try:
             if __task__ == "title_generation":
@@ -111,28 +136,26 @@ class Pipe:
 
             async def countdown():
                 for i in range(5, 0, -1):
-                    await __event_emitter__(
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": f"Time remaining: {i}s",
-                                "done": False,
-                                "hidden": False,
-                            },
-                        }
-                    )
-                    await asyncio.sleep(1)
-
-                await __event_emitter__(
-                    {
+                    status_count: StatusEvent = {
                         "type": "status",
                         "data": {
-                            "description": "Process complete!",
-                            "done": True,
+                            "description": f"Time remaining: {i}s",
+                            "done": False,
                             "hidden": False,
                         },
                     }
-                )
+                    await __event_emitter__(status_count)
+                    await asyncio.sleep(1)
+
+                status_finish: StatusEvent = {
+                    "type": "status",
+                    "data": {
+                        "description": "Process complete!",
+                        "done": True,
+                        "hidden": False,
+                    },
+                }
+                await __event_emitter__(status_finish)
 
             asyncio.create_task(countdown())
 
@@ -162,12 +185,23 @@ class Pipe:
                 data=str(all_params),
             )
 
+            raise Exception("NameError, this is a test")
+
             return "Hello World!"
 
         except Exception:
             error_msg = "Pipe function error:"
             log.exception(error_msg)
-            return error_msg
+            error: ChatCompletionEvent = {
+                "type": "chat:completion",
+                "data": {
+                    "content": None,
+                    "done": True,
+                    "error": {"detail": error_msg},
+                },
+            }
+            await __event_emitter__(error)
+            return
 
     """Helper functions inside the Pipe class."""
 
