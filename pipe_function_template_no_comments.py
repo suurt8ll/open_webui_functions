@@ -36,6 +36,11 @@ if TYPE_CHECKING:
     from loguru._handler import Handler
 
 
+class ModelData(TypedDict):
+    id: str
+    name: NotRequired[str]
+
+
 class StatusEventData(TypedDict):
     description: str
     done: bool
@@ -96,13 +101,19 @@ class Pipe:
         self.valves = self.Valves()
         print("[pipe_function_template_no_comments] Function has been initialized!")
 
-    def pipes(self) -> list[dict]:
+    def pipes(self) -> list[ModelData]:
         self._add_log_handler()
         log.info("Registering models.")
-        return [
-            {"id": "model_id_1", "name": "model_1"},
-            {"id": "model_id_2", "name": "model_2"},
-        ]
+        try:
+            print(1 / 0)
+            return [
+                {"id": "model_id_1", "name": "model_1"},
+                {"id": "model_id_2", "name": "model_2"},
+            ]
+        except Exception as e:
+            error_msg = "Error during registering models: "
+            log.exception(error_msg)
+            return [_return_error_model(error_msg + str(e))]
 
     async def pipe(
         self,
@@ -229,7 +240,8 @@ class Pipe:
 
 async def _emit_error(
     error_msg: str, __event_emitter__: Callable[[Event], Awaitable[None]]
-):
+) -> None:
+    """Emits an event to the front-end that causes it to display a nice red error message."""
     error: ChatCompletionEvent = {
         "type": "chat:completion",
         "data": {
@@ -239,3 +251,11 @@ async def _emit_error(
         },
     }
     await __event_emitter__(error)
+
+
+def _return_error_model(error_msg: str) -> ModelData:
+    """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+    return {
+        "id": "error",
+        "name": error_msg,
+    }
