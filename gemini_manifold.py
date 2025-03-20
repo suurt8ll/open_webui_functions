@@ -91,9 +91,17 @@ log = logger.bind(auditable=False)
 class Pipe:
     class Valves(BaseModel):
         GEMINI_API_KEY: str = Field(default="")
+        GEMINI_API_BASE_URL: str = Field(
+            default="https://generativelanguage.googleapis.com",
+            description="The base URL for calling the Gemini API",
+        )
         MODEL_WHITELIST: str = Field(
             default="",
             description="Comma-separated list of allowed model names. Supports wildcards (*).",
+        )
+        CACHE_MODELS: bool = Field(
+            default=True,
+            description="Whether to request models only on first load and when whitelist changes.",
         )
         USE_GROUNDING_SEARCH: bool = Field(
             default=False,
@@ -103,6 +111,9 @@ class Pipe:
         GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD: float = Field(
             default=0.3,
             description="See Google AI docs for more information. Only supported for 1.0 and 1.5 models",
+        )
+        USE_PERMISSIVE_SAFETY: bool = Field(
+            default=False, description="Whether to request relaxed safety filtering"
         )
         LOG_LEVEL: Literal["INFO", "WARNING", "ERROR", "DEBUG", "OFF"] = Field(
             default="INFO",
@@ -116,6 +127,7 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
+        self.last_whitelist = self.valves.MODEL_WHITELIST
         self.models = []
         self.client = None
 
@@ -129,18 +141,25 @@ class Pipe:
                 raise ValueError("GEMINI_API_KEY is not set.")
 
             # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
-            # TODO Allow user to choose if they want to fetch models only during function initialization or every time pipes is called.
             if not self.client:
+                http_options = types.HttpOptions(base_url=self.valves.GEMINI_API_BASE_URL)
                 self.client = genai.Client(
                     api_key=self.valves.GEMINI_API_KEY,
+                    http_options=http_options,
                 )
             else:
                 log.info("Client already initialized.")
 
-            # Return existing models if already initialized
-            if self.models:
+            # Return existing models if all conditions are met
+            if (
+                self.models
+                and self.valves.CACHE_MODELS
+                and self.last_whitelist == self.valves.MODEL_WHITELIST
+            ):
                 log.info("Models already initialized.")
                 return self.models
+
+            self.last_whitelist = self.valves.MODEL_WHITELIST
 
             # Get and process new models
             models = self._get_google_models()
@@ -465,6 +484,7 @@ class Pipe:
             "top_k": body.get("top_k", 40),
             "max_output_tokens": body.get("max_tokens", 8192),
             "stop_sequences": body.get("stop", []),
+            "safety_settings": self._get_safety_settings(model_name),
         }
 
         if "gemini-2.0-flash-exp-image-generation" in model_name:
@@ -576,7 +596,7 @@ class Pipe:
 
         try:
             whitelist = (
-                self.valves.MODEL_WHITELIST.split(",")
+                self.valves.MODEL_WHITELIST.replace(" ", "").split(",")
                 if self.valves.MODEL_WHITELIST
                 else ["*"]
             )
@@ -628,6 +648,55 @@ class Pipe:
                     "name": "Error retrieving models. Please check the logs.",
                 }
             ]
+    
+    def _get_safety_settings(self, model_name: str):
+        """Get safety settings based on model name and permissive setting."""
+
+        if not self.valves.USE_PERMISSIVE_SAFETY:
+            return []
+
+        # Settings supported by most models
+        category_threshold_map = {
+            types.HarmCategory.HARM_CATEGORY_HARASSMENT: types.HarmBlockThreshold.OFF,
+            types.HarmCategory.HARM_CATEGORY_HATE_SPEECH: types.HarmBlockThreshold.OFF,
+            types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: types.HarmBlockThreshold.OFF,
+            types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: types.HarmBlockThreshold.OFF,
+            types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY: types.HarmBlockThreshold.BLOCK_NONE,
+        }
+
+        # Older models use BLOCK_NONE
+        if model_name in [
+            "gemini-1.5-pro-001",
+            "gemini-1.5-flash-001",
+            "gemini-1.5-flash-8b-exp-0827",
+            "gemini-1.5-flash-8b-exp-0924",
+            "gemini-pro",
+            "gemini-1.0-pro",
+            "gemini-1.0-pro-001",
+        ]:
+            for category in category_threshold_map:
+                category_threshold_map[category] = (
+                    types.HarmBlockThreshold.BLOCK_NONE
+                )
+
+        # Gemini 2.0 Flash supports CIVIC_INTEGRITY OFF
+        if model_name in [
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-001",
+            "gemini-2.0-flash-exp",
+        ]:
+            category_threshold_map[
+                types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY
+            ] = types.HarmBlockThreshold.OFF
+
+        log.debug(f"Safety settings: {str({k.value: v.value for k, v in category_threshold_map.items()})}")
+
+        safety_settings = [
+            types.SafetySetting(category=category, threshold=threshold)
+            for category, threshold in category_threshold_map.items()
+        ]
+        return safety_settings
+
 
     def _strip_prefix(self, model_name: str) -> str:
         """
