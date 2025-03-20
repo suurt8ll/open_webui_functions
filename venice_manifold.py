@@ -129,7 +129,14 @@ class Pipe:
         __request__: Request,
         __event_emitter__: Callable[[Event], Awaitable[None]],
         __task__: str,
-    ) -> str | dict | StreamingResponse | Iterator | AsyncGenerator | Generator:
+        __metadata__: dict[str, Any],
+    ) -> str | dict | StreamingResponse | Iterator | AsyncGenerator | Generator | None:
+
+        if "error" in __metadata__["model"]["id"]:
+            error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
+            log.exception(error_msg)
+            await _emit_error(error_msg, __event_emitter__)
+            return
 
         if not self.valves.VENICE_API_TOKEN:
             return "Error: Missing VENICE_API_TOKEN in valves configuration"
@@ -147,6 +154,7 @@ class Pipe:
         if not prompt:
             return "Error: No prompt found in user message"
 
+        # FIXME move these to the beginning.
         if __task__ == "title_generation":
             log.warning(
                 "Detected title generation task! I do not know how to handle this so I'm returning something generic."
@@ -160,6 +168,7 @@ class Pipe:
 
         log.debug(f"Model: {model}, Prompt: {prompt}")
 
+        # FIXME Move it out of pipe for cleaner code?
         async def timer_task(start_time: float):
             """Counts up and emits status updates."""
             try:
@@ -237,6 +246,7 @@ class Pipe:
 
     def _get_models(self) -> list[ModelData]:
         try:
+            print(1 / 0)
             response = requests.get(
                 "https://api.venice.ai/api/v1/models?type=image",
                 headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},

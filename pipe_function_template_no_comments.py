@@ -136,6 +136,12 @@ class Pipe:
         | Generator
         | None
     ):
+        if "error" in __metadata__["model"]["id"]:
+            error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
+            log.exception(error_msg)
+            await _emit_error(error_msg, __event_emitter__)
+            return
+
         if __task__ == "title_generation":
             log.info("Detected title generation task!")
             return '{"title": "Example Title"}'
@@ -196,7 +202,8 @@ class Pipe:
         )
 
         try:
-            raise Exception("NameError, this is a test.")
+            k = True
+            # raise Exception("NameError, this is a test.")
         except Exception:
             error_msg = "Error happened inside the pipe function."
             log.exception(error_msg)
@@ -257,5 +264,5 @@ def _return_error_model(error_msg: str) -> ModelData:
     """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
     return {
         "id": "error",
-        "name": error_msg,
+        "name": "[pipe_function_template_no_comments] " + error_msg,
     }
