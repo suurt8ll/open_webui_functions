@@ -190,17 +190,9 @@ class Pipe:
             return "Hello World!"
 
         except Exception:
-            error_msg = "Pipe function error:"
+            error_msg = "Error happened inside the pipe function."
             log.exception(error_msg)
-            error: ChatCompletionEvent = {
-                "type": "chat:completion",
-                "data": {
-                    "content": None,
-                    "done": True,
-                    "error": {"detail": error_msg},
-                },
-            }
-            await __event_emitter__(error)
+            await _emit_error(error_msg, __event_emitter__)
             return
 
     """Helper functions inside the Pipe class."""
@@ -234,3 +226,17 @@ class Pipe:
         log.info(
             f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
         )
+
+
+async def _emit_error(
+    error_msg: str, __event_emitter__: Callable[[Event], Awaitable[None]]
+):
+    error: ChatCompletionEvent = {
+        "type": "chat:completion",
+        "data": {
+            "content": None,
+            "done": True,
+            "error": {"detail": error_msg},
+        },
+    }
+    await __event_emitter__(error)
