@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.5.0
+version: 1.6.0
 requirements: google-genai==1.7.0
 """
 
@@ -18,6 +18,7 @@ requirements: google-genai==1.7.0
 #   - Image input
 #   - Streaming
 #   - Grounding with Google Search
+#   - Safety settings
 
 # Features that are supported by API but not yet implemented in the manifold:
 #   TODO Audio input support.
