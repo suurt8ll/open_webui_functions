@@ -105,7 +105,6 @@ class Pipe:
         self._add_log_handler()
         log.info("Registering models.")
         try:
-            print(1 / 0)
             return [
                 {"id": "model_id_1", "name": "model_1"},
                 {"id": "model_id_2", "name": "model_2"},

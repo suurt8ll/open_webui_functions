@@ -199,65 +199,50 @@ class Pipe:
         start_time = time.time()
         timer = asyncio.create_task(timer_task(start_time))
 
+        image_data = await self._generate_image(model, prompt)
+
+        timer.cancel()
         try:
-            image_data = await self._generate_image(model, prompt)
-        finally:
-            timer.cancel()  # Always cancel the timer, even if _generate_image fails
-            try:
-                await timer  # Ensure timer is fully cleaned up
-            except asyncio.CancelledError:
-                pass  # Expected, already handled
+            await timer  # Ensure timer is fully cleaned up
+        except asyncio.CancelledError:
+            pass  # Expected, already handled
 
         total_time = time.time() - start_time
+        success = image_data and image_data.get("images")
+        status_text = f"Image {'generated' if success else 'generation failed'} after {total_time:.2f}s"
+
         await __event_emitter__(
             {
                 "type": "status",
                 "data": {
-                    "description": f"Image generated in {total_time:.2f}s",
+                    "description": status_text,
                     "done": True,
                     "hidden": False,
                 },
             }
         )
 
-        if image_data and image_data.get("images"):
+        if success:
             log.info("Image generated successfully!")
-            base64_image = image_data["images"][0]
+            base64_image = image_data["images"][0]  # type: ignore
 
             if self.valves.USE_FILES_API:
                 # Decode the base64 image data
                 image_data = base64.b64decode(base64_image)
                 # FIXME make mime type dynamic
-                image_url = self._upload_image(
+                image_url = await self._upload_image(
                     image_data, "image/png", model, prompt, __user__, __request__
                 )
+                if not image_url:
+                    return
                 return f"![Generated Image]({image_url})"
             else:
                 return f"![Generated Image](data:image/png;base64,{base64_image})"
-
-        # If we arrive here then image generation failed.
-        total_time = time.time() - start_time
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": f"Image generation failed after {total_time:.2f}s",
-                    "done": True,
-                    "hidden": False,
-                },
-            }
-        )
-
-        error_msg = "Failed to generate image, look into logs for more info."
-        log.error(error_msg)
-        await self._emit_error(error_msg)
-        return
 
     """Helper functions inside the Pipe class."""
 
     def _get_models(self) -> list[ModelData]:
         try:
-            print(1 / 0)
             response = requests.get(
                 "https://api.venice.ai/api/v1/models?type=image",
                 headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},
@@ -303,18 +288,18 @@ class Pipe:
                     response.raise_for_status()
                     return await response.json()
 
-        except aiohttp.ClientResponseError:
-            error_msg = "Image generation failed:"
+        except aiohttp.ClientResponseError as e:
+            error_msg = "Image generation failed: "
             log.exception(error_msg)
-            await self._emit_error(error_msg)
+            await self._emit_error(error_msg + str(e))
             return
-        except Exception:
-            error_msg = "Generation error:"
+        except Exception as e:
+            error_msg = "Generation error: " + str(e)
             log.exception(error_msg)
             await self._emit_error(error_msg)
             return
 
-    def _upload_image(
+    async def _upload_image(
         self,
         image_data: bytes,
         mime_type: str,
@@ -322,7 +307,7 @@ class Pipe:
         prompt: str,
         __user__: UserData,
         __request__: Request,
-    ) -> str:
+    ) -> str | None:
 
         # Create metadata for the image
         image_metadata = {
@@ -333,7 +318,10 @@ class Pipe:
         # Get the *full* user object from the database
         user = Users.get_user_by_id(__user__["id"])
         if user is None:
-            return "Error: User not found"
+            error_msg = "User not found."
+            log.error(error_msg)
+            await self._emit_error(error_msg)
+            return
 
         # Upload the image using the imported function
         image_url: str = upload_image(
@@ -387,6 +375,9 @@ class Pipe:
             },
         }
         await self.__event_emitter__(error)
+
+
+"""Helper functions outside the Pipe class."""
 
 
 def _return_error_model(error_msg: str) -> ModelData:
