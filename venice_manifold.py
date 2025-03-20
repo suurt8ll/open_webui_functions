@@ -48,8 +48,10 @@ if TYPE_CHECKING:
 
 
 class ModelData(TypedDict):
+    """This is how the `pipes` function expects the `dict` to look like."""
+
     id: str
-    name: NotRequired[str]
+    name: str
 
 
 class ErrorData(TypedDict):
@@ -371,7 +373,7 @@ class Pipe:
             "data": {
                 "content": None,
                 "done": True,
-                "error": {"detail": error_msg},
+                "error": {"detail": "\n" + error_msg},
             },
         }
         await self.__event_emitter__(error)

@@ -40,7 +40,7 @@ class ModelData(TypedDict):
     """This is how the `pipes` function expects the `dict` to look like."""
 
     id: str
-    name: NotRequired[str]
+    name: str
 
 
 class StatusEventData(TypedDict):

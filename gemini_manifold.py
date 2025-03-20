@@ -43,6 +43,8 @@ from typing import (
     Any,
     AsyncGenerator,
     AsyncIterator,
+    Awaitable,
+    Callable,
     Generator,
     Iterator,
     Literal,
@@ -77,12 +79,38 @@ SEARCH_MODEL_SUFFIX = "++SEARCH"
 
 
 class UserData(TypedDict):
+    """This is how `__user__` `dict` looks like."""
+
     id: str
     email: str
     name: str
     role: Literal["admin", "user", "pending"]
     valves: NotRequired[Any]  # object of type UserValves
 
+
+class ModelData(TypedDict):
+    """This is how the `pipes` function expects the `dict` to look like."""
+
+    id: str
+    name: str
+
+
+class ErrorData(TypedDict):
+    detail: str
+
+
+class ChatCompletionEventData(TypedDict):
+    content: Optional[str]
+    done: bool
+    error: NotRequired[ErrorData]
+
+
+class ChatCompletionEvent(TypedDict):
+    type: Literal["chat:completion"]
+    data: ChatCompletionEventData
+
+
+Event = ChatCompletionEvent
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
 log = logger.bind(auditable=False)
@@ -118,57 +146,53 @@ class Pipe:
         self.valves = self.Valves()
         self.models = []
         self.client = None
+        print("[gemini_manifold] Function has been initialized!")
 
     # FIXME Make it async
-    def pipes(self) -> list[dict]:
+    def pipes(self) -> list[ModelData]:
         """Register all available Google models."""
+
         self._add_log_handler()
-        # FIXME Don't wrap everything like that with try block.
-        try:
-            if not self.valves.GEMINI_API_KEY:
-                raise ValueError("GEMINI_API_KEY is not set.")
 
-            # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
-            # TODO Allow user to choose if they want to fetch models only during function initialization or every time pipes is called.
-            if not self.client:
-                self.client = genai.Client(
-                    api_key=self.valves.GEMINI_API_KEY,
-                )
-            else:
-                log.info("Client already initialized.")
+        if not self.valves.GEMINI_API_KEY:
+            raise ValueError("GEMINI_API_KEY is not set.")
 
-            # Return existing models if already initialized
-            if self.models:
-                log.info("Models already initialized.")
-                return self.models
-
-            # Get and process new models
-            models = self._get_google_models()
-
-            # Handle error cases
-            if models and models[0].get("id") in ["error", "no_models_found"]:
-                return models
-
-            log.debug("Registered models:", data=models)
-            self.models = models
-            return (
-                models
-                if models
-                else [{"id": "no_models", "name": "No models available"}]
+        # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
+        # TODO Allow user to choose if they want to fetch models only during function initialization or every time pipes is called.
+        if not self.client:
+            self.client = genai.Client(
+                api_key=self.valves.GEMINI_API_KEY,
             )
+        else:
+            log.info("genai client is already initialized.")
 
-        except Exception as e:
-            error_msg = "Error in pipes method:"
-            log.exception(error_msg)
-            return [{"id": "error", "name": f"Error initializing models: {e}"}]
+        # FIXME this should be the very first check inside pipes method.
+        # Return existing models if already initialized
+        if self.models:
+            log.info("Models are already initialized.")
+            return self.models
+
+        # Get and process new models
+        models = self._get_google_models()
+        log.debug("Registered models:", data=models)
+
+        self.models = models
+        return models
 
     async def pipe(
         self,
         body: dict,
         __user__: UserData,
         __request__: Request,
+        __event_emitter__: Callable[[Event], Awaitable[None]],
     ) -> (
-        str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
+        str
+        | dict[str, Any]
+        | StreamingResponse
+        | Iterator
+        | AsyncGenerator
+        | Generator
+        | None
     ):
         """Helper functions inside the pipe() method"""
 
@@ -429,6 +453,8 @@ class Pipe:
 
         """Main pipe method."""
 
+        self.__event_emitter__ = __event_emitter__
+
         messages = body.get("messages", [])
         system_prompt, remaining_messages = _pop_system_prompt(messages)
         contents = _transform_messages_to_contents(remaining_messages)
@@ -560,74 +586,61 @@ class Pipe:
             f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
         )
 
-    def _get_google_models(self):
+    def _get_google_models(self) -> list[ModelData]:
         """Retrieve Google models with prefix stripping."""
 
-        # Check if client is initialized and return error if not.
-        # FIXME Use raise.
         if not self.client:
-            log.error("Client not initialized.")
-            return [
-                {
-                    "id": "error",
-                    "name": "Client not initialized. Please check the logs.",
-                }
-            ]
+            log.error("Client is not initialized.")
+            return []
+
+        whitelist = (
+            self.valves.MODEL_WHITELIST.split(",")
+            if self.valves.MODEL_WHITELIST
+            else ["*"]
+        )
 
         try:
-            whitelist = (
-                self.valves.MODEL_WHITELIST.split(",")
-                if self.valves.MODEL_WHITELIST
-                else ["*"]
-            )
             models = self.client.models.list(config={"query_base": True})
-            log.info(
-                f"[get_google_models] Retrieved {len(models)} models from Gemini Developer API."
-            )
-            model_list = [
-                {
-                    "id": self._strip_prefix(model.name),
-                    "name": model.display_name,
-                }
-                for model in models
-                if model.name
-                and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
-                if model.supported_actions
-                and "generateContent" in model.supported_actions
-                if model.name and model.name.startswith("models/")
-            ]
-
-            if not model_list:
-                log.warning("No models found matching whitelist.")
-                return [
-                    {
-                        "id": "no_models_found",
-                        "name": "No models found matching whitelist.",
-                    }
-                ]
-
-            # Add synthesis model id which support search if grounding search is enabled.
-            if not self.valves.USE_GROUNDING_SEARCH:
-                return model_list
-            for original_model in model_list:
-                if original_model["id"] in ALLOWED_GROUNDING_MODELS:
-                    model_list.append(
-                        {
-                            "id": original_model["id"] + SEARCH_MODEL_SUFFIX,
-                            "name": original_model["name"] + " with Search",
-                        }
-                    )
-
-            return model_list
-        except Exception:
+        except Exception as e:
             error_msg = "Error retrieving models:"
             log.exception(error_msg)
-            return [
-                {
-                    "id": "error",
-                    "name": "Error retrieving models. Please check the logs.",
-                }
-            ]
+            return [_return_error_model(error_msg + str(e))]
+        log.info(f"Retrieved {len(models)} models from Gemini Developer API.")
+
+        model_list = [
+            ModelData(
+                id=self._strip_prefix(model.name),
+                name=model.display_name,
+            )
+            for model in models
+            if (
+                model.name is not None  # Ensure name is present
+                and model.display_name is not None  # Ensure display_name is present
+                and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
+                and model.supported_actions
+                and "generateContent" in model.supported_actions
+                and model.name.startswith("models/")
+            )
+        ]
+
+        if not model_list:
+            log.warning("No models found matching whitelist.")
+            return []
+
+        # Add synthesis model id which support search if grounding search is enabled.
+        # TODO Add this logic into the previous `model_list` construction logic? We are already looping over models there.
+        if not self.valves.USE_GROUNDING_SEARCH:
+            return model_list
+        for original_model in model_list:
+            if original_model["id"] in ALLOWED_GROUNDING_MODELS:
+                model_list.append(
+                    {
+                        "id": original_model["id"] + SEARCH_MODEL_SUFFIX,
+                        "name": original_model["name"] + " with Search",
+                    }
+                )
+
+        return model_list
 
     def _strip_prefix(self, model_name: str) -> str:
         """
@@ -706,3 +719,23 @@ class Pipe:
         )
         log.info("Image uploaded.", image_url=image_url)
         return image_url
+
+    async def _emit_error(self, error_msg: str) -> None:
+        """Emits an event to the front-end that causes it to display a nice red error message."""
+        error: ChatCompletionEvent = {
+            "type": "chat:completion",
+            "data": {
+                "content": None,
+                "done": True,
+                "error": {"detail": "\n" + error_msg},
+            },
+        }
+        await self.__event_emitter__(error)
+
+
+def _return_error_model(error_msg: str) -> ModelData:
+    """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+    return {
+        "id": "error",
+        "name": "[pipe_function_template_no_comments] " + error_msg,
+    }
