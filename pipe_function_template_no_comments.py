@@ -125,75 +125,74 @@ class Pipe:
         | Generator
         | None
     ):
-        try:
-            if __task__ == "title_generation":
-                log.info("Detected title generation task!")
-                return '{"title": "Example Title"}'
+        if __task__ == "title_generation":
+            log.info("Detected title generation task!")
+            return '{"title": "Example Title"}'
 
-            if __task__ == "tags_generation":
-                log.info("Detected tag generation task!")
-                return '{"tags": ["tag1", "tag2", "tag3"]}'
+        if __task__ == "tags_generation":
+            log.info("Detected tag generation task!")
+            return '{"tags": ["tag1", "tag2", "tag3"]}'
 
-            async def countdown():
-                for i in range(5, 0, -1):
-                    status_count: StatusEvent = {
-                        "type": "status",
-                        "data": {
-                            "description": f"Time remaining: {i}s",
-                            "done": False,
-                            "hidden": False,
-                        },
-                    }
-                    await __event_emitter__(status_count)
-                    await asyncio.sleep(1)
-
-                status_finish: StatusEvent = {
+        async def countdown():
+            for i in range(5, 0, -1):
+                status_count: StatusEvent = {
                     "type": "status",
                     "data": {
-                        "description": "Process complete!",
-                        "done": True,
+                        "description": f"Time remaining: {i}s",
+                        "done": False,
                         "hidden": False,
                     },
                 }
-                await __event_emitter__(status_finish)
+                await __event_emitter__(status_count)
+                await asyncio.sleep(1)
 
-            asyncio.create_task(countdown())
-
-            string_from_valve = self.valves.EXAMPLE_STRING
-            string_from_user_valve = getattr(
-                __user__.get("valves"), "EXAMPLE_STRING_USER", None
-            )
-
-            log.debug("String from valve:", data=string_from_valve)
-            log.debug("String from user valve:", data=string_from_user_valve)
-
-            all_params = {
-                "body": body,
-                "__user__": __user__,
-                "__request__": __request__,
-                "__event_emitter__": __event_emitter__,
-                "__event_call__": __event_call__,
-                "__task__": __task__,
-                "__task_body__": __task_body__,
-                "__files__": __files__,
-                "__metadata__": __metadata__,
-                "__tools__": __tools__,
+            status_finish: StatusEvent = {
+                "type": "status",
+                "data": {
+                    "description": "Process complete!",
+                    "done": True,
+                    "hidden": False,
+                },
             }
+            await __event_emitter__(status_finish)
 
-            log.debug(
-                "Returning all parameters as JSON:",
-                data=str(all_params),
-            )
+        asyncio.create_task(countdown())
 
-            raise Exception("NameError, this is a test")
+        string_from_valve = self.valves.EXAMPLE_STRING
+        string_from_user_valve = getattr(
+            __user__.get("valves"), "EXAMPLE_STRING_USER", None
+        )
 
-            return "Hello World!"
+        log.debug("String from valve:", data=string_from_valve)
+        log.debug("String from user valve:", data=string_from_user_valve)
 
+        all_params = {
+            "body": body,
+            "__user__": __user__,
+            "__request__": __request__,
+            "__event_emitter__": __event_emitter__,
+            "__event_call__": __event_call__,
+            "__task__": __task__,
+            "__task_body__": __task_body__,
+            "__files__": __files__,
+            "__metadata__": __metadata__,
+            "__tools__": __tools__,
+        }
+
+        log.debug(
+            "Returning all parameters as JSON:",
+            data=str(all_params),
+        )
+
+        try:
+            raise Exception("NameError, this is a test.")
         except Exception:
             error_msg = "Error happened inside the pipe function."
             log.exception(error_msg)
             await _emit_error(error_msg, __event_emitter__)
             return
+
+        return "Hello World!"
 
     """Helper functions inside the Pipe class."""
 
