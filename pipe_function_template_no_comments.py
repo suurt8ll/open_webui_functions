@@ -37,6 +37,8 @@ if TYPE_CHECKING:
 
 
 class ModelData(TypedDict):
+    """This is how the `pipes` function expects the `dict` to look like."""
+
     id: str
     name: NotRequired[str]
 
@@ -71,6 +73,8 @@ Event = StatusEvent | ChatCompletionEvent
 
 
 class UserData(TypedDict):
+    """This is how `__user__` `dict` looks like."""
+
     id: str
     email: str
     name: str
@@ -106,8 +110,8 @@ class Pipe:
         log.info("Registering models.")
         try:
             return [
-                {"id": "model_id_1", "name": "model_1"},
-                {"id": "model_id_2", "name": "model_2"},
+                ModelData(id="model_id_1", name="model_1"),
+                ModelData(id="model_id_2", name="model_2"),
             ]
         except Exception as e:
             error_msg = "Error during registering models: "
@@ -248,20 +252,20 @@ class Pipe:
 
     async def _emit_error(self, error_msg: str) -> None:
         """Emits an event to the front-end that causes it to display a nice red error message."""
-        error: ChatCompletionEvent = {
-            "type": "chat:completion",
-            "data": {
-                "content": None,
-                "done": True,
-                "error": {"detail": error_msg},
-            },
-        }
+        error = ChatCompletionEvent(
+            type="chat:completion",
+            data=ChatCompletionEventData(
+                content=None,
+                done=True,
+                error=ErrorData(detail="\n" + error_msg),
+            ),
+        )
         await self.__event_emitter__(error)
 
 
 def _return_error_model(error_msg: str) -> ModelData:
     """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
-    return {
-        "id": "error",
-        "name": "[pipe_function_template_no_comments] " + error_msg,
-    }
+    return ModelData(
+        id="error",
+        name="[pipe_function_template_no_comments] " + error_msg,
+    )
