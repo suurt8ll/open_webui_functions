@@ -184,11 +184,14 @@ class Pipe:
         # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
         if not self.client:
             http_options = types.HttpOptions(base_url=self.valves.GEMINI_API_BASE_URL)
-            # FIXME: This could error, handler it.
-            self.client = genai.Client(
-                api_key=self.valves.GEMINI_API_KEY,
-                http_options=http_options,
-            )
+            try:
+                self.client = genai.Client(
+                    api_key=self.valves.GEMINI_API_KEY,
+                    http_options=http_options,
+                )
+            except Exception as e:
+                error_msg = f"genai client initalization failed: {str(e)}"
+                return [_return_error_model(error_msg)]
         else:
             log.info("Client already initialized.")
 
@@ -817,6 +820,7 @@ class Pipe:
 
 def _return_error_model(error_msg: str) -> ModelData:
     """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+    # FIXME put log. methods here too.
     return {
         "id": "error",
         "name": "[gemini_manifold] " + error_msg,
