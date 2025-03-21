@@ -19,6 +19,7 @@ from typing import (
     Iterator,
     Callable,
     Literal,
+    Optional,
     TypedDict,
     Any,
     NotRequired,
@@ -35,18 +36,45 @@ if TYPE_CHECKING:
     from loguru._handler import Handler
 
 
+class ModelData(TypedDict):
+    """This is how the `pipes` function expects the `dict` to look like."""
+
+    id: str
+    name: str
+
+
 class StatusEventData(TypedDict):
     description: str
     done: bool
     hidden: bool
 
 
-class ChatEventData(TypedDict):
+class ErrorData(TypedDict):
+    detail: str
+
+
+class ChatCompletionEventData(TypedDict):
+    content: Optional[str]
+    done: bool
+    error: NotRequired[ErrorData]
+
+
+class StatusEvent(TypedDict):
     type: Literal["status"]
     data: StatusEventData
 
 
+class ChatCompletionEvent(TypedDict):
+    type: Literal["chat:completion"]
+    data: ChatCompletionEventData
+
+
+Event = StatusEvent | ChatCompletionEvent
+
+
 class UserData(TypedDict):
+    """This is how `__user__` `dict` looks like."""
+
     id: str
     email: str
     name: str
@@ -77,20 +105,25 @@ class Pipe:
         self.valves = self.Valves()
         print("[pipe_function_template_no_comments] Function has been initialized!")
 
-    def pipes(self) -> list[dict]:
+    def pipes(self) -> list[ModelData]:
         self._add_log_handler()
         log.info("Registering models.")
-        return [
-            {"id": "model_id_1", "name": "model_1"},
-            {"id": "model_id_2", "name": "model_2"},
-        ]
+        try:
+            return [
+                ModelData(id="model_id_1", name="model_1"),
+                ModelData(id="model_id_2", name="model_2"),
+            ]
+        except Exception as e:
+            error_msg = "Error during registering models: "
+            log.exception(error_msg)
+            return [_return_error_model(error_msg + str(e))]
 
     async def pipe(
         self,
         body: dict[str, Any],
         __user__: UserData,
         __request__: Request,
-        __event_emitter__: Callable[[ChatEventData], Awaitable[None]],
+        __event_emitter__: Callable[[Event], Awaitable[None]],
         __event_call__: Callable[[dict[str, Any]], Awaitable[Any]],
         __task__: str,
         __task_body__: dict[str, Any],
@@ -98,76 +131,92 @@ class Pipe:
         __metadata__: dict[str, Any],
         __tools__: list[Any],
     ) -> (
-        str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
+        str
+        | dict[str, Any]
+        | StreamingResponse
+        | Iterator
+        | AsyncGenerator
+        | Generator
+        | None
     ):
-        try:
-            if __task__ == "title_generation":
-                log.info("Detected title generation task!")
-                return '{"title": "Example Title"}'
 
-            if __task__ == "tags_generation":
-                log.info("Detected tag generation task!")
-                return '{"tags": ["tag1", "tag2", "tag3"]}'
+        self.__event_emitter__ = __event_emitter__
 
-            async def countdown():
-                for i in range(5, 0, -1):
-                    await __event_emitter__(
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": f"Time remaining: {i}s",
-                                "done": False,
-                                "hidden": False,
-                            },
-                        }
-                    )
-                    await asyncio.sleep(1)
-
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": "Process complete!",
-                            "done": True,
-                            "hidden": False,
-                        },
-                    }
-                )
-
-            asyncio.create_task(countdown())
-
-            string_from_valve = self.valves.EXAMPLE_STRING
-            string_from_user_valve = getattr(
-                __user__.get("valves"), "EXAMPLE_STRING_USER", None
-            )
-
-            log.debug("String from valve:", data=string_from_valve)
-            log.debug("String from user valve:", data=string_from_user_valve)
-
-            all_params = {
-                "body": body,
-                "__user__": __user__,
-                "__request__": __request__,
-                "__event_emitter__": __event_emitter__,
-                "__event_call__": __event_call__,
-                "__task__": __task__,
-                "__task_body__": __task_body__,
-                "__files__": __files__,
-                "__metadata__": __metadata__,
-                "__tools__": __tools__,
-            }
-
-            log.debug(
-                "Returning all parameters as JSON:",
-                data=str(all_params),
-            )
-
-            return "Hello World!"
-
-        except Exception:
-            error_msg = "Pipe function error:"
+        if "error" in __metadata__["model"]["id"]:
+            error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
             log.exception(error_msg)
-            return error_msg
+            await self._emit_error(error_msg)
+            return
+
+        if __task__ == "title_generation":
+            log.info("Detected title generation task!")
+            return '{"title": "Example Title"}'
+
+        if __task__ == "tags_generation":
+            log.info("Detected tag generation task!")
+            return '{"tags": ["tag1", "tag2", "tag3"]}'
+
+        # FIXME: Move the countdown example to a separate status emission example file.
+        async def countdown():
+            for i in range(5, 0, -1):
+                status_count: StatusEvent = {
+                    "type": "status",
+                    "data": {
+                        "description": f"Time remaining: {i}s",
+                        "done": False,
+                        "hidden": False,
+                    },
+                }
+                await __event_emitter__(status_count)
+                await asyncio.sleep(1)
+
+            status_finish: StatusEvent = {
+                "type": "status",
+                "data": {
+                    "description": "Process complete!",
+                    "done": True,
+                    "hidden": False,
+                },
+            }
+            await __event_emitter__(status_finish)
+
+        asyncio.create_task(countdown())
+
+        string_from_valve = self.valves.EXAMPLE_STRING
+        string_from_user_valve = getattr(
+            __user__.get("valves"), "EXAMPLE_STRING_USER", None
+        )
+
+        log.debug("String from valve:", data=string_from_valve)
+        log.debug("String from user valve:", data=string_from_user_valve)
+
+        all_params = {
+            "body": body,
+            "__user__": __user__,
+            "__request__": __request__,
+            "__event_emitter__": __event_emitter__,
+            "__event_call__": __event_call__,
+            "__task__": __task__,
+            "__task_body__": __task_body__,
+            "__files__": __files__,
+            "__metadata__": __metadata__,
+            "__tools__": __tools__,
+        }
+
+        log.debug(
+            "Returning all parameters as JSON:",
+            data=str(all_params),
+        )
+
+        # FIXME: Move error handling examples to a separate function.
+        try:
+            raise Exception("NameError, this is a test.")
+        except Exception as e:
+            error_msg = f"Error happened inside the pipe function: {str(e)}"
+            await self._emit_error(error_msg)
+            return
+
+        return "Hello World!"
 
     """Helper functions inside the Pipe class."""
 
@@ -200,3 +249,29 @@ class Pipe:
         log.info(
             f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
         )
+
+    async def _emit_error(
+        self, error_msg: str, warning: bool = False, exception: bool = True
+    ) -> None:
+        """Emits an event to the front-end that causes it to display a nice red error message."""
+        error = ChatCompletionEvent(
+            type="chat:completion",
+            data=ChatCompletionEventData(
+                content=None,
+                done=True,
+                error=ErrorData(detail="\n" + error_msg),
+            ),
+        )
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        await self.__event_emitter__(error)
+
+
+def _return_error_model(error_msg: str) -> ModelData:
+    """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+    return ModelData(
+        id="error",
+        name="[pipe_function_template] " + error_msg,
+    )

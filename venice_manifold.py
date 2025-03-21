@@ -23,6 +23,7 @@ from typing import (
     Generator,
     Iterator,
     NotRequired,
+    Optional,
     TypedDict,
     Literal,
     Callable,
@@ -46,15 +47,40 @@ if TYPE_CHECKING:
     from loguru._handler import Handler
 
 
+class ModelData(TypedDict):
+    """This is how the `pipes` function expects the `dict` to look like."""
+
+    id: str
+    name: str
+
+
+class ErrorData(TypedDict):
+    detail: str
+
+
+class ChatCompletionEventData(TypedDict):
+    content: Optional[str]
+    done: bool
+    error: NotRequired[ErrorData]
+
+
 class StatusEventData(TypedDict):
     description: str
     done: bool
     hidden: bool
 
 
-class ChatEventData(TypedDict):
+class StatusEvent(TypedDict):
     type: Literal["status"]
     data: StatusEventData
+
+
+class ChatCompletionEvent(TypedDict):
+    type: Literal["chat:completion"]
+    data: ChatCompletionEventData
+
+
+Event = StatusEvent | ChatCompletionEvent
 
 
 class UserData(TypedDict):
@@ -90,30 +116,35 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
+        print("[venice_manifold] Function has been initialized!")
 
     # FIXME Make it async.
-    def pipes(self) -> list[dict]:
+    def pipes(self) -> list[ModelData]:
+        # I'm adding the handler here because LOG_LEVEL is not set inside __init__ sadly.
         self._add_log_handler()
-        try:
-            models = self._get_models()
-            log.debug("Got models:", models=models)
-            return [{"id": model["id"], "name": model["id"]} for model in models]
-        except Exception:
-            error_msg = "Error getting models:"
-            log.exception(error_msg)
-            return []
+        return self._get_models()
 
     async def pipe(
         self,
         body: dict,
         __user__: UserData,
         __request__: Request,
-        __event_emitter__: Callable[[ChatEventData], Awaitable[None]],
+        __event_emitter__: Callable[[Event], Awaitable[None]],
         __task__: str,
-    ) -> str | dict | StreamingResponse | Iterator | AsyncGenerator | Generator:
+        __metadata__: dict[str, Any],
+    ) -> str | dict | StreamingResponse | Iterator | AsyncGenerator | Generator | None:
+
+        self.__event_emitter__ = __event_emitter__
+
+        if "error" in __metadata__["model"]["id"]:
+            error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
+            await self._emit_error(error_msg, exception=False)
+            return
 
         if not self.valves.VENICE_API_TOKEN:
-            return "Error: Missing VENICE_API_TOKEN in valves configuration"
+            error_msg = "Missing VENICE_API_TOKEN in valves configuration."
+            await self._emit_error(error_msg, exception=False)
+            return
 
         model = body.get("model", "").split(".", 1)[-1]
         prompt = next(
@@ -126,8 +157,11 @@ class Pipe:
         )
 
         if not prompt:
-            return "Error: No prompt found in user message"
+            error_msg = "No prompt found in user message."
+            await self._emit_error(error_msg, exception=False)
+            return
 
+        # FIXME move these to the beginning.
         if __task__ == "title_generation":
             log.warning(
                 "Detected title generation task! I do not know how to handle this so I'm returning something generic."
@@ -141,6 +175,7 @@ class Pipe:
 
         log.debug(f"Model: {model}, Prompt: {prompt}")
 
+        # FIXME Move it out of pipe for cleaner code?
         async def timer_task(start_time: float):
             """Counts up and emits status updates."""
             try:
@@ -163,75 +198,67 @@ class Pipe:
         start_time = time.time()
         timer = asyncio.create_task(timer_task(start_time))
 
+        image_data = await self._generate_image(model, prompt)
+
+        timer.cancel()
         try:
-            image_data = await self._generate_image(model, prompt)
-        finally:
-            timer.cancel()  # Always cancel the timer, even if _generate_image fails
-            try:
-                await timer  # Ensure timer is fully cleaned up
-            except asyncio.CancelledError:
-                pass  # Expected, already handled
+            await timer  # Ensure timer is fully cleaned up
+        except asyncio.CancelledError:
+            pass  # Expected, already handled
 
         total_time = time.time() - start_time
+        success = image_data and image_data.get("images")
+        status_text = f"Image {'generated' if success else 'generation failed'} after {total_time:.2f}s"
+
         await __event_emitter__(
             {
                 "type": "status",
                 "data": {
-                    "description": f"Image generated in {total_time:.2f}s",
+                    "description": status_text,
                     "done": True,
                     "hidden": False,
                 },
             }
         )
 
-        if image_data and image_data.get("images"):
+        if success:
             log.info("Image generated successfully!")
-            base64_image = image_data["images"][0]
+            base64_image = image_data["images"][0]  # type: ignore
 
             if self.valves.USE_FILES_API:
                 # Decode the base64 image data
                 image_data = base64.b64decode(base64_image)
                 # FIXME make mime type dynamic
-                image_url = self._upload_image(
+                image_url = await self._upload_image(
                     image_data, "image/png", model, prompt, __user__, __request__
                 )
+                if not image_url:
+                    return
                 return f"![Generated Image]({image_url})"
             else:
                 return f"![Generated Image](data:image/png;base64,{base64_image})"
 
-        log.error("Image generation failed.")
-
-        total_time = time.time() - start_time
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": f"Image generation failed after {total_time:.2f}s",
-                    "done": True,
-                    "hidden": False,
-                },
-            }
-        )
-        return "Error: Failed to generate image"
-
     """Helper functions inside the Pipe class."""
 
-    def _get_models(self) -> list[dict[str, Any]]:
+    def _get_models(self) -> list[ModelData]:
         try:
             response = requests.get(
                 "https://api.venice.ai/api/v1/models?type=image",
                 headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},
             )
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-            return response.json().get("data", [])
+            response.raise_for_status()
+            raw_models = response.json().get("data", [])
+            if not raw_models:
+                log.warning("Venice API returned no models.")
+            return [{"id": model["id"], "name": model["id"]} for model in raw_models]
         except requests.exceptions.RequestException:
             error_msg = "Error getting models:"
             log.exception(error_msg)
-            return []
-        except Exception:
-            error_msg = "An unexpected error occurred:"
+            return [_return_error_model(error_msg)]
+        except Exception as e:
+            error_msg = "An unexpected error occurred: "
             log.exception(error_msg)
-            return []
+            return [_return_error_model(error_msg + str(e))]
 
     async def _generate_image(self, model: str, prompt: str) -> dict | None:
         try:
@@ -260,16 +287,16 @@ class Pipe:
                     response.raise_for_status()
                     return await response.json()
 
-        except aiohttp.ClientResponseError:
-            error_msg = "Image generation failed:"
-            log.exception(error_msg)
-            return None
-        except Exception:
-            error_msg = "Generation error:"
-            log.exception(error_msg)
-            return None
+        except aiohttp.ClientResponseError as e:
+            error_msg = f"Image generation failed: {str(e)}"
+            await self._emit_error(error_msg)
+            return
+        except Exception as e:
+            error_msg = f"Generation error: {str(e)}"
+            await self._emit_error(error_msg)
+            return
 
-    def _upload_image(
+    async def _upload_image(
         self,
         image_data: bytes,
         mime_type: str,
@@ -277,7 +304,7 @@ class Pipe:
         prompt: str,
         __user__: UserData,
         __request__: Request,
-    ) -> str:
+    ) -> str | None:
 
         # Create metadata for the image
         image_metadata = {
@@ -288,7 +315,9 @@ class Pipe:
         # Get the *full* user object from the database
         user = Users.get_user_by_id(__user__["id"])
         if user is None:
-            return "Error: User not found"
+            error_msg = "User not found."
+            await self._emit_error(error_msg, exception=False)
+            return
 
         # Upload the image using the imported function
         image_url: str = upload_image(
@@ -330,3 +359,32 @@ class Pipe:
         log.info(
             f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
         )
+
+    async def _emit_error(
+        self, error_msg: str, warning: bool = False, exception: bool = True
+    ) -> None:
+        """Emits an event to the front-end that causes it to display a nice red error message."""
+        error = ChatCompletionEvent(
+            type="chat:completion",
+            data=ChatCompletionEventData(
+                content=None,
+                done=True,
+                error=ErrorData(detail="\n" + error_msg),
+            ),
+        )
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        await self.__event_emitter__(error)
+
+
+"""Helper functions outside the Pipe class."""
+
+
+def _return_error_model(error_msg: str) -> ModelData:
+    """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+    return {
+        "id": "error",
+        "name": "[venice_manifold] " + error_msg,
+    }

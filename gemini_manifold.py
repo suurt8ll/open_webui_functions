@@ -44,6 +44,8 @@ from typing import (
     Any,
     AsyncGenerator,
     AsyncIterator,
+    Awaitable,
+    Callable,
     Generator,
     Iterator,
     Literal,
@@ -78,12 +80,38 @@ SEARCH_MODEL_SUFFIX = "++SEARCH"
 
 
 class UserData(TypedDict):
+    """This is how `__user__` `dict` looks like."""
+
     id: str
     email: str
     name: str
     role: Literal["admin", "user", "pending"]
     valves: NotRequired[Any]  # object of type UserValves
 
+
+class ModelData(TypedDict):
+    """This is how the `pipes` function expects the `dict` to look like."""
+
+    id: str
+    name: str
+
+
+class ErrorData(TypedDict):
+    detail: str
+
+
+class ChatCompletionEventData(TypedDict):
+    content: Optional[str]
+    done: bool
+    error: NotRequired[ErrorData]
+
+
+class ChatCompletionEvent(TypedDict):
+    type: Literal["chat:completion"]
+    data: ChatCompletionEventData
+
+
+Event = ChatCompletionEvent
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
 log = logger.bind(auditable=False)
@@ -131,66 +159,68 @@ class Pipe:
         self.last_whitelist = self.valves.MODEL_WHITELIST
         self.models = []
         self.client = None
+        print("[gemini_manifold] Function has been initialized!")
 
     # FIXME Make it async
-    def pipes(self) -> list[dict]:
+    def pipes(self) -> list[ModelData]:
         """Register all available Google models."""
-        self._add_log_handler()
-        # FIXME Don't wrap everything like that with try block.
-        try:
-            if not self.valves.GEMINI_API_KEY:
-                raise ValueError("GEMINI_API_KEY is not set.")
 
-            # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
-            if not self.client:
-                http_options = types.HttpOptions(base_url=self.valves.GEMINI_API_BASE_URL)
+        self._add_log_handler()
+
+        # Return existing models if all conditions are met
+        if (
+            self.models
+            and self.valves.CACHE_MODELS
+            and self.last_whitelist == self.valves.MODEL_WHITELIST
+        ):
+            log.info("Models are already initialized. Returning the cached list.")
+            return self.models
+
+        if not self.valves.GEMINI_API_KEY:
+            error_msg = "GEMINI_API_KEY is not set."
+            return [_return_error_model(error_msg, exception=False)]
+
+        # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
+        if not self.client:
+            http_options = types.HttpOptions(base_url=self.valves.GEMINI_API_BASE_URL)
+            try:
                 self.client = genai.Client(
                     api_key=self.valves.GEMINI_API_KEY,
                     http_options=http_options,
                 )
-            else:
-                log.info("Client already initialized.")
+            except Exception as e:
+                error_msg = f"genai client initalization failed: {str(e)}"
+                return [_return_error_model(error_msg)]
+        else:
+            log.info("Client already initialized.")
 
-            # Return existing models if all conditions are met
-            if (
-                self.models
-                and self.valves.CACHE_MODELS
-                and self.last_whitelist == self.valves.MODEL_WHITELIST
-            ):
-                log.info("Models already initialized.")
-                return self.models
+        self.last_whitelist = self.valves.MODEL_WHITELIST
 
-            self.last_whitelist = self.valves.MODEL_WHITELIST
+        # Get and process new models, errors are handler inside the method.
+        models = self._get_google_models()
+        log.debug("Registered models:", data=models)
 
-            # Get and process new models
-            models = self._get_google_models()
-
-            # Handle error cases
-            if models and models[0].get("id") in ["error", "no_models_found"]:
-                return models
-
-            log.debug("Registered models:", data=models)
-            self.models = models
-            return (
-                models
-                if models
-                else [{"id": "no_models", "name": "No models available"}]
-            )
-
-        except Exception as e:
-            error_msg = "Error in pipes method:"
-            log.exception(error_msg)
-            return [{"id": "error", "name": f"Error initializing models: {e}"}]
+        self.models = models
+        return models
 
     async def pipe(
         self,
         body: dict,
         __user__: UserData,
         __request__: Request,
+        __event_emitter__: Callable[[Event], Awaitable[None]],
+        __metadata__: dict[str, Any],
     ) -> (
-        str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
+        str
+        | dict[str, Any]
+        | StreamingResponse
+        | Iterator
+        | AsyncGenerator
+        | Generator
+        | None
     ):
         """Helper functions inside the pipe() method"""
+        # FIXME: Move all of these into Pipe class for cleaner look.
 
         def _pop_system_prompt(
             messages: list[dict],
@@ -361,10 +391,6 @@ class Pipe:
             messages: list[dict],
         ) -> list[types.Content]:
             """Transforms messages to google-genai contents, supporting text and images."""
-            if not genai or not types:
-                raise ValueError(
-                    "google-genai is not installed. Please install it to proceed."
-                )
 
             contents: list[types.Content] = []
 
@@ -408,8 +434,6 @@ class Pipe:
             )
 
             async for chunk in response_stream:
-                if self.valves.LOG_LEVEL == "DEBUG":
-                    print(chunk.text, end="")
                 if chunk.candidates:
                     if len(chunk.candidates) > 1:
                         log.warning(
@@ -449,6 +473,19 @@ class Pipe:
 
         """Main pipe method."""
 
+        self.__event_emitter__ = __event_emitter__
+
+        if not self.client:
+            error_msg = "genai client is not initialized."
+            await self._emit_error(error_msg, exception=False)
+            return
+
+        # TODO Contruct a type for `__metadata__`.
+        if "error" in __metadata__["model"]["id"]:
+            error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
+            await self._emit_error(error_msg, exception=False)
+            return
+
         messages = body.get("messages", [])
         system_prompt, remaining_messages = _pop_system_prompt(messages)
         contents = _transform_messages_to_contents(remaining_messages)
@@ -458,24 +495,18 @@ class Pipe:
             "Received body:", body=str(self.truncate_long_strings(body.copy(), max_len))
         )
         log.debug(f"System prompt: {system_prompt}")
+        turn_content_dict_list: list[dict] = []
         for content in contents:
             truncated_content = self.truncate_long_strings(
                 content.model_dump().copy(), max_len
             )
-            # FIXME log this better.
-            log.debug(
-                "google.genai.types.Content object:", content=str(truncated_content)
-            )
+            turn_content_dict_list.append(truncated_content)
+        log.debug(
+            "list[google.genai.types.Content] object that will be given to the Gemini API:",
+            content_list=str(turn_content_dict_list),
+        )
 
         model_name = self._strip_prefix(body.get("model", ""))
-        if model_name in [
-            "no_models_found",
-            "error",
-            "version_error",
-            "no_models",
-            "import_error",
-        ]:
-            return f"Error: {model_name.replace('_', ' ')}"
         log.debug(f"Model name: {model_name}")
 
         config_params = {
@@ -488,14 +519,15 @@ class Pipe:
             "safety_settings": self._get_safety_settings(model_name),
         }
 
+        # FIXME: refac
         if "gemini-2.0-flash-exp-image-generation" in model_name:
             config_params["response_modalities"] = ["Text", "Image"]
             # Image Generation model does not support the system prompt message
-            # FIXME log only when system prompt is actually present.
-            log.warning(
-                "Image Generation model does not support the system prompt message! Removing the system prompt."
-            )
-            del config_params["system_instruction"]
+            if config_params.get("system_instruction"):
+                log.warning(
+                    "Image Generation model does not support the system prompt message! Removing the system prompt."
+                )
+                del config_params["system_instruction"]
         else:
             config_params["response_modalities"] = ["Text"]
 
@@ -517,7 +549,7 @@ class Pipe:
                         types.Tool(google_search=types.GoogleSearch())
                     ]
             else:
-                print(f"[pipe] model {model_name} doesn't support grounding search")
+                log.debug(f"Model {model_name} doesn't support grounding search.")
 
         config = types.GenerateContentConfig(**config_params)
 
@@ -528,26 +560,27 @@ class Pipe:
         }
 
         try:
+            # TODO: Handle errors related to Google Safety Settings feature.
             if body.get("stream", False):
                 return _process_stream(gen_content_args, __request__, __user__)
-            else:  # streaming is disabled
-                if not self.client:
-                    return "Error: Client not initialized."
-                # FIXME Make it async.
-                # FIXME Support native image gen here too.
+            else:
                 if "gemini-2.0-flash-exp-image-generation" in model_name:
-                    log.warning(
-                        "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
-                    )
-                    return "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
+                    warn_msg = "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
+                    await self._emit_error(warn_msg, warning=True)
+                    return None
+                # FIXME: Make it async.
+                # FIXME: Support native image gen here too.
                 response = self.client.models.generate_content(**gen_content_args)
-                response_text = response.text if response.text else "No response text."
-                return response_text
+                if not response.text:
+                    warn_msg = "Non-stremaing response did not have any text inside it."
+                    await self._emit_error(warn_msg, warning=True)
+                    return None
+                return response.text
 
         except Exception as e:
-            error_msg = f"Content generation error:"
-            log.exception(error_msg)
-            return error_msg + " " + str(e)
+            error_msg = f"Content generation error: {str(e)}"
+            await self._emit_error(error_msg)
+            return None
 
     """Helper functions inside the Pipe class."""
 
@@ -581,75 +614,61 @@ class Pipe:
             f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
         )
 
-    def _get_google_models(self):
+    def _get_google_models(self) -> list[ModelData]:
         """Retrieve Google models with prefix stripping."""
 
-        # Check if client is initialized and return error if not.
-        # FIXME Use raise.
         if not self.client:
-            log.error("Client not initialized.")
-            return [
-                {
-                    "id": "error",
-                    "name": "Client not initialized. Please check the logs.",
-                }
-            ]
+            log.error("Client is not initialized.")
+            return []
+
+        whitelist = (
+            self.valves.MODEL_WHITELIST.replace(" ", "").split(",")
+            if self.valves.MODEL_WHITELIST
+            else ["*"]
+        )
 
         try:
-            whitelist = (
-                self.valves.MODEL_WHITELIST.replace(" ", "").split(",")
-                if self.valves.MODEL_WHITELIST
-                else ["*"]
-            )
             models = self.client.models.list(config={"query_base": True})
-            log.info(
-                f"[get_google_models] Retrieved {len(models)} models from Gemini Developer API."
+        except Exception as e:
+            error_msg = f"Error retrieving models: {str(e)}"
+            return [_return_error_model(error_msg)]
+        log.info(f"Retrieved {len(models)} models from Gemini Developer API.")
+
+        model_list = [
+            ModelData(
+                id=self._strip_prefix(model.name),
+                name=model.display_name,
             )
-            model_list = [
-                {
-                    "id": self._strip_prefix(model.name),
-                    "name": model.display_name,
-                }
-                for model in models
-                if model.name
+            for model in models
+            if (
+                model.name is not None  # Ensure name is present
+                and model.display_name is not None  # Ensure display_name is present
                 and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
-                if model.supported_actions
+                and model.supported_actions
                 and "generateContent" in model.supported_actions
-                if model.name and model.name.startswith("models/")
-            ]
+                and model.name.startswith("models/")
+            )
+        ]
 
-            if not model_list:
-                log.warning("No models found matching whitelist.")
-                return [
-                    {
-                        "id": "no_models_found",
-                        "name": "No models found matching whitelist.",
-                    }
-                ]
+        if not model_list:
+            log.warning("No models found matching whitelist.")
+            return []
 
-            # Add synthesis model id which support search if grounding search is enabled.
-            if not self.valves.USE_GROUNDING_SEARCH:
-                return model_list
-            for original_model in model_list:
-                if original_model["id"] in ALLOWED_GROUNDING_MODELS:
-                    model_list.append(
-                        {
-                            "id": original_model["id"] + SEARCH_MODEL_SUFFIX,
-                            "name": original_model["name"] + " with Search",
-                        }
-                    )
-
+        # Add synthesis model id which support search if grounding search is enabled.
+        # TODO Add this logic into the previous `model_list` construction logic? We are already looping over models there.
+        if not self.valves.USE_GROUNDING_SEARCH:
             return model_list
-        except Exception:
-            error_msg = "Error retrieving models:"
-            log.exception(error_msg)
-            return [
-                {
-                    "id": "error",
-                    "name": "Error retrieving models. Please check the logs.",
-                }
-            ]
-    
+        for original_model in model_list:
+            if original_model["id"] in ALLOWED_GROUNDING_MODELS:
+                model_list.append(
+                    {
+                        "id": original_model["id"] + SEARCH_MODEL_SUFFIX,
+                        "name": original_model["name"] + " with Search",
+                    }
+                )
+
+        return model_list
+
     def _get_safety_settings(self, model_name: str):
         """Get safety settings based on model name and permissive setting."""
 
@@ -676,9 +695,7 @@ class Pipe:
             "gemini-1.0-pro-001",
         ]:
             for category in category_threshold_map:
-                category_threshold_map[category] = (
-                    types.HarmBlockThreshold.BLOCK_NONE
-                )
+                category_threshold_map[category] = types.HarmBlockThreshold.BLOCK_NONE
 
         # Gemini 2.0 Flash supports CIVIC_INTEGRITY OFF
         if model_name in [
@@ -686,18 +703,19 @@ class Pipe:
             "gemini-2.0-flash-001",
             "gemini-2.0-flash-exp",
         ]:
-            category_threshold_map[
-                types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY
-            ] = types.HarmBlockThreshold.OFF
+            category_threshold_map[types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY] = (
+                types.HarmBlockThreshold.OFF
+            )
 
-        log.debug(f"Safety settings: {str({k.value: v.value for k, v in category_threshold_map.items()})}")
+        log.debug(
+            f"Safety settings: {str({k.value: v.value for k, v in category_threshold_map.items()})}"
+        )
 
         safety_settings = [
             types.SafetySetting(category=category, threshold=threshold)
             for category, threshold in category_threshold_map.items()
         ]
         return safety_settings
-
 
     def _strip_prefix(self, model_name: str) -> str:
         """
@@ -755,6 +773,8 @@ class Pipe:
         __request__: Request,
     ) -> str:
 
+        # FIXME: Handle potental errors.
+
         # Create metadata for the image
         image_metadata = {
             "model": model,
@@ -776,3 +796,35 @@ class Pipe:
         )
         log.info("Image uploaded.", image_url=image_url)
         return image_url
+
+    async def _emit_error(
+        self, error_msg: str, warning: bool = False, exception: bool = True
+    ) -> None:
+        """Emits an event to the front-end that causes it to display a nice red error message."""
+        error = ChatCompletionEvent(
+            type="chat:completion",
+            data=ChatCompletionEventData(
+                content=None,
+                done=True,
+                error=ErrorData(detail="\n" + error_msg),
+            ),
+        )
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        await self.__event_emitter__(error)
+
+
+def _return_error_model(
+    error_msg: str, warning: bool = False, exception: bool = True
+) -> ModelData:
+    """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+    if warning:
+        log.opt(depth=1, exception=False).warning(error_msg)
+    else:
+        log.opt(depth=1, exception=exception).error(error_msg)
+    return {
+        "id": "error",
+        "name": "[gemini_manifold] " + error_msg,
+    }
