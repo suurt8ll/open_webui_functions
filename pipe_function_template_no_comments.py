@@ -156,6 +156,7 @@ class Pipe:
             log.info("Detected tag generation task!")
             return '{"tags": ["tag1", "tag2", "tag3"]}'
 
+        # FIXME: Move the countdown example to a separate status emission example file.
         async def countdown():
             for i in range(5, 0, -1):
                 status_count: StatusEvent = {
@@ -207,12 +208,11 @@ class Pipe:
             data=str(all_params),
         )
 
+        # FIXME: Move error handling examples to a separate function.
         try:
-            k = True
-            # raise Exception("NameError, this is a test.")
-        except Exception:
-            error_msg = "Error happened inside the pipe function."
-            log.exception(error_msg)
+            raise Exception("NameError, this is a test.")
+        except Exception as e:
+            error_msg = f"Error happened inside the pipe function: {str(e)}"
             await self._emit_error(error_msg)
             return
 
@@ -250,7 +250,9 @@ class Pipe:
             f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
         )
 
-    async def _emit_error(self, error_msg: str) -> None:
+    async def _emit_error(
+        self, error_msg: str, warning: bool = False, exception: bool = True
+    ) -> None:
         """Emits an event to the front-end that causes it to display a nice red error message."""
         error = ChatCompletionEvent(
             type="chat:completion",
@@ -260,6 +262,10 @@ class Pipe:
                 error=ErrorData(detail="\n" + error_msg),
             ),
         )
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
         await self.__event_emitter__(error)
 
 
@@ -267,5 +273,5 @@ def _return_error_model(error_msg: str) -> ModelData:
     """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
     return ModelData(
         id="error",
-        name="[pipe_function_template_no_comments] " + error_msg,
+        name="[pipe_function_template] " + error_msg,
     )

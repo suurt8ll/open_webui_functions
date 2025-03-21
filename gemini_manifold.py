@@ -453,15 +453,13 @@ class Pipe:
 
         if not self.client:
             error_msg = "genai client is not initialized."
-            log.error(error_msg)
-            await self._emit_error(error_msg)
+            await self._emit_error(error_msg, exception=False)
             return
 
         # TODO Contruct a type for `__metadata__`.
         if "error" in __metadata__["model"]["id"]:
             error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
-            log.exception(error_msg)
-            await self._emit_error(error_msg)
+            await self._emit_error(error_msg, exception=False)
             return
 
         messages = body.get("messages", [])
@@ -540,23 +538,20 @@ class Pipe:
             else:
                 if "gemini-2.0-flash-exp-image-generation" in model_name:
                     warn_msg = "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
-                    log.warning(warn_msg)
-                    await self._emit_error(warn_msg)
+                    await self._emit_error(warn_msg, warning=True)
                     return None
                 # FIXME: Make it async.
                 # FIXME: Support native image gen here too.
                 response = self.client.models.generate_content(**gen_content_args)
                 if not response.text:
                     warn_msg = "Non-stremaing response did not have any text inside it."
-                    log.warning(warn_msg)
-                    await self._emit_error(warn_msg)
+                    await self._emit_error(warn_msg, warning=True)
                     return None
                 return response.text
 
         except Exception as e:
-            error_msg = "Content generation error: "
-            log.exception(error_msg)
-            await self._emit_error(error_msg + str(e))
+            error_msg = f"Content generation error: {str(e)}"
+            await self._emit_error(error_msg)
             return None
 
     """Helper functions inside the Pipe class."""
@@ -727,17 +722,22 @@ class Pipe:
         log.info("Image uploaded.", image_url=image_url)
         return image_url
 
-    async def _emit_error(self, error_msg: str) -> None:
+    async def _emit_error(
+        self, error_msg: str, warning: bool = False, exception: bool = True
+    ) -> None:
         """Emits an event to the front-end that causes it to display a nice red error message."""
-        error: ChatCompletionEvent = {
-            "type": "chat:completion",
-            "data": {
-                "content": None,
-                "done": True,
-                "error": {"detail": "\n" + error_msg},
-            },
-        }
-        # FIXME: use log.debug, .info, .warning etc. here too? In a way that somehow preserves the correct log location and trace.
+        error = ChatCompletionEvent(
+            type="chat:completion",
+            data=ChatCompletionEventData(
+                content=None,
+                done=True,
+                error=ErrorData(detail="\n" + error_msg),
+            ),
+        )
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
         await self.__event_emitter__(error)
 
 

@@ -138,14 +138,12 @@ class Pipe:
 
         if "error" in __metadata__["model"]["id"]:
             error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
-            log.error(error_msg)
-            await self._emit_error(error_msg)
+            await self._emit_error(error_msg, exception=False)
             return
 
         if not self.valves.VENICE_API_TOKEN:
             error_msg = "Missing VENICE_API_TOKEN in valves configuration."
-            log.error(error_msg)
-            await self._emit_error(error_msg)
+            await self._emit_error(error_msg, exception=False)
             return
 
         model = body.get("model", "").split(".", 1)[-1]
@@ -160,8 +158,7 @@ class Pipe:
 
         if not prompt:
             error_msg = "No prompt found in user message."
-            log.error(error_msg)
-            await self._emit_error(error_msg)
+            await self._emit_error(error_msg, exception=False)
             return
 
         # FIXME move these to the beginning.
@@ -291,13 +288,11 @@ class Pipe:
                     return await response.json()
 
         except aiohttp.ClientResponseError as e:
-            error_msg = "Image generation failed: "
-            log.exception(error_msg)
-            await self._emit_error(error_msg + str(e))
+            error_msg = f"Image generation failed: {str(e)}"
+            await self._emit_error(error_msg)
             return
         except Exception as e:
-            error_msg = "Generation error: " + str(e)
-            log.exception(error_msg)
+            error_msg = f"Generation error: {str(e)}"
             await self._emit_error(error_msg)
             return
 
@@ -321,8 +316,7 @@ class Pipe:
         user = Users.get_user_by_id(__user__["id"])
         if user is None:
             error_msg = "User not found."
-            log.error(error_msg)
-            await self._emit_error(error_msg)
+            await self._emit_error(error_msg, exception=False)
             return
 
         # Upload the image using the imported function
@@ -366,16 +360,22 @@ class Pipe:
             f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
         )
 
-    async def _emit_error(self, error_msg: str) -> None:
+    async def _emit_error(
+        self, error_msg: str, warning: bool = False, exception: bool = True
+    ) -> None:
         """Emits an event to the front-end that causes it to display a nice red error message."""
-        error: ChatCompletionEvent = {
-            "type": "chat:completion",
-            "data": {
-                "content": None,
-                "done": True,
-                "error": {"detail": "\n" + error_msg},
-            },
-        }
+        error = ChatCompletionEvent(
+            type="chat:completion",
+            data=ChatCompletionEventData(
+                content=None,
+                done=True,
+                error=ErrorData(detail="\n" + error_msg),
+            ),
+        )
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
         await self.__event_emitter__(error)
 
 
