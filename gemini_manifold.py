@@ -172,7 +172,7 @@ class Pipe:
             log.info("Models are already initialized.")
             return self.models
 
-        # Get and process new models
+        # Get and process new models, errors are handler inside the method.
         models = self._get_google_models()
         log.debug("Registered models:", data=models)
 
@@ -471,14 +471,16 @@ class Pipe:
             "Received body:", body=str(self.truncate_long_strings(body.copy(), max_len))
         )
         log.debug(f"System prompt: {system_prompt}")
+        turn_content_dict_list: list[dict] = []
         for content in contents:
             truncated_content = self.truncate_long_strings(
                 content.model_dump().copy(), max_len
             )
-            # FIXME log this better.
-            log.debug(
-                "google.genai.types.Content object:", content=str(truncated_content)
-            )
+            turn_content_dict_list.append(truncated_content)
+        log.debug(
+            "list[google.genai.types.Content] object that will be given to the Gemini API:",
+            content_list=str(turn_content_dict_list),
+        )
 
         model_name = self._strip_prefix(body.get("model", ""))
         log.debug(f"Model name: {model_name}")
@@ -533,6 +535,7 @@ class Pipe:
         }
 
         try:
+            # TODO: Handle errors related to Google Safety Settings feature.
             if body.get("stream", False):
                 return _process_stream(gen_content_args, __request__, __user__)
             else:
