@@ -185,6 +185,7 @@ class Pipe:
         __user__: UserData,
         __request__: Request,
         __event_emitter__: Callable[[Event], Awaitable[None]],
+        __metadata__: dict[str, Any],
     ) -> (
         str
         | dict[str, Any]
@@ -195,6 +196,7 @@ class Pipe:
         | None
     ):
         """Helper functions inside the pipe() method"""
+        # FIXME: Move all of these into Pipe class for cleaner look.
 
         def _pop_system_prompt(
             messages: list[dict],
@@ -365,10 +367,6 @@ class Pipe:
             messages: list[dict],
         ) -> list[types.Content]:
             """Transforms messages to google-genai contents, supporting text and images."""
-            if not genai or not types:
-                raise ValueError(
-                    "google-genai is not installed. Please install it to proceed."
-                )
 
             contents: list[types.Content] = []
 
@@ -412,8 +410,6 @@ class Pipe:
             )
 
             async for chunk in response_stream:
-                if self.valves.LOG_LEVEL == "DEBUG":
-                    print(chunk.text, end="")
                 if chunk.candidates:
                     if len(chunk.candidates) > 1:
                         log.warning(
@@ -455,6 +451,19 @@ class Pipe:
 
         self.__event_emitter__ = __event_emitter__
 
+        if not self.client:
+            error_msg = "genai client is not initialized."
+            log.error(error_msg)
+            await self._emit_error(error_msg)
+            return
+
+        # TODO Contruct a type for `__metadata__`.
+        if "error" in __metadata__["model"]["id"]:
+            error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
+            log.exception(error_msg)
+            await self._emit_error(error_msg)
+            return
+
         messages = body.get("messages", [])
         system_prompt, remaining_messages = _pop_system_prompt(messages)
         contents = _transform_messages_to_contents(remaining_messages)
@@ -474,14 +483,6 @@ class Pipe:
             )
 
         model_name = self._strip_prefix(body.get("model", ""))
-        if model_name in [
-            "no_models_found",
-            "error",
-            "version_error",
-            "no_models",
-            "import_error",
-        ]:
-            return f"Error: {model_name.replace('_', ' ')}"
         log.debug(f"Model name: {model_name}")
 
         config_params = {
@@ -493,14 +494,15 @@ class Pipe:
             "stop_sequences": body.get("stop", []),
         }
 
+        # FIXME: refac
         if "gemini-2.0-flash-exp-image-generation" in model_name:
             config_params["response_modalities"] = ["Text", "Image"]
             # Image Generation model does not support the system prompt message
-            # FIXME log only when system prompt is actually present.
-            log.warning(
-                "Image Generation model does not support the system prompt message! Removing the system prompt."
-            )
-            del config_params["system_instruction"]
+            if config_params.get("system_instruction"):
+                log.warning(
+                    "Image Generation model does not support the system prompt message! Removing the system prompt."
+                )
+                del config_params["system_instruction"]
         else:
             config_params["response_modalities"] = ["Text"]
 
@@ -522,7 +524,7 @@ class Pipe:
                         types.Tool(google_search=types.GoogleSearch())
                     ]
             else:
-                print(f"[pipe] model {model_name} doesn't support grounding search")
+                log.debug(f"Model {model_name} doesn't support grounding search.")
 
         config = types.GenerateContentConfig(**config_params)
 
@@ -535,24 +537,27 @@ class Pipe:
         try:
             if body.get("stream", False):
                 return _process_stream(gen_content_args, __request__, __user__)
-            else:  # streaming is disabled
-                if not self.client:
-                    return "Error: Client not initialized."
-                # FIXME Make it async.
-                # FIXME Support native image gen here too.
+            else:
                 if "gemini-2.0-flash-exp-image-generation" in model_name:
-                    log.warning(
-                        "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
-                    )
-                    return "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
+                    warn_msg = "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
+                    log.warning(warn_msg)
+                    await self._emit_error(warn_msg)
+                    return None
+                # FIXME: Make it async.
+                # FIXME: Support native image gen here too.
                 response = self.client.models.generate_content(**gen_content_args)
-                response_text = response.text if response.text else "No response text."
-                return response_text
+                if not response.text:
+                    warn_msg = "Non-stremaing response did not have any text inside it."
+                    log.warning(warn_msg)
+                    await self._emit_error(warn_msg)
+                    return None
+                return response.text
 
         except Exception as e:
-            error_msg = f"Content generation error:"
+            error_msg = "Content generation error: "
             log.exception(error_msg)
-            return error_msg + " " + str(e)
+            await self._emit_error(error_msg + str(e))
+            return None
 
     """Helper functions inside the Pipe class."""
 
@@ -698,6 +703,8 @@ class Pipe:
         __request__: Request,
     ) -> str:
 
+        # FIXME: Handle potental errors.
+
         # Create metadata for the image
         image_metadata = {
             "model": model,
@@ -730,6 +737,7 @@ class Pipe:
                 "error": {"detail": "\n" + error_msg},
             },
         }
+        # FIXME: use log.debug, .info, .warning etc. here too? In a way that somehow preserves the correct log location and trace.
         await self.__event_emitter__(error)
 
 
@@ -737,5 +745,5 @@ def _return_error_model(error_msg: str) -> ModelData:
     """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
     return {
         "id": "error",
-        "name": "[pipe_function_template_no_comments] " + error_msg,
+        "name": "[gemini_manifold] " + error_msg,
     }
