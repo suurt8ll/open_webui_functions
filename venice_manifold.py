@@ -6,14 +6,16 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.8.0
+version: 0.9.0
 """
 
 # NB! This is work in progress and not yet fully featured.
 # Feel free to contribute to the development of this function in my GitHub repository!
 # Currently it takes the last user message as prompt and generates an image using the selected model and returns it as a markdown image.
 
-# TODO Use another LLM model to generate the image prompt?
+# TODO: Use another LLM model to generate the image prompt?
+# TODO: Negative prompts
+# TODO: Upscaling
 
 import asyncio
 import sys
