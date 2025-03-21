@@ -167,29 +167,30 @@ class Pipe:
 
         self._add_log_handler()
 
-        if not self.valves.GEMINI_API_KEY:
-            raise ValueError("GEMINI_API_KEY is not set.")
-
-        # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
-        # TODO Allow user to choose if they want to fetch models only during function initialization or every time pipes is called.
-        if not self.client:
-            http_options = types.HttpOptions(base_url=self.valves.GEMINI_API_BASE_URL)
-            self.client = genai.Client(
-                api_key=self.valves.GEMINI_API_KEY,
-                http_options=http_options,
-            )
-        else:
-            log.info("Client already initialized.")
-
-        # FIXME this should be the very first check inside pipes method.
         # Return existing models if all conditions are met
         if (
             self.models
             and self.valves.CACHE_MODELS
             and self.last_whitelist == self.valves.MODEL_WHITELIST
         ):
-            log.info("Models are already initialized.")
+            log.info("Models are already initialized. Returning the cached list.")
             return self.models
+
+        if not self.valves.GEMINI_API_KEY:
+            error_msg = "GEMINI_API_KEY is not set."
+            log.error(error_msg)
+            return [_return_error_model(error_msg)]
+
+        # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
+        if not self.client:
+            http_options = types.HttpOptions(base_url=self.valves.GEMINI_API_BASE_URL)
+            # FIXME: This could error, handler it.
+            self.client = genai.Client(
+                api_key=self.valves.GEMINI_API_KEY,
+                http_options=http_options,
+            )
+        else:
+            log.info("Client already initialized.")
 
         self.last_whitelist = self.valves.MODEL_WHITELIST
 
