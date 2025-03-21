@@ -90,11 +90,14 @@ class Pipe:
 
         sources: list[Source] = [
             {
-                "source": {"name": "sigma"},
-                "document": ["Sigma sigma boy sigma boy.", "sigma boy brainrot"],
+                "source": {"name": "Example Sources"},
+                "document": [
+                    "This is an example document coming from source1.",
+                    "This is another example document coming from source2.",
+                ],
                 "metadata": [
-                    {"source": "https://en.wikipedia.org/wiki/Sigma_Boy"},
-                    {"source": "https://en.wikipedia.org/wiki/Brain_rot"},
+                    {"source": "https://example1.com/source1"},
+                    {"source": "https://subdomain.example2.com/source2"},
                 ],
             }
         ]
@@ -102,7 +105,7 @@ class Pipe:
         sources_test: ChatCompletionEvent = {
             "type": "chat:completion",
             "data": {
-                "content": "This is a heartmoving song [0].",
+                "content": "This is an example response [0][1].",
                 "done": True,
                 "sources": sources,
             },
