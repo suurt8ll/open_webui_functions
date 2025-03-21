@@ -421,7 +421,7 @@ class Pipe:
 
         async def _stream_response(
             gen_content_args: dict, __request__: Request, __user__: UserData
-        ) -> list[types.GenerateContentResponse]:
+        ) -> Tuple[list[types.GenerateContentResponse], str]:
             """Streams the resposne to the front-end using `__event_emitter__` and finally returns the full aggregated response."""
             # FIXME: Too much repeating code, refac somewhere in the distant future lol.
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
@@ -477,7 +477,7 @@ class Pipe:
                                 data=ChatCompletionEventData(content=content),
                             )
                             await __event_emitter__(emission)
-            return aggregated_chunks
+            return aggregated_chunks, content
 
         """Main pipe method."""
 
@@ -571,7 +571,10 @@ class Pipe:
         try:
             # TODO: Handle errors related to Google Safety Settings feature.
             if body.get("stream", False):
-                res = await _stream_response(gen_content_args, __request__, __user__)
+                res, raw_text = await _stream_response(
+                    gen_content_args, __request__, __user__
+                )
+                cited_text = None
                 for chunk in res:
                     print(
                         json.dumps(
@@ -581,6 +584,17 @@ class Pipe:
                         )
                         + ","
                     )
+                    text_w_citations = _add_citations(chunk.model_dump(), raw_text)
+                    if text_w_citations:
+                        cited_text = text_w_citations
+                print(raw_text)
+                if cited_text:
+                    print(cited_text)
+                    emit_w_sources: ChatCompletionEvent = {
+                        "type": "chat:completion",
+                        "data": {"content": cited_text, "done": True},
+                    }
+                    await __event_emitter__(emit_w_sources)
                 return None
             else:
                 if "gemini-2.0-flash-exp-image-generation" in model_name:
@@ -836,6 +850,23 @@ class Pipe:
         else:
             log.opt(depth=1, exception=exception).error(error_msg)
         await self.__event_emitter__(error)
+
+
+def _add_citations(data: dict, raw_str: str) -> str | None:
+    # Check if grounding_metadata exists
+    if not data["candidates"][0].get("grounding_metadata"):
+        return None
+
+    supports = data["candidates"][0]["grounding_metadata"]["grounding_supports"]
+    for support in supports:
+        text = support["segment"]["text"]
+        start = raw_str.find(text)
+        if start != -1:
+            end_pos = start + len(text)  # Right end position
+            grounding_chunk_indices = support["grounding_chunk_indices"]
+            indices_str = "".join(f"[{index}]" for index in grounding_chunk_indices)
+            raw_str = raw_str[:end_pos] + indices_str + raw_str[end_pos:]
+    return raw_str
 
 
 def _return_error_model(
