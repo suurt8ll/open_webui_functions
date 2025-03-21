@@ -15,8 +15,7 @@ fi
 # Change to the target directory
 cd "$TARGET_DIR" || { echo "Failed to cd into '$TARGET_DIR'"; exit 1; }
 
-# Source the nvm initialization script
-source /usr/share/nvm/init-nvm.sh || { echo "Failed to source nvm init script"; exit 1; }
+# TODO check if Node version is correct.
 
 # Check if npm install is needed
 needs_install=false
