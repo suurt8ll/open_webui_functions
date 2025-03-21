@@ -178,8 +178,7 @@ class Pipe:
 
         if not self.valves.GEMINI_API_KEY:
             error_msg = "GEMINI_API_KEY is not set."
-            log.error(error_msg)
-            return [_return_error_model(error_msg)]
+            return [_return_error_model(error_msg, exception=False)]
 
         # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
         if not self.client:
@@ -631,9 +630,8 @@ class Pipe:
         try:
             models = self.client.models.list(config={"query_base": True})
         except Exception as e:
-            error_msg = "Error retrieving models:"
-            log.exception(error_msg)
-            return [_return_error_model(error_msg + str(e))]
+            error_msg = f"Error retrieving models: {str(e)}"
+            return [_return_error_model(error_msg)]
         log.info(f"Retrieved {len(models)} models from Gemini Developer API.")
 
         model_list = [
@@ -818,9 +816,14 @@ class Pipe:
         await self.__event_emitter__(error)
 
 
-def _return_error_model(error_msg: str) -> ModelData:
+def _return_error_model(
+    error_msg: str, warning: bool = False, exception: bool = True
+) -> ModelData:
     """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
-    # FIXME put log. methods here too.
+    if warning:
+        log.opt(depth=1, exception=False).warning(error_msg)
+    else:
+        log.opt(depth=1, exception=exception).error(error_msg)
     return {
         "id": "error",
         "name": "[gemini_manifold] " + error_msg,
