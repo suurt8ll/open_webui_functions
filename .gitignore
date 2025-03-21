@@ -1,5 +1,5 @@
 .env
 .venv/
-docs/
-open_webui
 .vscode/
+
+docs/

@@ -11,6 +11,7 @@ requirements:
 """
 
 import asyncio
+import sys
 from typing import (
     Any,
     NotRequired,
@@ -22,28 +23,28 @@ from typing import (
     Literal,
     Optional,
     TypedDict,
+    Any,
+    NotRequired,
+    TYPE_CHECKING,
 )
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
-from starlette.requests import Request
-import json
-import traceback
-import inspect
-from open_webui.models.files import Files
+from fastapi import Request
+from open_webui.utils.logger import stdout_format
+from loguru import logger
 
-COLORS = {
-    "RED": "\033[91m",
-    "GREEN": "\033[92m",
-    "YELLOW": "\033[93m",
-    "BLUE": "\033[94m",
-    "MAGENTA": "\033[95m",
-    "CYAN": "\033[96m",
-    "WHITE": "\033[97m",
-    "RESET": "\033[0m",
-}
+if TYPE_CHECKING:
+    from loguru import Record
+    from loguru._handler import Handler
 
 
-# Event Type Definitions ------------------------------------------------------
+class ModelData(TypedDict):
+    """This is how the `pipes` function expects the `dict` to look like."""
+
+    id: str
+    name: str
+
+
 class StatusEventData(TypedDict):
     action: NotRequired[Optional[Literal["web_search", "knowledge_search"]]]
     description: str
@@ -53,28 +54,14 @@ class StatusEventData(TypedDict):
     hidden: NotRequired[bool]
 
 
-class Source(TypedDict):
-    source: dict[str, str]
-    document: list[str]
-    metadata: list[dict[str, str]]
-
-
-class UsageStatistics(TypedDict):
-    prompt_tokens: Optional[int]
-    completion_tokens: Optional[int]
-    total_tokens: Optional[int]
+class ErrorData(TypedDict):
+    detail: str
 
 
 class ChatCompletionEventData(TypedDict):
-    id: NotRequired[str]
-    done: NotRequired[bool]
-    choices: NotRequired[list[dict[str, dict[str, str]]]]
-    content: NotRequired[str]
-    sources: NotRequired[list[Source]]
-    selected_model_id: NotRequired[str]
-    error: NotRequired[dict[str, str]]
-    usage: NotRequired[UsageStatistics]
-    title: NotRequired[str]
+    content: Optional[str]
+    done: bool
+    error: NotRequired[ErrorData]
 
 
 class StatusEvent(TypedDict):
@@ -90,13 +77,26 @@ class ChatCompletionEvent(TypedDict):
 Event = StatusEvent | ChatCompletionEvent
 
 
-# Main Pipe Implementation ----------------------------------------------------
+class UserData(TypedDict):
+    """This is how `__user__` `dict` looks like."""
+
+    id: str
+    email: str
+    name: str
+    role: Literal["admin", "user", "pending"]
+    valves: NotRequired[Any]  # object of type UserValves
+
+
+# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
+log = logger.bind(auditable=False)
+
+
 class Pipe:
     class Valves(BaseModel):
         EXAMPLE_STRING: str = Field(
             default="", title="Admin String", description="String configurable by admin"
         )
-        LOG_LEVEL: Literal["INFO", "WARNING", "ERROR", "DEBUG", "OFF"] = Field(
+        LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
@@ -108,19 +108,24 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
-        self._print_colored("Function has been initialized!", "INFO")
+        print("[pipe_function_template_no_comments] Function has been initialized!")
 
-    def pipes(self) -> list[dict]:
-        self._print_colored("Registering models.", "INFO")
-        return [
-            {"id": "model_id_1", "name": "model_1"},
-            {"id": "model_id_2", "name": "model_2"},
-        ]
+    def pipes(self) -> list[ModelData]:
+        self._add_log_handler()
+        log.info("Registering models.")
+        try:
+            return [
+                ModelData(id="model_id_1", name="model_1"),
+                ModelData(id="model_id_2", name="model_2"),
+            ]
+        except Exception as e:
+            error_msg = f"Error during registering models: {str(e)}"
+            return [_return_error_model(error_msg)]
 
     async def pipe(
         self,
         body: dict[str, Any],
-        __user__: dict[str, Any],
+        __user__: UserData,
         __request__: Request,
         __event_emitter__: Callable[[Event], Awaitable[None]],
         __event_call__: Callable[[dict[str, Any]], Awaitable[Any]],
@@ -138,101 +143,145 @@ class Pipe:
         | Generator
         | None
     ):
-        try:
-            if __task__ == "title_generation":
-                self._print_colored("Detected title generation task!", "INFO")
-                return '{"title": "Example Title"}'
 
-            if __task__ == "tags_generation":
-                self._print_colored("Detected tag generation task!", "INFO")
-                return '{"tags": ["tag1", "tag2", "tag3"]}'
+        self.__event_emitter__ = __event_emitter__
 
-            async def countdown():
-                # Status event example
-                for i in range(3, 0, -1):
-                    await __event_emitter__(
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": f"Time remaining: {i}s",
-                                "done": False,
-                            },
-                        }
-                    )
-                    await asyncio.sleep(1)
+        if "error" in __metadata__["model"]["id"]:
+            error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
+            log.exception(error_msg)
+            await self._emit_error(error_msg)
+            return
 
-                # Final status event
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {"description": "Process complete!", "done": True},
-                    }
-                )
+        if __task__ == "title_generation":
+            log.info("Detected title generation task!")
+            return '{"title": "Example Title"}'
 
-            asyncio.create_task(countdown())
+        if __task__ == "tags_generation":
+            log.info("Detected tag generation task!")
+            return '{"tags": ["tag1", "tag2", "tag3"]}'
 
-            string_from_valve = self.valves.EXAMPLE_STRING
-            string_from_user_valve = __user__["valves"].EXAMPLE_STRING_USER
+        # FIXME: Move the countdown example to a separate status emission example file.
+        async def countdown():
+            for i in range(5, 0, -1):
+                status_count: StatusEvent = {
+                    "type": "status",
+                    "data": {
+                        "description": f"Time remaining: {i}s",
+                        "done": False,
+                        "hidden": False,
+                    },
+                }
+                await __event_emitter__(status_count)
+                await asyncio.sleep(1)
 
-            self._print_colored(f"String from valve: {string_from_valve}", "INFO")
-            self._print_colored(
-                f"String from user valve: {string_from_user_valve}", "INFO"
-            )
-
-            all_params = {
-                "body": body,
-                "__user__": __user__,
-                "__request__": __request__,
-                "__event_emitter__": __event_emitter__,
-                "__event_call__": __event_call__,
-                "__task__": __task__,
-                "__task_body__": __task_body__,
-                "__files__": __files__,
-                "__metadata__": __metadata__,
-                "__tools__": __tools__,
+            status_finish: StatusEvent = {
+                "type": "status",
+                "data": {
+                    "description": "Process complete!",
+                    "done": True,
+                    "hidden": False,
+                },
             }
+            await __event_emitter__(status_finish)
 
-            all_params_json = json.dumps(all_params, indent=2, default=str)
-            self._print_colored("Returning all parameters as JSON:", "DEBUG")
-            print(all_params_json)
+        asyncio.create_task(countdown())
 
-            if __files__ and len(__files__) > 0:
-                self._print_colored(
-                    f'Detected a file upload! {__files__[0]["file"]["path"]}', "INFO"
-                )
+        string_from_valve = self.valves.EXAMPLE_STRING
+        string_from_user_valve = getattr(
+            __user__.get("valves"), "EXAMPLE_STRING_USER", None
+        )
 
-            return "Hello World!"
+        log.debug("String from valve:", data=string_from_valve)
+        log.debug("String from user valve:", data=string_from_user_valve)
 
+        all_params = {
+            "body": body,
+            "__user__": __user__,
+            "__request__": __request__,
+            "__event_emitter__": __event_emitter__,
+            "__event_call__": __event_call__,
+            "__task__": __task__,
+            "__task_body__": __task_body__,
+            "__files__": __files__,
+            "__metadata__": __metadata__,
+            "__tools__": __tools__,
+        }
+
+        log.debug(
+            "Returning all parameters as JSON:",
+            data=str(all_params),
+        )
+
+        # FIXME: Move error handling examples to a separate function.
+        try:
+            raise Exception("NameError, this is a test.")
         except Exception as e:
-            error_msg = f"Pipe function error: {str(e)}\n{traceback.format_exc()}"
-            self._print_colored(error_msg, "ERROR")
-            return error_msg
+            error_msg = f"Error happened inside the pipe function: {str(e)}"
+            await self._emit_error(error_msg)
+            return
+
+        return "Hello World!"
 
     """Helper functions inside the Pipe class."""
 
-    def _print_colored(self, message: str, level: str = "INFO") -> None:
-        """
-        Prints a colored log message to the console, respecting the configured log level.
-        """
-        if not hasattr(self, "valves") or self.valves.LOG_LEVEL == "OFF":
-            return
+    def _add_log_handler(self):
+        """Adds handler to the root loguru instance for this plugin if one does not exist already."""
 
-        # Define log level hierarchy
-        level_priority = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3}
+        def plugin_filter(record: "Record"):
+            """Filter function to only allow logs from this plugin (based on module name)."""
+            return record["name"] == __name__  # Filter by module name
 
-        # Only print if message level is >= configured level
-        if level_priority.get(level, 0) >= level_priority.get(self.valves.LOG_LEVEL, 0):
-            color_map = {
-                "INFO": COLORS["GREEN"],
-                "WARNING": COLORS["YELLOW"],
-                "ERROR": COLORS["RED"],
-                "DEBUG": COLORS["BLUE"],
-            }
-            color = color_map.get(level, COLORS["WHITE"])
-            frame = inspect.currentframe()
-            if frame:
-                frame = frame.f_back
-            method_name = frame.f_code.co_name if frame else "<unknown>"
-            print(
-                f"{color}[{level}][pipe_function_skeleton][{method_name}]{COLORS['RESET']} {message}"
-            )
+        # Access the internal state of the logger
+        handlers: dict[int, "Handler"] = logger._core.handlers  # type: ignore
+        for key, handler in handlers.items():
+            existing_filter = handler._filter
+            if (
+                hasattr(existing_filter, "__name__")
+                and existing_filter.__name__ == plugin_filter.__name__
+                and hasattr(existing_filter, "__module__")
+                and existing_filter.__module__ == plugin_filter.__module__
+            ):
+                log.debug("Handler for this plugin is already present!")
+                return
+
+        logger.add(
+            sys.stdout,
+            level=self.valves.LOG_LEVEL,
+            format=stdout_format,
+            filter=plugin_filter,
+        )
+        log.info(
+            f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
+        )
+
+    async def _emit_error(
+        self, error_msg: str, warning: bool = False, exception: bool = True
+    ) -> None:
+        """Emits an event to the front-end that causes it to display a nice red error message."""
+        error = ChatCompletionEvent(
+            type="chat:completion",
+            data=ChatCompletionEventData(
+                content=None,
+                done=True,
+                error=ErrorData(detail="\n" + error_msg),
+            ),
+        )
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        await self.__event_emitter__(error)
+
+
+def _return_error_model(
+    error_msg: str, warning: bool = False, exception: bool = True
+) -> ModelData:
+    """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+    if warning:
+        log.opt(depth=1, exception=False).warning(error_msg)
+    else:
+        log.opt(depth=1, exception=exception).error(error_msg)
+    return {
+        "id": "error",
+        "name": "[gemini_manifold] " + error_msg,
+    }
