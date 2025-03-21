@@ -97,14 +97,29 @@ class ModelData(TypedDict):
     name: str
 
 
+class SourceSource(TypedDict):
+    name: str
+
+
+class SourceMetadata(TypedDict, total=False):
+    source: str
+
+
+class Source(TypedDict):
+    source: SourceSource
+    document: list[str]
+    metadata: list[SourceMetadata]
+
+
 class ErrorData(TypedDict):
     detail: str
 
 
 class ChatCompletionEventData(TypedDict):
-    content: Optional[str]
+    content: NotRequired[str]
     done: NotRequired[bool]
     error: NotRequired[ErrorData]
+    sources: NotRequired[list[Source]]
 
 
 class ChatCompletionEvent(TypedDict):
@@ -575,6 +590,7 @@ class Pipe:
                     gen_content_args, __request__, __user__
                 )
                 cited_text = None
+                emit_sources = None
                 for chunk in res:
                     print(
                         json.dumps(
@@ -586,15 +602,12 @@ class Pipe:
                     )
                     text_w_citations = _add_citations(chunk.model_dump(), raw_text)
                     if text_w_citations:
-                        cited_text = text_w_citations
+                        cited_text, emit_sources = text_w_citations
                 print(raw_text)
-                if cited_text:
+                if cited_text and emit_sources:
                     print(cited_text)
-                    emit_w_sources: ChatCompletionEvent = {
-                        "type": "chat:completion",
-                        "data": {"content": cited_text, "done": True},
-                    }
-                    await __event_emitter__(emit_w_sources)
+                    print(json.dumps(emit_sources, indent=2))
+                    await __event_emitter__(emit_sources)
                 return None
             else:
                 if "gemini-2.0-flash-exp-image-generation" in model_name:
@@ -840,7 +853,6 @@ class Pipe:
         error = ChatCompletionEvent(
             type="chat:completion",
             data=ChatCompletionEventData(
-                content=None,
                 done=True,
                 error=ErrorData(detail="\n" + error_msg),
             ),
@@ -852,21 +864,43 @@ class Pipe:
         await self.__event_emitter__(error)
 
 
-def _add_citations(data: dict, raw_str: str) -> str | None:
-    # Check if grounding_metadata exists
+def _add_citations(data: dict, raw_str: str) -> Tuple[Optional[str], Optional[Event]]:
     if not data["candidates"][0].get("grounding_metadata"):
-        return None
+        return None, None
 
     supports = data["candidates"][0]["grounding_metadata"]["grounding_supports"]
+    grounding_chunks = data["candidates"][0]["grounding_metadata"]["grounding_chunks"]
+
+    uris = []
+    for g_c in grounding_chunks:
+        uri = g_c["web"]["uri"]
+        uris.append(uri)
+
     for support in supports:
         text = support["segment"]["text"]
         start = raw_str.find(text)
         if start != -1:
-            end_pos = start + len(text)  # Right end position
-            grounding_chunk_indices = support["grounding_chunk_indices"]
-            indices_str = "".join(f"[{index}]" for index in grounding_chunk_indices)
+            end_pos = start + len(text)
+            indices_str = "".join(
+                f"[{index}]" for index in support["grounding_chunk_indices"]
+            )
             raw_str = raw_str[:end_pos] + indices_str + raw_str[end_pos:]
-    return raw_str
+
+    sources_list = []
+    if uris:
+        metadata_list: list[SourceMetadata] = [{"source": uri} for uri in uris]
+        document_list: list[str] = ["Grounding with google"] * len(uris)
+        source_entry: Source = {
+            "source": {"name": "web_search"},
+            "document": document_list,
+            "metadata": metadata_list,
+        }
+        sources_list.append(source_entry)
+
+    event_data: ChatCompletionEventData = {"content": raw_str, "sources": sources_list}
+    event: Event = {"type": "chat:completion", "data": event_data}
+
+    return raw_str, event
 
 
 def _return_error_model(
