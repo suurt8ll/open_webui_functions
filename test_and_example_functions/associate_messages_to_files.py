@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version:
+version: 0.0.0
 requirements:
 """
 
@@ -17,21 +17,20 @@ from typing import (
     Iterator,
     Any,
     Literal,
-    Optional,
+    TYPE_CHECKING,
 )
-import sys
 
-if sys.version_info >= (3, 12):
-    from typing import TypedDict
-else:
-    from typing_extensions import TypedDict
-from uuid import UUID
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
-from starlette.requests import Request
 import traceback
 import inspect
 from open_webui.models.chats import Chats, ChatModel
+
+if TYPE_CHECKING:
+    from manifold_types import (
+        Message,
+        UserData,
+    )  # My personal types in a separate file for more robustness.
 
 COLORS = {
     "RED": "\033[91m",
@@ -43,35 +42,6 @@ COLORS = {
     "WHITE": "\033[97m",
     "RESET": "\033[0m",
 }
-
-
-class FileInfo(TypedDict):
-    type: str
-    file: dict[str, Any]
-    id: str
-    url: str
-    name: str
-    status: str
-    size: int
-    error: str
-    itemId: str
-
-
-class Message(BaseModel):
-    id: UUID
-    parentId: Optional[UUID] = None
-    childrenIds: list[UUID] = Field(default_factory=list)
-    role: Literal["user", "assistant"]
-    content: str
-    files: Optional[list[FileInfo]]
-    timestamp: int
-    models: list[str] = Field(default_factory=list)
-    model: Optional[str] = None  # Only for assistant role
-    modelName: Optional[str] = None  # Only for assistant role
-    modelIdx: Optional[int] = None  # Only for assistant role
-    userContext: Optional[Any] = None  # Only for assistant role
-    sources: Optional[list[dict[str, Any]]]  # Only for assistant role
-    done: Optional[bool]  # Only for assistant role
 
 
 class Pipe:
@@ -88,7 +58,7 @@ class Pipe:
     async def pipe(
         self,
         body: dict[str, Any],
-        __user__: dict[str, Any],
+        __user__: UserData,
         __metadata__: dict[str, Any],
     ) -> (
         str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
@@ -128,7 +98,7 @@ class Pipe:
             f"Printing the raw ChatModel object:\n{json.dumps(chat.model_dump(), indent=2)}",
             "DEBUG",
         )
-        messages: list[Message] = chat.chat.get("messages", [])
+        messages: list["Message"] = chat.chat.get("messages", [])
         result = []
         for message in messages:
             role = message.role
@@ -152,6 +122,7 @@ class Pipe:
             )
         return result
 
+    # FIXME: replace with new logging
     def _print_colored(self, message: str, level: str = "INFO") -> None:
         if not hasattr(self, "valves") or self.valves.LOG_LEVEL == "OFF":
             return

@@ -17,16 +17,17 @@ version: 0.9.1
 # TODO: Negative prompts
 # TODO: Upscaling
 
-import asyncio
 import sys
+import time
+import asyncio
+import requests
+import aiohttp
+import base64
 from typing import (
     Any,
     AsyncGenerator,
     Generator,
     Iterator,
-    NotRequired,
-    Optional,
-    TypedDict,
     Literal,
     Callable,
     Awaitable,
@@ -35,10 +36,6 @@ from typing import (
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 from fastapi import Request
-import requests
-import aiohttp
-import time
-import base64
 from open_webui.routers.images import upload_image
 from open_webui.models.users import Users
 from open_webui.utils.logger import stdout_format
@@ -47,50 +44,7 @@ from loguru import logger
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler
-
-
-class ModelData(TypedDict):
-    """This is how the `pipes` function expects the `dict` to look like."""
-
-    id: str
-    name: str
-
-
-class ErrorData(TypedDict):
-    detail: str
-
-
-class ChatCompletionEventData(TypedDict):
-    content: Optional[str]
-    done: bool
-    error: NotRequired[ErrorData]
-
-
-class StatusEventData(TypedDict):
-    description: str
-    done: bool
-    hidden: bool
-
-
-class StatusEvent(TypedDict):
-    type: Literal["status"]
-    data: StatusEventData
-
-
-class ChatCompletionEvent(TypedDict):
-    type: Literal["chat:completion"]
-    data: ChatCompletionEventData
-
-
-Event = StatusEvent | ChatCompletionEvent
-
-
-class UserData(TypedDict):
-    id: str
-    email: str
-    name: str
-    role: Literal["admin", "user", "pending"]
-    valves: NotRequired[Any]  # object of type UserValves
+    from manifold_types import *  # My personal types in a separate file for more robustness.
 
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
@@ -121,7 +75,7 @@ class Pipe:
         print("[venice_manifold] Function has been initialized!")
 
     # FIXME Make it async.
-    def pipes(self) -> list[ModelData]:
+    def pipes(self) -> list["ModelData"]:
         # I'm adding the handler here because LOG_LEVEL is not set inside __init__ sadly.
         self._add_log_handler()
         return self._get_models()
@@ -129,9 +83,9 @@ class Pipe:
     async def pipe(
         self,
         body: dict,
-        __user__: UserData,
+        __user__: "UserData",
         __request__: Request,
-        __event_emitter__: Callable[[Event], Awaitable[None]],
+        __event_emitter__: Callable[["Event"], Awaitable[None]],
         __task__: str,
         __metadata__: dict[str, Any],
     ) -> str | dict | StreamingResponse | Iterator | AsyncGenerator | Generator | None:
@@ -242,7 +196,7 @@ class Pipe:
 
     """Helper functions inside the Pipe class."""
 
-    def _get_models(self) -> list[ModelData]:
+    def _get_models(self) -> list["ModelData"]:
         try:
             response = requests.get(
                 "https://api.venice.ai/api/v1/models?type=image",
@@ -302,7 +256,7 @@ class Pipe:
         mime_type: str,
         model: str,
         prompt: str,
-        __user__: UserData,
+        __user__: "UserData",
         __request__: Request,
     ) -> str | None:
 
@@ -364,14 +318,13 @@ class Pipe:
         self, error_msg: str, warning: bool = False, exception: bool = True
     ) -> None:
         """Emits an event to the front-end that causes it to display a nice red error message."""
-        error = ChatCompletionEvent(
-            type="chat:completion",
-            data=ChatCompletionEventData(
-                content=None,
-                done=True,
-                error=ErrorData(detail="\n" + error_msg),
-            ),
-        )
+        error: "ChatCompletionEvent" = {
+            "type": "chat:completion",
+            "data": {
+                "done": True,
+                "error": {"detail": "\n" + error_msg},
+            },
+        }
         if warning:
             log.opt(depth=1, exception=False).warning(error_msg)
         else:
@@ -384,7 +337,7 @@ class Pipe:
 
 def _return_error_model(
     error_msg: str, warning: bool = False, exception: bool = True
-) -> ModelData:
+) -> "ModelData":
     """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
     if warning:
         log.opt(depth=1, exception=False).warning(error_msg)
