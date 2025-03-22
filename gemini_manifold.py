@@ -15,6 +15,7 @@ requirements: google-genai==1.7.0
 
 # Supported features:
 #   - Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
+#   - Display citations in the front-end.
 #   - Image input
 #   - Streaming
 #   - Grounding with Google Search
@@ -25,11 +26,9 @@ requirements: google-genai==1.7.0
 #   TODO Video input support.
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 #   TODO Display usage statistics (token counts)
-#   TODO Display citations in the front-end.
 
 # Other things to do:
 #   TODO Better type checking.
-#   TODO Return errors as correctly formatted error types for the frontend to handle (red text in the front-end).
 #   TODO Refactor, make this mess more readable lol.
 
 import asyncio
@@ -610,10 +609,8 @@ class Pipe:
                         )
                         + ","
                     )
-                    cited_text, emit_sources = await _add_citations(
-                        chunk.model_dump(), raw_text
-                    )
-                if cited_text and emit_sources:
+                    emit_sources = await _add_citations(chunk, raw_text)
+                if emit_sources:
                     print(json.dumps(emit_sources, indent=2))
                     await __event_emitter__(emit_sources)
                 return None
@@ -873,54 +870,67 @@ class Pipe:
 
 
 async def _add_citations(
-    data: dict, raw_str: str
-) -> Tuple[Optional[str], Optional[Event]]:
+    data: types.GenerateContentResponse, raw_str: str
+) -> Optional[Event]:
     async def resolve_url(session, url) -> str:
         """Asynchronously resolves a URL by following redirects"""
         try:
             async with session.get(url, allow_redirects=True) as response:
                 return str(response.url)
         except Exception as e:
+            # FIXME: Consider more robust logging
             print(f"Error resolving URL: {e}")
             return url
 
-    if not data["candidates"][0].get("grounding_metadata"):
-        return None, None
+    if not data.candidates:
+        return None
 
-    supports = data["candidates"][0]["grounding_metadata"]["grounding_supports"]
-    grounding_chunks = data["candidates"][0]["grounding_metadata"]["grounding_chunks"]
+    candidate = data.candidates[0]
+    grounding_metadata = candidate.grounding_metadata if candidate else None
 
-    uris = [g_c["web"]["uri"] for g_c in grounding_chunks]
+    if (
+        not grounding_metadata
+        or not grounding_metadata.grounding_supports
+        or not grounding_metadata.grounding_chunks
+    ):
+        return None
+
+    supports = grounding_metadata.grounding_supports
+    grounding_chunks = grounding_metadata.grounding_chunks
+
+    uris: list[str] = [
+        g_c.web.uri for g_c in grounding_chunks if g_c.web and g_c.web.uri
+    ]
 
     for support in supports:
-        text = support["segment"]["text"]
-        start = raw_str.find(text)
-        if start != -1:
-            end_pos = start + len(text)
-            indices_str = "".join(
-                f"[{index}]" for index in support["grounding_chunk_indices"]
-            )
-            raw_str = f"{raw_str[:end_pos]}{indices_str}{raw_str[end_pos:]}"
+        text: Optional[str] = support.segment.text if support.segment else None
+        if text:
+            start = raw_str.find(text)
+            if start != -1:
+                end_pos = start + len(text)
+                citation_markers = "".join(
+                    f"[{index}]" for index in (support.grounding_chunk_indices or [])
+                )
+                raw_str = f"{raw_str[:end_pos]}{citation_markers}{raw_str[end_pos:]}"
 
-    sources_list = []
+    sources_list: list[Source] = []
     if uris:
         async with aiohttp.ClientSession() as session:
             tasks = [resolve_url(session, uri) for uri in uris]
             resolved_uris = await asyncio.gather(*tasks)
 
-        metadata_list = [{"source": uri} for uri in resolved_uris]
-        document_list = [""] * len(uris)
-        source_entry = {
-            "source": {"name": "web_search"},
-            "document": document_list,
-            "metadata": metadata_list,
-        }
-        sources_list.append(source_entry)
+        sources_list = [
+            {
+                "source": {"name": "web_search"},
+                "document": [""] * len(resolved_uris),
+                "metadata": [{"source": uri} for uri in resolved_uris],
+            }
+        ]
 
     event_data: ChatCompletionEventData = {"content": raw_str, "sources": sources_list}
     event: Event = {"type": "chat:completion", "data": event_data}
 
-    return raw_str, event
+    return event
 
 
 def _return_error_model(
