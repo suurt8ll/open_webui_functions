@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.7.0
+version: 1.8.0
 requirements: google-genai==1.7.0
 """
 
@@ -57,7 +57,6 @@ from typing import (
     TypedDict,
     TYPE_CHECKING,
 )
-import requests
 from starlette.responses import StreamingResponse
 from open_webui.routers.images import upload_image
 from open_webui.models.files import Files
