@@ -283,5 +283,5 @@ def _return_error_model(
         log.opt(depth=1, exception=exception).error(error_msg)
     return {
         "id": "error",
-        "name": "[gemini_manifold] " + error_msg,
+        "name": "[template] " + error_msg,
     }
