@@ -146,7 +146,7 @@ class Pipe:
 
         if not self.valves.GEMINI_API_KEY:
             error_msg = "GEMINI_API_KEY is not set."
-            return [_return_error_model(error_msg, exception=False)]
+            return [self._return_error_model(error_msg, exception=False)]
 
         # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
         if not self.client:
@@ -158,7 +158,7 @@ class Pipe:
                 )
             except Exception as e:
                 error_msg = f"genai client initalization failed: {str(e)}"
-                return [_return_error_model(error_msg)]
+                return [self._return_error_model(error_msg)]
         else:
             log.info("Client already initialized.")
 
@@ -187,266 +187,6 @@ class Pipe:
         | Generator
         | None
     ):
-        """Helper functions inside the pipe() method"""
-        # FIXME: Move all of these into Pipe class for cleaner look.
-
-        def _pop_system_prompt(
-            messages: list[dict],
-        ) -> Tuple[Optional[str], list[dict]]:
-            """Extracts system message from messages."""
-            system_message_content = None
-            messages_without_system = []
-            for message in messages:
-                if message.get("role") == "system":
-                    system_message_content = message.get("content")
-                else:
-                    messages_without_system.append(message)
-            return system_message_content, messages_without_system
-
-        def _get_mime_type(file_uri: str) -> str:
-            """
-            Utility function to determine MIME type based on file extension.
-            Extend this function to support more MIME types as needed.
-            """
-            if file_uri.endswith(".jpg") or file_uri.endswith(".jpeg"):
-                return "image/jpeg"
-            elif file_uri.endswith(".png"):
-                return "image/png"
-            elif file_uri.endswith(".gif"):
-                return "image/gif"
-            elif file_uri.endswith(".bmp"):
-                return "image/bmp"
-            elif file_uri.endswith(".webp"):
-                return "image/webp"
-            else:
-                # Default MIME type if unknown
-                return "application/octet-stream"
-
-        def _extract_markdown_image(text: str) -> list[types.Part]:
-            """Extracts and converts markdown images to parts, preserving text order."""
-            parts = []
-            last_pos = 0
-
-            for match in re.finditer(
-                r"!\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)",
-                text,
-            ):
-                # Add text before the image
-                text_segment = text[last_pos : match.start()]
-                if text_segment.strip():
-                    parts.append(types.Part.from_text(text=text_segment))
-
-                # Determine if it's base64 or a file URL
-                if match.group(2):  # Base64 encoded image
-                    try:
-                        mime_type = match.group(2)
-                        base64_data = match.group(3)
-                        log.debug(
-                            "Found base64 image link!",
-                            mime_type=mime_type,
-                            base64_data=match.group(3)[:50] + "...",
-                        )
-                        image_part = types.Part.from_bytes(
-                            data=base64.b64decode(base64_data),
-                            mime_type=mime_type,
-                        )
-                        parts.append(image_part)
-                    except Exception:
-                        log.exception("Error decoding base64 image:")
-
-                elif match.group(4):  # File URL
-                    log.debug("Found API image link!", id=match.group(4))
-                    file_id = match.group(4)
-                    file_model = Files.get_file_by_id(file_id)
-
-                    if file_model is None:
-                        log.warning("File with this ID not found.", id=file_id)
-                        #  Could add placeholder text here if desired
-                        continue  # Skip to the next match
-
-                    try:
-                        # "continue" above ensures that file_model is not None
-                        content_type = file_model.meta.get("content_type")  # type: ignore
-                        if content_type is None:
-                            log.warning(
-                                "Content type not found for this file ID.",
-                                id=file_id,
-                            )
-                            continue
-
-                        with open(file_model.path, "rb") as file:  # type: ignore
-                            image_data = file.read()
-
-                        image_part = types.Part.from_bytes(
-                            data=image_data, mime_type=content_type
-                        )
-                        parts.append(image_part)
-
-                    except FileNotFoundError:
-                        log.exception(
-                            "File not found on disk for this ID.",
-                            id=file_id,
-                            path=file_model.path,
-                        )
-                    except KeyError:
-                        log.exception(
-                            "Metadata error for this file ID: 'content_type' missing.",
-                            id=file_id,
-                        )
-                    except Exception:
-                        log.exception("Error processing file with this ID", id=file_id)
-
-                last_pos = match.end()
-
-            # Add remaining text
-            remaining_text = text[last_pos:]
-            if remaining_text.strip():
-                parts.append(types.Part.from_text(text=remaining_text))
-
-            return parts
-
-        def _process_image_url(image_url: str) -> Optional[types.Part]:
-            """Processes an image URL, handling GCS, data URIs, and standard URLs."""
-            try:
-                if image_url.startswith("gs://"):
-                    return types.Part.from_uri(
-                        file_uri=image_url, mime_type=_get_mime_type(image_url)
-                    )
-                elif image_url.startswith("data:image"):
-                    match = re.match(r"data:(image/\w+);base64,(.+)", image_url)
-                    if match:
-                        return types.Part.from_bytes(
-                            data=base64.b64decode(match.group(2)),
-                            mime_type=match.group(1),
-                        )
-                    else:
-                        raise ValueError("Invalid data URI for image.")
-                else:  # Assume standard URL
-                    return types.Part.from_uri(
-                        file_uri=image_url, mime_type=_get_mime_type(image_url)
-                    )
-            except Exception as e:
-                print(f"Error processing image URL '{image_url}': {e}")
-                return None  # Return None to indicate failure
-
-        def _process_content_item(item: dict) -> list[types.Part]:
-            """Processes a single content item, handling text and image_url types."""
-            item_type = item.get("type")
-            parts = []
-
-            if item_type == "text":
-                text = item.get("text", "")
-                parts.extend(
-                    _extract_markdown_image(text)
-                )  # Always process for markdown images
-            elif item_type == "image_url":
-                image_url_dict = item.get("image_url", {})
-                image_url = image_url_dict.get("url", "")
-                if isinstance(image_url, str):
-                    part = _process_image_url(image_url)
-                    if part:
-                        parts.append(part)
-                else:
-                    print(
-                        f"Warning: Unexpected image_url format: {image_url_dict}. Skipping."
-                    )
-            else:
-                print(f"Warning: Unsupported item type: {item_type}. Skipping.")
-
-            return parts
-
-        def _transform_messages_to_contents(
-            messages: list[dict],
-        ) -> list[types.Content]:
-            """Transforms messages to google-genai contents, supporting text and images."""
-
-            contents: list[types.Content] = []
-
-            for message in messages:
-                role = (
-                    "model"
-                    if message.get("role") == "assistant"
-                    else message.get("role")
-                )
-                content = message.get("content", "")
-                parts = []
-
-                if isinstance(content, list):
-                    for item in content:
-                        parts.extend(_process_content_item(item))
-                else:  # Treat as plain text
-                    parts.extend(
-                        _extract_markdown_image(content)
-                    )  # process markdown images
-                    if not parts:  # if there were no markdown images, add the text
-                        parts.append(types.Part.from_text(text=content))
-
-                contents.append(types.Content(role=role, parts=parts))
-
-            return contents
-
-        async def _stream_response(
-            gen_content_args: dict, __request__: Request, __user__: "UserData"
-        ) -> Tuple[list[types.GenerateContentResponse], str]:
-            """Streams the resposne to the front-end using `__event_emitter__` and finally returns the full aggregated response."""
-            # FIXME: Too much repeating code, refac somewhere in the distant future lol.
-            response_stream: AsyncIterator[types.GenerateContentResponse] = (
-                await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
-            )
-            aggregated_chunks: list[types.GenerateContentResponse] = []
-            content: str = ""
-            async for chunk in response_stream:
-                aggregated_chunks.append(chunk)
-                if chunk.candidates:
-                    if len(chunk.candidates) > 1:
-                        log.warning(
-                            "Multiple candidates found in response, defaulting to the first candidate."
-                        )
-                    candidate = chunk.candidates[0]  # Default to the first candidate
-                    if candidate.content and candidate.content.parts:
-                        for part in candidate.content.parts:
-                            text_part = getattr(
-                                part, "text", None
-                            )  # Safely get the text part
-                            if text_part is not None:
-                                content = f"{content}{text_part}"
-                                emission: "ChatCompletionEvent" = {
-                                    "type": "chat:completion",
-                                    "data": {"content": content},
-                                }
-                                await __event_emitter__(emission)
-                                # Skip to the next part if it's text
-                                continue
-                            # Image Handling Logic
-                            inline_data = getattr(part, "inline_data", None)
-                            if inline_data is not None:
-                                mime_type = inline_data.mime_type
-                                image_data = inline_data.data
-                                if self.valves.USE_FILES_API:
-                                    image_url = self._upload_image(
-                                        image_data,
-                                        mime_type,
-                                        gen_content_args.get("model", ""),
-                                        "TAKE IT FROM gen_content_args contents",
-                                        __user__,
-                                        __request__,
-                                    )
-                                    markdown_image = f"![Generated Image]({image_url})"
-                                else:
-                                    image_data_decoded = base64.b64encode(
-                                        image_data
-                                    ).decode()
-                                    markdown_image = f"![Generated Image](data:{mime_type};base64,{image_data_decoded})"
-                                content = f"{content}{markdown_image}"
-                            emission: "ChatCompletionEvent" = {
-                                "type": "chat:completion",
-                                "data": {"content": content},
-                            }
-                            await __event_emitter__(emission)
-            return aggregated_chunks, content
-
-        """Main pipe method."""
-
         self.__event_emitter__ = __event_emitter__
 
         if not self.client:
@@ -461,8 +201,8 @@ class Pipe:
             return
 
         messages = body.get("messages", [])
-        system_prompt, remaining_messages = _pop_system_prompt(messages)
-        contents = _transform_messages_to_contents(remaining_messages)
+        system_prompt, remaining_messages = self._pop_system_prompt(messages)
+        contents = self._transform_messages_to_contents(remaining_messages)
 
         max_len = 50
         log.debug(
@@ -535,9 +275,10 @@ class Pipe:
         }
 
         try:
+            # TODO: refac, break to smaller pieces.
             # TODO: Handle errors related to Google Safety Settings feature.
             if body.get("stream", False):
-                res, raw_text = await _stream_response(
+                res, raw_text = await self._stream_response(
                     gen_content_args, __request__, __user__
                 )
                 cited_text = None
@@ -551,7 +292,7 @@ class Pipe:
                         )
                         + ","
                     )
-                    emit_sources = await _add_citations(chunk, raw_text)
+                    emit_sources = await self._add_citations(chunk, raw_text)
                 if emit_sources:
                     print(json.dumps(emit_sources, indent=2))
                     await __event_emitter__(emit_sources)
@@ -575,7 +316,264 @@ class Pipe:
             await self._emit_error(error_msg)
             return None
 
-    """Helper functions inside the Pipe class."""
+    """
+    Helper methods inside the Pipe class.
+    """
+
+    async def _stream_response(
+        self, gen_content_args: dict, __request__: Request, __user__: "UserData"
+    ) -> Tuple[list[types.GenerateContentResponse], str]:
+        """Streams the resposne to the front-end using `__event_emitter__` and finally returns the full aggregated response."""
+        # FIXME: Too much repeating code, refac somewhere in the distant future lol.
+        response_stream: AsyncIterator[types.GenerateContentResponse] = (
+            await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
+        )
+        aggregated_chunks: list[types.GenerateContentResponse] = []
+        content: str = ""
+        async for chunk in response_stream:
+            aggregated_chunks.append(chunk)
+            if chunk.candidates:
+                if len(chunk.candidates) > 1:
+                    log.warning(
+                        "Multiple candidates found in response, defaulting to the first candidate."
+                    )
+                candidate = chunk.candidates[0]  # Default to the first candidate
+                if candidate.content and candidate.content.parts:
+                    for part in candidate.content.parts:
+                        text_part = getattr(
+                            part, "text", None
+                        )  # Safely get the text part
+                        if text_part is not None:
+                            content = f"{content}{text_part}"
+                            emission: "ChatCompletionEvent" = {
+                                "type": "chat:completion",
+                                "data": {"content": content},
+                            }
+                            await self.__event_emitter__(emission)
+                            # Skip to the next part if it's text
+                            continue
+                        # Image Handling Logic
+                        inline_data = getattr(part, "inline_data", None)
+                        if inline_data is not None:
+                            mime_type = inline_data.mime_type
+                            image_data = inline_data.data
+                            if self.valves.USE_FILES_API:
+                                image_url = self._upload_image(
+                                    image_data,
+                                    mime_type,
+                                    gen_content_args.get("model", ""),
+                                    "TAKE IT FROM gen_content_args contents",
+                                    __user__,
+                                    __request__,
+                                )
+                                markdown_image = f"![Generated Image]({image_url})"
+                            else:
+                                image_data_decoded = base64.b64encode(
+                                    image_data
+                                ).decode()
+                                markdown_image = f"![Generated Image](data:{mime_type};base64,{image_data_decoded})"
+                            content = f"{content}{markdown_image}"
+                        emission: "ChatCompletionEvent" = {
+                            "type": "chat:completion",
+                            "data": {"content": content},
+                        }
+                        await self.__event_emitter__(emission)
+        return aggregated_chunks, content
+
+    def _pop_system_prompt(
+        self,
+        messages: list[dict],
+    ) -> Tuple[Optional[str], list[dict]]:
+        """Extracts system message from messages."""
+        system_message_content = None
+        messages_without_system = []
+        for message in messages:
+            if message.get("role") == "system":
+                system_message_content = message.get("content")
+            else:
+                messages_without_system.append(message)
+        return system_message_content, messages_without_system
+
+    def _get_mime_type(self, file_uri: str) -> str:
+        """
+        Utility function to determine MIME type based on file extension.
+        Extend this function to support more MIME types as needed.
+        """
+        if file_uri.endswith(".jpg") or file_uri.endswith(".jpeg"):
+            return "image/jpeg"
+        elif file_uri.endswith(".png"):
+            return "image/png"
+        elif file_uri.endswith(".gif"):
+            return "image/gif"
+        elif file_uri.endswith(".bmp"):
+            return "image/bmp"
+        elif file_uri.endswith(".webp"):
+            return "image/webp"
+        else:
+            # Default MIME type if unknown
+            return "application/octet-stream"
+
+    def _process_image_url(self, image_url: str) -> Optional[types.Part]:
+        """Processes an image URL, handling GCS, data URIs, and standard URLs."""
+        try:
+            if image_url.startswith("gs://"):
+                return types.Part.from_uri(
+                    file_uri=image_url, mime_type=self._get_mime_type(image_url)
+                )
+            elif image_url.startswith("data:image"):
+                match = re.match(r"data:(image/\w+);base64,(.+)", image_url)
+                if match:
+                    return types.Part.from_bytes(
+                        data=base64.b64decode(match.group(2)),
+                        mime_type=match.group(1),
+                    )
+                else:
+                    raise ValueError("Invalid data URI for image.")
+            else:  # Assume standard URL
+                return types.Part.from_uri(
+                    file_uri=image_url, mime_type=self._get_mime_type(image_url)
+                )
+        except Exception as e:
+            print(f"Error processing image URL '{image_url}': {e}")
+            return None  # Return None to indicate failure
+
+    def _extract_markdown_image(self, text: str) -> list[types.Part]:
+        """Extracts and converts markdown images to parts, preserving text order."""
+        parts = []
+        last_pos = 0
+
+        for match in re.finditer(
+            r"!\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)",
+            text,
+        ):
+            # Add text before the image
+            text_segment = text[last_pos : match.start()]
+            if text_segment.strip():
+                parts.append(types.Part.from_text(text=text_segment))
+
+            # Determine if it's base64 or a file URL
+            if match.group(2):  # Base64 encoded image
+                try:
+                    mime_type = match.group(2)
+                    base64_data = match.group(3)
+                    log.debug(
+                        "Found base64 image link!",
+                        mime_type=mime_type,
+                        base64_data=match.group(3)[:50] + "...",
+                    )
+                    image_part = types.Part.from_bytes(
+                        data=base64.b64decode(base64_data),
+                        mime_type=mime_type,
+                    )
+                    parts.append(image_part)
+                except Exception:
+                    log.exception("Error decoding base64 image:")
+
+            elif match.group(4):  # File URL
+                log.debug("Found API image link!", id=match.group(4))
+                file_id = match.group(4)
+                file_model = Files.get_file_by_id(file_id)
+
+                if file_model is None:
+                    log.warning("File with this ID not found.", id=file_id)
+                    #  Could add placeholder text here if desired
+                    continue  # Skip to the next match
+
+                try:
+                    # "continue" above ensures that file_model is not None
+                    content_type = file_model.meta.get("content_type")  # type: ignore
+                    if content_type is None:
+                        log.warning(
+                            "Content type not found for this file ID.",
+                            id=file_id,
+                        )
+                        continue
+
+                    with open(file_model.path, "rb") as file:  # type: ignore
+                        image_data = file.read()
+
+                    image_part = types.Part.from_bytes(
+                        data=image_data, mime_type=content_type
+                    )
+                    parts.append(image_part)
+
+                except FileNotFoundError:
+                    log.exception(
+                        "File not found on disk for this ID.",
+                        id=file_id,
+                        path=file_model.path,
+                    )
+                except KeyError:
+                    log.exception(
+                        "Metadata error for this file ID: 'content_type' missing.",
+                        id=file_id,
+                    )
+                except Exception:
+                    log.exception("Error processing file with this ID", id=file_id)
+
+            last_pos = match.end()
+
+        # Add remaining text
+        remaining_text = text[last_pos:]
+        if remaining_text.strip():
+            parts.append(types.Part.from_text(text=remaining_text))
+
+        return parts
+
+    def _process_content_item(self, item: dict) -> list[types.Part]:
+        """Processes a single content item, handling text and image_url types."""
+        item_type = item.get("type")
+        parts = []
+
+        if item_type == "text":
+            text = item.get("text", "")
+            parts.extend(
+                self._extract_markdown_image(text)
+            )  # Always process for markdown images
+        elif item_type == "image_url":
+            image_url_dict = item.get("image_url", {})
+            image_url = image_url_dict.get("url", "")
+            if isinstance(image_url, str):
+                part = self._process_image_url(image_url)
+                if part:
+                    parts.append(part)
+            else:
+                print(
+                    f"Warning: Unexpected image_url format: {image_url_dict}. Skipping."
+                )
+        else:
+            print(f"Warning: Unsupported item type: {item_type}. Skipping.")
+
+        return parts
+
+    def _transform_messages_to_contents(
+        self,
+        messages: list[dict],
+    ) -> list[types.Content]:
+        """Transforms messages to google-genai contents, supporting text and images."""
+
+        contents: list[types.Content] = []
+
+        for message in messages:
+            role = (
+                "model" if message.get("role") == "assistant" else message.get("role")
+            )
+            content = message.get("content", "")
+            parts = []
+
+            if isinstance(content, list):
+                for item in content:
+                    parts.extend(self._process_content_item(item))
+            else:  # Treat as plain text
+                parts.extend(
+                    self._extract_markdown_image(content)
+                )  # process markdown images
+                if not parts:  # if there were no markdown images, add the text
+                    parts.append(types.Part.from_text(text=content))
+
+            contents.append(types.Content(role=role, parts=parts))
+
+        return contents
 
     def _add_log_handler(self):
         """Adds handler to the root loguru instance for this plugin if one does not exist already."""
@@ -624,7 +622,7 @@ class Pipe:
             models = self.client.models.list(config={"query_base": True})
         except Exception as e:
             error_msg = f"Error retrieving models: {str(e)}"
-            return [_return_error_model(error_msg)]
+            return [self._return_error_model(error_msg)]
         log.info(f"Retrieved {len(models)} models from Gemini Developer API.")
 
         model_list: list["ModelData"] = [
@@ -810,83 +808,84 @@ class Pipe:
             log.opt(depth=1, exception=exception).error(error_msg)
         await self.__event_emitter__(error)
 
+    async def _add_citations(
+        self, data: types.GenerateContentResponse, raw_str: str
+    ) -> Optional["Event"]:
+        async def resolve_url(session, url) -> str:
+            """Asynchronously resolves a URL by following redirects"""
+            try:
+                async with session.get(url, allow_redirects=True) as response:
+                    return str(response.url)
+            except Exception as e:
+                # FIXME: Consider more robust logging
+                print(f"Error resolving URL: {e}")
+                return url
 
-async def _add_citations(
-    data: types.GenerateContentResponse, raw_str: str
-) -> Optional["Event"]:
-    async def resolve_url(session, url) -> str:
-        """Asynchronously resolves a URL by following redirects"""
-        try:
-            async with session.get(url, allow_redirects=True) as response:
-                return str(response.url)
-        except Exception as e:
-            # FIXME: Consider more robust logging
-            print(f"Error resolving URL: {e}")
-            return url
+        if not data.candidates:
+            return None
 
-    if not data.candidates:
-        return None
+        candidate = data.candidates[0]
+        grounding_metadata = candidate.grounding_metadata if candidate else None
 
-    candidate = data.candidates[0]
-    grounding_metadata = candidate.grounding_metadata if candidate else None
+        if (
+            not grounding_metadata
+            or not grounding_metadata.grounding_supports
+            or not grounding_metadata.grounding_chunks
+        ):
+            return None
 
-    if (
-        not grounding_metadata
-        or not grounding_metadata.grounding_supports
-        or not grounding_metadata.grounding_chunks
-    ):
-        return None
+        supports = grounding_metadata.grounding_supports
+        grounding_chunks = grounding_metadata.grounding_chunks
 
-    supports = grounding_metadata.grounding_supports
-    grounding_chunks = grounding_metadata.grounding_chunks
-
-    uris: list[str] = [
-        g_c.web.uri for g_c in grounding_chunks if g_c.web and g_c.web.uri
-    ]
-
-    for support in supports:
-        text: Optional[str] = support.segment.text if support.segment else None
-        if text:
-            start = raw_str.find(text)
-            if start != -1:
-                end_pos = start + len(text)
-                citation_markers = "".join(
-                    f"[{index}]" for index in (support.grounding_chunk_indices or [])
-                )
-                raw_str = f"{raw_str[:end_pos]}{citation_markers}{raw_str[end_pos:]}"
-
-    sources_list: list["Source"] = []
-    if uris:
-        async with aiohttp.ClientSession() as session:
-            tasks = [resolve_url(session, uri) for uri in uris]
-            resolved_uris = await asyncio.gather(*tasks)
-
-        sources_list = [
-            {
-                "source": {"name": "web_search"},
-                "document": [""] * len(resolved_uris),
-                "metadata": [{"source": uri} for uri in resolved_uris],
-            }
+        uris: list[str] = [
+            g_c.web.uri for g_c in grounding_chunks if g_c.web and g_c.web.uri
         ]
 
-    event_data: "ChatCompletionEventData" = {
-        "content": raw_str,
-        "sources": sources_list,
-    }
-    event: "Event" = {"type": "chat:completion", "data": event_data}
+        for support in supports:
+            text: Optional[str] = support.segment.text if support.segment else None
+            if text:
+                start = raw_str.find(text)
+                if start != -1:
+                    end_pos = start + len(text)
+                    citation_markers = "".join(
+                        f"[{index}]"
+                        for index in (support.grounding_chunk_indices or [])
+                    )
+                    raw_str = (
+                        f"{raw_str[:end_pos]}{citation_markers}{raw_str[end_pos:]}"
+                    )
 
-    return event
+        sources_list: list["Source"] = []
+        if uris:
+            async with aiohttp.ClientSession() as session:
+                tasks = [resolve_url(session, uri) for uri in uris]
+                resolved_uris = await asyncio.gather(*tasks)
 
+            sources_list = [
+                {
+                    "source": {"name": "web_search"},
+                    "document": [""] * len(resolved_uris),
+                    "metadata": [{"source": uri} for uri in resolved_uris],
+                }
+            ]
 
-def _return_error_model(
-    error_msg: str, warning: bool = False, exception: bool = True
-) -> "ModelData":
-    """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
-    if warning:
-        log.opt(depth=1, exception=False).warning(error_msg)
-    else:
-        log.opt(depth=1, exception=exception).error(error_msg)
-    return {
-        "id": "error",
-        "name": "[gemini_manifold] " + error_msg,
-    }
+        event_data: "ChatCompletionEventData" = {
+            "content": raw_str,
+            "sources": sources_list,
+        }
+        event: "Event" = {"type": "chat:completion", "data": event_data}
+
+        return event
+
+    def _return_error_model(
+        self, error_msg: str, warning: bool = False, exception: bool = True
+    ) -> "ModelData":
+        """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        return {
+            "id": "error",
+            "name": "[gemini_manifold] " + error_msg,
+        }
