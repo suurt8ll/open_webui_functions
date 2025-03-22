@@ -27,17 +27,24 @@ from starlette.responses import StreamingResponse
 
 
 class SourceSource(TypedDict):
-    name: str
+    docs: NotRequired[list[dict]]
+    name: str  # the search query used
+    type: NotRequired[Literal["web_search"]]
+    urls: NotRequired[list[str]]
 
 
 class SourceMetadata(TypedDict, total=False):
-    source: str
+    source: str  # url
+    title: NotRequired[str]  # website title
+    description: NotRequired[str]  # website description
+    language: NotRequired[str]  # website language
 
 
 class Source(TypedDict):
     source: SourceSource
     document: list[str]
     metadata: list[SourceMetadata]
+    distances: NotRequired[list[float]]
 
 
 class ErrorData(TypedDict):
@@ -90,22 +97,33 @@ class Pipe:
 
         sources: list[Source] = [
             {
-                "source": {"name": "Example Sources"},
-                "document": [
-                    "This is an example document coming from source1.",
-                    "This is another example document coming from source2.",
-                ],
+                "source": {"name": "example search query"},
+                "document": ["", ""],
                 "metadata": [
                     {"source": "https://example1.com/source1"},
                     {"source": "https://subdomain.example2.com/source2"},
                 ],
-            }
+            },
+            {
+                "source": {"name": "example search query2"},
+                "document": [
+                    "This is an example document coming from source3 in second query.",
+                    "This is another example document coming from source4 in second query.",
+                ],
+                "metadata": [
+                    {"title": "source3", "source": "https://example3.com/source3"},
+                    {
+                        "title": "source4",
+                        "source": "https://example4.com/source4",
+                    },
+                ],
+            },
         ]
 
         sources_test: ChatCompletionEvent = {
             "type": "chat:completion",
             "data": {
-                "content": "This is an example response [0][1].",
+                "content": "This is an example response [0][1]. This sentence has citations from the second query [2][3].",
                 "done": True,
                 "sources": sources,
             },

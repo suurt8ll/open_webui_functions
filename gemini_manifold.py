@@ -56,6 +56,7 @@ from typing import (
     TypedDict,
     TYPE_CHECKING,
 )
+import requests
 from starlette.responses import StreamingResponse
 from open_webui.routers.images import upload_image
 from open_webui.models.files import Files
@@ -98,17 +99,24 @@ class ModelData(TypedDict):
 
 
 class SourceSource(TypedDict):
-    name: str
+    docs: NotRequired[list[dict]]
+    name: str  # the search query used
+    type: NotRequired[Literal["web_search"]]
+    urls: NotRequired[list[str]]
 
 
 class SourceMetadata(TypedDict, total=False):
-    source: str
+    source: str  # url
+    title: NotRequired[str]  # website title
+    description: NotRequired[str]  # website description
+    language: NotRequired[str]  # website language
 
 
 class Source(TypedDict):
     source: SourceSource
     document: list[str]
     metadata: list[SourceMetadata]
+    distances: NotRequired[list[float]]
 
 
 class ErrorData(TypedDict):
@@ -600,12 +608,10 @@ class Pipe:
                         )
                         + ","
                     )
-                    text_w_citations = _add_citations(chunk.model_dump(), raw_text)
-                    if text_w_citations:
-                        cited_text, emit_sources = text_w_citations
-                print(raw_text)
+                    cited_text, emit_sources = _add_citations(
+                        chunk.model_dump(), raw_text
+                    )
                 if cited_text and emit_sources:
-                    print(cited_text)
                     print(json.dumps(emit_sources, indent=2))
                     await __event_emitter__(emit_sources)
                 return None
@@ -865,6 +871,18 @@ class Pipe:
 
 
 def _add_citations(data: dict, raw_str: str) -> Tuple[Optional[str], Optional[Event]]:
+    def resolve_url(url) -> str:
+        """Resolves a URL by following redirects and returns the final URL."""
+        try:
+            response = requests.get(
+                url, allow_redirects=True
+            )  # Allow redirects to be followed
+            return response.url  # The final URL after all redirects
+        except requests.exceptions.RequestException as e:
+            # FIXME: use `_emit_error`
+            print(f"Error resolving URL: {e}")
+            return url
+
     if not data["candidates"][0].get("grounding_metadata"):
         return None, None
 
@@ -888,8 +906,11 @@ def _add_citations(data: dict, raw_str: str) -> Tuple[Optional[str], Optional[Ev
 
     sources_list = []
     if uris:
-        metadata_list: list[SourceMetadata] = [{"source": uri} for uri in uris]
-        document_list: list[str] = ["Grounding with google"] * len(uris)
+        # FIXME: Resolve all at once, async?
+        metadata_list: list[SourceMetadata] = [
+            {"source": resolve_url(uri)} for uri in uris
+        ]
+        document_list: list[str] = [""] * len(uris)
         source_entry: Source = {
             "source": {"name": "web_search"},
             "document": document_list,
