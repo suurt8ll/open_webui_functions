@@ -32,7 +32,9 @@ requirements: google-genai==1.7.0
 #   TODO Return errors as correctly formatted error types for the frontend to handle (red text in the front-end).
 #   TODO Refactor, make this mess more readable lol.
 
+import asyncio
 import json
+import aiohttp
 from google import genai
 from google.genai import types
 import base64
@@ -608,7 +610,7 @@ class Pipe:
                         )
                         + ","
                     )
-                    cited_text, emit_sources = _add_citations(
+                    cited_text, emit_sources = await _add_citations(
                         chunk.model_dump(), raw_text
                     )
                 if cited_text and emit_sources:
@@ -870,16 +872,15 @@ class Pipe:
         await self.__event_emitter__(error)
 
 
-def _add_citations(data: dict, raw_str: str) -> Tuple[Optional[str], Optional[Event]]:
-    def resolve_url(url) -> str:
-        """Resolves a URL by following redirects and returns the final URL."""
+async def _add_citations(
+    data: dict, raw_str: str
+) -> Tuple[Optional[str], Optional[Event]]:
+    async def resolve_url(session, url) -> str:
+        """Asynchronously resolves a URL by following redirects"""
         try:
-            response = requests.get(
-                url, allow_redirects=True
-            )  # Allow redirects to be followed
-            return response.url  # The final URL after all redirects
-        except requests.exceptions.RequestException as e:
-            # FIXME: use `_emit_error`
+            async with session.get(url, allow_redirects=True) as response:
+                return str(response.url)
+        except Exception as e:
             print(f"Error resolving URL: {e}")
             return url
 
@@ -889,10 +890,7 @@ def _add_citations(data: dict, raw_str: str) -> Tuple[Optional[str], Optional[Ev
     supports = data["candidates"][0]["grounding_metadata"]["grounding_supports"]
     grounding_chunks = data["candidates"][0]["grounding_metadata"]["grounding_chunks"]
 
-    uris = []
-    for g_c in grounding_chunks:
-        uri = g_c["web"]["uri"]
-        uris.append(uri)
+    uris = [g_c["web"]["uri"] for g_c in grounding_chunks]
 
     for support in supports:
         text = support["segment"]["text"]
@@ -902,16 +900,17 @@ def _add_citations(data: dict, raw_str: str) -> Tuple[Optional[str], Optional[Ev
             indices_str = "".join(
                 f"[{index}]" for index in support["grounding_chunk_indices"]
             )
-            raw_str = raw_str[:end_pos] + indices_str + raw_str[end_pos:]
+            raw_str = f"{raw_str[:end_pos]}{indices_str}{raw_str[end_pos:]}"
 
     sources_list = []
     if uris:
-        # FIXME: Resolve all at once, async?
-        metadata_list: list[SourceMetadata] = [
-            {"source": resolve_url(uri)} for uri in uris
-        ]
-        document_list: list[str] = [""] * len(uris)
-        source_entry: Source = {
+        async with aiohttp.ClientSession() as session:
+            tasks = [resolve_url(session, uri) for uri in uris]
+            resolved_uris = await asyncio.gather(*tasks)
+
+        metadata_list = [{"source": uri} for uri in resolved_uris]
+        document_list = [""] * len(uris)
+        source_entry = {
             "source": {"name": "web_search"},
             "document": document_list,
             "metadata": metadata_list,
