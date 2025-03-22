@@ -172,7 +172,7 @@ class Pipe:
 
     async def pipe(
         self,
-        body: dict,
+        body: dict[str, Any],
         __user__: "UserData",
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]],
@@ -193,22 +193,33 @@ class Pipe:
             await self._emit_error(error_msg, exception=False)
             return
 
+        model_name = body.get("model")
+        if not model_name:
+            error_msg = "body object does not contain model name."
+            await self._emit_error(error_msg, exception=False)
+            return None
+        model_name = self._strip_prefix(model_name)
+
         # TODO Contruct a type for `__metadata__`.
         if "error" in __metadata__["model"]["id"]:
             error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
             await self._emit_error(error_msg, exception=False)
             return
 
-        messages = body.get("messages", [])
-        system_prompt, remaining_messages = self._pop_system_prompt(messages)
-        contents = self._transform_messages_to_contents(remaining_messages)
-
         max_len = 50
+        # TODO: Log truncate object helper method?
         log.debug(
             "Received body:",
             body=str(self._truncate_long_strings(copy.deepcopy(body), max_len)),
         )
+
+        messages = body.get("messages", [])
+        system_prompt, remaining_messages = self._pop_system_prompt(messages)
         log.debug(f"System prompt: {system_prompt}")
+        contents: list[types.Content] = self._transform_messages_to_contents(
+            remaining_messages
+        )
+
         turn_content_dict_list: list[dict] = []
         for content in contents:
             truncated_content = self._truncate_long_strings(
@@ -220,55 +231,49 @@ class Pipe:
             content_list=str(turn_content_dict_list),
         )
 
-        model_name = self._strip_prefix(body.get("model", ""))
-        log.debug(f"Model name: {model_name}")
+        # TODO: Take defaults from the general front-end config.
+        gen_content_conf = types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=body.get("temperature"),
+            top_p=body.get("top_p"),
+            top_k=body.get("top_k"),
+            max_output_tokens=body.get("max_tokens"),
+            stop_sequences=body.get("stop"),
+            safety_settings=self._get_safety_settings(model_name),
+        )
 
-        config_params: dict[str, Any] = {
-            "system_instruction": system_prompt,
-            "temperature": body.get("temperature", 0.7),
-            "top_p": body.get("top_p", 0.9),
-            "top_k": body.get("top_k", 40),
-            "max_output_tokens": body.get("max_tokens", 8192),
-            "stop_sequences": body.get("stop", []),
-            "safety_settings": self._get_safety_settings(model_name),
-        }
-
-        config_params["response_modalities"] = ["Text"]
+        gen_content_conf.response_modalities = ["Text"]
         if "gemini-2.0-flash-exp-image-generation" in model_name:
-            config_params["response_modalities"].append("Image")
+            gen_content_conf.response_modalities.append("Image")
             # FIXME: append to user message instead.
-            sys_pr: Optional[str] = config_params.pop("system_instruction")
-            if sys_pr:
+            if gen_content_conf.system_instruction:
+                gen_content_conf.system_instruction = None
                 log.warning(
-                    "Image Generation model does not support the system prompt message! Removed the system prompt."
+                    "Image Generation model does not support the system prompt message! Removing the system prompt."
                 )
 
         if self.valves.USE_GROUNDING_SEARCH:
             if model_name.endswith(SEARCH_MODEL_SUFFIX):
-                log.info("Using grounding search.")
+                log.info("Using grounding with Google Search.")
                 gs = None
-                # Dynamic retrieval only supported for 1.0 and 1.5 models
+                # Dynamic retrieval only supported for 1.0 and 1.5 models.
                 if "1.0" in model_name or "1.5" in model_name:
                     gs = types.GoogleSearchRetrieval(
                         dynamic_retrieval_config=types.DynamicRetrievalConfig(
                             dynamic_threshold=self.valves.GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD
                         )
                     )
-                    config_params["tools"] = [types.Tool(google_search_retrieval=gs)]
+                    gen_content_conf.tools = [types.Tool(google_search_retrieval=gs)]
                 else:
                     gs = types.GoogleSearchRetrieval()
-                    config_params["tools"] = [
+                    gen_content_conf.tools = [
                         types.Tool(google_search=types.GoogleSearch())
                     ]
-            else:
-                log.debug(f"Model {model_name} doesn't support grounding search.")
-
-        config = types.GenerateContentConfig(**config_params)
 
         gen_content_args = {
             "model": model_name.replace(SEARCH_MODEL_SUFFIX, ""),
             "contents": contents,
-            "config": config,
+            "config": gen_content_conf,
         }
 
         # TODO: Handle errors related to Google Safety Settings feature.
