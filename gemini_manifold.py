@@ -28,8 +28,7 @@ requirements: google-genai==1.7.0
 #   TODO Display usage statistics (token counts)
 
 # Other things to do:
-#   TODO Better type checking.
-#   TODO Refactor, make this mess more readable lol.
+#   TODO [refac] make this mess more readable lol.
 
 import asyncio
 import copy
@@ -272,43 +271,49 @@ class Pipe:
             "config": config,
         }
 
-        try:
-            # TODO: refac, break to smaller pieces.
-            # TODO: Handle errors related to Google Safety Settings feature.
-            if body.get("stream", False):
+        # TODO: Handle errors related to Google Safety Settings feature.
+        if body.get("stream", False):
+            try:
                 res, raw_text = await self._stream_response(
                     gen_content_args, __request__, __user__
                 )
-                emit_sources = None
-                chunks_str = "["
-                for chunk in res:
-                    chunks_str = f"{chunks_str}{self._truncate_long_strings(chunk.model_dump())},"
-                    emit_sources = await self._add_citations(chunk, raw_text)
-                chunks_str = chunks_str[:-1] + "]"
-                log.debug("Got response from Google API:", response=chunks_str)
-                if emit_sources:
-                    emit_str = str(self._truncate_long_strings(copy.deepcopy(emit_sources)))  # type: ignore
-                    log.debug("Emitting the sources:", emit_object=emit_str)
-                    await __event_emitter__(emit_sources)
+            except Exception as e:
+                error_msg = f"Error occured during streaming: {str(e)}"
+                await self._emit_error(error_msg)
                 return None
-            else:
-                if "gemini-2.0-flash-exp-image-generation" in model_name:
-                    warn_msg = "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
-                    await self._emit_error(warn_msg, warning=True)
-                    return None
-                # FIXME: Make it async.
-                # FIXME: Support native image gen here too.
-                response = self.client.models.generate_content(**gen_content_args)
-                if not response.text:
-                    warn_msg = "Non-stremaing response did not have any text inside it."
-                    await self._emit_error(warn_msg, warning=True)
-                    return None
-                return response.text
+            emit_sources = None
+            chunks_str = "["
+            for chunk in res:
+                chunks_str = (
+                    f"{chunks_str}{self._truncate_long_strings(chunk.model_dump())},"
+                )
+                emit_sources = await self._add_citations(chunk, raw_text)
+            chunks_str = chunks_str[:-1] + "]"
+            log.debug("Got response from Google API:", response=chunks_str)
+            if emit_sources:
+                emit_str = str(self._truncate_long_strings(copy.deepcopy(emit_sources)))  # type: ignore
+                log.debug("Emitting the sources:", emit_object=emit_str)
+                await __event_emitter__(emit_sources)
+            return None
 
+        # Non-streaming response.
+        if "gemini-2.0-flash-exp-image-generation" in model_name:
+            warn_msg = "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
+            await self._emit_error(warn_msg, warning=True)
+            return None
+        try:
+            # FIXME: Make it async.
+            # FIXME: Support native image gen here too.
+            response = self.client.models.generate_content(**gen_content_args)
         except Exception as e:
             error_msg = f"Content generation error: {str(e)}"
             await self._emit_error(error_msg)
             return None
+        if not response.text:
+            warn_msg = "Non-stremaing response did not have any text inside it."
+            await self._emit_error(warn_msg, warning=True)
+            return None
+        return response.text
 
     """
     Helper methods inside the Pipe class.
@@ -318,7 +323,7 @@ class Pipe:
         self, gen_content_args: dict, __request__: Request, __user__: "UserData"
     ) -> Tuple[list[types.GenerateContentResponse], str]:
         """Streams the resposne to the front-end using `__event_emitter__` and finally returns the full aggregated response."""
-        # FIXME: Too much repeating code, refac somewhere in the distant future lol.
+        # FIXME: [refac] Too much repeating code, refac somewhere in the distant future lol.
         response_stream: AsyncIterator[types.GenerateContentResponse] = (
             await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
         )
@@ -639,8 +644,8 @@ class Pipe:
             log.warning("No models found matching whitelist.")
             return []
 
-        # Add synthesis model id which support search if grounding search is enabled.
-        # TODO Add this logic into the previous `model_list` construction logic? We are already looping over models there.
+        # Add synthesis model id which support for search if grounding search is enabled.
+        # TODO: [refac] Add this logic into the previous `model_list` construction logic? We are already looping over models there.
         if not self.valves.USE_GROUNDING_SEARCH:
             return model_list
         for original_model in model_list:
@@ -712,10 +717,9 @@ class Pipe:
             stripped = re.sub(r"^.*?[./]", "", model_name)
             return stripped
         except Exception:
-            error_msg = "Error stripping prefix:"
+            error_msg = "Error stripping prefix, using the original model name."
             log.exception(error_msg)
-            # FIXME OR should it error out??
-            return model_name  # Return original if stripping fails
+            return model_name
 
     def _truncate_long_strings(
         self, data: dict[str, Any], max_length: int = 50
@@ -762,18 +766,17 @@ class Pipe:
         __user__: "UserData",
         __request__: Request,
     ) -> str:
-
-        # FIXME: Handle potental errors.
-
         # Create metadata for the image
         image_metadata = {
             "model": model,
             "prompt": prompt,
         }
 
+        # FIXME: Handle potental errors.
         # Get the *full* user object from the database
         user = Users.get_user_by_id(__user__["id"])
         if user is None:
+            # FIXME: better logging
             return "Error: User not found"
 
         # Upload the image using the imported function
