@@ -27,9 +27,6 @@ requirements: google-genai==1.7.0
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 #   TODO Display usage statistics (token counts)
 
-# Other things to do:
-#   TODO [refac] make this mess more readable lol.
-
 import asyncio
 import copy
 import aiohttp
@@ -207,7 +204,6 @@ class Pipe:
             return
 
         max_len = 50
-        # TODO: Log truncate object helper method?
         log.debug(
             "Received body:",
             body=str(self._truncate_long_strings(copy.deepcopy(body), max_len)),
@@ -278,6 +274,7 @@ class Pipe:
 
         # TODO: Handle errors related to Google Safety Settings feature.
         if body.get("stream", False):
+            # Streaming response.
             try:
                 res, raw_text = await self._stream_response(
                     gen_content_args, __request__, __user__
@@ -321,68 +318,80 @@ class Pipe:
         return response.text
 
     """
-    Helper methods inside the Pipe class.
+    ---------- Helper methods inside the Pipe class. ----------
     """
 
     async def _stream_response(
         self, gen_content_args: dict, __request__: Request, __user__: "UserData"
     ) -> Tuple[list[types.GenerateContentResponse], str]:
-        """Streams the resposne to the front-end using `__event_emitter__` and finally returns the full aggregated response."""
-        # FIXME: [refac] Too much repeating code, refac somewhere in the distant future lol.
+        """
+        Streams the response to the front-end using `__event_emitter__` and finally returns the full aggregated response.
+        """
         response_stream: AsyncIterator[types.GenerateContentResponse] = (
             await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
         )
         aggregated_chunks: list[types.GenerateContentResponse] = []
-        content: str = ""
+        content = ""
+
         async for chunk in response_stream:
             aggregated_chunks.append(chunk)
-            if chunk.candidates:
-                if len(chunk.candidates) > 1:
-                    log.warning(
-                        "Multiple candidates found in response, defaulting to the first candidate."
+            candidate = self._get_first_candidate(chunk.candidates)
+            if not candidate or not candidate.content or not candidate.content.parts:
+                log.warning(
+                    "candidate, candidate.content or candidate.content.parts is missing. Skipping to the next chunk."
+                )
+                continue
+            for part in candidate.content.parts:
+                if text_part := part.text:
+                    content += text_part
+                elif inline_data := part.inline_data:
+                    content += self._process_image_part(
+                        inline_data, gen_content_args, __user__, __request__
                     )
-                candidate = chunk.candidates[0]  # Default to the first candidate
-                if candidate.content and candidate.content.parts:
-                    for part in candidate.content.parts:
-                        text_part = getattr(
-                            part, "text", None
-                        )  # Safely get the text part
-                        if text_part is not None:
-                            content = f"{content}{text_part}"
-                            emission: "ChatCompletionEvent" = {
-                                "type": "chat:completion",
-                                "data": {"content": content},
-                            }
-                            await self.__event_emitter__(emission)
-                            # Skip to the next part if it's text
-                            continue
-                        # Image Handling Logic
-                        inline_data = getattr(part, "inline_data", None)
-                        if inline_data is not None:
-                            mime_type = inline_data.mime_type
-                            image_data = inline_data.data
-                            if self.valves.USE_FILES_API:
-                                image_url = self._upload_image(
-                                    image_data,
-                                    mime_type,
-                                    gen_content_args.get("model", ""),
-                                    "TAKE IT FROM gen_content_args contents",
-                                    __user__,
-                                    __request__,
-                                )
-                                markdown_image = f"![Generated Image]({image_url})"
-                            else:
-                                image_data_decoded = base64.b64encode(
-                                    image_data
-                                ).decode()
-                                markdown_image = f"![Generated Image](data:{mime_type};base64,{image_data_decoded})"
-                            content = f"{content}{markdown_image}"
-                        emission: "ChatCompletionEvent" = {
-                            "type": "chat:completion",
-                            "data": {"content": content},
-                        }
-                        await self.__event_emitter__(emission)
+                await self._emit_completion(content)
+
         return aggregated_chunks, content
+
+    def _get_first_candidate(
+        self, candidates: Optional[list[types.Candidate]]
+    ) -> Optional[types.Candidate]:
+        """Selects the first candidate, logging a warning if multiple exist."""
+        if not candidates:
+            log.warning("Received chunk with no candidates, skipping processing.")
+            return None
+        if len(candidates) > 1:
+            log.warning("Multiple candidates found, defaulting to first candidate.")
+        return candidates[0]
+
+    def _process_image_part(
+        self, inline_data, gen_content_args: dict, user: "UserData", request: Request
+    ) -> str:
+        """Handles image data conversion to markdown."""
+        mime_type = inline_data.mime_type
+        image_data = inline_data.data
+
+        if self.valves.USE_FILES_API:
+            image_url = self._upload_image(
+                image_data,
+                mime_type,
+                gen_content_args.get("model", ""),
+                "TAKE IT FROM gen_content_args contents",
+                user,
+                request,
+            )
+            return f"![Generated Image]({image_url})"
+        else:
+            encoded = base64.b64encode(image_data).decode()
+            return f"![Generated Image](data:{mime_type};base64,{encoded})"
+
+    # TODO: [refac] Use is elsewhere too.
+    async def _emit_completion(self, content: str):
+        """Emits completion event with current content."""
+        emission: ChatCompletionEvent = {
+            "type": "chat:completion",
+            "data": {"content": content},
+        }
+        await self.__event_emitter__(emission)
 
     def _pop_system_prompt(
         self,
