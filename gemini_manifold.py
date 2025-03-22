@@ -51,10 +51,8 @@ from typing import (
     Generator,
     Iterator,
     Literal,
-    NotRequired,
     Tuple,
     Optional,
-    TypedDict,
     TYPE_CHECKING,
 )
 from starlette.responses import StreamingResponse
@@ -67,6 +65,7 @@ from loguru import logger
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler
+    from manifold_types import *  # My personal types in a separate file for more robustness.
 
 # FIXME What about other 2.0 models?
 # according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
@@ -80,62 +79,6 @@ ALLOWED_GROUNDING_MODELS = [
 # To avoid conflict name in the future, here use suffix not in gemini naming pattern.
 SEARCH_MODEL_SUFFIX = "++SEARCH"
 
-
-class UserData(TypedDict):
-    """This is how `__user__` `dict` looks like."""
-
-    id: str
-    email: str
-    name: str
-    role: Literal["admin", "user", "pending"]
-    valves: NotRequired[Any]  # object of type UserValves
-
-
-class ModelData(TypedDict):
-    """This is how the `pipes` function expects the `dict` to look like."""
-
-    id: str
-    name: str
-
-
-class SourceSource(TypedDict):
-    docs: NotRequired[list[dict]]
-    name: str  # the search query used
-    type: NotRequired[Literal["web_search"]]
-    urls: NotRequired[list[str]]
-
-
-class SourceMetadata(TypedDict, total=False):
-    source: str  # url
-    title: NotRequired[str]  # website title
-    description: NotRequired[str]  # website description
-    language: NotRequired[str]  # website language
-
-
-class Source(TypedDict):
-    source: SourceSource
-    document: list[str]
-    metadata: list[SourceMetadata]
-    distances: NotRequired[list[float]]
-
-
-class ErrorData(TypedDict):
-    detail: str
-
-
-class ChatCompletionEventData(TypedDict):
-    content: NotRequired[str]
-    done: NotRequired[bool]
-    error: NotRequired[ErrorData]
-    sources: NotRequired[list[Source]]
-
-
-class ChatCompletionEvent(TypedDict):
-    type: Literal["chat:completion"]
-    data: ChatCompletionEventData
-
-
-Event = ChatCompletionEvent
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
 log = logger.bind(auditable=False)
@@ -181,13 +124,13 @@ class Pipe:
     def __init__(self):
         self.valves = self.Valves()
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
-        self.models: list[ModelData] = []
+        self.models: list["ModelData"] = []
         self.client: Optional[genai.Client] = None
         self.aggregated_chunks: list[types.GenerateContentResponse] = []
         print("[gemini_manifold] Function has been initialized!")
 
     # FIXME Make it async
-    def pipes(self) -> list[ModelData]:
+    def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
 
         self._add_log_handler()
@@ -231,9 +174,9 @@ class Pipe:
     async def pipe(
         self,
         body: dict,
-        __user__: UserData,
+        __user__: "UserData",
         __request__: Request,
-        __event_emitter__: Callable[[Event], Awaitable[None]],
+        __event_emitter__: Callable[["Event"], Awaitable[None]],
         __metadata__: dict[str, Any],
     ) -> (
         str
@@ -443,7 +386,7 @@ class Pipe:
             return contents
 
         async def _stream_response(
-            gen_content_args: dict, __request__: Request, __user__: UserData
+            gen_content_args: dict, __request__: Request, __user__: "UserData"
         ) -> Tuple[list[types.GenerateContentResponse], str]:
             """Streams the resposne to the front-end using `__event_emitter__` and finally returns the full aggregated response."""
             # FIXME: Too much repeating code, refac somewhere in the distant future lol.
@@ -467,10 +410,10 @@ class Pipe:
                             )  # Safely get the text part
                             if text_part is not None:
                                 content = f"{content}{text_part}"
-                                emission = ChatCompletionEvent(
-                                    type="chat:completion",
-                                    data=ChatCompletionEventData(content=content),
-                                )
+                                emission: "ChatCompletionEvent" = {
+                                    "type": "chat:completion",
+                                    "data": {"content": content},
+                                }
                                 await __event_emitter__(emission)
                                 # Skip to the next part if it's text
                                 continue
@@ -495,10 +438,10 @@ class Pipe:
                                     ).decode()
                                     markdown_image = f"![Generated Image](data:{mime_type};base64,{image_data_decoded})"
                                 content = f"{content}{markdown_image}"
-                            emission = ChatCompletionEvent(
-                                type="chat:completion",
-                                data=ChatCompletionEventData(content=content),
-                            )
+                            emission: "ChatCompletionEvent" = {
+                                "type": "chat:completion",
+                                "data": {"content": content},
+                            }
                             await __event_emitter__(emission)
             return aggregated_chunks, content
 
@@ -664,7 +607,7 @@ class Pipe:
             f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
         )
 
-    def _get_google_models(self) -> list[ModelData]:
+    def _get_google_models(self) -> list["ModelData"]:
         """Retrieve Google models with prefix stripping."""
 
         if not self.client:
@@ -684,11 +627,11 @@ class Pipe:
             return [_return_error_model(error_msg)]
         log.info(f"Retrieved {len(models)} models from Gemini Developer API.")
 
-        model_list = [
-            ModelData(
-                id=self._strip_prefix(model.name),
-                name=model.display_name,
-            )
+        model_list: list["ModelData"] = [
+            {
+                "id": self._strip_prefix(model.name),
+                "name": model.display_name,
+            }
             for model in models
             if (
                 model.name is not None  # Ensure name is present
@@ -822,7 +765,7 @@ class Pipe:
         mime_type: str,
         model: str,
         prompt: str,
-        __user__: UserData,
+        __user__: "UserData",
         __request__: Request,
     ) -> str:
 
@@ -854,13 +797,13 @@ class Pipe:
         self, error_msg: str, warning: bool = False, exception: bool = True
     ) -> None:
         """Emits an event to the front-end that causes it to display a nice red error message."""
-        error = ChatCompletionEvent(
-            type="chat:completion",
-            data=ChatCompletionEventData(
-                done=True,
-                error=ErrorData(detail="\n" + error_msg),
-            ),
-        )
+        error: ChatCompletionEvent = {
+            "type": "chat:completion",
+            "data": {
+                "done": True,
+                "error": {"detail": "\n" + error_msg},
+            },
+        }
         if warning:
             log.opt(depth=1, exception=False).warning(error_msg)
         else:
@@ -870,7 +813,7 @@ class Pipe:
 
 async def _add_citations(
     data: types.GenerateContentResponse, raw_str: str
-) -> Optional[Event]:
+) -> Optional["Event"]:
     async def resolve_url(session, url) -> str:
         """Asynchronously resolves a URL by following redirects"""
         try:
@@ -912,7 +855,7 @@ async def _add_citations(
                 )
                 raw_str = f"{raw_str[:end_pos]}{citation_markers}{raw_str[end_pos:]}"
 
-    sources_list: list[Source] = []
+    sources_list: list["Source"] = []
     if uris:
         async with aiohttp.ClientSession() as session:
             tasks = [resolve_url(session, uri) for uri in uris]
@@ -926,15 +869,18 @@ async def _add_citations(
             }
         ]
 
-    event_data: ChatCompletionEventData = {"content": raw_str, "sources": sources_list}
-    event: Event = {"type": "chat:completion", "data": event_data}
+    event_data: "ChatCompletionEventData" = {
+        "content": raw_str,
+        "sources": sources_list,
+    }
+    event: "Event" = {"type": "chat:completion", "data": event_data}
 
     return event
 
 
 def _return_error_model(
     error_msg: str, warning: bool = False, exception: bool = True
-) -> ModelData:
+) -> "ModelData":
     """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
     if warning:
         log.opt(depth=1, exception=False).warning(error_msg)
