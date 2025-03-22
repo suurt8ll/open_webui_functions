@@ -32,7 +32,7 @@ requirements: google-genai==1.7.0
 #   TODO Refactor, make this mess more readable lol.
 
 import asyncio
-import json
+import copy
 import aiohttp
 from google import genai
 from google.genai import types
@@ -207,13 +207,13 @@ class Pipe:
         max_len = 50
         log.debug(
             "Received body:",
-            body=str(self._truncate_long_strings(body.copy(), max_len)),
+            body=str(self._truncate_long_strings(copy.deepcopy(body), max_len)),
         )
         log.debug(f"System prompt: {system_prompt}")
         turn_content_dict_list: list[dict] = []
         for content in contents:
             truncated_content = self._truncate_long_strings(
-                content.model_dump().copy(), max_len
+                content.model_dump(), max_len
             )
             turn_content_dict_list.append(truncated_content)
         log.debug(
@@ -281,20 +281,16 @@ class Pipe:
                 res, raw_text = await self._stream_response(
                     gen_content_args, __request__, __user__
                 )
-                cited_text = None
                 emit_sources = None
+                chunks_str = "["
                 for chunk in res:
-                    print(
-                        json.dumps(
-                            self._truncate_long_strings(chunk.model_dump()),
-                            indent=2,
-                            default=str,
-                        )
-                        + ","
-                    )
+                    chunks_str = f"{chunks_str}{self._truncate_long_strings(chunk.model_dump())},"
                     emit_sources = await self._add_citations(chunk, raw_text)
+                chunks_str = chunks_str[:-1] + "]"
+                log.debug("Got response from Google API:", response=chunks_str)
                 if emit_sources:
-                    print(json.dumps(emit_sources, indent=2))
+                    emit_str = str(self._truncate_long_strings(copy.deepcopy(emit_sources)))  # type: ignore
+                    log.debug("Emitting the sources:", emit_object=emit_str)
                     await __event_emitter__(emit_sources)
                 return None
             else:
@@ -723,7 +719,9 @@ class Pipe:
             # FIXME OR should it error out??
             return model_name  # Return original if stripping fails
 
-    def _truncate_long_strings(self, data: dict, max_length: int = 50) -> dict:
+    def _truncate_long_strings(
+        self, data: dict[str, Any], max_length: int = 50
+    ) -> dict[str, Any]:
         """
         Recursively truncates all string and bytes fields within a dictionary that exceed
         the specified maximum length. Bytes are converted to strings before truncation.
