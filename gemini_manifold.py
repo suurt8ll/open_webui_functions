@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.7.0
+version: 1.8.0
 requirements: google-genai==1.7.0
 """
 
@@ -15,6 +15,7 @@ requirements: google-genai==1.7.0
 
 # Supported features:
 #   - Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
+#   - Display citations in the front-end.
 #   - Image input
 #   - Streaming
 #   - Grounding with Google Search
@@ -25,13 +26,14 @@ requirements: google-genai==1.7.0
 #   TODO Video input support.
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 #   TODO Display usage statistics (token counts)
-#   TODO Display citations in the front-end.
 
 # Other things to do:
 #   TODO Better type checking.
-#   TODO Return errors as correctly formatted error types for the frontend to handle (red text in the front-end).
 #   TODO Refactor, make this mess more readable lol.
 
+import asyncio
+import json
+import aiohttp
 from google import genai
 from google.genai import types
 import base64
@@ -96,14 +98,36 @@ class ModelData(TypedDict):
     name: str
 
 
+class SourceSource(TypedDict):
+    docs: NotRequired[list[dict]]
+    name: str  # the search query used
+    type: NotRequired[Literal["web_search"]]
+    urls: NotRequired[list[str]]
+
+
+class SourceMetadata(TypedDict, total=False):
+    source: str  # url
+    title: NotRequired[str]  # website title
+    description: NotRequired[str]  # website description
+    language: NotRequired[str]  # website language
+
+
+class Source(TypedDict):
+    source: SourceSource
+    document: list[str]
+    metadata: list[SourceMetadata]
+    distances: NotRequired[list[float]]
+
+
 class ErrorData(TypedDict):
     detail: str
 
 
 class ChatCompletionEventData(TypedDict):
-    content: Optional[str]
-    done: bool
+    content: NotRequired[str]
+    done: NotRequired[bool]
     error: NotRequired[ErrorData]
+    sources: NotRequired[list[Source]]
 
 
 class ChatCompletionEvent(TypedDict):
@@ -156,9 +180,10 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
-        self.last_whitelist = self.valves.MODEL_WHITELIST
-        self.models = []
-        self.client = None
+        self.last_whitelist: str = self.valves.MODEL_WHITELIST
+        self.models: list[ModelData] = []
+        self.client: Optional[genai.Client] = None
+        self.aggregated_chunks: list[types.GenerateContentResponse] = []
         print("[gemini_manifold] Function has been initialized!")
 
     # FIXME Make it async
@@ -417,23 +442,18 @@ class Pipe:
 
             return contents
 
-        async def _process_stream(
+        async def _stream_response(
             gen_content_args: dict, __request__: Request, __user__: UserData
-        ) -> AsyncGenerator[str, None]:
-            """Helper function to process the stream and yield text chunks.
-
-            Args:
-                gen_content_args: The arguments to pass to generate_content_stream.
-
-            Yields:
-                str: Text chunks from the response.
-            """
-            # FIXME Get type checking working in here.
+        ) -> Tuple[list[types.GenerateContentResponse], str]:
+            """Streams the resposne to the front-end using `__event_emitter__` and finally returns the full aggregated response."""
+            # FIXME: Too much repeating code, refac somewhere in the distant future lol.
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
                 await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
             )
-
+            aggregated_chunks: list[types.GenerateContentResponse] = []
+            content: str = ""
             async for chunk in response_stream:
+                aggregated_chunks.append(chunk)
                 if chunk.candidates:
                     if len(chunk.candidates) > 1:
                         log.warning(
@@ -446,9 +466,15 @@ class Pipe:
                                 part, "text", None
                             )  # Safely get the text part
                             if text_part is not None:
-                                yield text_part
-                                continue  # Skip to the next part if it's text
-                            # --- Image Handling Logic ---
+                                content = f"{content}{text_part}"
+                                emission = ChatCompletionEvent(
+                                    type="chat:completion",
+                                    data=ChatCompletionEventData(content=content),
+                                )
+                                await __event_emitter__(emission)
+                                # Skip to the next part if it's text
+                                continue
+                            # Image Handling Logic
                             inline_data = getattr(part, "inline_data", None)
                             if inline_data is not None:
                                 mime_type = inline_data.mime_type
@@ -463,13 +489,18 @@ class Pipe:
                                         __request__,
                                     )
                                     markdown_image = f"![Generated Image]({image_url})"
-                                    yield markdown_image
                                 else:
                                     image_data_decoded = base64.b64encode(
                                         image_data
                                     ).decode()
                                     markdown_image = f"![Generated Image](data:{mime_type};base64,{image_data_decoded})"
-                                    yield markdown_image
+                                content = f"{content}{markdown_image}"
+                            emission = ChatCompletionEvent(
+                                type="chat:completion",
+                                data=ChatCompletionEventData(content=content),
+                            )
+                            await __event_emitter__(emission)
+            return aggregated_chunks, content
 
         """Main pipe method."""
 
@@ -492,12 +523,13 @@ class Pipe:
 
         max_len = 50
         log.debug(
-            "Received body:", body=str(self.truncate_long_strings(body.copy(), max_len))
+            "Received body:",
+            body=str(self._truncate_long_strings(body.copy(), max_len)),
         )
         log.debug(f"System prompt: {system_prompt}")
         turn_content_dict_list: list[dict] = []
         for content in contents:
-            truncated_content = self.truncate_long_strings(
+            truncated_content = self._truncate_long_strings(
                 content.model_dump().copy(), max_len
             )
             turn_content_dict_list.append(truncated_content)
@@ -562,7 +594,25 @@ class Pipe:
         try:
             # TODO: Handle errors related to Google Safety Settings feature.
             if body.get("stream", False):
-                return _process_stream(gen_content_args, __request__, __user__)
+                res, raw_text = await _stream_response(
+                    gen_content_args, __request__, __user__
+                )
+                cited_text = None
+                emit_sources = None
+                for chunk in res:
+                    print(
+                        json.dumps(
+                            self._truncate_long_strings(chunk.model_dump()),
+                            indent=2,
+                            default=str,
+                        )
+                        + ","
+                    )
+                    emit_sources = await _add_citations(chunk, raw_text)
+                if emit_sources:
+                    print(json.dumps(emit_sources, indent=2))
+                    await __event_emitter__(emit_sources)
+                return None
             else:
                 if "gemini-2.0-flash-exp-image-generation" in model_name:
                     warn_msg = "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
@@ -732,7 +782,7 @@ class Pipe:
             # FIXME OR should it error out??
             return model_name  # Return original if stripping fails
 
-    def truncate_long_strings(self, data: dict, max_length: int = 50) -> dict:
+    def _truncate_long_strings(self, data: dict, max_length: int = 50) -> dict:
         """
         Recursively truncates all string and bytes fields within a dictionary that exceed
         the specified maximum length. Bytes are converted to strings before truncation.
@@ -746,20 +796,23 @@ class Pipe:
         """
         for key, value in data.items():
             if isinstance(value, str) and len(value) > max_length:
-                data[key] = value[:max_length] + "..."  # Truncate and add ellipsis
+                truncated_length = len(value) - max_length
+                data[key] = value[:max_length] + f"[{truncated_length} chars truncated]"
             elif isinstance(value, bytes) and len(value) > max_length:
+                truncated_length = len(value) - max_length
                 data[key] = (
-                    value.hex()[:max_length] + "..."
-                )  # Convert to hex, truncate, and add ellipsis
+                    value.hex()[:max_length]
+                    + f"[{truncated_length} hex chars truncated]"
+                )
             elif isinstance(value, dict):
-                self.truncate_long_strings(
+                self._truncate_long_strings(
                     value, max_length
                 )  # Recursive call for nested dictionaries
             elif isinstance(value, list):
                 # Iterate through the list and process each element if it's a dictionary
                 for item in value:
                     if isinstance(item, dict):
-                        self.truncate_long_strings(item, max_length)
+                        self._truncate_long_strings(item, max_length)
 
         return data
 
@@ -804,7 +857,6 @@ class Pipe:
         error = ChatCompletionEvent(
             type="chat:completion",
             data=ChatCompletionEventData(
-                content=None,
                 done=True,
                 error=ErrorData(detail="\n" + error_msg),
             ),
@@ -814,6 +866,70 @@ class Pipe:
         else:
             log.opt(depth=1, exception=exception).error(error_msg)
         await self.__event_emitter__(error)
+
+
+async def _add_citations(
+    data: types.GenerateContentResponse, raw_str: str
+) -> Optional[Event]:
+    async def resolve_url(session, url) -> str:
+        """Asynchronously resolves a URL by following redirects"""
+        try:
+            async with session.get(url, allow_redirects=True) as response:
+                return str(response.url)
+        except Exception as e:
+            # FIXME: Consider more robust logging
+            print(f"Error resolving URL: {e}")
+            return url
+
+    if not data.candidates:
+        return None
+
+    candidate = data.candidates[0]
+    grounding_metadata = candidate.grounding_metadata if candidate else None
+
+    if (
+        not grounding_metadata
+        or not grounding_metadata.grounding_supports
+        or not grounding_metadata.grounding_chunks
+    ):
+        return None
+
+    supports = grounding_metadata.grounding_supports
+    grounding_chunks = grounding_metadata.grounding_chunks
+
+    uris: list[str] = [
+        g_c.web.uri for g_c in grounding_chunks if g_c.web and g_c.web.uri
+    ]
+
+    for support in supports:
+        text: Optional[str] = support.segment.text if support.segment else None
+        if text:
+            start = raw_str.find(text)
+            if start != -1:
+                end_pos = start + len(text)
+                citation_markers = "".join(
+                    f"[{index}]" for index in (support.grounding_chunk_indices or [])
+                )
+                raw_str = f"{raw_str[:end_pos]}{citation_markers}{raw_str[end_pos:]}"
+
+    sources_list: list[Source] = []
+    if uris:
+        async with aiohttp.ClientSession() as session:
+            tasks = [resolve_url(session, uri) for uri in uris]
+            resolved_uris = await asyncio.gather(*tasks)
+
+        sources_list = [
+            {
+                "source": {"name": "web_search"},
+                "document": [""] * len(resolved_uris),
+                "metadata": [{"source": uri} for uri in resolved_uris],
+            }
+        ]
+
+    event_data: ChatCompletionEventData = {"content": raw_str, "sources": sources_list}
+    event: Event = {"type": "chat:completion", "data": event_data}
+
+    return event
 
 
 def _return_error_model(

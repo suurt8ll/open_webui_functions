@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.9.0
+version: 0.9.1
 """
 
 # NB! This is work in progress and not yet fully featured.
@@ -253,14 +253,12 @@ class Pipe:
             if not raw_models:
                 log.warning("Venice API returned no models.")
             return [{"id": model["id"], "name": model["id"]} for model in raw_models]
-        except requests.exceptions.RequestException:
-            error_msg = "Error getting models:"
-            log.exception(error_msg)
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Error getting models: {str(e)}"
             return [_return_error_model(error_msg)]
         except Exception as e:
-            error_msg = "An unexpected error occurred: "
-            log.exception(error_msg)
-            return [_return_error_model(error_msg + str(e))]
+            error_msg = f"An unexpected error occurred: {str(e)}"
+            return [_return_error_model(error_msg)]
 
     async def _generate_image(self, model: str, prompt: str) -> dict | None:
         try:
@@ -384,8 +382,14 @@ class Pipe:
 """Helper functions outside the Pipe class."""
 
 
-def _return_error_model(error_msg: str) -> ModelData:
+def _return_error_model(
+    error_msg: str, warning: bool = False, exception: bool = True
+) -> ModelData:
     """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+    if warning:
+        log.opt(depth=1, exception=False).warning(error_msg)
+    else:
+        log.opt(depth=1, exception=exception).error(error_msg)
     return {
         "id": "error",
         "name": "[venice_manifold] " + error_msg,

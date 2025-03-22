@@ -13,6 +13,8 @@ requirements:
 import asyncio
 import sys
 from typing import (
+    Any,
+    NotRequired,
     AsyncGenerator,
     Awaitable,
     Generator,
@@ -44,9 +46,12 @@ class ModelData(TypedDict):
 
 
 class StatusEventData(TypedDict):
+    action: NotRequired[Optional[Literal["web_search", "knowledge_search"]]]
     description: str
-    done: bool
-    hidden: bool
+    done: NotRequired[bool]
+    query: NotRequired[str]  # knowledge_search
+    urls: NotRequired[list[str]]  # web_search
+    hidden: NotRequired[bool]
 
 
 class ErrorData(TypedDict):
@@ -114,9 +119,8 @@ class Pipe:
                 ModelData(id="model_id_2", name="model_2"),
             ]
         except Exception as e:
-            error_msg = "Error during registering models: "
-            log.exception(error_msg)
-            return [_return_error_model(error_msg + str(e))]
+            error_msg = f"Error during registering models: {str(e)}"
+            return [_return_error_model(error_msg)]
 
     async def pipe(
         self,
@@ -269,9 +273,15 @@ class Pipe:
         await self.__event_emitter__(error)
 
 
-def _return_error_model(error_msg: str) -> ModelData:
+def _return_error_model(
+    error_msg: str, warning: bool = False, exception: bool = True
+) -> ModelData:
     """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
-    return ModelData(
-        id="error",
-        name="[pipe_function_template] " + error_msg,
-    )
+    if warning:
+        log.opt(depth=1, exception=False).warning(error_msg)
+    else:
+        log.opt(depth=1, exception=exception).error(error_msg)
+    return {
+        "id": "error",
+        "name": "[template] " + error_msg,
+    }
