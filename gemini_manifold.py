@@ -224,7 +224,7 @@ class Pipe:
         model_name = self._strip_prefix(body.get("model", ""))
         log.debug(f"Model name: {model_name}")
 
-        config_params = {
+        config_params: dict[str, Any] = {
             "system_instruction": system_prompt,
             "temperature": body.get("temperature", 0.7),
             "top_p": body.get("top_p", 0.9),
@@ -234,17 +234,15 @@ class Pipe:
             "safety_settings": self._get_safety_settings(model_name),
         }
 
-        # FIXME: refac
+        config_params["response_modalities"] = ["Text"]
         if "gemini-2.0-flash-exp-image-generation" in model_name:
-            config_params["response_modalities"] = ["Text", "Image"]
-            # Image Generation model does not support the system prompt message
-            if config_params.get("system_instruction"):
+            config_params["response_modalities"].append("Image")
+            # FIXME: append to user message instead.
+            sys_pr: Optional[str] = config_params.pop("system_instruction")
+            if sys_pr:
                 log.warning(
-                    "Image Generation model does not support the system prompt message! Removing the system prompt."
+                    "Image Generation model does not support the system prompt message! Removed the system prompt."
                 )
-                del config_params["system_instruction"]
-        else:
-            config_params["response_modalities"] = ["Text"]
 
         if self.valves.USE_GROUNDING_SEARCH:
             if model_name.endswith(SEARCH_MODEL_SUFFIX):
@@ -656,7 +654,7 @@ class Pipe:
 
         return model_list
 
-    def _get_safety_settings(self, model_name: str):
+    def _get_safety_settings(self, model_name: str) -> list[types.SafetySetting]:
         """Get safety settings based on model name and permissive setting."""
 
         if not self.valves.USE_PERMISSIVE_SAFETY:
