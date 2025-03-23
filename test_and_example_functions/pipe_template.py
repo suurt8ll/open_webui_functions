@@ -1,6 +1,6 @@
 """
-title: Lean Pipe Function Skeleton
-id: pipe_function_skeleton
+title: Pipe Function Template
+id: pipe_template
 description: Good starting point for creating new pipe functions for Open WebUI.
 author: suurt8ll
 author_url: https://github.com/suurt8ll
@@ -229,5 +229,5 @@ def _return_error_model(
         log.opt(depth=1, exception=exception).error(error_msg)
     return {
         "id": "error",
-        "name": "[template] " + error_msg,
+        "name": "[pipe_template] " + error_msg,
     }
