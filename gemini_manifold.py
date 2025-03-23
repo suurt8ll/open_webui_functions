@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.8.0
+version: 1.8.1
 requirements: google-genai==1.7.0
 """
 
@@ -390,10 +390,10 @@ class Pipe:
         content: Optional[str] = None,
         done: bool = False,
         error: Optional[str] = None,
-        sources: Optional[list[Source]] = None,
+        sources: Optional[list["Source"]] = None,
     ):
         """Constructs and emits completion event."""
-        emission: ChatCompletionEvent = {
+        emission: "ChatCompletionEvent" = {
             "type": "chat:completion",
             "data": {"done": done},
         }
