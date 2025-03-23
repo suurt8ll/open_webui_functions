@@ -6,18 +6,20 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.0.1
+version: 0.0.0
 requirements:
 """
 
 import sys
+import inspect
+import httpx
 from typing import (
     Any,
     AsyncGenerator,
     Awaitable,
+    Callable,
     Generator,
     Iterator,
-    Callable,
     Literal,
     TYPE_CHECKING,
 )
@@ -26,15 +28,13 @@ from starlette.responses import StreamingResponse
 from fastapi import Request
 from open_webui.utils.logger import stdout_format
 from loguru import logger
+from packaging.version import Version
 
 # --- Imports for self-update ---
 from open_webui.routers.functions import update_function_by_id
 from open_webui.models.functions import FunctionForm, FunctionMeta
 from open_webui.models.users import Users
 from open_webui.utils.plugin import extract_frontmatter
-import inspect
-import httpx
-from packaging.version import Version
 
 if TYPE_CHECKING:
     from loguru import Record
@@ -55,13 +55,15 @@ class Pipe:
                 description="Select logging level. Use `docker logs -f open-webui` to view logs.",
             )
         )
+        GITHUB_RAW_URL: str = Field(
+            default="https://raw.githubusercontent.com/suurt8ll/open_webui_functions/refs/heads/feat/automatic-function-version-updates/test_and_example_functions/automatic_updates.py",
+            description="GitHub raw url to use for update checks.",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
         self.current_version = self._get_current_version()
-        print(
-            f"[automatic_updates] Function initialized. Version: {self.current_version}"
-        )
+        log.info(f"Function initialized. Version: {self.current_version}")
 
     async def pipes(self) -> list["ModelData"]:
         self._add_log_handler()
@@ -185,82 +187,85 @@ class Pipe:
         """Attempts to update the function itself."""
         log.info("Attempting self-update...")
 
-        # 1. Get the admin user
+        # TODO: Implement Throttling
+        # FIXME: If requirments: is persent then backend restarts? Could destory the logic here.
+
         try:
-            admin_user: Optional["UserModel"] = Users.get_user_by_id(id=__user__["id"])
+            # 1. Get the admin user
+            admin_user = Users.get_user_by_id(id=__user__["id"])
             if admin_user is None:
-                await self._emit_error("Could not retrieve admin user for self-update.")
-                return
+                raise ValueError("Could not retrieve admin user for self-update.")
+
+            # 2. Fetch the latest code from GitHub
+            github_code = await self._fetch_github_code()
+            if not github_code:
+                raise ValueError("Failed to fetch the latest code from GitHub.")
+
+            # 3. Extract metadata from the GitHub code
+            github_frontmatter = extract_frontmatter(github_code)
+            function_meta = FunctionMeta(
+                description=github_frontmatter.get("description", ""),
+                manifest=github_frontmatter,
+            )
+            log.debug(f"FunctionMeta for self-update: {function_meta}")
+
+            # 4. Get the function ID
+            function_id = github_frontmatter.get("id", __name__.split(".")[-1])
+            log.debug(f"Function ID for self-update: {function_id}")
+
+            # 5. Create FunctionForm
+            function_form = FunctionForm(
+                id=function_id,
+                name=github_frontmatter.get("title", "Automatic Updates"),
+                content=github_code,
+                meta=function_meta,
+            )
+            log.debug(f"FunctionForm for self-update: {function_form}")
+
+            # 6. Call update_function_by_id
+            updated_function = await update_function_by_id(
+                request=__request__,
+                id=function_id,
+                form_data=function_form,
+                user=admin_user,
+            )
+
+            if updated_function:
+                log.info(f"Function '{function_id}' successfully updated.")
+            else:
+                raise Exception(
+                    f"update_function_by_id returned None: Function '{function_id}' update failed."
+                )
+            # TODO: Update last update check timestamp in metadata.
+
         except Exception as e:
-            await self._emit_error(f"Error getting admin user: {e}")
-            return
-
-        # 2. Get the function ID (from the module name, in this example)
-        function_id = __name__.split(".")[-1]  # Extract ID from module name
-        log.debug(f"Function ID for self-update: {function_id}")
-
-        # 3. Create FunctionMeta (example values)
-        function_meta = FunctionMeta(
-            description="Updated description via self-update",
-            manifest={"updated": True},
-        )
-        log.debug(f"FunctionMeta for self-update: {function_meta}")
-
-        # 4. Create FunctionForm (example new content)
-        new_content = (
-            "def updated_function():\n    return 'This function has been updated!'"
-        )
-        function_form = FunctionForm(
-            id=function_id,
-            name="Automatic Updates (Updated)",  # Updated name
-            content=new_content,
-            meta=function_meta,
-        )
-        log.debug(f"FunctionForm for self-update: {function_form}")
-
-        # 5. Call update_function_by_id (PLACEHOLDER)
-        log.info(
-            "PLACEHOLDER: Would call update_function_by_id here with:"
-            f" request={__request__}, id={function_id}, form_data={function_form}, user={admin_user}"
-        )
-        # await update_function_by_id(
-        #     request=__request__,
-        #     id=function_id,
-        #     form_data=function_form,
-        #     user=admin_user,
-        # )
-        await self._emit_error("Self-update is disabled for safety.", warning=True)
+            log.error(f"Error updating function: {e}")
+            await self._emit_error(f"Error updating function: {e}")
 
     def _get_current_version(self):
         """Gets the current version from the function's frontmatter."""
         try:
             module = inspect.getmodule(self.__class__)
-            if module:
-                try:
-                    source_code = inspect.getsource(module)
-                except OSError as e:
-                    log.error(f"Error getting source code for module: {e}")
-                    source_code = None
-            else:
-                log.error("Could not determine module for class.")
-                source_code = None
+            if not module:
+                raise ValueError("Could not determine module for class.")
 
-            if source_code:
-                frontmatter = extract_frontmatter(source_code)
-                return frontmatter.get("version", "0.0.0")  # Default if not found
-            else:
-                return "0.0.0"  # Return default if source code is None
+            source_code = inspect.getsource(module)
+            frontmatter = extract_frontmatter(source_code)
+            return frontmatter.get("version", "0.0.0")
+        except OSError as e:
+            log.error(f"Error getting source code: {e}")
+            return "0.0.0"
         except Exception as e:
             log.error(f"Error getting current version: {e}")
             return "0.0.0"
 
     async def _fetch_github_code(self):
         """Fetches the code from the raw GitHub URL."""
-        raw_url = "https://raw.githubusercontent.com/suurt8ll/open_webui_functions/refs/heads/feat/automatic-function-version-updates/test_and_example_functions/automatic_updates.py"
+        raw_url = self.valves.GITHUB_RAW_URL
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(raw_url)
-                response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+                response.raise_for_status()
                 return response.text
         except httpx.HTTPStatusError as e:
             log.error(f"HTTP error fetching GitHub code: {e}")
@@ -271,7 +276,6 @@ class Pipe:
 
     def _extract_version_from_code(self, code):
         """Extracts the version from the code using extract_frontmatter."""
-
         frontmatter = extract_frontmatter(code)
         return frontmatter.get("version")
 
