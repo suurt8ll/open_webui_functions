@@ -59,7 +59,7 @@ class Pipe:
         self.valves = self.Valves()
         print("[log_testing] Initialization done!")
 
-    def pipes(self) -> list[dict]:
+    async def pipes(self) -> list[dict]:
         self._add_log_handler()
         log.info("Registering models.")
         return [
