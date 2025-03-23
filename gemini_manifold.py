@@ -228,6 +228,7 @@ class Pipe:
         )
 
         # TODO: Take defaults from the general front-end config.
+        # FIXME: If the conversation has used Search, then augment the sysetm prompt by telling the model to not use [] citations in it's own respose.
         gen_content_conf = types.GenerateContentConfig(
             system_instruction=system_prompt,
             temperature=body.get("temperature"),
@@ -384,13 +385,24 @@ class Pipe:
             encoded = base64.b64encode(image_data).decode()
             return f"![Generated Image](data:{mime_type};base64,{encoded})"
 
-    # TODO: [refac] Use is elsewhere too.
-    async def _emit_completion(self, content: str):
-        """Emits completion event with current content."""
+    async def _emit_completion(
+        self,
+        content: Optional[str] = None,
+        done: bool = False,
+        error: Optional[str] = None,
+        sources: Optional[list[Source]] = None,
+    ):
+        """Constructs and emits completion event."""
         emission: ChatCompletionEvent = {
             "type": "chat:completion",
-            "data": {"content": content},
+            "data": {"done": done},
         }
+        if content:
+            emission["data"]["content"] = content
+        if error:
+            emission["data"]["error"] = {"detail": error}
+        if sources:
+            emission["data"]["sources"] = sources
         await self.__event_emitter__(emission)
 
     def _pop_system_prompt(
@@ -808,22 +820,16 @@ class Pipe:
         self, error_msg: str, warning: bool = False, exception: bool = True
     ) -> None:
         """Emits an event to the front-end that causes it to display a nice red error message."""
-        error: ChatCompletionEvent = {
-            "type": "chat:completion",
-            "data": {
-                "done": True,
-                "error": {"detail": "\n" + error_msg},
-            },
-        }
         if warning:
             log.opt(depth=1, exception=False).warning(error_msg)
         else:
             log.opt(depth=1, exception=exception).error(error_msg)
-        await self.__event_emitter__(error)
+        await self._emit_completion(error=f"\n{error_msg}", done=True)
 
     async def _add_citations(
         self, data: types.GenerateContentResponse, raw_str: str
-    ) -> Optional["Event"]:
+    ) -> Optional["ChatCompletionEvent"]:
+
         async def resolve_url(session, url) -> str:
             """Asynchronously resolves a URL by following redirects"""
             try:
