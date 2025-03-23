@@ -15,16 +15,12 @@ import inspect
 import httpx
 from typing import (
     Any,
-    AsyncGenerator,
     Awaitable,
     Callable,
-    Generator,
-    Iterator,
     Literal,
     TYPE_CHECKING,
 )
 from pydantic import BaseModel, Field
-from starlette.responses import StreamingResponse
 from fastapi import Request
 from open_webui.utils.logger import stdout_format
 from loguru import logger
@@ -40,7 +36,6 @@ if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler
     from manifold_types import *  # My personal types in a separate file for more robustness.
-    from open_webui.models.users import UserModel
 
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
@@ -76,20 +71,7 @@ class Pipe:
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __event_call__: Callable[["Event"], Awaitable[Any]],
-        __task__: str,
-        __task_body__: dict[str, Any],
-        __files__: list[dict[str, Any]],
-        __metadata__: dict[str, Any],
-        __tools__: list[Any],
-    ) -> (
-        str
-        | dict[str, Any]
-        | StreamingResponse
-        | Iterator
-        | AsyncGenerator
-        | Generator
-        | None
-    ):
+    ) -> Optional[str]:
 
         self.__event_emitter__ = __event_emitter__
 
@@ -99,11 +81,6 @@ class Pipe:
             "__request__": __request__,
             "__event_emitter__": __event_emitter__,
             "__event_call__": __event_call__,
-            "__task__": __task__,
-            "__task_body__": __task_body__,
-            "__files__": __files__,
-            "__metadata__": __metadata__,
-            "__tools__": __tools__,
         }
 
         log.debug(
@@ -112,6 +89,7 @@ class Pipe:
         )
 
         # --- Version Check and Update Notification ---
+        # TODO: Branch to it completely independent task that does not block event this plugin itself.
         github_code = await self._fetch_github_code()
         if github_code:
             github_version_str = self._extract_version_from_code(github_code)
@@ -244,6 +222,7 @@ class Pipe:
 
     def _get_current_version(self):
         """Gets the current version from the function's frontmatter."""
+        # FIXME: don't default to 0.0.0, return None and handle upstream.
         try:
             module = inspect.getmodule(self.__class__)
             if not module:
