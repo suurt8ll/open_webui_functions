@@ -105,4 +105,14 @@ class StatusEvent(TypedDict):
     data: StatusEventData
 
 
-Event = ChatCompletionEvent | StatusEvent
+class ConfirmationEventData(TypedDict):
+    title: str
+    message: str
+
+
+class ConfirmationEvent(TypedDict):
+    type: Literal["confirmation"]
+    data: ConfirmationEventData
+
+
+Event = ChatCompletionEvent | StatusEvent | ConfirmationEvent
