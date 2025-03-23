@@ -15,6 +15,7 @@ import inspect
 import httpx
 from typing import (
     Any,
+    Optional,
     Awaitable,
     Callable,
     Literal,
@@ -57,8 +58,27 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
-        self.current_version = self._get_current_version()
-        log.info(f"Function initialized. Version: {self.current_version}")
+
+        # Put the frontmatter values into self object.
+        frontmatter = self._extract_frontmatter()
+        self.title: Optional[str] = frontmatter.get("title")
+        self.id: Optional[str] = frontmatter.get("id")
+        self.description: Optional[str] = frontmatter.get("description")
+        self.author: Optional[str] = frontmatter.get("author")
+        self.author_url: Optional[str] = frontmatter.get("author_url")
+        self.funding_url: Optional[str] = frontmatter.get("funding_url")
+        self.license: Optional[str] = frontmatter.get("license")
+        self.requirements: Optional[str] = frontmatter.get("requirements")
+
+        self.version = None
+        try:
+            v = frontmatter.get("version")
+            self.version = Version(v) if v else None
+        except ValueError:
+            # Fails if version string does not follow PEP 440.
+            pass
+
+        log.info(f"[{self.id}] Function initialized.", self=str(self.__dict__))
 
     async def pipes(self) -> list["ModelData"]:
         self._add_log_handler()
@@ -100,13 +120,15 @@ class Pipe:
                     "type": "confirmation",
                     "data": {
                         "title": "Update Available",
-                        "message": f"A new version ({self.current_version} -> {github_version_str}) is available. Update?",
+                        "message": f"A new version ({self.version} -> {github_version_str}) is available. Update?",
                     },
                 }
                 response = await __event_call__(event_data)
 
                 if response is not None and response is True:  # Check for confirmation
                     await self._self_update(__request__, __user__)
+
+        # TODO: Use event emission to send a notification toast to the front-end telling how the update went and infroming the user to reload the browser.
 
         return "Hello World!"
 
@@ -220,9 +242,8 @@ class Pipe:
             log.error(f"Error updating function: {e}")
             await self._emit_error(f"Error updating function: {e}")
 
-    def _get_current_version(self):
-        """Gets the current version from the function's frontmatter."""
-        # FIXME: don't default to 0.0.0, return None and handle upstream.
+    def _extract_frontmatter(self):
+        """Extracts the frontmatter from the function's source code."""
         try:
             module = inspect.getmodule(self.__class__)
             if not module:
@@ -230,13 +251,13 @@ class Pipe:
 
             source_code = inspect.getsource(module)
             frontmatter = extract_frontmatter(source_code)
-            return frontmatter.get("version", "0.0.0")
+            return frontmatter
         except OSError as e:
             log.error(f"Error getting source code: {e}")
-            return "0.0.0"
+            return {}
         except Exception as e:
-            log.error(f"Error getting current version: {e}")
-            return "0.0.0"
+            log.error(f"Error getting frontmatter: {e}")
+            return {}
 
     async def _fetch_github_code(self):
         """Fetches the code from the raw GitHub URL."""
@@ -261,9 +282,11 @@ class Pipe:
     def _is_new_version_available(self, github_version_str):
         """Compares the GitHub version with the current version."""
         try:
-            current_version = Version(self.current_version)
-            github_version = Version(github_version_str)
-            return github_version > current_version
+            if current_version := self.version:
+                github_version = Version(github_version_str)
+                return github_version > current_version
+            else:
+                raise ValueError("Current version is missing.")
         except Exception as e:
             log.error(f"Error comparing versions: {e}")
             return False
