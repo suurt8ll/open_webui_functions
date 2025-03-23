@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.8.2
+version: 1.8.3
 requirements: google-genai==1.7.0
 """
 
@@ -44,21 +44,15 @@ from fastapi import Request
 from pydantic import BaseModel, Field
 from typing import (
     Any,
-    AsyncGenerator,
     AsyncIterator,
     Awaitable,
     Callable,
-    Generator,
-    Iterator,
     Literal,
     Tuple,
     Optional,
     TYPE_CHECKING,
 )
-from starlette.responses import StreamingResponse
-from open_webui.routers.images import upload_image
 from open_webui.models.files import FileForm, Files
-from open_webui.models.users import Users
 from open_webui.storage.provider import Storage
 from open_webui.utils.logger import stdout_format
 from loguru import logger
@@ -178,15 +172,9 @@ class Pipe:
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __metadata__: dict[str, Any],
-    ) -> (
-        str
-        | dict[str, Any]
-        | StreamingResponse
-        | Iterator
-        | AsyncGenerator
-        | Generator
-        | None
-    ):
+    ) -> Optional[str]:
+
+        # TODO: [refac] Move __user__ to self like that also.
         self.__event_emitter__ = __event_emitter__
 
         if not self.client:

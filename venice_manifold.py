@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.9.3
+version: 0.9.4
 """
 
 # NB! This is work in progress and not yet fully featured.
@@ -28,9 +28,6 @@ import aiohttp
 import base64
 from typing import (
     Any,
-    AsyncGenerator,
-    Generator,
-    Iterator,
     Literal,
     Callable,
     Awaitable,
@@ -38,7 +35,6 @@ from typing import (
     TYPE_CHECKING,
 )
 from pydantic import BaseModel, Field
-from starlette.responses import StreamingResponse
 from fastapi import Request
 from open_webui.models.files import Files, FileForm
 from open_webui.utils.logger import stdout_format
@@ -91,8 +87,9 @@ class Pipe:
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __task__: str,
         __metadata__: dict[str, Any],
-    ) -> str | dict | StreamingResponse | Iterator | AsyncGenerator | Generator | None:
+    ) -> Optional[str]:
 
+        # TODO: [refac] Move __user__ to self like that also.
         self.__event_emitter__ = __event_emitter__
 
         if "error" in __metadata__["model"]["id"]:
