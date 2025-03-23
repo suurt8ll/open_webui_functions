@@ -135,7 +135,7 @@ class Pipe:
 
         log.debug(f"Model: {model}, Prompt: {prompt}")
 
-        # FIXME Move it out of pipe for cleaner code?
+        # FIXME [refac] Move it out of pipe for cleaner code?
         async def timer_task(start_time: float):
             """Counts up and emits status updates."""
             try:
@@ -180,25 +180,26 @@ class Pipe:
                 },
             }
         )
+        if not success:
+            return None
 
-        if success:
-            log.info("Image generated successfully!")
-            base64_image = image_data["images"][0]  # type: ignore
+        log.info("Image generated successfully!")
+        base64_image = image_data["images"][0]  # type: ignore
 
-            if self.valves.USE_FILES_API:
-                # Decode the base64 image data
-                image_data = base64.b64decode(base64_image)
-                # FIXME make mime type dynamic
-                image_url = await self._upload_image(
-                    image_data, "image/png", model, prompt, __user__["id"], __request__
-                )
-                if not image_url:
-                    return
-                return f"![Generated Image]({image_url})"
-            else:
-                return f"![Generated Image](data:image/png;base64,{base64_image})"
+        if self.valves.USE_FILES_API:
+            # Decode the base64 image data
+            image_data = base64.b64decode(base64_image)
+            # FIXME make mime type dynamic
+            image_url = await self._upload_image(
+                image_data, "image/png", model, prompt, __user__["id"], __request__
+            )
+            return f"![Generated Image]({image_url})" if image_url else None
+        else:
+            return f"![Generated Image](data:image/png;base64,{base64_image})"
 
-    """Helper functions inside the Pipe class."""
+    """
+    ---------- Helper functions inside the Pipe class. ----------
+    """
 
     async def _get_models(self) -> list["ModelData"]:
         try:
@@ -222,7 +223,7 @@ class Pipe:
             error_msg = f"An unexpected error occurred: {str(e)}"
             return [self._return_error_model(error_msg)]
 
-    async def _generate_image(self, model: str, prompt: str) -> dict | None:
+    async def _generate_image(self, model: str, prompt: str) -> Optional[dict]:
         try:
             async with aiohttp.ClientSession() as session:
                 log.info(
