@@ -74,11 +74,10 @@ class Pipe:
         self.valves = self.Valves()
         print("[venice_manifold] Function has been initialized!")
 
-    # FIXME Make it async.
-    def pipes(self) -> list["ModelData"]:
+    async def pipes(self) -> list["ModelData"]:
         # I'm adding the handler here because LOG_LEVEL is not set inside __init__ sadly.
         self._add_log_handler()
-        return self._get_models()
+        return await self._get_models()
 
     async def pipe(
         self,
@@ -196,23 +195,27 @@ class Pipe:
 
     """Helper functions inside the Pipe class."""
 
-    def _get_models(self) -> list["ModelData"]:
+    async def _get_models(self) -> list["ModelData"]:
         try:
-            response = requests.get(
-                "https://api.venice.ai/api/v1/models?type=image",
-                headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},
-            )
-            response.raise_for_status()
-            raw_models = response.json().get("data", [])
-            if not raw_models:
-                log.warning("Venice API returned no models.")
-            return [{"id": model["id"], "name": model["id"]} for model in raw_models]
-        except requests.exceptions.RequestException as e:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://api.venice.ai/api/v1/models?type=image",
+                    headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},
+                ) as response:
+                    response.raise_for_status()
+                    raw_models = await response.json()
+                    raw_models = raw_models.get("data", [])
+                    if not raw_models:
+                        log.warning("Venice API returned no models.")
+                    return [
+                        {"id": model["id"], "name": model["id"]} for model in raw_models
+                    ]
+        except aiohttp.ClientResponseError as e:
             error_msg = f"Error getting models: {str(e)}"
-            return [_return_error_model(error_msg)]
+            return [self._return_error_model(error_msg)]
         except Exception as e:
             error_msg = f"An unexpected error occurred: {str(e)}"
-            return [_return_error_model(error_msg)]
+            return [self._return_error_model(error_msg)]
 
     async def _generate_image(self, model: str, prompt: str) -> dict | None:
         try:
@@ -331,19 +334,15 @@ class Pipe:
             log.opt(depth=1, exception=exception).error(error_msg)
         await self.__event_emitter__(error)
 
-
-"""Helper functions outside the Pipe class."""
-
-
-def _return_error_model(
-    error_msg: str, warning: bool = False, exception: bool = True
-) -> "ModelData":
-    """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
-    if warning:
-        log.opt(depth=1, exception=False).warning(error_msg)
-    else:
-        log.opt(depth=1, exception=exception).error(error_msg)
-    return {
-        "id": "error",
-        "name": "[venice_manifold] " + error_msg,
-    }
+    def _return_error_model(
+        self, error_msg: str, warning: bool = False, exception: bool = True
+    ) -> "ModelData":
+        """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        return {
+            "id": "error",
+            "name": "[venice_manifold] " + error_msg,
+        }
