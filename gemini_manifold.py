@@ -125,8 +125,7 @@ class Pipe:
         self.aggregated_chunks: list[types.GenerateContentResponse] = []
         print("[gemini_manifold] Function has been initialized!")
 
-    # FIXME Make it async
-    def pipes(self) -> list["ModelData"]:
+    async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
 
         self._add_log_handler()
@@ -161,7 +160,7 @@ class Pipe:
         self.last_whitelist = self.valves.MODEL_WHITELIST
 
         # Get and process new models, errors are handler inside the method.
-        models = self._get_google_models()
+        models = await self._get_google_models()
         log.debug("Registered models:", data=models)
 
         self.models = models
@@ -623,7 +622,7 @@ class Pipe:
 
         return contents
 
-    def _get_google_models(self) -> list["ModelData"]:
+    async def _get_google_models(self) -> list["ModelData"]:
         """Retrieve Google models with prefix stripping."""
 
         if not self.client:
@@ -637,7 +636,7 @@ class Pipe:
         )
 
         try:
-            models = self.client.models.list(config={"query_base": True})
+            models = await self.client.aio.models.list(config={"query_base": True})
         except Exception as e:
             error_msg = f"Error retrieving models: {str(e)}"
             return [self._return_error_model(error_msg)]
