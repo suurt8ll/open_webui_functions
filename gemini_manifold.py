@@ -322,6 +322,49 @@ class Pipe:
     ---------- Helper methods inside the Pipe class. ----------
     """
 
+    async def _emit_completion(
+        self,
+        content: Optional[str] = None,
+        done: bool = False,
+        error: Optional[str] = None,
+        sources: Optional[list["Source"]] = None,
+    ):
+        """Constructs and emits completion event."""
+        emission: "ChatCompletionEvent" = {
+            "type": "chat:completion",
+            "data": {"done": done},
+        }
+        if content:
+            emission["data"]["content"] = content
+        if error:
+            emission["data"]["error"] = {"detail": error}
+        if sources:
+            emission["data"]["sources"] = sources
+        await self.__event_emitter__(emission)
+
+    async def _emit_error(
+        self, error_msg: str, warning: bool = False, exception: bool = True
+    ) -> None:
+        """Emits an event to the front-end that causes it to display a nice red error message."""
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        await self._emit_completion(error=f"\n{error_msg}", done=True)
+
+    def _return_error_model(
+        self, error_msg: str, warning: bool = False, exception: bool = True
+    ) -> "ModelData":
+        """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        return {
+            "id": "error",
+            "name": "[gemini_manifold] " + error_msg,
+        }
+
     async def _stream_response(
         self, gen_content_args: dict, __request__: Request, __user__: "UserData"
     ) -> Tuple[list[types.GenerateContentResponse], str]:
@@ -384,26 +427,6 @@ class Pipe:
         else:
             encoded = base64.b64encode(image_data).decode()
             return f"![Generated Image](data:{mime_type};base64,{encoded})"
-
-    async def _emit_completion(
-        self,
-        content: Optional[str] = None,
-        done: bool = False,
-        error: Optional[str] = None,
-        sources: Optional[list["Source"]] = None,
-    ):
-        """Constructs and emits completion event."""
-        emission: "ChatCompletionEvent" = {
-            "type": "chat:completion",
-            "data": {"done": done},
-        }
-        if content:
-            emission["data"]["content"] = content
-        if error:
-            emission["data"]["error"] = {"detail": error}
-        if sources:
-            emission["data"]["sources"] = sources
-        await self.__event_emitter__(emission)
 
     def _pop_system_prompt(
         self,
@@ -600,36 +623,6 @@ class Pipe:
 
         return contents
 
-    def _add_log_handler(self):
-        """Adds handler to the root loguru instance for this plugin if one does not exist already."""
-
-        def plugin_filter(record: "Record"):
-            """Filter function to only allow logs from this plugin (based on module name)."""
-            return record["name"] == __name__  # Filter by module name
-
-        # Access the internal state of the logger
-        handlers: dict[int, "Handler"] = logger._core.handlers  # type: ignore
-        for key, handler in handlers.items():
-            existing_filter = handler._filter
-            if (
-                hasattr(existing_filter, "__name__")
-                and existing_filter.__name__ == plugin_filter.__name__
-                and hasattr(existing_filter, "__module__")
-                and existing_filter.__module__ == plugin_filter.__module__
-            ):
-                log.debug("Handler for this plugin is already present!")
-                return
-
-        logger.add(
-            sys.stdout,
-            level=self.valves.LOG_LEVEL,
-            format=stdout_format,
-            filter=plugin_filter,
-        )
-        log.info(
-            f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
-        )
-
     def _get_google_models(self) -> list["ModelData"]:
         """Retrieve Google models with prefix stripping."""
 
@@ -816,16 +809,6 @@ class Pipe:
         log.info("Image uploaded.", image_url=image_url)
         return image_url
 
-    async def _emit_error(
-        self, error_msg: str, warning: bool = False, exception: bool = True
-    ) -> None:
-        """Emits an event to the front-end that causes it to display a nice red error message."""
-        if warning:
-            log.opt(depth=1, exception=False).warning(error_msg)
-        else:
-            log.opt(depth=1, exception=exception).error(error_msg)
-        await self._emit_completion(error=f"\n{error_msg}", done=True)
-
     async def _add_citations(
         self, data: types.GenerateContentResponse, raw_str: str
     ) -> Optional["ChatCompletionEvent"]:
@@ -896,15 +879,32 @@ class Pipe:
 
         return event
 
-    def _return_error_model(
-        self, error_msg: str, warning: bool = False, exception: bool = True
-    ) -> "ModelData":
-        """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
-        if warning:
-            log.opt(depth=1, exception=False).warning(error_msg)
-        else:
-            log.opt(depth=1, exception=exception).error(error_msg)
-        return {
-            "id": "error",
-            "name": "[gemini_manifold] " + error_msg,
-        }
+    def _add_log_handler(self):
+        """Adds handler to the root loguru instance for this plugin if one does not exist already."""
+
+        def plugin_filter(record: "Record"):
+            """Filter function to only allow logs from this plugin (based on module name)."""
+            return record["name"] == __name__  # Filter by module name
+
+        # Access the internal state of the logger
+        handlers: dict[int, "Handler"] = logger._core.handlers  # type: ignore
+        for key, handler in handlers.items():
+            existing_filter = handler._filter
+            if (
+                hasattr(existing_filter, "__name__")
+                and existing_filter.__name__ == plugin_filter.__name__
+                and hasattr(existing_filter, "__module__")
+                and existing_filter.__module__ == plugin_filter.__module__
+            ):
+                log.debug("Handler for this plugin is already present!")
+                return
+
+        logger.add(
+            sys.stdout,
+            level=self.valves.LOG_LEVEL,
+            format=stdout_format,
+            filter=plugin_filter,
+        )
+        log.info(
+            f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
+        )
