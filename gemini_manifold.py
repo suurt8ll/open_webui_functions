@@ -29,6 +29,10 @@ requirements: google-genai==1.7.0
 
 import asyncio
 import copy
+import io
+import mimetypes
+import os
+import uuid
 import aiohttp
 from google import genai
 from google.genai import types
@@ -53,8 +57,9 @@ from typing import (
 )
 from starlette.responses import StreamingResponse
 from open_webui.routers.images import upload_image
-from open_webui.models.files import Files
+from open_webui.models.files import FileForm, Files
 from open_webui.models.users import Users
+from open_webui.storage.provider import Storage
 from open_webui.utils.logger import stdout_format
 from loguru import logger
 
@@ -388,9 +393,10 @@ class Pipe:
                 if text_part := part.text:
                     content += text_part
                 elif inline_data := part.inline_data:
-                    content += self._process_image_part(
+                    if img_url := self._process_image_part(
                         inline_data, gen_content_args, __user__, __request__
-                    )
+                    ):
+                        content += img_url
                 await self._emit_completion(content)
 
         return aggregated_chunks, content
@@ -408,7 +414,7 @@ class Pipe:
 
     def _process_image_part(
         self, inline_data, gen_content_args: dict, user: "UserData", request: Request
-    ) -> str:
+    ) -> Optional[str]:
         """Handles image data conversion to markdown."""
         mime_type = inline_data.mime_type
         image_data = inline_data.data
@@ -418,11 +424,11 @@ class Pipe:
                 image_data,
                 mime_type,
                 gen_content_args.get("model", ""),
-                "TAKE IT FROM gen_content_args contents",
-                user,
+                "Not implemented yet. TAKE IT FROM gen_content_args contents",
+                user["id"],
                 request,
             )
-            return f"![Generated Image]({image_url})"
+            return f"![Generated Image]({image_url})" if image_url else None
         else:
             encoded = base64.b64encode(image_data).decode()
             return f"![Generated Image](data:{mime_type};base64,{encoded})"
@@ -781,31 +787,55 @@ class Pipe:
         mime_type: str,
         model: str,
         prompt: str,
-        __user__: "UserData",
+        user_id: str,
         __request__: Request,
-    ) -> str:
-        # Create metadata for the image
+    ) -> str | None:
+        """
+        Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
+        Returns the url to uploaded image.
+        """
+        image_format = mimetypes.guess_extension(mime_type)
+        id = str(uuid.uuid4())
+        # TODO: Better filename? Prompt as the filename?
+        name = os.path.basename(f"generated-image{image_format}")
+        imagename = f"{id}_{name}"
+        image = io.BytesIO(image_data)
         image_metadata = {
             "model": model,
             "prompt": prompt,
         }
 
-        # FIXME: Handle potental errors.
-        # Get the *full* user object from the database
-        user = Users.get_user_by_id(__user__["id"])
-        if user is None:
-            # FIXME: better logging
-            return "Error: User not found"
-
-        # Upload the image using the imported function
-        image_url: str = upload_image(
-            request=__request__,
-            image_metadata=image_metadata,
-            image_data=image_data,
-            content_type=mime_type,
-            user=user,
+        # Upload the image to user configured storage provider.
+        log.info("Uploading the image to the configured storage provider.")
+        try:
+            contents, image_path = Storage.upload_file(image, imagename)
+        except Exception:
+            error_msg = f"Error occurred during upload to the storage provider."
+            log.exception(error_msg)
+            return None
+        # Add the image file to files database.
+        log.info("Adding the image file to Open WebUI files database.")
+        file_item = Files.insert_new_file(
+            user_id,
+            FileForm(
+                id=id,
+                filename=name,
+                path=image_path,
+                meta={
+                    "name": name,
+                    "content_type": mime_type,
+                    "size": len(contents),
+                    "data": image_metadata,
+                },
+            ),
         )
-        log.info("Image uploaded.", image_url=image_url)
+        if not file_item:
+            log.warning("Files.insert_new_file did not return anything.")
+            return None
+        # Get the image url.
+        image_url: str = __request__.app.url_path_for(
+            "get_file_content_by_id", id=file_item.id
+        )
         return image_url
 
     async def _add_citations(

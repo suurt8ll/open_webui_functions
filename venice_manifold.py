@@ -19,6 +19,7 @@ version: 0.9.3
 
 import io
 import mimetypes
+import os
 import sys
 import time
 import asyncio
@@ -33,15 +34,13 @@ from typing import (
     Literal,
     Callable,
     Awaitable,
+    Optional,
     TYPE_CHECKING,
 )
-from fastapi.datastructures import Headers
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
-from fastapi import Request, UploadFile
-from open_webui.routers.images import upload_image
-from open_webui.models.files import Files, FileModel, FileForm
-from open_webui.models.users import Users
+from fastapi import Request
+from open_webui.models.files import Files, FileForm
 from open_webui.utils.logger import stdout_format
 from open_webui.storage.provider import Storage
 from loguru import logger
@@ -190,7 +189,7 @@ class Pipe:
             # Decode the base64 image data
             image_data = base64.b64decode(base64_image)
             # FIXME make mime type dynamic
-            image_url = await self._upload_image(
+            image_url = self._upload_image(
                 image_data, "image/png", model, prompt, __user__["id"], __request__
             )
             return f"![Generated Image]({image_url})" if image_url else None
@@ -259,7 +258,7 @@ class Pipe:
             await self._emit_error(error_msg)
             return
 
-    async def _upload_image(
+    def _upload_image(
         self,
         image_data: bytes,
         mime_type: str,
@@ -274,7 +273,8 @@ class Pipe:
         """
         image_format = mimetypes.guess_extension(mime_type)
         id = str(uuid.uuid4())
-        name = f"generated-image{image_format}"
+        # TODO: Better filename? Prompt as the filename?
+        name = os.path.basename(f"generated-image{image_format}")
         imagename = f"{id}_{name}"
         image = io.BytesIO(image_data)
         image_metadata = {
