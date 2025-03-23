@@ -234,9 +234,22 @@ class Pipe:
     def _get_current_version(self):
         """Gets the current version from the function's frontmatter."""
         try:
-            source_code = inspect.getsource(self.__class__)  # Get source of the class
-            frontmatter = extract_frontmatter(source_code)
-            return frontmatter.get("version", "0.0.0")  # Default to 0.0.0 if not found
+            module = inspect.getmodule(self.__class__)
+            if module:
+                try:
+                    source_code = inspect.getsource(module)
+                except OSError as e:
+                    log.error(f"Error getting source code for module: {e}")
+                    source_code = None
+            else:
+                log.error("Could not determine module for class.")
+                source_code = None
+
+            if source_code:
+                frontmatter = extract_frontmatter(source_code)
+                return frontmatter.get("version", "0.0.0")  # Default if not found
+            else:
+                return "0.0.0"  # Return default if source code is None
         except Exception as e:
             log.error(f"Error getting current version: {e}")
             return "0.0.0"
