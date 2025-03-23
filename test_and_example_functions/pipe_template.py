@@ -57,7 +57,7 @@ class Pipe:
         self.valves = self.Valves()
         print("[pipe_function_template_no_comments] Function has been initialized!")
 
-    def pipes(self) -> list["ModelData"]:
+    async def pipes(self) -> list["ModelData"]:
         self._add_log_handler()
         log.info("Registering models.")
         try:
