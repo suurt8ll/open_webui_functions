@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.9.3
+version: 0.9.4
 """
 
 # NB! This is work in progress and not yet fully featured.
@@ -17,28 +17,28 @@ version: 0.9.3
 # TODO: Negative prompts
 # TODO: Upscaling
 
+import io
+import mimetypes
+import os
 import sys
 import time
 import asyncio
-import requests
+import uuid
 import aiohttp
 import base64
 from typing import (
     Any,
-    AsyncGenerator,
-    Generator,
-    Iterator,
     Literal,
     Callable,
     Awaitable,
+    Optional,
     TYPE_CHECKING,
 )
 from pydantic import BaseModel, Field
-from starlette.responses import StreamingResponse
 from fastapi import Request
-from open_webui.routers.images import upload_image
-from open_webui.models.users import Users
+from open_webui.models.files import Files, FileForm
 from open_webui.utils.logger import stdout_format
+from open_webui.storage.provider import Storage
 from loguru import logger
 
 if TYPE_CHECKING:
@@ -87,8 +87,9 @@ class Pipe:
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __task__: str,
         __metadata__: dict[str, Any],
-    ) -> str | dict | StreamingResponse | Iterator | AsyncGenerator | Generator | None:
+    ) -> Optional[str]:
 
+        # TODO: [refac] Move __user__ to self like that also.
         self.__event_emitter__ = __event_emitter__
 
         if "error" in __metadata__["model"]["id"]:
@@ -130,7 +131,7 @@ class Pipe:
 
         log.debug(f"Model: {model}, Prompt: {prompt}")
 
-        # FIXME Move it out of pipe for cleaner code?
+        # FIXME [refac] Move it out of pipe for cleaner code?
         async def timer_task(start_time: float):
             """Counts up and emits status updates."""
             try:
@@ -175,25 +176,26 @@ class Pipe:
                 },
             }
         )
+        if not success:
+            return None
 
-        if success:
-            log.info("Image generated successfully!")
-            base64_image = image_data["images"][0]  # type: ignore
+        log.info("Image generated successfully!")
+        base64_image = image_data["images"][0]  # type: ignore
 
-            if self.valves.USE_FILES_API:
-                # Decode the base64 image data
-                image_data = base64.b64decode(base64_image)
-                # FIXME make mime type dynamic
-                image_url = await self._upload_image(
-                    image_data, "image/png", model, prompt, __user__, __request__
-                )
-                if not image_url:
-                    return
-                return f"![Generated Image]({image_url})"
-            else:
-                return f"![Generated Image](data:image/png;base64,{base64_image})"
+        if self.valves.USE_FILES_API:
+            # Decode the base64 image data
+            image_data = base64.b64decode(base64_image)
+            # FIXME make mime type dynamic
+            image_url = self._upload_image(
+                image_data, "image/png", model, prompt, __user__["id"], __request__
+            )
+            return f"![Generated Image]({image_url})" if image_url else None
+        else:
+            return f"![Generated Image](data:image/png;base64,{base64_image})"
 
-    """Helper functions inside the Pipe class."""
+    """
+    ---------- Helper functions inside the Pipe class. ----------
+    """
 
     async def _get_models(self) -> list["ModelData"]:
         try:
@@ -217,7 +219,7 @@ class Pipe:
             error_msg = f"An unexpected error occurred: {str(e)}"
             return [self._return_error_model(error_msg)]
 
-    async def _generate_image(self, model: str, prompt: str) -> dict | None:
+    async def _generate_image(self, model: str, prompt: str) -> Optional[dict]:
         try:
             async with aiohttp.ClientSession() as session:
                 log.info(
@@ -253,38 +255,61 @@ class Pipe:
             await self._emit_error(error_msg)
             return
 
-    async def _upload_image(
+    def _upload_image(
         self,
         image_data: bytes,
         mime_type: str,
         model: str,
         prompt: str,
-        __user__: "UserData",
+        user_id: str,
         __request__: Request,
     ) -> str | None:
-
-        # Create metadata for the image
+        """
+        Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
+        Returns the url to uploaded image.
+        """
+        image_format = mimetypes.guess_extension(mime_type)
+        id = str(uuid.uuid4())
+        # TODO: Better filename? Prompt as the filename?
+        name = os.path.basename(f"generated-image{image_format}")
+        imagename = f"{id}_{name}"
+        image = io.BytesIO(image_data)
         image_metadata = {
             "model": model,
             "prompt": prompt,
         }
 
-        # Get the *full* user object from the database
-        user = Users.get_user_by_id(__user__["id"])
-        if user is None:
-            error_msg = "User not found."
-            await self._emit_error(error_msg, exception=False)
-            return
-
-        # Upload the image using the imported function
-        image_url: str = upload_image(
-            request=__request__,
-            image_metadata=image_metadata,
-            image_data=image_data,
-            content_type=mime_type,
-            user=user,
+        # Upload the image to user configured storage provider.
+        log.info("Uploading the image to the configured storage provider.")
+        try:
+            contents, image_path = Storage.upload_file(image, imagename)
+        except Exception:
+            error_msg = f"Error occurred during upload to the storage provider."
+            log.exception(error_msg)
+            return None
+        # Add the image file to files database.
+        log.info("Adding the image file to Open WebUI files database.")
+        file_item = Files.insert_new_file(
+            user_id,
+            FileForm(
+                id=id,
+                filename=name,
+                path=image_path,
+                meta={
+                    "name": name,
+                    "content_type": mime_type,
+                    "size": len(contents),
+                    "data": image_metadata,
+                },
+            ),
         )
-        log.info(f"Image uploaded. URL: {image_url}")
+        if not file_item:
+            log.warning("Files.insert_new_file did not return anything.")
+            return None
+        # Get the image url.
+        image_url: str = __request__.app.url_path_for(
+            "get_file_content_by_id", id=file_item.id
+        )
         return image_url
 
     def _add_log_handler(self):
