@@ -17,10 +17,12 @@ version: 0.9.3
 # TODO: Negative prompts
 # TODO: Upscaling
 
+import io
+import mimetypes
 import sys
 import time
 import asyncio
-import requests
+import uuid
 import aiohttp
 import base64
 from typing import (
@@ -33,12 +35,15 @@ from typing import (
     Awaitable,
     TYPE_CHECKING,
 )
+from fastapi.datastructures import Headers
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
-from fastapi import Request
+from fastapi import Request, UploadFile
 from open_webui.routers.images import upload_image
+from open_webui.models.files import Files, FileModel, FileForm
 from open_webui.models.users import Users
 from open_webui.utils.logger import stdout_format
+from open_webui.storage.provider import Storage
 from loguru import logger
 
 if TYPE_CHECKING:
@@ -185,7 +190,7 @@ class Pipe:
                 image_data = base64.b64decode(base64_image)
                 # FIXME make mime type dynamic
                 image_url = await self._upload_image(
-                    image_data, "image/png", model, prompt, __user__, __request__
+                    image_data, "image/png", model, prompt, __user__["id"], __request__
                 )
                 if not image_url:
                     return
@@ -259,32 +264,54 @@ class Pipe:
         mime_type: str,
         model: str,
         prompt: str,
-        __user__: "UserData",
+        user_id: str,
         __request__: Request,
     ) -> str | None:
-
-        # Create metadata for the image
+        """
+        Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
+        Returns the url to uploaded image.
+        """
+        image_format = mimetypes.guess_extension(mime_type)
+        id = str(uuid.uuid4())
+        name = f"generated-image{image_format}"
+        imagename = f"{id}_{name}"
+        image = io.BytesIO(image_data)
         image_metadata = {
             "model": model,
             "prompt": prompt,
         }
 
-        # Get the *full* user object from the database
-        user = Users.get_user_by_id(__user__["id"])
-        if user is None:
-            error_msg = "User not found."
-            await self._emit_error(error_msg, exception=False)
-            return
-
-        # Upload the image using the imported function
-        image_url: str = upload_image(
-            request=__request__,
-            image_metadata=image_metadata,
-            image_data=image_data,
-            content_type=mime_type,
-            user=user,
+        # Upload the image to user configured storage provider.
+        log.info("Uploading the image to the configured storage provider.")
+        try:
+            contents, image_path = Storage.upload_file(image, imagename)
+        except Exception:
+            error_msg = f"Error occurred during upload to the storage provider."
+            log.exception(error_msg)
+            return None
+        # Add the image file to files database.
+        log.info("Adding the image file to Open WebUI files database.")
+        file_item = Files.insert_new_file(
+            user_id,
+            FileForm(
+                id=id,
+                filename=name,
+                path=image_path,
+                meta={
+                    "name": name,
+                    "content_type": mime_type,
+                    "size": len(contents),
+                    "data": image_metadata,
+                },
+            ),
         )
-        log.info(f"Image uploaded. URL: {image_url}")
+        if not file_item:
+            log.warning("Files.insert_new_file did not return anything.")
+            return None
+        # Get the image url.
+        image_url: str = __request__.app.url_path_for(
+            "get_file_content_by_id", id=file_item.id
+        )
         return image_url
 
     def _add_log_handler(self):
