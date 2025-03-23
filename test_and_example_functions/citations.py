@@ -12,58 +12,19 @@ requirements:
 
 from typing import (
     Any,
-    NotRequired,
     AsyncGenerator,
     Awaitable,
     Generator,
     Iterator,
     Callable,
     Literal,
-    Optional,
-    TypedDict,
+    TYPE_CHECKING,
 )
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
-
-class SourceSource(TypedDict):
-    docs: NotRequired[list[dict]]
-    name: str  # the search query used
-    type: NotRequired[Literal["web_search"]]
-    urls: NotRequired[list[str]]
-
-
-class SourceMetadata(TypedDict, total=False):
-    source: str  # url
-    title: NotRequired[str]  # website title
-    description: NotRequired[str]  # website description
-    language: NotRequired[str]  # website language
-
-
-class Source(TypedDict):
-    source: SourceSource
-    document: list[str]
-    metadata: list[SourceMetadata]
-    distances: NotRequired[list[float]]
-
-
-class ErrorData(TypedDict):
-    detail: str
-
-
-class ChatCompletionEventData(TypedDict):
-    content: Optional[str]
-    done: bool
-    sources: NotRequired[list[Source]]
-    error: NotRequired[ErrorData]
-
-
-class ChatCompletionEvent(TypedDict):
-    type: Literal["chat:completion"]
-    data: ChatCompletionEventData
-
-
-Event = ChatCompletionEvent
+if TYPE_CHECKING:
+    from manifold_types import *  # My personal types in a separate file for more robustness.
 
 
 class Pipe:
@@ -82,7 +43,7 @@ class Pipe:
     async def pipe(
         self,
         body: dict[str, Any],
-        __event_emitter__: Callable[[Event], Awaitable[None]],
+        __event_emitter__: Callable[["Event"], Awaitable[None]],
     ) -> (
         str
         | dict[str, Any]
@@ -95,7 +56,7 @@ class Pipe:
 
         self.__event_emitter__ = __event_emitter__
 
-        sources: list[Source] = [
+        sources: list["Source"] = [
             {
                 "source": {"name": "example search query"},
                 "document": ["", ""],
@@ -120,7 +81,7 @@ class Pipe:
             },
         ]
 
-        sources_test: ChatCompletionEvent = {
+        sources_test: "ChatCompletionEvent" = {
             "type": "chat:completion",
             "data": {
                 "content": "This is an example response [0][1]. This sentence has citations from the second query [2][3].",

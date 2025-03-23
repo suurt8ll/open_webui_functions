@@ -10,7 +10,6 @@ version: 0.0.0
 requirements:
 """
 
-import json
 import sys
 from typing import (
     Any,
@@ -30,14 +29,9 @@ from loguru import logger
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler
-
-
-class UserData(TypedDict):
-    id: str
-    email: str
-    name: str
-    role: Literal["admin", "user", "pending"]
-    valves: NotRequired[Any]  # object of type UserValves
+    from manifold_types import (
+        UserData,
+    )  # My personal types in a separate file for more robustness.
 
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
@@ -76,7 +70,7 @@ class Pipe:
     async def pipe(
         self,
         body: dict,
-        __user__: UserData,
+        __user__: "UserData",
     ) -> str | dict | StreamingResponse | Iterator | AsyncGenerator | Generator | None:
 
         log.trace("TRACE message!")

@@ -1,6 +1,6 @@
 """
-title: Lean Pipe Function Skeleton
-id: pipe_function_skeleton
+title: Pipe Function Template
+id: pipe_template
 description: Good starting point for creating new pipe functions for Open WebUI.
 author: suurt8ll
 author_url: https://github.com/suurt8ll
@@ -14,17 +14,12 @@ import asyncio
 import sys
 from typing import (
     Any,
-    NotRequired,
     AsyncGenerator,
     Awaitable,
     Generator,
     Iterator,
     Callable,
     Literal,
-    Optional,
-    TypedDict,
-    Any,
-    NotRequired,
     TYPE_CHECKING,
 )
 from pydantic import BaseModel, Field
@@ -36,55 +31,7 @@ from loguru import logger
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler
-
-
-class ModelData(TypedDict):
-    """This is how the `pipes` function expects the `dict` to look like."""
-
-    id: str
-    name: str
-
-
-class StatusEventData(TypedDict):
-    action: NotRequired[Optional[Literal["web_search", "knowledge_search"]]]
-    description: str
-    done: NotRequired[bool]
-    query: NotRequired[str]  # knowledge_search
-    urls: NotRequired[list[str]]  # web_search
-    hidden: NotRequired[bool]
-
-
-class ErrorData(TypedDict):
-    detail: str
-
-
-class ChatCompletionEventData(TypedDict):
-    content: Optional[str]
-    done: bool
-    error: NotRequired[ErrorData]
-
-
-class StatusEvent(TypedDict):
-    type: Literal["status"]
-    data: StatusEventData
-
-
-class ChatCompletionEvent(TypedDict):
-    type: Literal["chat:completion"]
-    data: ChatCompletionEventData
-
-
-Event = StatusEvent | ChatCompletionEvent
-
-
-class UserData(TypedDict):
-    """This is how `__user__` `dict` looks like."""
-
-    id: str
-    email: str
-    name: str
-    role: Literal["admin", "user", "pending"]
-    valves: NotRequired[Any]  # object of type UserValves
+    from manifold_types import *  # My personal types in a separate file for more robustness.
 
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
@@ -110,13 +57,13 @@ class Pipe:
         self.valves = self.Valves()
         print("[pipe_function_template_no_comments] Function has been initialized!")
 
-    def pipes(self) -> list[ModelData]:
+    def pipes(self) -> list["ModelData"]:
         self._add_log_handler()
         log.info("Registering models.")
         try:
             return [
-                ModelData(id="model_id_1", name="model_1"),
-                ModelData(id="model_id_2", name="model_2"),
+                {"id": "model_id_1", "name": "model_1"},
+                {"id": "model_id_2", "name": "model_2"},
             ]
         except Exception as e:
             error_msg = f"Error during registering models: {str(e)}"
@@ -125,9 +72,9 @@ class Pipe:
     async def pipe(
         self,
         body: dict[str, Any],
-        __user__: UserData,
+        __user__: "UserData",
         __request__: Request,
-        __event_emitter__: Callable[[Event], Awaitable[None]],
+        __event_emitter__: Callable[["Event"], Awaitable[None]],
         __event_call__: Callable[[dict[str, Any]], Awaitable[Any]],
         __task__: str,
         __task_body__: dict[str, Any],
@@ -258,14 +205,13 @@ class Pipe:
         self, error_msg: str, warning: bool = False, exception: bool = True
     ) -> None:
         """Emits an event to the front-end that causes it to display a nice red error message."""
-        error = ChatCompletionEvent(
-            type="chat:completion",
-            data=ChatCompletionEventData(
-                content=None,
-                done=True,
-                error=ErrorData(detail="\n" + error_msg),
-            ),
-        )
+        error: "ChatCompletionEvent" = {
+            "type": "chat:completion",
+            "data": {
+                "done": True,
+                "error": {"detail": "\n" + error_msg},
+            },
+        }
         if warning:
             log.opt(depth=1, exception=False).warning(error_msg)
         else:
@@ -275,7 +221,7 @@ class Pipe:
 
 def _return_error_model(
     error_msg: str, warning: bool = False, exception: bool = True
-) -> ModelData:
+) -> "ModelData":
     """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
     if warning:
         log.opt(depth=1, exception=False).warning(error_msg)
@@ -283,5 +229,5 @@ def _return_error_model(
         log.opt(depth=1, exception=exception).error(error_msg)
     return {
         "id": "error",
-        "name": "[template] " + error_msg,
+        "name": "[pipe_template] " + error_msg,
     }
