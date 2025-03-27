@@ -65,6 +65,7 @@ if TYPE_CHECKING:
 # FIXME What about other 2.0 models?
 # according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
 ALLOWED_GROUNDING_MODELS = [
+    "gemini-2.5-pro-exp-03-25",
     "gemini-2.0-flash",
     "gemini-1.5-pro",
     "gemini-1.5-flash",
