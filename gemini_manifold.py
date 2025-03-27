@@ -283,7 +283,9 @@ class Pipe:
                 chunks_str = (
                     f"{chunks_str}{self._truncate_long_strings(chunk.model_dump())},"
                 )
-                emit_sources = await self._add_citations(chunk, raw_text)
+                emit_sources = await self._get_chat_completion_event_w_sources(
+                    chunk, raw_text
+                )
             chunks_str = chunks_str[:-1] + "]"
             log.debug("Got response from Google API:", response=chunks_str)
             if emit_sources:
@@ -827,26 +829,31 @@ class Pipe:
         )
         return image_url
 
-    async def _add_citations(
+    async def _get_chat_completion_event_w_sources(
         self, data: types.GenerateContentResponse, raw_str: str
     ) -> Optional["ChatCompletionEvent"]:
+        """Adds citation markers and source references to raw_str based on grounding metadata"""
 
         async def resolve_url(session, url) -> str:
-            """Asynchronously resolves a URL by following redirects"""
+            """Asynchronously resolves a URL by following redirects to get final destination URL
+            Returns original URL if resolution fails (error handled with basic print logging)
+            """
             try:
                 async with session.get(url, allow_redirects=True) as response:
                     return str(response.url)
             except Exception as e:
-                # FIXME: Consider more robust logging
+                # FIXME: Consider implementing proper error logging instead of print()
                 print(f"Error resolving URL: {e}")
                 return url
 
+        # Early exit if no candidate content exists
         if not data.candidates:
             return None
 
         candidate = data.candidates[0]
         grounding_metadata = candidate.grounding_metadata if candidate else None
 
+        # Require valid metadata structure to proceed
         if (
             not grounding_metadata
             or not grounding_metadata.grounding_supports
@@ -854,46 +861,61 @@ class Pipe:
         ):
             return None
 
+        # Extract key components from metadata
         supports = grounding_metadata.grounding_supports
         grounding_chunks = grounding_metadata.grounding_chunks
 
+        # Collect all available URIs from grounding chunks
         uris: list[str] = [
             g_c.web.uri for g_c in grounding_chunks if g_c.web and g_c.web.uri
         ]
 
+        # Process each support to add citation markers
         for support in supports:
-            text: Optional[str] = support.segment.text if support.segment else None
-            if text:
-                start = raw_str.find(text)
-                if start != -1:
-                    end_pos = start + len(text)
+            text_segment = support.segment.text if support.segment else None
+            if text_segment:
+                # Find where the text appears in the raw string
+                start_pos = raw_str.find(text_segment)
+                if start_pos != -1:
+                    end_pos = start_pos + len(text_segment)
+                    # Create citation markers from associated chunk indices
+                    citation_indices = support.grounding_chunk_indices or []
                     citation_markers = "".join(
-                        f"[{index}]"
-                        for index in (support.grounding_chunk_indices or [])
+                        f"[{index}]" for index in citation_indices
                     )
+                    # Insert markers immediately after the matched text
                     raw_str = (
                         f"{raw_str[:end_pos]}{citation_markers}{raw_str[end_pos:]}"
                     )
 
+        # Resolve URIs asynchronously using aiohttp
         sources_list: list["Source"] = []
         if uris:
             async with aiohttp.ClientSession() as session:
-                tasks = [resolve_url(session, uri) for uri in uris]
-                resolved_uris = await asyncio.gather(*tasks)
+                # Create list of async URL resolution tasks
+                resolution_tasks = [resolve_url(session, uri) for uri in uris]
+                # Wait for all resolutions to complete
+                resolved_uris = await asyncio.gather(*resolution_tasks)
 
+            # Structure sources with resolved URLs
             sources_list = [
                 {
                     "source": {"name": "web_search"},
-                    "document": [""] * len(resolved_uris),
+                    "document": [""]
+                    * len(resolved_uris),  # Placeholder for document content
                     "metadata": [{"source": uri} for uri in resolved_uris],
                 }
             ]
 
+        # Prepare final event structure with modified content and sources
         event_data: "ChatCompletionEventData" = {
-            "content": raw_str,
-            "sources": sources_list,
+            "content": raw_str,  # Content with added citations
+            "sources": sources_list,  # List of resolved source references
         }
-        event: "Event" = {"type": "chat:completion", "data": event_data}
+        event: "Event" = {
+            "type": "chat:completion",
+            "data": event_data,
+        }
 
         return event
 
