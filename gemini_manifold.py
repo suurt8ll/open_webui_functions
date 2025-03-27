@@ -870,6 +870,12 @@ class Pipe:
             g_c.web.uri for g_c in grounding_chunks if g_c.web and g_c.web.uri
         ]
 
+        if not uris:
+            log.warning(
+                "The candidate object has grounding_metadata variable, but no uris were found."
+            )
+            return None
+
         # Process each support to add citation markers
         for support in supports:
             text_segment = support.segment.text if support.segment else None
@@ -887,25 +893,28 @@ class Pipe:
                     raw_str = (
                         f"{raw_str[:end_pos]}{citation_markers}{raw_str[end_pos:]}"
                     )
+                else:
+                    log.warning(
+                        "Provided text segment was not found inside the raw text.",
+                        segment=text_segment,
+                    )
 
         # Resolve URIs asynchronously using aiohttp
-        sources_list: list["Source"] = []
-        if uris:
-            async with aiohttp.ClientSession() as session:
-                # Create list of async URL resolution tasks
-                resolution_tasks = [resolve_url(session, uri) for uri in uris]
-                # Wait for all resolutions to complete
-                resolved_uris = await asyncio.gather(*resolution_tasks)
+        async with aiohttp.ClientSession() as session:
+            # Create list of async URL resolution tasks
+            resolution_tasks = [resolve_url(session, uri) for uri in uris]
+            # Wait for all resolutions to complete
+            resolved_uris = await asyncio.gather(*resolution_tasks)
 
-            # Structure sources with resolved URLs
-            sources_list = [
-                {
-                    "source": {"name": "web_search"},
-                    "document": [""]
-                    * len(resolved_uris),  # Placeholder for document content
-                    "metadata": [{"source": uri} for uri in resolved_uris],
-                }
-            ]
+        # Structure sources with resolved URLs
+        sources_list: list[Source] = [
+            {
+                "source": {"name": "web_search"},
+                "document": [""]
+                * len(resolved_uris),  # Placeholder for document content
+                "metadata": [{"source": uri} for uri in resolved_uris],
+            }
+        ]
 
         # Prepare final event structure with modified content and sources
         event_data: "ChatCompletionEventData" = {
