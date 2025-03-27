@@ -92,5 +92,8 @@ tmux send-keys -t openwebui_session:1 "python function_updater.py" Enter
 # Switch back to the first window (index 0)
 tmux select-window -t openwebui_session:0
 
+# Enable mouse scrolling.
+tmux set-option -g mouse on
+
 # Attach to the tmux session
 tmux attach-session -t openwebui_session
