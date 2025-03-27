@@ -879,25 +879,23 @@ class Pipe:
         # Process each support to add citation markers
         for support in supports:
             text_segment = support.segment.text if support.segment else None
-            if text_segment:
-                # Find where the text appears in the raw string
-                start_pos = raw_str.find(text_segment)
-                if start_pos != -1:
-                    end_pos = start_pos + len(text_segment)
-                    # Create citation markers from associated chunk indices
-                    citation_indices = support.grounding_chunk_indices or []
-                    citation_markers = "".join(
-                        f"[{index}]" for index in citation_indices
-                    )
-                    # Insert markers immediately after the matched text
-                    raw_str = (
-                        f"{raw_str[:end_pos]}{citation_markers}{raw_str[end_pos:]}"
-                    )
-                else:
-                    log.warning(
-                        "Provided text segment was not found inside the raw text.",
-                        segment=text_segment,
-                    )
+            # Skip to next support if this one does not have the text segment.
+            if not text_segment:
+                continue
+            # Find where the text appears in the raw string
+            start_pos = raw_str.find(text_segment)
+            if start_pos != -1:
+                end_pos = start_pos + len(text_segment)
+                # Create citation markers from associated chunk indices
+                citation_indices = support.grounding_chunk_indices or []
+                citation_markers = "".join(f"[{index}]" for index in citation_indices)
+                # Insert markers immediately after the matched text
+                raw_str = f"{raw_str[:end_pos]}{citation_markers}{raw_str[end_pos:]}"
+            else:
+                log.warning(
+                    "Provided text segment was not found inside the raw text.",
+                    segment=text_segment,
+                )
 
         # Resolve URIs asynchronously using aiohttp
         async with aiohttp.ClientSession() as session:
