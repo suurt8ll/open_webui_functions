@@ -1,6 +1,5 @@
 from typing import Any, Literal, NotRequired, Optional, TypedDict
 from uuid import UUID
-
 from pydantic import BaseModel, Field
 
 
@@ -61,11 +60,14 @@ class SourceSource(TypedDict):
     urls: NotRequired[list[str]]
 
 
-class SourceMetadata(TypedDict, total=False):
+class SourceMetadata(TypedDict):
     source: str  # url
     title: NotRequired[str]  # website title
     description: NotRequired[str]  # website description
     language: NotRequired[str]  # website language
+    # These keys are not used by Open WebUI front-end, they for my plugin only.
+    original_url: NotRequired[str]  # original, unresolved url
+    supports: list[dict]  # needs to be serialized from genai.types.GroundingSupport
 
 
 class Source(TypedDict):

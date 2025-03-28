@@ -834,16 +834,17 @@ class Pipe:
     ) -> Optional["ChatCompletionEvent"]:
         """Adds citation markers and source references to raw_str based on grounding metadata"""
 
-        async def resolve_url(session, url) -> str:
+        async def resolve_url(session: aiohttp.ClientSession, url: str) -> str:
             """Asynchronously resolves a URL by following redirects to get final destination URL
-            Returns original URL if resolution fails (error handled with basic print logging)
+            Returns original URL if resolution fails.
             """
             try:
                 async with session.get(url, allow_redirects=True) as response:
                     return str(response.url)
-            except Exception as e:
-                # FIXME: Consider implementing proper error logging instead of print()
-                print(f"Error resolving URL: {e}")
+            except Exception:
+                log.exception(
+                    f"Error resolving URL, returning the original url.", url=url
+                )
                 return url
 
         # Early exit if no candidate content exists
@@ -852,7 +853,6 @@ class Pipe:
 
         candidate = data.candidates[0]
         grounding_metadata = candidate.grounding_metadata if candidate else None
-
         # Require valid metadata structure to proceed
         if (
             not grounding_metadata
@@ -861,69 +861,80 @@ class Pipe:
         ):
             return None
 
-        # Extract key components from metadata
         supports = grounding_metadata.grounding_supports
         grounding_chunks = grounding_metadata.grounding_chunks
 
-        # Collect all available URIs from grounding chunks
-        uris: list[str] = [
-            g_c.web.uri for g_c in grounding_chunks if g_c.web and g_c.web.uri
+        # Collect all available URIs from grounding chunks and format them into a list of dicts
+        source_metadatas: list[SourceMetadata] = [
+            {"source": g_c.web.uri, "supports": []}
+            for g_c in grounding_chunks
+            if g_c.web and g_c.web.uri
         ]
-
-        if not uris:
-            log.warning(
-                "The candidate object has grounding_metadata variable, but no uris were found."
-            )
+        if not source_metadatas:
+            log.warning("No URLs were found in grounding_metadata.")
             return None
 
-        # Process each support to add citation markers
-        for support in supports:
-            text_segment = support.segment.text if support.segment else None
-            # Skip to next support if this one does not have the text segment.
-            if not text_segment:
-                continue
-            # Find where the text appears in the raw string
-            start_pos = raw_str.find(text_segment)
-            if start_pos != -1:
-                end_pos = start_pos + len(text_segment)
-                # Create citation markers from associated chunk indices
-                citation_indices = support.grounding_chunk_indices or []
-                citation_markers = "".join(f"[{index}]" for index in citation_indices)
-                # Insert markers immediately after the matched text
-                raw_str = f"{raw_str[:end_pos]}{citation_markers}{raw_str[end_pos:]}"
-            else:
-                log.warning(
-                    "Provided text segment was not found inside the raw text.",
-                    segment=text_segment,
-                )
-
-        # Resolve URIs asynchronously using aiohttp
+        log.info("Resolving all the source URLs asyncronously.")
         async with aiohttp.ClientSession() as session:
             # Create list of async URL resolution tasks
-            resolution_tasks = [resolve_url(session, uri) for uri in uris]
+            resolution_tasks = [
+                resolve_url(session, metadata["source"])
+                for metadata in source_metadatas
+                if metadata["source"]
+            ]
             # Wait for all resolutions to complete
             resolved_uris = await asyncio.gather(*resolution_tasks)
+        log.info("URL resolution completed.")
+        # Replace original urls with resolved ones and store old urls in a separate key.
+        for index, metadata in enumerate(source_metadatas):
+            metadata["original_url"] = metadata["source"]
+            metadata["source"] = resolved_uris[index]
+
+        encoded_raw_str = raw_str.encode()
+        # Starting the injection from the end ensures that end_pos variables
+        # do not get shifted by next insertions.
+        for support in reversed(supports):
+            if not (
+                support.grounding_chunk_indices
+                and support.confidence_scores
+                and support.segment
+                and support.segment.end_index
+                and support.segment.start_index
+                and support.segment.text
+            ):
+                continue
+            end_pos = support.segment.end_index
+            indices = support.grounding_chunk_indices
+            # Create citation markers from associated chunk indices
+            citation_markers = "".join(f"[{index}]" for index in indices)
+            encoded_citation_markers = citation_markers.encode()
+            encoded_raw_str = (
+                encoded_raw_str[:end_pos]
+                + encoded_citation_markers
+                + encoded_raw_str[end_pos:]
+            )
+            for indice in indices:
+                source_metadatas[indice]["supports"].append(support.model_dump())
 
         # Structure sources with resolved URLs
         sources_list: list[Source] = [
             {
                 "source": {"name": "web_search"},
                 "document": [""]
-                * len(resolved_uris),  # Placeholder for document content
-                "metadata": [{"source": uri} for uri in resolved_uris],
+                * len(source_metadatas),  # We do not have website content
+                "metadata": [metadata for metadata in source_metadatas],
             }
         ]
-
         # Prepare final event structure with modified content and sources
         event_data: "ChatCompletionEventData" = {
-            "content": raw_str,  # Content with added citations
+            "content": encoded_raw_str.decode(),  # Content with added citations
             "sources": sources_list,  # List of resolved source references
+            "done": True,
         }
         event: "Event" = {
             "type": "chat:completion",
             "data": event_data,
         }
-
         return event
 
     def _add_log_handler(self):
