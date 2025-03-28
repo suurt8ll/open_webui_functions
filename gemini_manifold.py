@@ -48,7 +48,6 @@ from typing import (
     Awaitable,
     Callable,
     Literal,
-    Tuple,
     Optional,
     TYPE_CHECKING,
 )
@@ -205,7 +204,7 @@ class Pipe:
         messages = body.get("messages", [])
         system_prompt, remaining_messages = self._pop_system_prompt(messages)
         log.debug(f"System prompt: {system_prompt}")
-        contents: list[types.Content] = self._transform_messages_to_contents(
+        contents: list[types.Content] = self._genai_contents_from_messages(
             remaining_messages
         )
 
@@ -362,7 +361,7 @@ class Pipe:
 
     async def _stream_response(
         self, gen_content_args: dict, __request__: Request, __user__: "UserData"
-    ) -> Tuple[list[types.GenerateContentResponse], str]:
+    ) -> tuple[list[types.GenerateContentResponse], str]:
         """
         Streams the response to the front-end using `__event_emitter__` and finally returns the full aggregated response.
         """
@@ -427,7 +426,7 @@ class Pipe:
     def _pop_system_prompt(
         self,
         messages: list[dict],
-    ) -> Tuple[Optional[str], list[dict]]:
+    ) -> tuple[Optional[str], list[dict]]:
         """Extracts system message from messages."""
         system_message_content = None
         messages_without_system = []
@@ -440,27 +439,21 @@ class Pipe:
 
     def _get_mime_type(self, file_uri: str) -> str:
         """
-        Utility function to determine MIME type based on file extension.
-        Extend this function to support more MIME types as needed.
+        Determines MIME type based on file extension using the mimetypes module.
         """
-        if file_uri.endswith(".jpg") or file_uri.endswith(".jpeg"):
-            return "image/jpeg"
-        elif file_uri.endswith(".png"):
-            return "image/png"
-        elif file_uri.endswith(".gif"):
-            return "image/gif"
-        elif file_uri.endswith(".bmp"):
-            return "image/bmp"
-        elif file_uri.endswith(".webp"):
-            return "image/webp"
-        else:
-            # Default MIME type if unknown
-            return "application/octet-stream"
+        mime_type, encoding = mimetypes.guess_type(file_uri)
+        if mime_type is None:
+            return "application/octet-stream"  # Default MIME type if unknown
+        return mime_type
 
-    def _process_image_url(self, image_url: str) -> Optional[types.Part]:
-        """Processes an image URL, handling GCS, data URIs, and standard URLs."""
+    def _genai_part_from_image_url(self, image_url: str) -> Optional[types.Part]:
+        """
+        Processes an image URL and returns a genai.types.Part object from it
+        Handles GCS, data URIs, and standard URLs.
+        """
         try:
             if image_url.startswith("gs://"):
+                # FIXME: mime type helper would error out here, it only handles filenames.
                 return types.Part.from_uri(
                     file_uri=image_url, mime_type=self._get_mime_type(image_url)
                 )
@@ -474,16 +467,20 @@ class Pipe:
                 else:
                     raise ValueError("Invalid data URI for image.")
             else:  # Assume standard URL
+                # FIXME: mime type helper would error out here too, it only handles filenames.
                 return types.Part.from_uri(
                     file_uri=image_url, mime_type=self._get_mime_type(image_url)
                 )
-        except Exception as e:
-            print(f"Error processing image URL '{image_url}': {e}")
-            return None  # Return None to indicate failure
+        except Exception:
+            log.exception("Error processing image URL.", image_url=image_url)
+            return None
 
-    def _extract_markdown_image(self, text: str) -> list[types.Part]:
-        """Extracts and converts markdown images to parts, preserving text order."""
-        parts = []
+    def _genai_parts_from_text(self, text: str) -> list[types.Part]:
+        """
+        Turns raw text into list of genai.types.Parts objects.
+        Extracts and converts markdown images to parts, preserving text order.
+        """
+        parts: list[types.Part] = []
         last_pos = 0
 
         for match in re.finditer(
@@ -564,22 +561,19 @@ class Pipe:
 
         return parts
 
-    def _process_content_item(self, item: dict) -> list[types.Part]:
-        """Processes a single content item, handling text and image_url types."""
-        item_type = item.get("type")
+    def _genai_parts_from_content(self, item: dict) -> list[types.Part]:
+        """Processes a single content item from the `body` payload."""
+        item_type = "text" if isinstance(item, str) else item.get("type")
         parts = []
 
         if item_type == "text":
             text = item.get("text", "")
-            parts.extend(
-                self._extract_markdown_image(text)
-            )  # Always process for markdown images
+            parts.extend(self._genai_parts_from_text(text))
         elif item_type == "image_url":
             image_url_dict = item.get("image_url", {})
-            image_url = image_url_dict.get("url", "")
+            image_url = image_url_dict.get("url")
             if isinstance(image_url, str):
-                part = self._process_image_url(image_url)
-                if part:
+                if part := self._genai_part_from_image_url(image_url):
                     parts.append(part)
             else:
                 print(
@@ -590,31 +584,24 @@ class Pipe:
 
         return parts
 
-    def _transform_messages_to_contents(
-        self,
-        messages: list[dict],
+    def _genai_contents_from_messages(
+        self, messages: list[dict]
     ) -> list[types.Content]:
-        """Transforms messages to google-genai contents, supporting text and images."""
-
+        """
+        Transforms messages from the `body` payload to genai.types.Content object.
+        """
         contents: list[types.Content] = []
-
         for message in messages:
             role = (
                 "model" if message.get("role") == "assistant" else message.get("role")
             )
-            content = message.get("content", "")
-            parts = []
-
+            content: str | list[dict] = message.get("content", "")
+            parts: list[types.Part] = []
             if isinstance(content, list):
                 for item in content:
-                    parts.extend(self._process_content_item(item))
+                    parts.extend(self._genai_parts_from_content(item))
             else:  # Treat as plain text
-                parts.extend(
-                    self._extract_markdown_image(content)
-                )  # process markdown images
-                if not parts:  # if there were no markdown images, add the text
-                    parts.append(types.Part.from_text(text=content))
-
+                parts.extend(self._genai_parts_from_text(content))
             contents.append(types.Content(role=role, parts=parts))
 
         return contents
