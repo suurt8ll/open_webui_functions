@@ -11,106 +11,128 @@ requirements:
 """
 
 import json
+import sys
 from typing import (
-    AsyncGenerator,
-    Generator,
-    Iterator,
     Any,
+    Awaitable,
+    Callable,
     Literal,
+    cast,
     TYPE_CHECKING,
 )
 
 from pydantic import BaseModel, Field
-from starlette.responses import StreamingResponse
-import traceback
-import inspect
-from open_webui.models.chats import Chats, ChatModel
+from open_webui.models.chats import Chats
+from open_webui.utils.logger import stdout_format
+from loguru import logger
 
 if TYPE_CHECKING:
-    from manifold_types import (
-        Message,
-        UserData,
-    )  # My personal types in a separate file for more robustness.
+    from loguru import Record
+    from loguru._handler import Handler
+    from manifold_types import *  # My personal types in a separate file for more robustness.
 
-COLORS = {
-    "RED": "\033[91m",
-    "GREEN": "\033[92m",
-    "YELLOW": "\033[93m",
-    "BLUE": "\033[94m",
-    "MAGENTA": "\033[95m",
-    "CYAN": "\033[96m",
-    "WHITE": "\033[97m",
-    "RESET": "\033[0m",
-}
+# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
+log = logger.bind(auditable=False)
 
 
 class Pipe:
     class Valves(BaseModel):
-        LOG_LEVEL: Literal["INFO", "WARNING", "ERROR", "DEBUG", "OFF"] = Field(
+        LOG_LEVEL: Literal[
+            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
+        ] = Field(
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
 
     def __init__(self):
         self.valves = self.Valves()
-        self._print_colored("Function has been initialized!", "INFO")
+        print("[associate_messages_to_files] Initialization done!")
+
+    async def pipes(self) -> list["ModelData"]:
+        self._add_log_handler()
+        log.info("Registering the pipe model.")
+        return [
+            {"id": "associate_messages_to_files", "name": "Associate Messages to Files"}
+        ]
 
     async def pipe(
         self,
         body: dict[str, Any],
-        __user__: UserData,
+        __event_emitter__: Callable[["Event"], Awaitable[None]],
+        __user__: "UserData",
         __metadata__: dict[str, Any],
-    ) -> (
-        str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator
+    ) -> Optional[str]:
+
+        self.__event_emitter__ = __event_emitter__
+
+        chat_id = __metadata__.get("chat_id")
+        if not chat_id:
+            error_msg = "Chat ID not found in request body or metadata."
+            await self._emit_error(error_msg, exception=False)
+            return None
+
+        # Get the message history directly from the backend.
+        chat = Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=__user__["id"])
+
+        if chat:
+            print(json.dumps(chat.model_dump(), indent=2, default=str))
+        else:
+            error_msg = f"Chat with ID {chat_id} not found."
+            await self._emit_error(error_msg, exception=False)
+            return None
+        return "Hello World!"
+
+    """
+    ---------- Helper methods inside the Pipe class. ----------
+    """
+
+    async def _emit_completion(
+        self,
+        content: Optional[str] = None,
+        done: bool = False,
+        error: Optional[str] = None,
+        sources: Optional[list["Source"]] = None,
     ):
-        try:
-            chat_id = __metadata__.get("chat_id")
-            if not chat_id:
-                self._print_colored(
-                    "Error: Chat ID not found in request body or metadata.", "ERROR"
-                )
-                return "Error: Chat ID not found."
+        """Constructs and emits completion event."""
+        emission: "ChatCompletionEvent" = {
+            "type": "chat:completion",
+            "data": {"done": done},
+        }
+        if content:
+            emission["data"]["content"] = content
+        if error:
+            emission["data"]["error"] = {"detail": error}
+        if sources:
+            emission["data"]["sources"] = sources
+        await self.__event_emitter__(emission)
 
-            # Get the message history directly from the backend.
-            chat = Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=__user__["id"])
+    async def _emit_error(
+        self, error_msg: str, warning: bool = False, exception: bool = True
+    ) -> None:
+        """Emits an event to the front-end that causes it to display a nice red error message."""
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        await self._emit_completion(error=f"\n{error_msg}", done=True)
 
-            if chat:
-                result = await self._process_chat_messages(chat)
-                self._print_colored(
-                    f"Printing the processed messages:\n{json.dumps(result, indent=2)}",
-                    "DEBUG",
-                )
-            else:
-                self._print_colored(f"Chat with ID {chat_id} not found.", "WARNING")
-                return f"Chat with ID {chat_id} not found."
-            return "Hello World!"
-
-        except Exception as e:
-            error_msg = f"Pipe function error: {str(e)}\n{traceback.format_exc()}"
-            self._print_colored(error_msg, "ERROR")
-            return error_msg
-
-    """Helper functions inside pipe method."""
-
-    async def _process_chat_messages(self, chat: ChatModel) -> list[dict[str, Any]]:
-        """Turns the Open WebUI's ChatModel object into more lean dict object that contains only the messages."""
-        self._print_colored(
-            f"Printing the raw ChatModel object:\n{json.dumps(chat.model_dump(), indent=2)}",
-            "DEBUG",
-        )
-        messages: list["Message"] = chat.chat.get("messages", [])
+    async def _process_chat_messages(self, chat: ChatChatModel) -> list[dict[str, Any]]:
+        """
+        Turns the Open WebUI's ChatModel object into more lean dict object that contains only the messages.
+        """
+        messages: list["MessageModel"] = chat.get("messages", [])
         result = []
         for message in messages:
-            role = message.role
-            content = message.content
+            role = message.get("role")
+            content = message.get("content")
             files = []
             if role == "user":
-                files_for_message = message.files
+                message = cast(UserMessageModel, message)
+                files_for_message = message.get("files")
                 if files_for_message:
-                    files = [
-                        file_data.get("name", "") for file_data in files_for_message
-                    ]
+                    files = [file_data.get("name") for file_data in files_for_message]
             elif role == "assistant":
+                message = cast(AssistantMessageModel, message)
                 if not hasattr(message, "done"):
                     continue
             result.append(
@@ -122,24 +144,32 @@ class Pipe:
             )
         return result
 
-    # FIXME: replace with new logging
-    def _print_colored(self, message: str, level: str = "INFO") -> None:
-        if not hasattr(self, "valves") or self.valves.LOG_LEVEL == "OFF":
-            return
+    def _add_log_handler(self):
+        """Adds handler to the root loguru instance for this plugin if one does not exist already."""
 
-        level_priority = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3}
-        if level_priority.get(level, 0) >= level_priority.get(self.valves.LOG_LEVEL, 0):
-            color_map = {
-                "INFO": COLORS["GREEN"],
-                "WARNING": COLORS["YELLOW"],
-                "ERROR": COLORS["RED"],
-                "DEBUG": COLORS["BLUE"],
-            }
-            color = color_map.get(level, COLORS["WHITE"])
-            frame = inspect.currentframe()
-            if frame:
-                frame = frame.f_back
-            method_name = frame.f_code.co_name if frame else "<unknown>"
-            print(
-                f"{color}[{level}][associate_messages_to_files][{method_name}]{COLORS['RESET']} {message}"
-            )
+        def plugin_filter(record: "Record"):
+            """Filter function to only allow logs from this plugin (based on module name)."""
+            return record["name"] == __name__  # Filter by module name
+
+        # Access the internal state of the logger
+        handlers: dict[int, "Handler"] = logger._core.handlers  # type: ignore
+        for key, handler in handlers.items():
+            existing_filter = handler._filter
+            if (
+                hasattr(existing_filter, "__name__")
+                and existing_filter.__name__ == plugin_filter.__name__
+                and hasattr(existing_filter, "__module__")
+                and existing_filter.__module__ == plugin_filter.__module__
+            ):
+                log.debug("Handler for this plugin is already present!")
+                return
+
+        logger.add(
+            sys.stdout,
+            level=self.valves.LOG_LEVEL,
+            format=stdout_format,
+            filter=plugin_filter,
+        )
+        log.info(
+            f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
+        )
