@@ -30,6 +30,7 @@ requirements: google-genai==1.8.0
 import asyncio
 import copy
 import io
+import json
 import mimetypes
 import os
 import uuid
@@ -50,7 +51,9 @@ from typing import (
     Literal,
     Optional,
     TYPE_CHECKING,
+    cast,
 )
+from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
 from open_webui.storage.provider import Storage
 from open_webui.utils.logger import stdout_format
@@ -122,7 +125,6 @@ class Pipe:
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
         self.models: list["ModelData"] = []
         self.client: Optional[genai.Client] = None
-        self.aggregated_chunks: list[types.GenerateContentResponse] = []
         print("[gemini_manifold] Function has been initialized!")
 
     async def pipes(self) -> list["ModelData"]:
@@ -131,6 +133,7 @@ class Pipe:
         self._add_log_handler()
 
         # Return existing models if all conditions are met
+        # FIXME: Always check for models if current model is the error placeholder.
         if (
             self.models
             and self.valves.CACHE_MODELS
@@ -196,24 +199,34 @@ class Pipe:
             await self._emit_error(error_msg, exception=False)
             return
 
-        max_len = 50
-        log.debug(
-            "Received body:",
-            body=str(self._truncate_long_strings(copy.deepcopy(body), max_len)),
+        # Get the message history directly from the backend.
+        # This allows us to see data about sources and files data.
+        chat_id = __metadata__.get("chat_id")
+        if not chat_id:
+            error_msg = "Chat ID not found in request body or metadata."
+            await self._emit_error(error_msg, exception=False)
+            return None
+        chat = Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=__user__["id"])
+
+        if not chat:
+            error_msg = f"Chat with ID {chat_id} not found."
+            await self._emit_error(error_msg, exception=False)
+            return None
+
+        chat_content: ChatChatModel = chat.chat  # type: ignore
+        print(
+            json.dumps(self._truncate_long_strings(copy.deepcopy(chat_content)), indent=2, default=str)  # type: ignore
         )
 
-        messages = body.get("messages", [])
-        system_prompt, remaining_messages = self._pop_system_prompt(messages)
+        messages = chat_content.get("messages")
+        chat_params = chat_content.get("params")
+        system_prompt = chat_params.get("system")
         log.debug(f"System prompt: {system_prompt}")
-        contents: list[types.Content] = self._genai_contents_from_messages(
-            remaining_messages
-        )
+        contents = self._genai_contents_from_messages(messages)
 
         turn_content_dict_list: list[dict] = []
         for content in contents:
-            truncated_content = self._truncate_long_strings(
-                content.model_dump(), max_len
-            )
+            truncated_content = self._truncate_long_strings(content.model_dump())
             turn_content_dict_list.append(truncated_content)
         log.debug(
             "list[google.genai.types.Content] object that will be given to the Gemini API:",
@@ -314,8 +327,10 @@ class Pipe:
         return response.text
 
     """
-    ---------- Helper methods inside the Pipe class. ----------
+    ---------- Helper methods inside the Pipe class ----------
     """
+
+    """Event emission and error logging"""
 
     async def _emit_completion(
         self,
@@ -360,92 +375,61 @@ class Pipe:
             "name": "[gemini_manifold] " + error_msg,
         }
 
-    async def _stream_response(
-        self, gen_content_args: dict, __request__: Request, __user__: "UserData"
-    ) -> tuple[list[types.GenerateContentResponse], str]:
+    """ChatModel.chat.messages -> list[genai.types.Content] conversion"""
+
+    def _genai_contents_from_messages(
+        self, messages: list["MessageModel"]
+    ) -> list[types.Content]:
         """
-        Streams the response to the front-end using `__event_emitter__` and finally returns the full aggregated response.
+        Transforms `ChatModel.chat.messages` list into `genai.types.Content`.
         """
-        response_stream: AsyncIterator[types.GenerateContentResponse] = (
-            await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
-        )
-        aggregated_chunks: list[types.GenerateContentResponse] = []
-        content = ""
 
-        async for chunk in response_stream:
-            aggregated_chunks.append(chunk)
-            candidate = self._get_first_candidate(chunk.candidates)
-            if not candidate or not candidate.content or not candidate.content.parts:
-                log.warning(
-                    "candidate, candidate.content or candidate.content.parts is missing. Skipping to the next chunk."
-                )
-                continue
-            for part in candidate.content.parts:
-                if text_part := part.text:
-                    content += text_part
-                elif inline_data := part.inline_data:
-                    if img_url := self._process_image_part(
-                        inline_data, gen_content_args, __user__, __request__
-                    ):
-                        content += img_url
-                await self._emit_completion(content)
+        def process_user_message(message: "UserMessageModel") -> list[types.Part]:
+            """
+            Processes user message, extracts image parts.
+            """
+            parts: list[types.Part] = []
+            if files := message.get("files"):
+                for file in files:
+                    if file.get("type") == "image":
+                        if image_part := self._genai_part_from_image_url(
+                            file.get("url")
+                        ):
+                            parts.append(image_part)
+            return parts
 
-        return aggregated_chunks, content
+        def process_assistant_message(
+            message: "AssistantMessageModel",
+        ) -> list[types.Part]:
+            """
+            Processes assistant message sources. Removes citation markers if they exsist.
+            """
+            parts: list[types.Part] = []
+            if sources := message.get("sources"):
+                # TODO: Remove source markers here.
+                print(f"This message has sources!\n{sources}")
+            return parts
 
-    def _get_first_candidate(
-        self, candidates: Optional[list[types.Candidate]]
-    ) -> Optional[types.Candidate]:
-        """Selects the first candidate, logging a warning if multiple exist."""
-        if not candidates:
-            log.warning("Received chunk with no candidates, skipping processing.")
-            return None
-        if len(candidates) > 1:
-            log.warning("Multiple candidates found, defaulting to first candidate.")
-        return candidates[0]
-
-    def _process_image_part(
-        self, inline_data, gen_content_args: dict, user: "UserData", request: Request
-    ) -> Optional[str]:
-        """Handles image data conversion to markdown."""
-        mime_type = inline_data.mime_type
-        image_data = inline_data.data
-
-        if self.valves.USE_FILES_API:
-            image_url = self._upload_image(
-                image_data,
-                mime_type,
-                gen_content_args.get("model", ""),
-                "Not implemented yet. TAKE IT FROM gen_content_args contents",
-                user["id"],
-                request,
-            )
-            return f"![Generated Image]({image_url})" if image_url else None
-        else:
-            encoded = base64.b64encode(image_data).decode()
-            return f"![Generated Image](data:{mime_type};base64,{encoded})"
-
-    def _pop_system_prompt(
-        self,
-        messages: list[dict],
-    ) -> tuple[Optional[str], list[dict]]:
-        """Extracts system message from messages."""
-        system_message_content = None
-        messages_without_system = []
+        contents: list[types.Content] = []
         for message in messages:
-            if message.get("role") == "system":
-                system_message_content = message.get("content")
+            content = message.get("content")
+            role = message.get("role")
+            parts: list[types.Part] = []
+            if role == "user":
+                parts = process_user_message(cast("UserMessageModel", message))
+            elif role == "assistant":
+                message = cast("AssistantMessageModel", message)
+                if not message.get("done"):
+                    continue
+                role = "model"
+                parts = process_assistant_message(message)
             else:
-                messages_without_system.append(message)
-        return system_message_content, messages_without_system
+                log.warning(f"{role} is an unsupported role, skipping this message.")
+                continue
+            parts += self._genai_parts_from_text(content)
+            contents.append(types.Content(role=role, parts=parts))
 
-    def _get_mime_type(self, file_uri: str) -> str:
-        """
-        Determines MIME type based on file extension using the mimetypes module.
-        """
-        mime_type, encoding = mimetypes.guess_type(file_uri)
-        if mime_type is None:
-            return "application/octet-stream"  # Default MIME type if unknown
-        return mime_type
+        return contents
 
     def _genai_part_from_image_url(self, image_url: str) -> Optional[types.Part]:
         """
@@ -461,6 +445,8 @@ class Pipe:
             elif image_url.startswith("data:image"):
                 match = re.match(r"data:(image/\w+);base64,(.+)", image_url)
                 if match:
+                    print(match.group(1))
+                    print(f"{match.group(2)[:20]}[...]{match.group(2)[-20:]}")
                     return types.Part.from_bytes(
                         data=base64.b64decode(match.group(2)),
                         mime_type=match.group(1),
@@ -473,6 +459,7 @@ class Pipe:
                     file_uri=image_url, mime_type=self._get_mime_type(image_url)
                 )
         except Exception:
+            # TODO: Send warnin toast to user in front-end.
             log.exception("Error processing image URL.", image_url=image_url)
             return None
 
@@ -562,50 +549,130 @@ class Pipe:
 
         return parts
 
-    def _genai_parts_from_content(self, item: dict) -> list[types.Part]:
-        """Processes a single content item from the `body` payload."""
-        item_type = "text" if isinstance(item, str) else item.get("type")
-        parts = []
+    """Model response streaming"""
 
-        if item_type == "text":
-            text = item.get("text", "")
-            parts.extend(self._genai_parts_from_text(text))
-        elif item_type == "image_url":
-            image_url_dict = item.get("image_url", {})
-            image_url = image_url_dict.get("url")
-            if isinstance(image_url, str):
-                if part := self._genai_part_from_image_url(image_url):
-                    parts.append(part)
-            else:
-                print(
-                    f"Warning: Unexpected image_url format: {image_url_dict}. Skipping."
+    async def _stream_response(
+        self, gen_content_args: dict, __request__: Request, __user__: "UserData"
+    ) -> tuple[list[types.GenerateContentResponse], str]:
+        """
+        Streams the response to the front-end using `__event_emitter__` and finally returns the full aggregated response.
+        """
+        response_stream: AsyncIterator[types.GenerateContentResponse] = (
+            await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
+        )
+        aggregated_chunks: list[types.GenerateContentResponse] = []
+        content = ""
+
+        async for chunk in response_stream:
+            aggregated_chunks.append(chunk)
+            candidate = self._get_first_candidate(chunk.candidates)
+            if not candidate or not candidate.content or not candidate.content.parts:
+                log.warning(
+                    "candidate, candidate.content or candidate.content.parts is missing. Skipping to the next chunk."
                 )
-        else:
-            print(f"Warning: Unsupported item type: {item_type}. Skipping.")
+                continue
+            for part in candidate.content.parts:
+                if text_part := part.text:
+                    content += text_part
+                elif inline_data := part.inline_data:
+                    if img_url := self._process_image_part(
+                        inline_data, gen_content_args, __user__, __request__
+                    ):
+                        content += img_url
+                await self._emit_completion(content)
 
-        return parts
+        return aggregated_chunks, content
 
-    def _genai_contents_from_messages(
-        self, messages: list[dict]
-    ) -> list[types.Content]:
-        """
-        Transforms messages from the `body` payload to genai.types.Content object.
-        """
-        contents: list[types.Content] = []
-        for message in messages:
-            role = (
-                "model" if message.get("role") == "assistant" else message.get("role")
+    def _get_first_candidate(
+        self, candidates: Optional[list[types.Candidate]]
+    ) -> Optional[types.Candidate]:
+        """Selects the first candidate, logging a warning if multiple exist."""
+        if not candidates:
+            log.warning("Received chunk with no candidates, skipping processing.")
+            return None
+        if len(candidates) > 1:
+            log.warning("Multiple candidates found, defaulting to first candidate.")
+        return candidates[0]
+
+    def _process_image_part(
+        self, inline_data, gen_content_args: dict, user: "UserData", request: Request
+    ) -> Optional[str]:
+        """Handles image data conversion to markdown."""
+        mime_type = inline_data.mime_type
+        image_data = inline_data.data
+
+        if self.valves.USE_FILES_API:
+            image_url = self._upload_image(
+                image_data,
+                mime_type,
+                gen_content_args.get("model", ""),
+                "Not implemented yet. TAKE IT FROM gen_content_args contents",
+                user["id"],
+                request,
             )
-            content: str | list[dict] = message.get("content", "")
-            parts: list[types.Part] = []
-            if isinstance(content, list):
-                for item in content:
-                    parts.extend(self._genai_parts_from_content(item))
-            else:  # Treat as plain text
-                parts.extend(self._genai_parts_from_text(content))
-            contents.append(types.Content(role=role, parts=parts))
+            return f"![Generated Image]({image_url})" if image_url else None
+        else:
+            encoded = base64.b64encode(image_data).decode()
+            return f"![Generated Image](data:{mime_type};base64,{encoded})"
 
-        return contents
+    def _upload_image(
+        self,
+        image_data: bytes,
+        mime_type: str,
+        model: str,
+        prompt: str,
+        user_id: str,
+        __request__: Request,
+    ) -> str | None:
+        """
+        Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
+        Returns the url to uploaded image.
+        """
+        image_format = mimetypes.guess_extension(mime_type)
+        id = str(uuid.uuid4())
+        # TODO: Better filename? Prompt as the filename?
+        name = os.path.basename(f"generated-image{image_format}")
+        imagename = f"{id}_{name}"
+        image = io.BytesIO(image_data)
+        image_metadata = {
+            "model": model,
+            "prompt": prompt,
+        }
+
+        # Upload the image to user configured storage provider.
+        log.info("Uploading the image to the configured storage provider.")
+        try:
+            contents, image_path = Storage.upload_file(image, imagename)
+        except Exception:
+            error_msg = f"Error occurred during upload to the storage provider."
+            log.exception(error_msg)
+            return None
+        # Add the image file to files database.
+        log.info("Adding the image file to Open WebUI files database.")
+        file_item = Files.insert_new_file(
+            user_id,
+            FileForm(
+                id=id,
+                filename=name,
+                path=image_path,
+                meta={
+                    "name": name,
+                    "content_type": mime_type,
+                    "size": len(contents),
+                    "data": image_metadata,
+                },
+            ),
+        )
+        if not file_item:
+            log.warning("Files.insert_new_file did not return anything.")
+            return None
+        # Get the image url.
+        image_url: str = __request__.app.url_path_for(
+            "get_file_content_by_id", id=file_item.id
+        )
+        return image_url
+
+    """Model retrival from API"""
 
     async def _get_google_models(self) -> list["ModelData"]:
         """Retrieve Google models with prefix stripping."""
@@ -724,6 +791,8 @@ class Pipe:
             log.exception(error_msg)
             return model_name
 
+    """Other helpers"""
+
     def _truncate_long_strings(
         self, data: dict[str, Any], max_length: int = 50
     ) -> dict[str, Any]:
@@ -759,63 +828,6 @@ class Pipe:
                         self._truncate_long_strings(item, max_length)
 
         return data
-
-    def _upload_image(
-        self,
-        image_data: bytes,
-        mime_type: str,
-        model: str,
-        prompt: str,
-        user_id: str,
-        __request__: Request,
-    ) -> str | None:
-        """
-        Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
-        Returns the url to uploaded image.
-        """
-        image_format = mimetypes.guess_extension(mime_type)
-        id = str(uuid.uuid4())
-        # TODO: Better filename? Prompt as the filename?
-        name = os.path.basename(f"generated-image{image_format}")
-        imagename = f"{id}_{name}"
-        image = io.BytesIO(image_data)
-        image_metadata = {
-            "model": model,
-            "prompt": prompt,
-        }
-
-        # Upload the image to user configured storage provider.
-        log.info("Uploading the image to the configured storage provider.")
-        try:
-            contents, image_path = Storage.upload_file(image, imagename)
-        except Exception:
-            error_msg = f"Error occurred during upload to the storage provider."
-            log.exception(error_msg)
-            return None
-        # Add the image file to files database.
-        log.info("Adding the image file to Open WebUI files database.")
-        file_item = Files.insert_new_file(
-            user_id,
-            FileForm(
-                id=id,
-                filename=name,
-                path=image_path,
-                meta={
-                    "name": name,
-                    "content_type": mime_type,
-                    "size": len(contents),
-                    "data": image_metadata,
-                },
-            ),
-        )
-        if not file_item:
-            log.warning("Files.insert_new_file did not return anything.")
-            return None
-        # Get the image url.
-        image_url: str = __request__.app.url_path_for(
-            "get_file_content_by_id", id=file_item.id
-        )
-        return image_url
 
     async def _get_chat_completion_event_w_sources(
         self, data: types.GenerateContentResponse, raw_str: str
@@ -954,3 +966,12 @@ class Pipe:
         log.info(
             f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
         )
+
+    def _get_mime_type(self, file_uri: str) -> str:
+        """
+        Determines MIME type based on file extension using the mimetypes module.
+        """
+        mime_type, encoding = mimetypes.guess_type(file_uri)
+        if mime_type is None:
+            return "application/octet-stream"  # Default MIME type if unknown
+        return mime_type

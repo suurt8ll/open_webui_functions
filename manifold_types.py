@@ -5,7 +5,7 @@ from open_webui.models.files import FileModelResponse
 
 
 class FileInfo(TypedDict):
-    type: str  # could be "file"
+    type: str  # could be "file", "image"
     file: FileModelResponse
     id: str
     url: str
@@ -46,18 +46,17 @@ class MessageModel(TypedDict):
     id: UUID
     parentId: Optional[UUID]
     childrenIds: list[UUID]
+    role: Literal["user", "assistant"]
     content: str
     timestamp: datetime
 
 
 class UserMessageModel(MessageModel):
-    role: Literal["user"]
     files: NotRequired[list[FileInfo]]
     models: list[str]
 
 
 class AssistantMessageModel(MessageModel):
-    role: Literal["assistant"]
     model: str
     modelName: str
     modelIdx: int
@@ -66,13 +65,18 @@ class AssistantMessageModel(MessageModel):
     done: NotRequired[bool]
 
 
+class ChatParams(TypedDict):
+    system: NotRequired[str]
+    temperature: NotRequired[float]
+
+
 class ChatChatModel(TypedDict):
     """Type for the `ChatModel.chat` variable"""
 
     id: str  # Or UUID if appropriate
     title: str
     models: list[str]
-    params: dict[str, Any]  # Use a more specific type if you know the structure
+    params: ChatParams
     history: dict[str, Any]
     messages: list[MessageModel]
     tags: list[str]
