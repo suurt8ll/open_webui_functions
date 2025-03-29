@@ -32,7 +32,7 @@ class SourceMetadata(TypedDict):
     language: NotRequired[str]  # website language
     # These keys are not used by Open WebUI front-end, they for my plugin only.
     original_url: NotRequired[str]  # original, unresolved url
-    supports: list[dict]  # needs to be serialized from genai.types.GroundingSupport
+    supports: NotRequired[list[dict]]
 
 
 class Source(TypedDict):

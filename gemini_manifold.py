@@ -106,6 +106,7 @@ class Pipe:
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=False, description="Whether to request relaxed safety filtering"
         )
+        # FIXME: remove OFF and add TRACE, CRITICAL
         LOG_LEVEL: Literal["INFO", "WARNING", "ERROR", "DEBUG", "OFF"] = Field(
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
