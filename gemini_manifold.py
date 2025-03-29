@@ -291,19 +291,12 @@ class Pipe:
                 await self._emit_error(error_msg)
                 return None
             emit_sources = None
-            chunks_str = "["
             for chunk in res:
-                chunks_str = (
-                    f"{chunks_str}{self._truncate_long_strings(chunk.model_dump())},"
-                )
                 emit_sources = await self._get_chat_completion_event_w_sources(
                     chunk, raw_text
                 )
-            chunks_str = chunks_str[:-1] + "]"
-            log.debug("Got response from Google API:", response=chunks_str)
             if emit_sources:
-                emit_str = str(self._truncate_long_strings(copy.deepcopy(emit_sources)))  # type: ignore
-                log.debug("Emitting the sources:", emit_object=emit_str)
+                log.info("Sending chat completion event with the sources.")
                 await __event_emitter__(emit_sources)
             return None
 
@@ -400,15 +393,19 @@ class Pipe:
 
         def process_assistant_message(
             message: "AssistantMessageModel",
-        ) -> list[types.Part]:
+        ) -> tuple[list[types.Part], str]:
             """
             Processes assistant message sources. Removes citation markers if they exsist.
             """
             parts: list[types.Part] = []
+            filtered_content = content
             if sources := message.get("sources"):
-                # TODO: Remove source markers here.
-                print(f"This message has sources!\n{sources}")
-            return parts
+                filtered_content = self._remove_citation_markers(content, sources)
+                log.debug(
+                    "Removed source markers from the assistant message.",
+                    new_text=filtered_content,
+                )
+            return parts, filtered_content
 
         contents: list[types.Content] = []
         for message in messages:
@@ -422,7 +419,7 @@ class Pipe:
                 if not message.get("done"):
                     continue
                 role = "model"
-                parts = process_assistant_message(message)
+                parts, content = process_assistant_message(message)
             else:
                 log.warning(f"{role} is an unsupported role, skipping this message.")
                 continue
@@ -791,43 +788,7 @@ class Pipe:
             log.exception(error_msg)
             return model_name
 
-    """Other helpers"""
-
-    def _truncate_long_strings(
-        self, data: dict[str, Any], max_length: int = 50
-    ) -> dict[str, Any]:
-        """
-        Recursively truncates all string and bytes fields within a dictionary that exceed
-        the specified maximum length. Bytes are converted to strings before truncation.
-
-        Args:
-            data: A dictionary representing the JSON data.
-            max_length: The maximum length of strings before truncation.
-
-        Returns:
-            The modified dictionary with long strings truncated.
-        """
-        for key, value in data.items():
-            if isinstance(value, str) and len(value) > max_length:
-                truncated_length = len(value) - max_length
-                data[key] = value[:max_length] + f"[{truncated_length} chars truncated]"
-            elif isinstance(value, bytes) and len(value) > max_length:
-                truncated_length = len(value) - max_length
-                data[key] = (
-                    value.hex()[:max_length]
-                    + f"[{truncated_length} hex chars truncated]"
-                )
-            elif isinstance(value, dict):
-                self._truncate_long_strings(
-                    value, max_length
-                )  # Recursive call for nested dictionaries
-            elif isinstance(value, list):
-                # Iterate through the list and process each element if it's a dictionary
-                for item in value:
-                    if isinstance(item, dict):
-                        self._truncate_long_strings(item, max_length)
-
-        return data
+    """Citations"""
 
     async def _get_chat_completion_event_w_sources(
         self, data: types.GenerateContentResponse, raw_str: str
@@ -936,6 +897,80 @@ class Pipe:
             "data": event_data,
         }
         return event
+
+    def _remove_citation_markers(self, text: str, sources: list["Source"]) -> str:
+        processed: set[str] = set()
+        for source in sources:
+            supports = [
+                metadata["supports"]
+                for metadata in source.get("metadata", [])
+                if "supports" in metadata
+            ]
+            supports = [item for sublist in supports for item in sublist]
+            for support in supports:
+                support = types.GroundingSupport(**support)
+                indices = support.grounding_chunk_indices
+                segment = support.segment
+                if not (indices and segment):
+                    continue
+                segment_text = segment.text
+                if not segment_text:
+                    continue
+                # Using a shortened version because user could edit the assistant message in the front-end.
+                # If citation segment get's edited, then the markers would not be removed. Shortening reduces the
+                # chances of this happening.
+                segment_end = segment_text[-32:]
+                if segment_end in processed:
+                    continue
+                processed.add(segment_end)
+                citation_markers = "".join(f"[{index}]" for index in indices)
+                # Find the position of the citation markers in the text
+                pos = text.find(segment_text + citation_markers)
+                if pos != -1:
+                    # Remove the citation markers
+                    text = (
+                        text[: pos + len(segment_text)]
+                        + text[pos + len(segment_text) + len(citation_markers) :]
+                    )
+        return text
+
+    """Other helpers"""
+
+    def _truncate_long_strings(
+        self, data: dict[str, Any], max_length: int = 50
+    ) -> dict[str, Any]:
+        """
+        Recursively truncates all string and bytes fields within a dictionary that exceed
+        the specified maximum length. Bytes are converted to strings before truncation.
+
+        Args:
+            data: A dictionary representing the JSON data.
+            max_length: The maximum length of strings before truncation.
+
+        Returns:
+            The modified dictionary with long strings truncated.
+        """
+        for key, value in data.items():
+            if isinstance(value, str) and len(value) > max_length:
+                truncated_length = len(value) - max_length
+                data[key] = value[:max_length] + f"[{truncated_length} chars truncated]"
+            elif isinstance(value, bytes) and len(value) > max_length:
+                truncated_length = len(value) - max_length
+                data[key] = (
+                    value.hex()[:max_length]
+                    + f"[{truncated_length} hex chars truncated]"
+                )
+            elif isinstance(value, dict):
+                self._truncate_long_strings(
+                    value, max_length
+                )  # Recursive call for nested dictionaries
+            elif isinstance(value, list):
+                # Iterate through the list and process each element if it's a dictionary
+                for item in value:
+                    if isinstance(item, dict):
+                        self._truncate_long_strings(item, max_length)
+
+        return data
 
     def _add_log_handler(self):
         """Adds handler to the root loguru instance for this plugin if one does not exist already."""
