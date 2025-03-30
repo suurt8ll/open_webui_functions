@@ -292,6 +292,7 @@ class Pipe:
                 return None
             emit_sources = None
             for chunk in res:
+                # TODO: Call this only on final finish chunk.
                 emit_sources = await self._get_chat_completion_event_w_sources(
                     chunk, raw_text
                 )
@@ -313,7 +314,16 @@ class Pipe:
             error_msg = f"Content generation error: {str(e)}"
             await self._emit_error(error_msg)
             return None
-        if not response.text:
+        if raw_text := response.text:
+            # TODO: [refac] unify this logic with streaming response.
+            emit_sources = await self._get_chat_completion_event_w_sources(
+                response, raw_text
+            )
+            if emit_sources:
+                log.info("Sending chat completion event with the sources.")
+                await __event_emitter__(emit_sources)
+                return None
+        else:
             warn_msg = "Non-stremaing response did not have any text inside it."
             await self._emit_error(warn_msg, warning=True)
             return None
@@ -576,6 +586,7 @@ class Pipe:
                         inline_data, gen_content_args, __user__, __request__
                     ):
                         content += img_url
+                # TODO: Streaming this way loses the support for Filter.stream() method processing for filter plugins.
                 await self._emit_completion(content)
 
         return aggregated_chunks, content
@@ -822,6 +833,7 @@ class Pipe:
         ):
             return None
 
+        # TODO: Add the used search queries as status message.
         supports = grounding_metadata.grounding_supports
         grounding_chunks = grounding_metadata.grounding_chunks
 
