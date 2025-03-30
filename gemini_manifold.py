@@ -27,6 +27,8 @@ requirements: google-genai==1.8.0
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 #   TODO Display usage statistics (token counts)
 
+from google import genai
+from google.genai import types
 import asyncio
 import copy
 import io
@@ -35,8 +37,6 @@ import mimetypes
 import os
 import uuid
 import aiohttp
-from google import genai
-from google.genai import types
 import base64
 import re
 import fnmatch
@@ -129,43 +129,12 @@ class Pipe:
         self.valves = self.Valves(**(valves if valves else {}))
 
         # TODO: Add the log handler here, not in `pipes`.
-        # TODO: [refac] Break into smaller helper methods.
 
         # Initialize the genai client.
-        self.client = None
-        if self.valves.GEMINI_API_KEY:
-            http_options = types.HttpOptions(base_url=self.valves.GEMINI_API_BASE_URL)
-            try:
-                self.client = genai.Client(
-                    api_key=self.valves.GEMINI_API_KEY,
-                    http_options=http_options,
-                )
-                log.info("genai client successfully initialized!")
-            except Exception:
-                log.exception("genai client initialization failed.")
-        else:
-            log.error("GEMINI_API_KEY is not set.")
-
+        self.client = self._get_genai_client()
         # Get Google models from the API.
-        self.google_models = None
-        if self.client:
-            try:
-                self.google_models = self.client.models.list(
-                    config={"query_base": True}
-                )
-            except Exception:
-                log.exception("Retriving models from Google API failed.")
-        if self.google_models:
-            log.info(
-                f"Retrieved {len(self.google_models)} models from Gemini Developer API."
-            )
-            # Filter Google models list down.
-            self.google_models = [
-                model
-                for model in self.google_models
-                if model.supported_actions
-                and "generateContent" in model.supported_actions
-            ]
+        self.google_models = self._get_genai_models()
+
         self.models: list["ModelData"] = []
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
 
@@ -722,7 +691,42 @@ class Pipe:
         )
         return image_url
 
-    """Model retrival from API"""
+    """Client initialization and model retrival from Google API"""
+
+    def _get_genai_client(self) -> Optional[genai.Client]:
+        client = None
+        if self.valves.GEMINI_API_KEY:
+            http_options = types.HttpOptions(base_url=self.valves.GEMINI_API_BASE_URL)
+            try:
+                client = genai.Client(
+                    api_key=self.valves.GEMINI_API_KEY,
+                    http_options=http_options,
+                )
+                log.info("genai client successfully initialized!")
+            except Exception:
+                log.exception("genai client initialization failed.")
+        else:
+            log.error("GEMINI_API_KEY is not set.")
+        return client
+
+    def _get_genai_models(self):
+        """
+        Gets valid Google models from the API.
+        Returns a google.genai.pagers.Pager object.
+        """
+        google_models = []
+        if self.client:
+            try:
+                google_models = self.client.models.list(config={"query_base": True})
+            except Exception:
+                log.exception("Retriving models from Google API failed.")
+        log.info(f"Retrieved {len(google_models)} models from Gemini Developer API.")
+        # Filter Google models list down.
+        return [
+            model
+            for model in google_models
+            if model.supported_actions and "generateContent" in model.supported_actions
+        ]
 
     def _get_safety_settings(self, model_name: str) -> list[types.SafetySetting]:
         """Get safety settings based on model name and permissive setting."""
