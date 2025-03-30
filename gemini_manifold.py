@@ -85,7 +85,7 @@ log = logger.bind(auditable=False)
 
 class Pipe:
     class Valves(BaseModel):
-        GEMINI_API_KEY: str = Field(default="")
+        GEMINI_API_KEY: Optional[str] = Field(default=None)
         GEMINI_API_BASE_URL: str = Field(
             default="https://generativelanguage.googleapis.com",
             description="The base URL for calling the Gemini API",
@@ -125,6 +125,14 @@ class Pipe:
             description="Save the image files using Open WebUI's API for files.",
         )
 
+    class UserValves(BaseModel):
+        GEMINI_API_KEY: Optional[str] = Field(default=None)
+        GEMINI_API_BASE_URL: str = Field(
+            default="https://generativelanguage.googleapis.com",
+            description="The base URL for calling the Gemini API",
+        )
+        # TODO: Add more options that can be changed by the user.
+
     def __init__(self):
 
         # This hack makes the valves values available to the `__init__` method.
@@ -138,8 +146,8 @@ class Pipe:
 
         # TODO: Add the log handler here, not in `pipes`.
 
-        # Initialize the genai client.
-        self.client = self._get_genai_client()
+        # Initialize the genai client with default API given in Valves.
+        self.clients = {"default": self._get_genai_client()}
         # Get Google models from the API.
         self.google_models = self._get_genai_models()
 
@@ -157,10 +165,6 @@ class Pipe:
         if not self.google_models:
             error_msg = "Error during getting the models from Google API, check logs."
             return [self._return_error_model(error_msg)]
-
-        print(
-            f"Saved whitelist: {self.last_whitelist}\nWhitelist from valves: {self.valves.MODEL_WHITELIST}"
-        )
 
         # Return existing models if all conditions are met and no error models are present
         if (
@@ -210,11 +214,10 @@ class Pipe:
         __metadata__: dict[str, Any],
     ) -> Optional[str]:
 
-        # TODO: [refac] Move __user__ to self like that also.
         self.__event_emitter__ = __event_emitter__
 
-        if not self.client:
-            error_msg = "genai client is not initialized."
+        if not (client := self._get_user_client(__user__)):
+            error_msg = "There are no usable genai clients, check the logs."
             await self._emit_error(error_msg, exception=False)
             return
 
@@ -246,10 +249,6 @@ class Pipe:
             return None
 
         chat_content: ChatChatModel = chat.chat  # type: ignore
-        print(
-            json.dumps(self._truncate_long_strings(copy.deepcopy(chat_content)), indent=2, default=str)  # type: ignore
-        )
-
         messages = chat_content.get("messages")
         chat_params = chat_content.get("params")
         system_prompt = chat_params.get("system")
@@ -316,7 +315,7 @@ class Pipe:
             # Streaming response.
             try:
                 res, raw_text = await self._stream_response(
-                    gen_content_args, __request__, __user__
+                    gen_content_args, __request__, __user__, client
                 )
             except Exception as e:
                 error_msg = f"Error occured during streaming: {str(e)}"
@@ -341,7 +340,7 @@ class Pipe:
         try:
             # FIXME: Make it async.
             # FIXME: Support native image gen here too.
-            response = self.client.models.generate_content(**gen_content_args)
+            response = client.models.generate_content(**gen_content_args)
         except Exception as e:
             error_msg = f"Content generation error: {str(e)}"
             await self._emit_error(error_msg)
@@ -591,13 +590,17 @@ class Pipe:
     """Model response streaming"""
 
     async def _stream_response(
-        self, gen_content_args: dict, __request__: Request, __user__: "UserData"
+        self,
+        gen_content_args: dict,
+        __request__: Request,
+        __user__: "UserData",
+        client: genai.Client,
     ) -> tuple[list[types.GenerateContentResponse], str]:
         """
         Streams the response to the front-end using `__event_emitter__` and finally returns the full aggregated response.
         """
         response_stream: AsyncIterator[types.GenerateContentResponse] = (
-            await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
+            await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
         )
         aggregated_chunks: list[types.GenerateContentResponse] = []
         content = ""
@@ -714,13 +717,17 @@ class Pipe:
 
     """Client initialization and model retrival from Google API"""
 
-    def _get_genai_client(self) -> Optional[genai.Client]:
+    def _get_genai_client(
+        self, api_key: Optional[str] = None, base_url: Optional[str] = None
+    ) -> Optional[genai.Client]:
         client = None
-        if self.valves.GEMINI_API_KEY:
-            http_options = types.HttpOptions(base_url=self.valves.GEMINI_API_BASE_URL)
+        api_key = api_key if api_key else self.valves.GEMINI_API_KEY
+        base_url = base_url if base_url else self.valves.GEMINI_API_BASE_URL
+        if api_key:
+            http_options = types.HttpOptions(base_url=base_url)
             try:
                 client = genai.Client(
-                    api_key=self.valves.GEMINI_API_KEY,
+                    api_key=api_key,
                     http_options=http_options,
                 )
                 log.info("genai client successfully initialized!")
@@ -736,9 +743,9 @@ class Pipe:
         Returns a google.genai.pagers.Pager object.
         """
         google_models = []
-        if self.client:
+        if client := self.clients.get("default"):
             try:
-                google_models = self.client.models.list(config={"query_base": True})
+                google_models = client.models.list(config={"query_base": True})
             except Exception:
                 log.exception("Retriving models from Google API failed.")
         log.info(f"Retrieved {len(google_models)} models from Gemini Developer API.")
@@ -748,6 +755,28 @@ class Pipe:
             for model in google_models
             if model.supported_actions and "generateContent" in model.supported_actions
         ]
+
+    def _get_user_client(self, __user__: "UserData") -> Optional[genai.Client]:
+        # Register a user spesific client if they have added their own API key.
+        user_valves: Optional[Pipe.UserValves] = __user__.get("valves")
+        if (
+            user_valves
+            and user_valves.GEMINI_API_KEY
+            and not self.clients.get(__user__["id"])
+        ):
+            self.clients[__user__.get("id")] = self._get_genai_client(
+                api_key=user_valves.GEMINI_API_KEY,
+                base_url=user_valves.GEMINI_API_BASE_URL,
+            )
+            log.info(
+                f'Creating a new genai client for user {__user__.get("email")} clients dict now looks like:\n{self.clients}.'
+            )
+        if user_client := self.clients.get(__user__.get("id")):
+            log.info(f'Using genai client with user {__user__.get("email")} API key.')
+            return user_client
+        else:
+            log.info("Using genai client with the default API key.")
+            return self.clients.get("default")
 
     def _get_safety_settings(self, model_name: str) -> list[types.SafetySetting]:
         """Get safety settings based on model name and permissive setting."""
