@@ -42,7 +42,7 @@ import re
 import fnmatch
 import sys
 from fastapi import Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 from typing import (
     Any,
     AsyncIterator,
@@ -91,8 +91,12 @@ class Pipe:
             description="The base URL for calling the Gemini API",
         )
         MODEL_WHITELIST: str = Field(
-            default="",
-            description="Comma-separated list of allowed model names. Supports wildcards (*).",
+            default="*",
+            description="Comma-separated list of allowed model names. Supports `fnmatch` patterns: *, ?, [seq], [!seq]. Default value is * (all models allowed).",
+        )
+        MODEL_BLACKLIST: Optional[str] = Field(
+            default=None,
+            description="Comma-separated list of blacklisted model names. Supports `fnmatch` patterns: *, ?, [seq], [!seq]. Default value is None (no blacklist).",
         )
         CACHE_MODELS: bool = Field(
             default=True,
@@ -127,6 +131,10 @@ class Pipe:
         # TODO: Get the id from the frontmatter instead of hardcoding it.
         valves = Functions.get_function_valves_by_id("gemini_manifold_google_genai")
         self.valves = self.Valves(**(valves if valves else {}))
+        # FIXME: Is logging out the API key a bad idea?
+        print(
+            f"[gemini_manifold] self.valves initialized:\n{self.valves.model_dump_json(indent=2)}"
+        )
 
         # TODO: Add the log handler here, not in `pipes`.
 
@@ -137,8 +145,9 @@ class Pipe:
 
         self.models: list["ModelData"] = []
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
+        self.last_blacklist = self.valves.MODEL_BLACKLIST
 
-        print("[gemini_manifold] Function has been initialized!")
+        print(f"[gemini_manifold] Function has been initialized:\n{self.__dict__}")
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
@@ -149,21 +158,32 @@ class Pipe:
             error_msg = "Error during getting the models from Google API, check logs."
             return [self._return_error_model(error_msg)]
 
+        print(
+            f"Saved whitelist: {self.last_whitelist}\nWhitelist from valves: {self.valves.MODEL_WHITELIST}"
+        )
+
         # Return existing models if all conditions are met and no error models are present
         if (
             self.models
             and self.valves.CACHE_MODELS
             and self.last_whitelist == self.valves.MODEL_WHITELIST
+            and self.last_blacklist == self.valves.MODEL_BLACKLIST
             and not any(model["id"] == "error" for model in self.models)
         ):
             log.info("Models are already initialized. Returning the cached list.")
             return self.models
 
         self.last_whitelist = self.valves.MODEL_WHITELIST
+        self.last_blacklist = self.valves.MODEL_BLACKLIST
         whitelist = (
             self.valves.MODEL_WHITELIST.replace(" ", "").split(",")
             if self.valves.MODEL_WHITELIST
-            else ["*"]
+            else []
+        )
+        blacklist = (
+            self.valves.MODEL_BLACKLIST.replace(" ", "").split(",")
+            if self.valves.MODEL_BLACKLIST
+            else []
         )
         models: list["ModelData"] = [
             {
@@ -174,6 +194,7 @@ class Pipe:
             if model.name
             and model.display_name
             and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
+            and not any(fnmatch.fnmatch(model.name, f"models/{b}") for b in blacklist)
         ]
         self.models = models
         log.debug("Registered models:", data=models)
