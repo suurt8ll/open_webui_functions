@@ -55,6 +55,7 @@ from typing import (
 )
 from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
+from open_webui.models.functions import Functions
 from open_webui.storage.provider import Storage
 from open_webui.utils.logger import stdout_format
 from loguru import logger
@@ -121,10 +122,32 @@ class Pipe:
         )
 
     def __init__(self):
-        self.valves = self.Valves()
+
+        # This hack makes the valves values available to the `__init__` method.
+        # TODO: Get the id from the frontmatter.
+        valves = Functions.get_function_valves_by_id("gemini_manifold_google_genai")
+        self.valves = self.Valves(**(valves if valves else {}))
+
+        # TODO: Add the log handler here, not in `pipes`.
+
+        # Initialize the genai client.
+        self.client = None
+        if self.valves.GEMINI_API_KEY:
+            http_options = types.HttpOptions(base_url=self.valves.GEMINI_API_BASE_URL)
+            try:
+                self.client = genai.Client(
+                    api_key=self.valves.GEMINI_API_KEY,
+                    http_options=http_options,
+                )
+                log.info("genai client successfully initialized!")
+            except Exception:
+                log.exception("genai client initialization failed.")
+        else:
+            log.error("GEMINI_API_KEY is not set.")
+
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
         self.models: list["ModelData"] = []
-        self.client: Optional[genai.Client] = None
+
         print("[gemini_manifold] Function has been initialized!")
 
     async def pipes(self) -> list["ModelData"]:
@@ -141,24 +164,6 @@ class Pipe:
         ):
             log.info("Models are already initialized. Returning the cached list.")
             return self.models
-
-        if not self.valves.GEMINI_API_KEY:
-            error_msg = "GEMINI_API_KEY is not set."
-            return [self._return_error_model(error_msg, exception=False)]
-
-        # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
-        if not self.client:
-            http_options = types.HttpOptions(base_url=self.valves.GEMINI_API_BASE_URL)
-            try:
-                self.client = genai.Client(
-                    api_key=self.valves.GEMINI_API_KEY,
-                    http_options=http_options,
-                )
-            except Exception as e:
-                error_msg = f"genai client initalization failed: {str(e)}"
-                return [self._return_error_model(error_msg)]
-        else:
-            log.info("Client already initialized.")
 
         self.last_whitelist = self.valves.MODEL_WHITELIST
 
