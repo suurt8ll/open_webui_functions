@@ -124,11 +124,12 @@ class Pipe:
     def __init__(self):
 
         # This hack makes the valves values available to the `__init__` method.
-        # TODO: Get the id from the frontmatter.
+        # TODO: Get the id from the frontmatter instead of hardcoding it.
         valves = Functions.get_function_valves_by_id("gemini_manifold_google_genai")
         self.valves = self.Valves(**(valves if valves else {}))
 
         # TODO: Add the log handler here, not in `pipes`.
+        # TODO: [refac] Break into smaller helper methods.
 
         # Initialize the genai client.
         self.client = None
@@ -145,8 +146,28 @@ class Pipe:
         else:
             log.error("GEMINI_API_KEY is not set.")
 
-        self.last_whitelist: str = self.valves.MODEL_WHITELIST
+        # Get Google models from the API.
+        self.google_models = None
+        if self.client:
+            try:
+                self.google_models = self.client.models.list(
+                    config={"query_base": True}
+                )
+            except Exception:
+                log.exception("Retriving models from Google API failed.")
+        if self.google_models:
+            log.info(
+                f"Retrieved {len(self.google_models)} models from Gemini Developer API."
+            )
+            # Filter Google models list down.
+            self.google_models = [
+                model
+                for model in self.google_models
+                if model.supported_actions
+                and "generateContent" in model.supported_actions
+            ]
         self.models: list["ModelData"] = []
+        self.last_whitelist: str = self.valves.MODEL_WHITELIST
 
         print("[gemini_manifold] Function has been initialized!")
 
@@ -154,6 +175,10 @@ class Pipe:
         """Register all available Google models."""
 
         self._add_log_handler()
+
+        if not self.google_models:
+            error_msg = "Error during getting the models from Google API, check logs."
+            return [self._return_error_model(error_msg)]
 
         # Return existing models if all conditions are met
         # FIXME: Always check for models if current model is the error placeholder.
@@ -166,12 +191,24 @@ class Pipe:
             return self.models
 
         self.last_whitelist = self.valves.MODEL_WHITELIST
-
-        # Get and process new models, errors are handler inside the method.
-        models = await self._get_google_models()
+        whitelist = (
+            self.valves.MODEL_WHITELIST.replace(" ", "").split(",")
+            if self.valves.MODEL_WHITELIST
+            else ["*"]
+        )
+        models: list["ModelData"] = [
+            {
+                "id": self._strip_prefix(model.name),
+                "name": model.display_name,
+            }
+            for model in self.google_models
+            if model.name
+            and model.display_name
+            and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
+        ]
+        self.models = models
         log.debug("Registered models:", data=models)
 
-        self.models = models
         return models
 
     async def pipe(
@@ -687,61 +724,6 @@ class Pipe:
 
     """Model retrival from API"""
 
-    async def _get_google_models(self) -> list["ModelData"]:
-        """Retrieve Google models with prefix stripping."""
-
-        if not self.client:
-            log.error("Client is not initialized.")
-            return []
-
-        whitelist = (
-            self.valves.MODEL_WHITELIST.replace(" ", "").split(",")
-            if self.valves.MODEL_WHITELIST
-            else ["*"]
-        )
-
-        try:
-            models = await self.client.aio.models.list(config={"query_base": True})
-        except Exception as e:
-            error_msg = f"Error retrieving models: {str(e)}"
-            return [self._return_error_model(error_msg)]
-        log.info(f"Retrieved {len(models)} models from Gemini Developer API.")
-
-        model_list: list["ModelData"] = [
-            {
-                "id": self._strip_prefix(model.name),
-                "name": model.display_name,
-            }
-            for model in models
-            if (
-                model.name is not None  # Ensure name is present
-                and model.display_name is not None  # Ensure display_name is present
-                and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
-                and model.supported_actions
-                and "generateContent" in model.supported_actions
-                and model.name.startswith("models/")
-            )
-        ]
-
-        if not model_list:
-            log.warning("No models found matching whitelist.")
-            return []
-
-        # Add synthesis model id which support for search if grounding search is enabled.
-        # TODO: [refac] Add this logic into the previous `model_list` construction logic? We are already looping over models there.
-        if not self.valves.USE_GROUNDING_SEARCH:
-            return model_list
-        for original_model in model_list:
-            if original_model["id"] in ALLOWED_GROUNDING_MODELS:
-                model_list.append(
-                    {
-                        "id": original_model["id"] + SEARCH_MODEL_SUFFIX,
-                        "name": original_model["name"] + " with Search",
-                    }
-                )
-
-        return model_list
-
     def _get_safety_settings(self, model_name: str) -> list[types.SafetySetting]:
         """Get safety settings based on model name and permissive setting."""
 
@@ -795,6 +777,7 @@ class Pipe:
         Strip any prefix from the model name up to and including the first '.' or '/'.
         This makes the method generic and adaptable to varying prefixes.
         """
+        # TODO: [refac] pointless helper, remove.
         try:
             # Use non-greedy regex to remove everything up to and including the first '.' or '/'
             stripped = re.sub(r"^.*?[./]", "", model_name)
