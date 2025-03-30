@@ -97,6 +97,7 @@ class Pipe:
             default=True,
             description="Whether to request models only on first load and when whitelist changes.",
         )
+        # TODO: If set to True then check if the search filter is installed, if not, install it and enable it. If set to false and search filter is enabled, disable it.
         USE_GROUNDING_SEARCH: bool = Field(
             default=False,
             description="Whether to use Grounding with Google Search. For more info: https://ai.google.dev/gemini-api/docs/grounding",
@@ -186,6 +187,7 @@ class Pipe:
             await self._emit_error(error_msg, exception=False)
             return
 
+        # FIXME: OK to asssume this is alwasy present and no check is neccecary?
         model_name = body.get("model")
         if not model_name:
             error_msg = "body object does not contain model name."
@@ -198,6 +200,8 @@ class Pipe:
             error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
             await self._emit_error(error_msg, exception=False)
             return
+
+        print(json.dumps(__metadata__, indent=2, default=str))
 
         # Get the message history directly from the backend.
         # This allows us to see data about sources and files data.
@@ -255,23 +259,25 @@ class Pipe:
                     "Image Generation model does not support the system prompt message! Removing the system prompt."
                 )
 
-        if self.valves.USE_GROUNDING_SEARCH:
-            if model_name.endswith(SEARCH_MODEL_SUFFIX):
-                log.info("Using grounding with Google Search.")
-                gs = None
-                # Dynamic retrieval only supported for 1.0 and 1.5 models.
-                if "1.0" in model_name or "1.5" in model_name:
-                    gs = types.GoogleSearchRetrieval(
-                        dynamic_retrieval_config=types.DynamicRetrievalConfig(
-                            dynamic_threshold=self.valves.GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD
-                        )
+        if self.valves.USE_GROUNDING_SEARCH and model_name.endswith(
+            SEARCH_MODEL_SUFFIX
+        ):
+            # TODO: Now check instead if filter function has signaled for search to happen (need to figure out how)
+            log.info("Using grounding with Google Search.")
+            gs = None
+            # Dynamic retrieval only supported for 1.0 and 1.5 models.
+            if "1.0" in model_name or "1.5" in model_name:
+                gs = types.GoogleSearchRetrieval(
+                    dynamic_retrieval_config=types.DynamicRetrievalConfig(
+                        dynamic_threshold=self.valves.GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD
                     )
-                    gen_content_conf.tools = [types.Tool(google_search_retrieval=gs)]
-                else:
-                    gs = types.GoogleSearchRetrieval()
-                    gen_content_conf.tools = [
-                        types.Tool(google_search=types.GoogleSearch())
-                    ]
+                )
+                gen_content_conf.tools = [types.Tool(google_search_retrieval=gs)]
+            else:
+                gs = types.GoogleSearchRetrieval()
+                gen_content_conf.tools = [
+                    types.Tool(google_search=types.GoogleSearch())
+                ]
 
         gen_content_args = {
             "model": model_name.replace(SEARCH_MODEL_SUFFIX, ""),
