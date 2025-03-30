@@ -128,7 +128,11 @@ class Pipe:
         )
 
     def __init__(self):
-        self.valves = self.Valves()
+
+        # This hack makes the valves values available to the `__init__` method.
+        valves = Functions.get_function_valves_by_id("gemini_manifold_google_genai")
+        self.valves = self.Valves(**(valves if valves else {}))
+
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
         self.models: list["ModelData"] = []
         self.client: Optional[genai.Client] = None
@@ -151,6 +155,7 @@ class Pipe:
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
 
+        # FIXME: This can now be moved into `__init__` cause valves values are available there.
         self._add_log_handler()
 
         # Return existing models if all conditions are met
