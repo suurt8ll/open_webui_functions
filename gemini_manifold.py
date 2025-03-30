@@ -103,7 +103,6 @@ class Pipe:
             default=True,
             description="Whether to request models only on first load and when whitelist changes.",
         )
-        # TODO: If set to True then check if the search filter is installed, if not, install it and enable it. If set to false and search filter is enabled, disable it.
         USE_GROUNDING_SEARCH: bool = Field(
             default=False,
             description="Whether to use Grounding with Google Search. For more info: https://ai.google.dev/gemini-api/docs/grounding",
@@ -142,13 +141,26 @@ class Pipe:
             log.info("Search filter helper is not installed!")
             search_filter = self._install_search_filter()
             if not search_filter:
-                log.error(
-                    f"Functions.insert_new_function returned None: Function '{SEARCH_FILTER_ID}' insertion failed."
-                )
+                log.error("Search filter insertion failed.")
             else:
                 log.info("Search filter installed successfully!")
-            # TODO: Enable the filter model.
-            # TODO: Activate the filter for models inside `ALLOWED_GROUNDING_MODELS`.
+                enabled_search_filter = Functions.update_function_by_id(
+                    id=search_filter.id, updated={"is_active": True}
+                )
+                if not enabled_search_filter:
+                    log.error("Search filter could not be enabled.")
+                log.info("Search filter enabled.")
+                # TODO: Activate the filter for models inside `ALLOWED_GROUNDING_MODELS`.
+        else:
+            # TODO: [refac] repeating logic here, find a better way.
+            if self.valves.USE_GROUNDING_SEARCH and not search_filter.is_active:
+                log.info("Search filter is installed but not active. Activating it.")
+                enabled_search_filter = Functions.update_function_by_id(
+                    id=search_filter.id, updated={"is_active": True}
+                )
+                if not enabled_search_filter:
+                    log.error("Search filter could not be enabled.")
+                log.info("Search filter enabled.")
 
         log.info("Function has been initialized!")
 
