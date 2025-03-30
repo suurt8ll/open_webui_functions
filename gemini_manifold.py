@@ -180,12 +180,12 @@ class Pipe:
             error_msg = "Error during getting the models from Google API, check logs."
             return [self._return_error_model(error_msg)]
 
-        # Return existing models if all conditions are met
-        # FIXME: Always check for models if current model is the error placeholder.
+        # Return existing models if all conditions are met and no error models are present
         if (
             self.models
             and self.valves.CACHE_MODELS
             and self.last_whitelist == self.valves.MODEL_WHITELIST
+            and not any(model["id"] == "error" for model in self.models)
         ):
             log.info("Models are already initialized. Returning the cached list.")
             return self.models
