@@ -259,12 +259,13 @@ class Pipe:
                     "Image Generation model does not support the system prompt message! Removing the system prompt."
                 )
 
-        if self.valves.USE_GROUNDING_SEARCH and model_name.endswith(
-            SEARCH_MODEL_SUFFIX
-        ):
-            # TODO: Now check instead if filter function has signaled for search to happen (need to figure out how)
+        use_search = __metadata__.get("features", {}).get(
+            "grounding_w_google_search", False
+        )
+        if self.valves.USE_GROUNDING_SEARCH and use_search:
             log.info("Using grounding with Google Search.")
             gs = None
+            # TODO: Move into the filter function.
             # Dynamic retrieval only supported for 1.0 and 1.5 models.
             if "1.0" in model_name or "1.5" in model_name:
                 gs = types.GoogleSearchRetrieval(
