@@ -28,7 +28,6 @@ requirements: google-genai==1.8.0
 #   TODO Display usage statistics (token counts)
 
 import asyncio
-import copy
 import io
 import json
 import mimetypes
@@ -55,6 +54,7 @@ from typing import (
 )
 from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
+from open_webui.models.functions import Functions
 from open_webui.storage.provider import Storage
 from open_webui.utils.logger import stdout_format
 from loguru import logger
@@ -64,7 +64,6 @@ if TYPE_CHECKING:
     from loguru._handler import Handler
     from manifold_types import *  # My personal types in a separate file for more robustness.
 
-# FIXME What about other 2.0 models?
 # according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
 ALLOWED_GROUNDING_MODELS = [
     "gemini-2.5-pro-exp-03-25",
@@ -74,9 +73,7 @@ ALLOWED_GROUNDING_MODELS = [
     "gemini-1.0-pro",
 ]
 
-# To avoid conflict name in the future, here use suffix not in gemini naming pattern.
-SEARCH_MODEL_SUFFIX = "++SEARCH"
-
+SEARCH_FILTER_ID = "grounding_with_google_search"
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
 log = logger.bind(auditable=False)
@@ -126,7 +123,11 @@ class Pipe:
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
         self.models: list["ModelData"] = []
         self.client: Optional[genai.Client] = None
-        print("[gemini_manifold] Function has been initialized!")
+        search_filter = Functions.get_function_by_id(id=SEARCH_FILTER_ID)
+        if not search_filter:
+            # TODO: Install, enable and tick the filer for models here.
+            print(f"[{__name__}] Search filter helper is not installed!")
+        print(f"[{__name__}] Function has been initialized!")
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
@@ -201,8 +202,6 @@ class Pipe:
             await self._emit_error(error_msg, exception=False)
             return
 
-        print(json.dumps(__metadata__, indent=2, default=str))
-
         # Get the message history directly from the backend.
         # This allows us to see data about sources and files data.
         chat_id = __metadata__.get("chat_id")
@@ -218,10 +217,6 @@ class Pipe:
             return None
 
         chat_content: ChatChatModel = chat.chat  # type: ignore
-        print(
-            json.dumps(self._truncate_long_strings(copy.deepcopy(chat_content)), indent=2, default=str)  # type: ignore
-        )
-
         messages = chat_content.get("messages")
         chat_params = chat_content.get("params")
         system_prompt = chat_params.get("system")
@@ -238,7 +233,6 @@ class Pipe:
         )
 
         # TODO: Take defaults from the general front-end config.
-        # FIXME: If the conversation has used Search, then augment the sysetm prompt by telling the model to not use [] citations in it's own respose.
         gen_content_conf = types.GenerateContentConfig(
             system_instruction=system_prompt,
             temperature=body.get("temperature"),
@@ -265,8 +259,8 @@ class Pipe:
         if self.valves.USE_GROUNDING_SEARCH and use_search:
             log.info("Using grounding with Google Search.")
             gs = None
-            # TODO: Move into the filter function.
             # Dynamic retrieval only supported for 1.0 and 1.5 models.
+            # TODO: Google AI for Developers says: "Note: Dynamic retrieval is only compatible with Gemini 1.5 Flash. For Gemini 2.0, you should use Search as a tool, as shown above."?
             if "1.0" in model_name or "1.5" in model_name:
                 gs = types.GoogleSearchRetrieval(
                     dynamic_retrieval_config=types.DynamicRetrievalConfig(
@@ -275,13 +269,13 @@ class Pipe:
                 )
                 gen_content_conf.tools = [types.Tool(google_search_retrieval=gs)]
             else:
-                gs = types.GoogleSearchRetrieval()
                 gen_content_conf.tools = [
                     types.Tool(google_search=types.GoogleSearch())
                 ]
+        # TODO: Log the final config that will be passed.
 
         gen_content_args = {
-            "model": model_name.replace(SEARCH_MODEL_SUFFIX, ""),
+            "model": model_name,
             "contents": contents,
             "config": gen_content_conf,
         }
@@ -638,7 +632,7 @@ class Pipe:
         prompt: str,
         user_id: str,
         __request__: Request,
-    ) -> str | None:
+    ) -> Optional[str]:
         """
         Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
         Returns the url to uploaded image.
@@ -727,20 +721,6 @@ class Pipe:
 
         if not model_list:
             log.warning("No models found matching whitelist.")
-            return []
-
-        # Add synthesis model id which support for search if grounding search is enabled.
-        # TODO: [refac] Add this logic into the previous `model_list` construction logic? We are already looping over models there.
-        if not self.valves.USE_GROUNDING_SEARCH:
-            return model_list
-        for original_model in model_list:
-            if original_model["id"] in ALLOWED_GROUNDING_MODELS:
-                model_list.append(
-                    {
-                        "id": original_model["id"] + SEARCH_MODEL_SUFFIX,
-                        "name": original_model["name"] + " with Search",
-                    }
-                )
 
         return model_list
 
