@@ -9,10 +9,20 @@ license: MIT
 version: 0.2.0
 """
 
+import json
+from pydantic import BaseModel, Field
+
 
 class Filter:
 
+    class Valves(BaseModel):
+        SET_TEMP_TO_ZERO: bool = Field(
+            default=False,
+            description="Decide if you want to set the temperature to 0 for grounded answers, Google reccomends it in their docs.",
+        )
+
     def __init__(self):
+        self.valves = self.Valves()
         print("[grounding_w_google_search] Filter function has been initialized!")
 
     def inlet(self, body: dict) -> dict:
@@ -32,7 +42,12 @@ class Filter:
             metadata = body.setdefault("metadata", {})
             metadata_features = metadata.setdefault("features", {})
             metadata_features["grounding_w_google_search"] = True
+            # Google suggest setting temperature to 0 if using grounding:
+            # https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-with-google-search#:~:text=For%20ideal%20results%2C%20use%20a%20temperature%20of%200.0.
+            if self.valves.SET_TEMP_TO_ZERO:
+                body["temperature"] = 0
 
+        print(f"Returning body:\n{json.dumps(body, indent=2, default=str)}")
         return body
 
     def stream(self, event: dict) -> dict:
