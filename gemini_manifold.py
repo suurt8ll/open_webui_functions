@@ -30,6 +30,7 @@ requirements: google-genai==1.8.0
 import asyncio
 import copy
 import io
+import json
 import mimetypes
 import os
 import uuid
@@ -48,10 +49,11 @@ from typing import (
     Awaitable,
     Callable,
     Literal,
-    Tuple,
     Optional,
     TYPE_CHECKING,
+    cast,
 )
+from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
 from open_webui.storage.provider import Storage
 from open_webui.utils.logger import stdout_format
@@ -107,6 +109,7 @@ class Pipe:
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=False, description="Whether to request relaxed safety filtering"
         )
+        # FIXME: remove OFF and add TRACE, CRITICAL
         LOG_LEVEL: Literal["INFO", "WARNING", "ERROR", "DEBUG", "OFF"] = Field(
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
@@ -122,7 +125,6 @@ class Pipe:
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
         self.models: list["ModelData"] = []
         self.client: Optional[genai.Client] = None
-        self.aggregated_chunks: list[types.GenerateContentResponse] = []
         print("[gemini_manifold] Function has been initialized!")
 
     async def pipes(self) -> list["ModelData"]:
@@ -131,6 +133,7 @@ class Pipe:
         self._add_log_handler()
 
         # Return existing models if all conditions are met
+        # FIXME: Always check for models if current model is the error placeholder.
         if (
             self.models
             and self.valves.CACHE_MODELS
@@ -196,24 +199,34 @@ class Pipe:
             await self._emit_error(error_msg, exception=False)
             return
 
-        max_len = 50
-        log.debug(
-            "Received body:",
-            body=str(self._truncate_long_strings(copy.deepcopy(body), max_len)),
+        # Get the message history directly from the backend.
+        # This allows us to see data about sources and files data.
+        chat_id = __metadata__.get("chat_id")
+        if not chat_id:
+            error_msg = "Chat ID not found in request body or metadata."
+            await self._emit_error(error_msg, exception=False)
+            return None
+        chat = Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=__user__["id"])
+
+        if not chat:
+            error_msg = f"Chat with ID {chat_id} not found."
+            await self._emit_error(error_msg, exception=False)
+            return None
+
+        chat_content: ChatChatModel = chat.chat  # type: ignore
+        print(
+            json.dumps(self._truncate_long_strings(copy.deepcopy(chat_content)), indent=2, default=str)  # type: ignore
         )
 
-        messages = body.get("messages", [])
-        system_prompt, remaining_messages = self._pop_system_prompt(messages)
+        messages = chat_content.get("messages")
+        chat_params = chat_content.get("params")
+        system_prompt = chat_params.get("system")
         log.debug(f"System prompt: {system_prompt}")
-        contents: list[types.Content] = self._transform_messages_to_contents(
-            remaining_messages
-        )
+        contents = self._genai_contents_from_messages(messages)
 
         turn_content_dict_list: list[dict] = []
         for content in contents:
-            truncated_content = self._truncate_long_strings(
-                content.model_dump(), max_len
-            )
+            truncated_content = self._truncate_long_strings(content.model_dump())
             turn_content_dict_list.append(truncated_content)
         log.debug(
             "list[google.genai.types.Content] object that will be given to the Gemini API:",
@@ -278,17 +291,13 @@ class Pipe:
                 await self._emit_error(error_msg)
                 return None
             emit_sources = None
-            chunks_str = "["
             for chunk in res:
-                chunks_str = (
-                    f"{chunks_str}{self._truncate_long_strings(chunk.model_dump())},"
+                # TODO: Call this only on final finish chunk.
+                emit_sources = await self._get_chat_completion_event_w_sources(
+                    chunk, raw_text
                 )
-                emit_sources = await self._add_citations(chunk, raw_text)
-            chunks_str = chunks_str[:-1] + "]"
-            log.debug("Got response from Google API:", response=chunks_str)
             if emit_sources:
-                emit_str = str(self._truncate_long_strings(copy.deepcopy(emit_sources)))  # type: ignore
-                log.debug("Emitting the sources:", emit_object=emit_str)
+                log.info("Sending chat completion event with the sources.")
                 await __event_emitter__(emit_sources)
             return None
 
@@ -305,15 +314,26 @@ class Pipe:
             error_msg = f"Content generation error: {str(e)}"
             await self._emit_error(error_msg)
             return None
-        if not response.text:
+        if raw_text := response.text:
+            # TODO: [refac] unify this logic with streaming response.
+            emit_sources = await self._get_chat_completion_event_w_sources(
+                response, raw_text
+            )
+            if emit_sources:
+                log.info("Sending chat completion event with the sources.")
+                await __event_emitter__(emit_sources)
+                return None
+        else:
             warn_msg = "Non-stremaing response did not have any text inside it."
             await self._emit_error(warn_msg, warning=True)
             return None
         return response.text
 
     """
-    ---------- Helper methods inside the Pipe class. ----------
+    ---------- Helper methods inside the Pipe class ----------
     """
+
+    """Event emission and error logging"""
 
     async def _emit_completion(
         self,
@@ -358,113 +378,82 @@ class Pipe:
             "name": "[gemini_manifold] " + error_msg,
         }
 
-    async def _stream_response(
-        self, gen_content_args: dict, __request__: Request, __user__: "UserData"
-    ) -> Tuple[list[types.GenerateContentResponse], str]:
-        """
-        Streams the response to the front-end using `__event_emitter__` and finally returns the full aggregated response.
-        """
-        response_stream: AsyncIterator[types.GenerateContentResponse] = (
-            await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
-        )
-        aggregated_chunks: list[types.GenerateContentResponse] = []
-        content = ""
+    """ChatModel.chat.messages -> list[genai.types.Content] conversion"""
 
-        async for chunk in response_stream:
-            aggregated_chunks.append(chunk)
-            candidate = self._get_first_candidate(chunk.candidates)
-            if not candidate or not candidate.content or not candidate.content.parts:
-                log.warning(
-                    "candidate, candidate.content or candidate.content.parts is missing. Skipping to the next chunk."
+    def _genai_contents_from_messages(
+        self, messages: list["MessageModel"]
+    ) -> list[types.Content]:
+        """
+        Transforms `ChatModel.chat.messages` list into `genai.types.Content`.
+        """
+
+        def process_user_message(message: "UserMessageModel") -> list[types.Part]:
+            """
+            Processes user message, extracts image parts.
+            """
+            parts: list[types.Part] = []
+            if files := message.get("files"):
+                for file in files:
+                    if file.get("type") == "image":
+                        if image_part := self._genai_part_from_image_url(
+                            file.get("url")
+                        ):
+                            parts.append(image_part)
+            return parts
+
+        def process_assistant_message(
+            message: "AssistantMessageModel",
+        ) -> tuple[list[types.Part], str]:
+            """
+            Processes assistant message sources. Removes citation markers if they exsist.
+            """
+            parts: list[types.Part] = []
+            filtered_content = content
+            if sources := message.get("sources"):
+                filtered_content = self._remove_citation_markers(content, sources)
+                log.debug(
+                    "Removed source markers from the assistant message.",
+                    new_text=filtered_content,
                 )
-                continue
-            for part in candidate.content.parts:
-                if text_part := part.text:
-                    content += text_part
-                elif inline_data := part.inline_data:
-                    if img_url := self._process_image_part(
-                        inline_data, gen_content_args, __user__, __request__
-                    ):
-                        content += img_url
-                await self._emit_completion(content)
+            return parts, filtered_content
 
-        return aggregated_chunks, content
-
-    def _get_first_candidate(
-        self, candidates: Optional[list[types.Candidate]]
-    ) -> Optional[types.Candidate]:
-        """Selects the first candidate, logging a warning if multiple exist."""
-        if not candidates:
-            log.warning("Received chunk with no candidates, skipping processing.")
-            return None
-        if len(candidates) > 1:
-            log.warning("Multiple candidates found, defaulting to first candidate.")
-        return candidates[0]
-
-    def _process_image_part(
-        self, inline_data, gen_content_args: dict, user: "UserData", request: Request
-    ) -> Optional[str]:
-        """Handles image data conversion to markdown."""
-        mime_type = inline_data.mime_type
-        image_data = inline_data.data
-
-        if self.valves.USE_FILES_API:
-            image_url = self._upload_image(
-                image_data,
-                mime_type,
-                gen_content_args.get("model", ""),
-                "Not implemented yet. TAKE IT FROM gen_content_args contents",
-                user["id"],
-                request,
-            )
-            return f"![Generated Image]({image_url})" if image_url else None
-        else:
-            encoded = base64.b64encode(image_data).decode()
-            return f"![Generated Image](data:{mime_type};base64,{encoded})"
-
-    def _pop_system_prompt(
-        self,
-        messages: list[dict],
-    ) -> Tuple[Optional[str], list[dict]]:
-        """Extracts system message from messages."""
-        system_message_content = None
-        messages_without_system = []
+        contents: list[types.Content] = []
         for message in messages:
-            if message.get("role") == "system":
-                system_message_content = message.get("content")
+            content = message.get("content")
+            role = message.get("role")
+            parts: list[types.Part] = []
+            if role == "user":
+                parts = process_user_message(cast("UserMessageModel", message))
+            elif role == "assistant":
+                message = cast("AssistantMessageModel", message)
+                if not message.get("done"):
+                    continue
+                role = "model"
+                parts, content = process_assistant_message(message)
             else:
-                messages_without_system.append(message)
-        return system_message_content, messages_without_system
+                log.warning(f"{role} is an unsupported role, skipping this message.")
+                continue
+            parts += self._genai_parts_from_text(content)
+            contents.append(types.Content(role=role, parts=parts))
 
-    def _get_mime_type(self, file_uri: str) -> str:
-        """
-        Utility function to determine MIME type based on file extension.
-        Extend this function to support more MIME types as needed.
-        """
-        if file_uri.endswith(".jpg") or file_uri.endswith(".jpeg"):
-            return "image/jpeg"
-        elif file_uri.endswith(".png"):
-            return "image/png"
-        elif file_uri.endswith(".gif"):
-            return "image/gif"
-        elif file_uri.endswith(".bmp"):
-            return "image/bmp"
-        elif file_uri.endswith(".webp"):
-            return "image/webp"
-        else:
-            # Default MIME type if unknown
-            return "application/octet-stream"
+        return contents
 
-    def _process_image_url(self, image_url: str) -> Optional[types.Part]:
-        """Processes an image URL, handling GCS, data URIs, and standard URLs."""
+    def _genai_part_from_image_url(self, image_url: str) -> Optional[types.Part]:
+        """
+        Processes an image URL and returns a genai.types.Part object from it
+        Handles GCS, data URIs, and standard URLs.
+        """
         try:
             if image_url.startswith("gs://"):
+                # FIXME: mime type helper would error out here, it only handles filenames.
                 return types.Part.from_uri(
                     file_uri=image_url, mime_type=self._get_mime_type(image_url)
                 )
             elif image_url.startswith("data:image"):
                 match = re.match(r"data:(image/\w+);base64,(.+)", image_url)
                 if match:
+                    print(match.group(1))
+                    print(f"{match.group(2)[:20]}[...]{match.group(2)[-20:]}")
                     return types.Part.from_bytes(
                         data=base64.b64decode(match.group(2)),
                         mime_type=match.group(1),
@@ -472,16 +461,21 @@ class Pipe:
                 else:
                     raise ValueError("Invalid data URI for image.")
             else:  # Assume standard URL
+                # FIXME: mime type helper would error out here too, it only handles filenames.
                 return types.Part.from_uri(
                     file_uri=image_url, mime_type=self._get_mime_type(image_url)
                 )
-        except Exception as e:
-            print(f"Error processing image URL '{image_url}': {e}")
-            return None  # Return None to indicate failure
+        except Exception:
+            # TODO: Send warnin toast to user in front-end.
+            log.exception("Error processing image URL.", image_url=image_url)
+            return None
 
-    def _extract_markdown_image(self, text: str) -> list[types.Part]:
-        """Extracts and converts markdown images to parts, preserving text order."""
-        parts = []
+    def _genai_parts_from_text(self, text: str) -> list[types.Part]:
+        """
+        Turns raw text into list of genai.types.Parts objects.
+        Extracts and converts markdown images to parts, preserving text order.
+        """
+        parts: list[types.Part] = []
         last_pos = 0
 
         for match in re.finditer(
@@ -562,60 +556,131 @@ class Pipe:
 
         return parts
 
-    def _process_content_item(self, item: dict) -> list[types.Part]:
-        """Processes a single content item, handling text and image_url types."""
-        item_type = item.get("type")
-        parts = []
+    """Model response streaming"""
 
-        if item_type == "text":
-            text = item.get("text", "")
-            parts.extend(
-                self._extract_markdown_image(text)
-            )  # Always process for markdown images
-        elif item_type == "image_url":
-            image_url_dict = item.get("image_url", {})
-            image_url = image_url_dict.get("url", "")
-            if isinstance(image_url, str):
-                part = self._process_image_url(image_url)
-                if part:
-                    parts.append(part)
-            else:
-                print(
-                    f"Warning: Unexpected image_url format: {image_url_dict}. Skipping."
+    async def _stream_response(
+        self, gen_content_args: dict, __request__: Request, __user__: "UserData"
+    ) -> tuple[list[types.GenerateContentResponse], str]:
+        """
+        Streams the response to the front-end using `__event_emitter__` and finally returns the full aggregated response.
+        """
+        response_stream: AsyncIterator[types.GenerateContentResponse] = (
+            await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
+        )
+        aggregated_chunks: list[types.GenerateContentResponse] = []
+        content = ""
+
+        async for chunk in response_stream:
+            aggregated_chunks.append(chunk)
+            candidate = self._get_first_candidate(chunk.candidates)
+            if not candidate or not candidate.content or not candidate.content.parts:
+                log.warning(
+                    "candidate, candidate.content or candidate.content.parts is missing. Skipping to the next chunk."
                 )
-        else:
-            print(f"Warning: Unsupported item type: {item_type}. Skipping.")
+                continue
+            for part in candidate.content.parts:
+                if text_part := part.text:
+                    content += text_part
+                elif inline_data := part.inline_data:
+                    if img_url := self._process_image_part(
+                        inline_data, gen_content_args, __user__, __request__
+                    ):
+                        content += img_url
+                # TODO: Streaming this way loses the support for Filter.stream() method processing for filter plugins.
+                await self._emit_completion(content)
 
-        return parts
+        return aggregated_chunks, content
 
-    def _transform_messages_to_contents(
-        self,
-        messages: list[dict],
-    ) -> list[types.Content]:
-        """Transforms messages to google-genai contents, supporting text and images."""
+    def _get_first_candidate(
+        self, candidates: Optional[list[types.Candidate]]
+    ) -> Optional[types.Candidate]:
+        """Selects the first candidate, logging a warning if multiple exist."""
+        if not candidates:
+            log.warning("Received chunk with no candidates, skipping processing.")
+            return None
+        if len(candidates) > 1:
+            log.warning("Multiple candidates found, defaulting to first candidate.")
+        return candidates[0]
 
-        contents: list[types.Content] = []
+    def _process_image_part(
+        self, inline_data, gen_content_args: dict, user: "UserData", request: Request
+    ) -> Optional[str]:
+        """Handles image data conversion to markdown."""
+        mime_type = inline_data.mime_type
+        image_data = inline_data.data
 
-        for message in messages:
-            role = (
-                "model" if message.get("role") == "assistant" else message.get("role")
+        if self.valves.USE_FILES_API:
+            image_url = self._upload_image(
+                image_data,
+                mime_type,
+                gen_content_args.get("model", ""),
+                "Not implemented yet. TAKE IT FROM gen_content_args contents",
+                user["id"],
+                request,
             )
-            content = message.get("content", "")
-            parts = []
+            return f"![Generated Image]({image_url})" if image_url else None
+        else:
+            encoded = base64.b64encode(image_data).decode()
+            return f"![Generated Image](data:{mime_type};base64,{encoded})"
 
-            if isinstance(content, list):
-                for item in content:
-                    parts.extend(self._process_content_item(item))
-            else:  # Treat as plain text
-                parts.extend(
-                    self._extract_markdown_image(content)
-                )  # process markdown images
-                if not parts:  # if there were no markdown images, add the text
-                    parts.append(types.Part.from_text(text=content))
+    def _upload_image(
+        self,
+        image_data: bytes,
+        mime_type: str,
+        model: str,
+        prompt: str,
+        user_id: str,
+        __request__: Request,
+    ) -> str | None:
+        """
+        Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
+        Returns the url to uploaded image.
+        """
+        image_format = mimetypes.guess_extension(mime_type)
+        id = str(uuid.uuid4())
+        # TODO: Better filename? Prompt as the filename?
+        name = os.path.basename(f"generated-image{image_format}")
+        imagename = f"{id}_{name}"
+        image = io.BytesIO(image_data)
+        image_metadata = {
+            "model": model,
+            "prompt": prompt,
+        }
 
-            contents.append(types.Content(role=role, parts=parts))
+        # Upload the image to user configured storage provider.
+        log.info("Uploading the image to the configured storage provider.")
+        try:
+            contents, image_path = Storage.upload_file(image, imagename)
+        except Exception:
+            error_msg = f"Error occurred during upload to the storage provider."
+            log.exception(error_msg)
+            return None
+        # Add the image file to files database.
+        log.info("Adding the image file to Open WebUI files database.")
+        file_item = Files.insert_new_file(
+            user_id,
+            FileForm(
+                id=id,
+                filename=name,
+                path=image_path,
+                meta={
+                    "name": name,
+                    "content_type": mime_type,
+                    "size": len(contents),
+                    "data": image_metadata,
+                },
+            ),
+        )
+        if not file_item:
+            log.warning("Files.insert_new_file did not return anything.")
+            return None
+        # Get the image url.
+        image_url: str = __request__.app.url_path_for(
+            "get_file_content_by_id", id=file_item.id
+        )
+        return image_url
 
-        return contents
+    """Model retrival from API"""
 
     async def _get_google_models(self) -> list["ModelData"]:
         """Retrieve Google models with prefix stripping."""
@@ -734,6 +799,155 @@ class Pipe:
             log.exception(error_msg)
             return model_name
 
+    """Citations"""
+
+    async def _get_chat_completion_event_w_sources(
+        self, data: types.GenerateContentResponse, raw_str: str
+    ) -> Optional["ChatCompletionEvent"]:
+        """Adds citation markers and source references to raw_str based on grounding metadata"""
+
+        async def resolve_url(session: aiohttp.ClientSession, url: str) -> str:
+            """Asynchronously resolves a URL by following redirects to get final destination URL
+            Returns original URL if resolution fails.
+            """
+            try:
+                async with session.get(url, allow_redirects=True) as response:
+                    return str(response.url)
+            except Exception:
+                log.exception(
+                    f"Error resolving URL, returning the original url.", url=url
+                )
+                return url
+
+        # Early exit if no candidate content exists
+        if not data.candidates:
+            return None
+
+        candidate = data.candidates[0]
+        grounding_metadata = candidate.grounding_metadata if candidate else None
+        # Require valid metadata structure to proceed
+        if (
+            not grounding_metadata
+            or not grounding_metadata.grounding_supports
+            or not grounding_metadata.grounding_chunks
+        ):
+            return None
+
+        # TODO: Add the used search queries as status message.
+        supports = grounding_metadata.grounding_supports
+        grounding_chunks = grounding_metadata.grounding_chunks
+
+        # Collect all available URIs from grounding chunks and format them into a list of dicts
+        source_metadatas: list[SourceMetadata] = [
+            {"source": g_c.web.uri, "supports": []}
+            for g_c in grounding_chunks
+            if g_c.web and g_c.web.uri
+        ]
+        if not source_metadatas:
+            log.warning("No URLs were found in grounding_metadata.")
+            return None
+
+        log.info("Resolving all the source URLs asyncronously.")
+        async with aiohttp.ClientSession() as session:
+            # Create list of async URL resolution tasks
+            resolution_tasks = [
+                resolve_url(session, metadata["source"])
+                for metadata in source_metadatas
+                if metadata["source"]
+            ]
+            # Wait for all resolutions to complete
+            resolved_uris = await asyncio.gather(*resolution_tasks)
+        log.info("URL resolution completed.")
+        # Replace original urls with resolved ones and store old urls in a separate key.
+        for index, metadata in enumerate(source_metadatas):
+            metadata["original_url"] = metadata["source"]
+            metadata["source"] = resolved_uris[index]
+
+        encoded_raw_str = raw_str.encode()
+        # Starting the injection from the end ensures that end_pos variables
+        # do not get shifted by next insertions.
+        for support in reversed(supports):
+            if not (
+                support.grounding_chunk_indices
+                and support.confidence_scores
+                and support.segment
+                and support.segment.end_index
+                and support.segment.start_index
+                and support.segment.text
+            ):
+                continue
+            end_pos = support.segment.end_index
+            indices = support.grounding_chunk_indices
+            # Create citation markers from associated chunk indices
+            citation_markers = "".join(f"[{index}]" for index in indices)
+            encoded_citation_markers = citation_markers.encode()
+            encoded_raw_str = (
+                encoded_raw_str[:end_pos]
+                + encoded_citation_markers
+                + encoded_raw_str[end_pos:]
+            )
+            for indice in indices:
+                source_metadatas[indice]["supports"].append(support.model_dump())
+
+        # Structure sources with resolved URLs
+        sources_list: list[Source] = [
+            {
+                "source": {"name": "web_search"},
+                "document": [""]
+                * len(source_metadatas),  # We do not have website content
+                "metadata": [metadata for metadata in source_metadatas],
+            }
+        ]
+        # Prepare final event structure with modified content and sources
+        event_data: "ChatCompletionEventData" = {
+            "content": encoded_raw_str.decode(),  # Content with added citations
+            "sources": sources_list,  # List of resolved source references
+            "done": True,
+        }
+        event: "Event" = {
+            "type": "chat:completion",
+            "data": event_data,
+        }
+        return event
+
+    def _remove_citation_markers(self, text: str, sources: list["Source"]) -> str:
+        processed: set[str] = set()
+        for source in sources:
+            supports = [
+                metadata["supports"]
+                for metadata in source.get("metadata", [])
+                if "supports" in metadata
+            ]
+            supports = [item for sublist in supports for item in sublist]
+            for support in supports:
+                support = types.GroundingSupport(**support)
+                indices = support.grounding_chunk_indices
+                segment = support.segment
+                if not (indices and segment):
+                    continue
+                segment_text = segment.text
+                if not segment_text:
+                    continue
+                # Using a shortened version because user could edit the assistant message in the front-end.
+                # If citation segment get's edited, then the markers would not be removed. Shortening reduces the
+                # chances of this happening.
+                segment_end = segment_text[-32:]
+                if segment_end in processed:
+                    continue
+                processed.add(segment_end)
+                citation_markers = "".join(f"[{index}]" for index in indices)
+                # Find the position of the citation markers in the text
+                pos = text.find(segment_text + citation_markers)
+                if pos != -1:
+                    # Remove the citation markers
+                    text = (
+                        text[: pos + len(segment_text)]
+                        + text[pos + len(segment_text) + len(citation_markers) :]
+                    )
+        return text
+
+    """Other helpers"""
+
     def _truncate_long_strings(
         self, data: dict[str, Any], max_length: int = 50
     ) -> dict[str, Any]:
@@ -770,133 +984,6 @@ class Pipe:
 
         return data
 
-    def _upload_image(
-        self,
-        image_data: bytes,
-        mime_type: str,
-        model: str,
-        prompt: str,
-        user_id: str,
-        __request__: Request,
-    ) -> str | None:
-        """
-        Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
-        Returns the url to uploaded image.
-        """
-        image_format = mimetypes.guess_extension(mime_type)
-        id = str(uuid.uuid4())
-        # TODO: Better filename? Prompt as the filename?
-        name = os.path.basename(f"generated-image{image_format}")
-        imagename = f"{id}_{name}"
-        image = io.BytesIO(image_data)
-        image_metadata = {
-            "model": model,
-            "prompt": prompt,
-        }
-
-        # Upload the image to user configured storage provider.
-        log.info("Uploading the image to the configured storage provider.")
-        try:
-            contents, image_path = Storage.upload_file(image, imagename)
-        except Exception:
-            error_msg = f"Error occurred during upload to the storage provider."
-            log.exception(error_msg)
-            return None
-        # Add the image file to files database.
-        log.info("Adding the image file to Open WebUI files database.")
-        file_item = Files.insert_new_file(
-            user_id,
-            FileForm(
-                id=id,
-                filename=name,
-                path=image_path,
-                meta={
-                    "name": name,
-                    "content_type": mime_type,
-                    "size": len(contents),
-                    "data": image_metadata,
-                },
-            ),
-        )
-        if not file_item:
-            log.warning("Files.insert_new_file did not return anything.")
-            return None
-        # Get the image url.
-        image_url: str = __request__.app.url_path_for(
-            "get_file_content_by_id", id=file_item.id
-        )
-        return image_url
-
-    async def _add_citations(
-        self, data: types.GenerateContentResponse, raw_str: str
-    ) -> Optional["ChatCompletionEvent"]:
-
-        async def resolve_url(session, url) -> str:
-            """Asynchronously resolves a URL by following redirects"""
-            try:
-                async with session.get(url, allow_redirects=True) as response:
-                    return str(response.url)
-            except Exception as e:
-                # FIXME: Consider more robust logging
-                print(f"Error resolving URL: {e}")
-                return url
-
-        if not data.candidates:
-            return None
-
-        candidate = data.candidates[0]
-        grounding_metadata = candidate.grounding_metadata if candidate else None
-
-        if (
-            not grounding_metadata
-            or not grounding_metadata.grounding_supports
-            or not grounding_metadata.grounding_chunks
-        ):
-            return None
-
-        supports = grounding_metadata.grounding_supports
-        grounding_chunks = grounding_metadata.grounding_chunks
-
-        uris: list[str] = [
-            g_c.web.uri for g_c in grounding_chunks if g_c.web and g_c.web.uri
-        ]
-
-        for support in supports:
-            text: Optional[str] = support.segment.text if support.segment else None
-            if text:
-                start = raw_str.find(text)
-                if start != -1:
-                    end_pos = start + len(text)
-                    citation_markers = "".join(
-                        f"[{index}]"
-                        for index in (support.grounding_chunk_indices or [])
-                    )
-                    raw_str = (
-                        f"{raw_str[:end_pos]}{citation_markers}{raw_str[end_pos:]}"
-                    )
-
-        sources_list: list["Source"] = []
-        if uris:
-            async with aiohttp.ClientSession() as session:
-                tasks = [resolve_url(session, uri) for uri in uris]
-                resolved_uris = await asyncio.gather(*tasks)
-
-            sources_list = [
-                {
-                    "source": {"name": "web_search"},
-                    "document": [""] * len(resolved_uris),
-                    "metadata": [{"source": uri} for uri in resolved_uris],
-                }
-            ]
-
-        event_data: "ChatCompletionEventData" = {
-            "content": raw_str,
-            "sources": sources_list,
-        }
-        event: "Event" = {"type": "chat:completion", "data": event_data}
-
-        return event
-
     def _add_log_handler(self):
         """Adds handler to the root loguru instance for this plugin if one does not exist already."""
 
@@ -926,3 +1013,12 @@ class Pipe:
         log.info(
             f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
         )
+
+    def _get_mime_type(self, file_uri: str) -> str:
+        """
+        Determines MIME type based on file extension using the mimetypes module.
+        """
+        mime_type, encoding = mimetypes.guess_type(file_uri)
+        if mime_type is None:
+            return "application/octet-stream"  # Default MIME type if unknown
+        return mime_type

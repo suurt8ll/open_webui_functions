@@ -1,36 +1,87 @@
 from typing import Any, Literal, NotRequired, Optional, TypedDict
 from uuid import UUID
-
-from pydantic import BaseModel, Field
+from datetime import datetime
+from open_webui.models.files import FileModelResponse
 
 
 class FileInfo(TypedDict):
-    type: str
-    file: dict[str, Any]
+    type: str  # could be "file", "image"
+    file: FileModelResponse
     id: str
     url: str
     name: str
+    collection_name: Optional[str]
     status: str
     size: int
     error: str
     itemId: str
 
 
-class Message(BaseModel):
+class SourceSource(TypedDict):
+    docs: NotRequired[list[dict]]
+    name: str  # the search query used
+    type: NotRequired[Literal["web_search", "file"]]
+    file: NotRequired[FileInfo]
+    urls: NotRequired[list[str]]
+
+
+class SourceMetadata(TypedDict):
+    source: str  # url
+    title: NotRequired[str]  # website title
+    description: NotRequired[str]  # website description
+    language: NotRequired[str]  # website language
+    # These keys are not used by Open WebUI front-end, they for my plugin only.
+    original_url: NotRequired[str]  # original, unresolved url
+    supports: NotRequired[list[dict]]
+
+
+class Source(TypedDict):
+    source: SourceSource
+    document: list[str]
+    metadata: list[SourceMetadata]
+    distances: NotRequired[list[float]]
+
+
+class MessageModel(TypedDict):
     id: UUID
-    parentId: Optional[UUID] = None
-    childrenIds: list[UUID] = Field(default_factory=list)
+    parentId: Optional[UUID]
+    childrenIds: list[UUID]
     role: Literal["user", "assistant"]
     content: str
-    files: Optional[list[FileInfo]]
-    timestamp: int
-    models: list[str] = Field(default_factory=list)
-    model: Optional[str] = None  # Only for assistant role
-    modelName: Optional[str] = None  # Only for assistant role
-    modelIdx: Optional[int] = None  # Only for assistant role
-    userContext: Optional[Any] = None  # Only for assistant role
-    sources: Optional[list[dict[str, Any]]]  # Only for assistant role
-    done: Optional[bool]  # Only for assistant role
+    timestamp: datetime
+
+
+class UserMessageModel(MessageModel):
+    files: NotRequired[list[FileInfo]]
+    models: list[str]
+
+
+class AssistantMessageModel(MessageModel):
+    model: str
+    modelName: str
+    modelIdx: int
+    userContext: Any
+    sources: NotRequired[list[Source]]
+    done: NotRequired[bool]
+
+
+class ChatParams(TypedDict):
+    system: NotRequired[str]
+    temperature: NotRequired[float]
+
+
+class ChatChatModel(TypedDict):
+    """Type for the `ChatModel.chat` variable"""
+
+    id: str  # Or UUID if appropriate
+    title: str
+    models: list[str]
+    params: ChatParams
+    history: dict[str, Any]
+    messages: list[MessageModel]
+    tags: list[str]
+    timestamp: datetime
+    files: list[FileInfo]  # Or a more specific type if you have file objects
 
 
 class UserData(TypedDict):
@@ -52,27 +103,6 @@ class ModelData(TypedDict):
 
     id: str
     name: str
-
-
-class SourceSource(TypedDict):
-    docs: NotRequired[list[dict]]
-    name: str  # the search query used
-    type: NotRequired[Literal["web_search"]]
-    urls: NotRequired[list[str]]
-
-
-class SourceMetadata(TypedDict, total=False):
-    source: str  # url
-    title: NotRequired[str]  # website title
-    description: NotRequired[str]  # website description
-    language: NotRequired[str]  # website language
-
-
-class Source(TypedDict):
-    source: SourceSource
-    document: list[str]
-    metadata: list[SourceMetadata]
-    distances: NotRequired[list[float]]
 
 
 class ErrorData(TypedDict):
