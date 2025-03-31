@@ -142,8 +142,8 @@ class Pipe:
 
         # Initialize the genai client with default API given in Valves.
         self.clients = {"default": self._get_genai_client()}
-        # Get Google models from the API.
-        self.models = self._filter_models(self._get_genai_models())
+
+        self.models: list["ModelData"] = []
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
         self.last_blacklist = self.valves.MODEL_BLACKLIST
 
@@ -167,7 +167,7 @@ class Pipe:
             return self.models
 
         # Filter the model list based on white- and blacklist.
-        self.models = self._filter_models(self._get_genai_models())
+        self.models = self._filter_models(await self._get_genai_models())
         log.debug("Registered models:", data=self.models)
 
         return self.models
@@ -727,7 +727,7 @@ class Pipe:
             log.info("Using genai client with the default API key.")
             return self.clients.get("default")
 
-    def _get_genai_models(self) -> list[types.Model]:
+    async def _get_genai_models(self) -> list[types.Model]:
         """
         Gets valid Google models from the API.
         Returns a google.genai.pagers.Pager object.
@@ -735,7 +735,9 @@ class Pipe:
         google_models = None
         if client := self.clients.get("default"):
             try:
-                google_models = client.models.list(config={"query_base": True})
+                google_models = await client.aio.models.list(
+                    config={"query_base": True}
+                )
             except Exception:
                 log.exception("Retriving models from Google API failed.")
         else:
