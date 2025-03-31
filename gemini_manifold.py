@@ -20,6 +20,7 @@ requirements: google-genai==1.8.0
 #   - Streaming
 #   - Grounding with Google Search
 #   - Safety settings
+#   - Each user can decide to use their own API key.
 
 # Features that are supported by API but not yet implemented in the manifold:
 #   TODO Audio input support.
@@ -83,17 +84,27 @@ log = logger.bind(auditable=False)
 class Pipe:
     class Valves(BaseModel):
         GEMINI_API_KEY: Optional[str] = Field(default=None)
+        REQUIRE_USER_API_KEY: bool = Field(
+            default=False,
+            description="""Whether to require user's own API key (applies to admins too).
+            User can give their own key through UserValves. 
+            Default value is False, if now user key is given then use GEMINI_API_KEY.""",
+        )
         GEMINI_API_BASE_URL: str = Field(
             default="https://generativelanguage.googleapis.com",
             description="The base URL for calling the Gemini API",
         )
         MODEL_WHITELIST: str = Field(
             default="*",
-            description="Comma-separated list of allowed model names. Supports `fnmatch` patterns: *, ?, [seq], [!seq]. Default value is * (all models allowed).",
+            description="""Comma-separated list of allowed model names. 
+            Supports `fnmatch` patterns: *, ?, [seq], [!seq]. 
+            Default value is * (all models allowed).""",
         )
         MODEL_BLACKLIST: Optional[str] = Field(
             default=None,
-            description="Comma-separated list of blacklisted model names. Supports `fnmatch` patterns: *, ?, [seq], [!seq]. Default value is None (no blacklist).",
+            description="""Comma-separated list of blacklisted model names. 
+            Supports `fnmatch` patterns: *, ?, [seq], [!seq]. 
+            Default value is None (no blacklist).""",
         )
         CACHE_MODELS: bool = Field(
             default=True,
@@ -186,8 +197,12 @@ class Pipe:
         if not (client := self._get_user_client(__user__)):
             error_msg = "There are no usable genai clients, check the logs."
             await self._emit_error(error_msg, exception=False)
-            return
+            return None
 
+        if self.clients.get("default") == client and self.valves.REQUIRE_USER_API_KEY:
+            error_msg = "You have not defined your own API key in UserValves. You need to define in to continue."
+            await self._emit_error(error_msg, exception=False)
+            return None
         model_name = body.get("model")
         if not model_name:
             error_msg = "body object does not contain model name."
@@ -199,7 +214,7 @@ class Pipe:
         if "error" in __metadata__["model"]["id"]:
             error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
             await self._emit_error(error_msg, exception=False)
-            return
+            return None
 
         # Get the message history directly from the backend.
         # This allows us to see data about sources and files data.
@@ -706,7 +721,7 @@ class Pipe:
         return client
 
     def _get_user_client(self, __user__: "UserData") -> Optional[genai.Client]:
-        # Register a user spesific client if they have added their own API key.
+        # Register a user specific client if they have added their own API key.
         user_valves: Optional[Pipe.UserValves] = __user__.get("valves")
         if (
             user_valves
