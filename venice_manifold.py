@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.9.4
+version: 0.10.0
 """
 
 # NB! This is work in progress and not yet fully featured.
@@ -37,6 +37,7 @@ from typing import (
 from pydantic import BaseModel, Field
 from fastapi import Request
 from open_webui.models.files import Files, FileForm
+from open_webui.models.functions import Functions
 from open_webui.utils.logger import stdout_format
 from open_webui.storage.provider import Storage
 from loguru import logger
@@ -53,11 +54,17 @@ log = logger.bind(auditable=False)
 
 class Pipe:
     class Valves(BaseModel):
-        VENICE_API_TOKEN: str = Field(default="", description="Venice.ai API Token")
+        VENICE_API_TOKEN: Optional[str] = Field(
+            default=None, description="Venice.ai API Token"
+        )
         HEIGHT: int = Field(default=1024, description="Image height")
         WIDTH: int = Field(default=1024, description="Image width")
         STEPS: int = Field(default=16, description="Image generation steps")
         CFG_SCALE: int = Field(default=4, description="Image generation scale")
+        CACHE_MODELS: bool = Field(
+            default=True,
+            description="Whether to request models only on first load.",
+        )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
@@ -71,13 +78,35 @@ class Pipe:
         )
 
     def __init__(self):
-        self.valves = self.Valves()
+
+        # This hack makes the valves values available to the `__init__` method.
+        # TODO: Get the id from the frontmatter instead of hardcoding it.
+        valves = Functions.get_function_valves_by_id("venice_image_generation")
+        self.valves = self.Valves(**(valves if valves else {}))
+        # FIXME: Is logging out the API key a bad idea?
+        print(
+            f"[venice_manifold] self.valves initialized:\n{self.valves.model_dump_json(indent=2)}"
+        )
+
+        self.models: list["ModelData"] = []
+
         print("[venice_manifold] Function has been initialized!")
 
     async def pipes(self) -> list["ModelData"]:
-        # I'm adding the handler here because LOG_LEVEL is not set inside __init__ sadly.
+        # TODO: Move into `__init__`
         self._add_log_handler()
-        return await self._get_models()
+
+        # Return existing models if all conditions are met and no error models are present
+        if (
+            self.models
+            and self.valves.CACHE_MODELS
+            and not any(model["id"] == "error" for model in self.models)
+        ):
+            log.info("Models are already initialized. Returning the cached list.")
+            return self.models
+
+        self.models = await self._get_models()
+        return self.models
 
     async def pipe(
         self,
@@ -210,7 +239,8 @@ class Pipe:
                     if not raw_models:
                         log.warning("Venice API returned no models.")
                     return [
-                        {"id": model["id"], "name": model["id"]} for model in raw_models
+                        {"id": model["id"], "name": model["id"], "description": None}
+                        for model in raw_models
                     ]
         except aiohttp.ClientResponseError as e:
             error_msg = f"Error getting models: {str(e)}"
@@ -370,4 +400,5 @@ class Pipe:
         return {
             "id": "error",
             "name": "[venice_manifold] " + error_msg,
+            "description": error_msg,
         }

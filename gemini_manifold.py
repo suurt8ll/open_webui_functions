@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.9.0
+version: 1.10.0
 requirements: google-genai==1.8.0
 """
 
@@ -20,6 +20,7 @@ requirements: google-genai==1.8.0
 #   - Streaming
 #   - Grounding with Google Search
 #   - Safety settings
+#   - Each user can decide to use their own API key.
 
 # Features that are supported by API but not yet implemented in the manifold:
 #   TODO Audio input support.
@@ -27,15 +28,14 @@ requirements: google-genai==1.8.0
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 #   TODO Display usage statistics (token counts)
 
+from google import genai
+from google.genai import types
 import asyncio
 import io
-import json
 import mimetypes
 import os
 import uuid
 import aiohttp
-from google import genai
-from google.genai import types
 import base64
 import re
 import fnmatch
@@ -90,24 +90,37 @@ log = logger.bind(auditable=False)
 
 class Pipe:
     class Valves(BaseModel):
-        GEMINI_API_KEY: str = Field(default="")
+        GEMINI_API_KEY: Optional[str] = Field(default=None)
+        REQUIRE_USER_API_KEY: bool = Field(
+            default=False,
+            description="""Whether to require user's own API key (applies to admins too).
+            User can give their own key through UserValves. 
+            Default value is False, if now user key is given then use GEMINI_API_KEY.""",
+        )
         GEMINI_API_BASE_URL: str = Field(
             default="https://generativelanguage.googleapis.com",
             description="The base URL for calling the Gemini API",
         )
         MODEL_WHITELIST: str = Field(
-            default="",
-            description="Comma-separated list of allowed model names. Supports wildcards (*).",
+            default="*",
+            description="""Comma-separated list of allowed model names. 
+            Supports `fnmatch` patterns: *, ?, [seq], [!seq]. 
+            Default value is * (all models allowed).""",
+        )
+        MODEL_BLACKLIST: Optional[str] = Field(
+            default=None,
+            description="""Comma-separated list of blacklisted model names. 
+            Supports `fnmatch` patterns: *, ?, [seq], [!seq]. 
+            Default value is None (no blacklist).""",
         )
         CACHE_MODELS: bool = Field(
             default=True,
-            description="Whether to request models only on first load and when whitelist changes.",
+            description="Whether to request models only on first load and when white- or blacklist changes.",
         )
         USE_GROUNDING_SEARCH: bool = Field(
             default=False,
             description="Whether to use Grounding with Google Search. For more info: https://ai.google.dev/gemini-api/docs/grounding",
         )
-        # FIXME Show this only when USE_GROUNDING_SEARCH is True
         GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD: float = Field(
             default=0.3,
             description="See Google AI docs for more information. Only supported for 1.0 and 1.5 models",
@@ -126,15 +139,24 @@ class Pipe:
             description="Save the image files using Open WebUI's API for files.",
         )
 
+    class UserValves(BaseModel):
+        GEMINI_API_KEY: Optional[str] = Field(default=None)
+        GEMINI_API_BASE_URL: str = Field(
+            default="https://generativelanguage.googleapis.com",
+            description="The base URL for calling the Gemini API",
+        )
+        # TODO: Add more options that can be changed by the user.
+
     def __init__(self):
 
         # This hack makes the valves values available to the `__init__` method.
+        # TODO: Get the id from the frontmatter instead of hardcoding it.
         valves = Functions.get_function_valves_by_id("gemini_manifold_google_genai")
         self.valves = self.Valves(**(valves if valves else {}))
-
-        self.last_whitelist: str = self.valves.MODEL_WHITELIST
-        self.models: list["ModelData"] = []
-        self.client: Optional[genai.Client] = None
+        # FIXME: Is logging out the API key a bad idea?
+        print(
+            f"[gemini_manifold] self.valves initialized:\n{self.valves.model_dump_json(indent=2)}"
+        )
 
         search_filter = Functions.get_function_by_id(id=SEARCH_FILTER_ID)
         if not search_filter:
@@ -162,50 +184,36 @@ class Pipe:
                     log.error("Search filter could not be enabled.")
                 log.info("Search filter enabled.")
 
-        log.info("Function has been initialized!")
+        # Initialize the genai client with default API given in Valves.
+        self.clients = {"default": self._get_genai_client()}
+        self.models: list["ModelData"] = []
+        self.last_whitelist: str = self.valves.MODEL_WHITELIST
+        self.last_blacklist = self.valves.MODEL_BLACKLIST
+
+        print(f"[gemini_manifold] Function has been initialized:\n{self.__dict__}")
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
 
-        # FIXME: This can now be moved into `__init__` cause valves values are available there.
+        # TODO: Move into `__init__`.
         self._add_log_handler()
 
-        # Return existing models if all conditions are met
-        # FIXME: Always check for models if current model is the error placeholder.
+        # Return existing models if all conditions are met and no error models are present
         if (
             self.models
             and self.valves.CACHE_MODELS
             and self.last_whitelist == self.valves.MODEL_WHITELIST
+            and self.last_blacklist == self.valves.MODEL_BLACKLIST
+            and not any(model["id"] == "error" for model in self.models)
         ):
             log.info("Models are already initialized. Returning the cached list.")
             return self.models
 
-        if not self.valves.GEMINI_API_KEY:
-            error_msg = "GEMINI_API_KEY is not set."
-            return [self._return_error_model(error_msg, exception=False)]
+        # Filter the model list based on white- and blacklist.
+        self.models = self._filter_models(await self._get_genai_models())
+        log.debug("Registered models:", data=self.models)
 
-        # GEMINI_API_KEY is not available inside __init__ for whatever reason so we initialize the client here.
-        if not self.client:
-            http_options = types.HttpOptions(base_url=self.valves.GEMINI_API_BASE_URL)
-            try:
-                self.client = genai.Client(
-                    api_key=self.valves.GEMINI_API_KEY,
-                    http_options=http_options,
-                )
-            except Exception as e:
-                error_msg = f"genai client initalization failed: {str(e)}"
-                return [self._return_error_model(error_msg)]
-        else:
-            log.info("Client already initialized.")
-
-        self.last_whitelist = self.valves.MODEL_WHITELIST
-
-        # Get and process new models, errors are handler inside the method.
-        models = await self._get_google_models()
-        log.debug("Registered models:", data=models)
-
-        self.models = models
-        return models
+        return self.models
 
     async def pipe(
         self,
@@ -216,15 +224,17 @@ class Pipe:
         __metadata__: dict[str, Any],
     ) -> Optional[str]:
 
-        # TODO: [refac] Move __user__ to self like that also.
         self.__event_emitter__ = __event_emitter__
 
-        if not self.client:
-            error_msg = "genai client is not initialized."
+        if not (client := self._get_user_client(__user__)):
+            error_msg = "There are no usable genai clients, check the logs."
             await self._emit_error(error_msg, exception=False)
-            return
+            return None
 
-        # FIXME: OK to asssume this is alwasy present and no check is neccecary?
+        if self.clients.get("default") == client and self.valves.REQUIRE_USER_API_KEY:
+            error_msg = "You have not defined your own API key in UserValves. You need to define in to continue."
+            await self._emit_error(error_msg, exception=False)
+            return None
         model_name = body.get("model")
         if not model_name:
             error_msg = "body object does not contain model name."
@@ -236,7 +246,7 @@ class Pipe:
         if "error" in __metadata__["model"]["id"]:
             error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
             await self._emit_error(error_msg, exception=False)
-            return
+            return None
 
         # Get the message history directly from the backend.
         # This allows us to see data about sources and files data.
@@ -321,7 +331,7 @@ class Pipe:
             # Streaming response.
             try:
                 res, raw_text = await self._stream_response(
-                    gen_content_args, __request__, __user__
+                    gen_content_args, __request__, __user__, client
                 )
             except Exception as e:
                 error_msg = f"Error occured during streaming: {str(e)}"
@@ -346,7 +356,7 @@ class Pipe:
         try:
             # FIXME: Make it async.
             # FIXME: Support native image gen here too.
-            response = self.client.models.generate_content(**gen_content_args)
+            response = client.models.generate_content(**gen_content_args)
         except Exception as e:
             error_msg = f"Content generation error: {str(e)}"
             await self._emit_error(error_msg)
@@ -413,6 +423,7 @@ class Pipe:
         return {
             "id": "error",
             "name": "[gemini_manifold] " + error_msg,
+            "description": error_msg,
         }
 
     """ChatModel.chat.messages -> list[genai.types.Content] conversion"""
@@ -596,13 +607,17 @@ class Pipe:
     """Model response streaming"""
 
     async def _stream_response(
-        self, gen_content_args: dict, __request__: Request, __user__: "UserData"
+        self,
+        gen_content_args: dict,
+        __request__: Request,
+        __user__: "UserData",
+        client: genai.Client,
     ) -> tuple[list[types.GenerateContentResponse], str]:
         """
         Streams the response to the front-end using `__event_emitter__` and finally returns the full aggregated response.
         """
         response_stream: AsyncIterator[types.GenerateContentResponse] = (
-            await self.client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
+            await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
         )
         aggregated_chunks: list[types.GenerateContentResponse] = []
         content = ""
@@ -717,48 +732,110 @@ class Pipe:
         )
         return image_url
 
-    """Model retrival from API"""
+    """Client initialization and model retrival from Google API"""
 
-    async def _get_google_models(self) -> list["ModelData"]:
-        """Retrieve Google models with prefix stripping."""
+    def _get_genai_client(
+        self, api_key: Optional[str] = None, base_url: Optional[str] = None
+    ) -> Optional[genai.Client]:
+        client = None
+        api_key = api_key if api_key else self.valves.GEMINI_API_KEY
+        base_url = base_url if base_url else self.valves.GEMINI_API_BASE_URL
+        if api_key:
+            http_options = types.HttpOptions(base_url=base_url)
+            try:
+                client = genai.Client(
+                    api_key=api_key,
+                    http_options=http_options,
+                )
+                log.info("genai client successfully initialized!")
+            except Exception:
+                log.exception("genai client initialization failed.")
+        else:
+            log.error("GEMINI_API_KEY is not set.")
+        return client
 
-        if not self.client:
-            log.error("Client is not initialized.")
+    def _get_user_client(self, __user__: "UserData") -> Optional[genai.Client]:
+        # Register a user specific client if they have added their own API key.
+        user_valves: Optional[Pipe.UserValves] = __user__.get("valves")
+        if (
+            user_valves
+            and user_valves.GEMINI_API_KEY
+            and not self.clients.get(__user__["id"])
+        ):
+            self.clients[__user__.get("id")] = self._get_genai_client(
+                api_key=user_valves.GEMINI_API_KEY,
+                base_url=user_valves.GEMINI_API_BASE_URL,
+            )
+            log.info(
+                f'Creating a new genai client for user {__user__.get("email")} clients dict now looks like:\n{self.clients}.'
+            )
+        if user_client := self.clients.get(__user__.get("id")):
+            log.info(f'Using genai client with user {__user__.get("email")} API key.')
+            return user_client
+        else:
+            log.info("Using genai client with the default API key.")
+            return self.clients.get("default")
+
+    async def _get_genai_models(self) -> list[types.Model]:
+        """
+        Gets valid Google models from the API.
+        Returns a google.genai.pagers.Pager object.
+        """
+        google_models = None
+        if client := self.clients.get("default"):
+            try:
+                google_models = await client.aio.models.list(
+                    config={"query_base": True}
+                )
+            except Exception:
+                log.exception("Retriving models from Google API failed.")
+        else:
+            log.error("API key is missing, can't get the models without it.")
             return []
+        if not google_models:
+            log.warning("API responded successfully but returned no models.")
+            return []
+        log.info(f"Retrieved {len(google_models)} models from Gemini Developer API.")
+        # Filter Google models list down to generative models only.
+        return [
+            model
+            for model in google_models
+            if model.supported_actions and "generateContent" in model.supported_actions
+        ]
 
+    def _filter_models(self, google_models: list[types.Model]) -> list["ModelData"]:
+        """
+        Filters the genai model list down based on configured white- and blacklist.
+        Returns a list[dict] that can be directly returned by the `pipes` method.
+        """
+        if not google_models:
+            error_msg = "Error during getting the models from Google API, check logs."
+            return [self._return_error_model(error_msg)]
+
+        self.last_whitelist = self.valves.MODEL_WHITELIST
+        self.last_blacklist = self.valves.MODEL_BLACKLIST
         whitelist = (
             self.valves.MODEL_WHITELIST.replace(" ", "").split(",")
             if self.valves.MODEL_WHITELIST
-            else ["*"]
+            else []
         )
-
-        try:
-            models = await self.client.aio.models.list(config={"query_base": True})
-        except Exception as e:
-            error_msg = f"Error retrieving models: {str(e)}"
-            return [self._return_error_model(error_msg)]
-        log.info(f"Retrieved {len(models)} models from Gemini Developer API.")
-
-        model_list: list["ModelData"] = [
+        blacklist = (
+            self.valves.MODEL_BLACKLIST.replace(" ", "").split(",")
+            if self.valves.MODEL_BLACKLIST
+            else []
+        )
+        return [
             {
                 "id": self._strip_prefix(model.name),
                 "name": model.display_name,
+                "description": model.description,
             }
-            for model in models
-            if (
-                model.name is not None  # Ensure name is present
-                and model.display_name is not None  # Ensure display_name is present
-                and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
-                and model.supported_actions
-                and "generateContent" in model.supported_actions
-                and model.name.startswith("models/")
-            )
+            for model in google_models
+            if model.name
+            and model.display_name
+            and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
+            and not any(fnmatch.fnmatch(model.name, f"models/{b}") for b in blacklist)
         ]
-
-        if not model_list:
-            log.warning("No models found matching whitelist.")
-
-        return model_list
 
     def _get_safety_settings(self, model_name: str) -> list[types.SafetySetting]:
         """Get safety settings based on model name and permissive setting."""
@@ -813,6 +890,7 @@ class Pipe:
         Strip any prefix from the model name up to and including the first '.' or '/'.
         This makes the method generic and adaptable to varying prefixes.
         """
+        # TODO: [refac] pointless helper, remove.
         try:
             # Use non-greedy regex to remove everything up to and including the first '.' or '/'
             stripped = re.sub(r"^.*?[./]", "", model_name)
