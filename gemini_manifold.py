@@ -30,9 +30,7 @@ requirements: google-genai==1.8.0
 from google import genai
 from google.genai import types
 import asyncio
-import copy
 import io
-import json
 import mimetypes
 import os
 import uuid
@@ -42,7 +40,7 @@ import re
 import fnmatch
 import sys
 from fastapi import Request
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field
 from typing import (
     Any,
     AsyncIterator,
@@ -65,7 +63,6 @@ if TYPE_CHECKING:
     from loguru._handler import Handler
     from manifold_types import *  # My personal types in a separate file for more robustness.
 
-# FIXME What about other 2.0 models?
 # according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
 ALLOWED_GROUNDING_MODELS = [
     "gemini-2.5-pro-exp-03-25",
@@ -106,7 +103,6 @@ class Pipe:
             default=False,
             description="Whether to use Grounding with Google Search. For more info: https://ai.google.dev/gemini-api/docs/grounding",
         )
-        # FIXME Show this only when USE_GROUNDING_SEARCH is True
         GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD: float = Field(
             default=0.3,
             description="See Google AI docs for more information. Only supported for 1.0 and 1.5 models",
@@ -144,14 +140,10 @@ class Pipe:
             f"[gemini_manifold] self.valves initialized:\n{self.valves.model_dump_json(indent=2)}"
         )
 
-        # TODO: Add the log handler here, not in `pipes`.
-
         # Initialize the genai client with default API given in Valves.
         self.clients = {"default": self._get_genai_client()}
         # Get Google models from the API.
-        self.google_models = self._get_genai_models()
-
-        self.models: list["ModelData"] = []
+        self.models = self._filter_models(self._get_genai_models())
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
         self.last_blacklist = self.valves.MODEL_BLACKLIST
 
@@ -160,11 +152,8 @@ class Pipe:
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
 
+        # TODO: Move into `__init__`.
         self._add_log_handler()
-
-        if not self.google_models:
-            error_msg = "Error during getting the models from Google API, check logs."
-            return [self._return_error_model(error_msg)]
 
         # Return existing models if all conditions are met and no error models are present
         if (
@@ -177,33 +166,14 @@ class Pipe:
             log.info("Models are already initialized. Returning the cached list.")
             return self.models
 
-        self.last_whitelist = self.valves.MODEL_WHITELIST
-        self.last_blacklist = self.valves.MODEL_BLACKLIST
-        whitelist = (
-            self.valves.MODEL_WHITELIST.replace(" ", "").split(",")
-            if self.valves.MODEL_WHITELIST
-            else []
-        )
-        blacklist = (
-            self.valves.MODEL_BLACKLIST.replace(" ", "").split(",")
-            if self.valves.MODEL_BLACKLIST
-            else []
-        )
-        models: list["ModelData"] = [
-            {
-                "id": self._strip_prefix(model.name),
-                "name": model.display_name,
-            }
-            for model in self.google_models
-            if model.name
-            and model.display_name
-            and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
-            and not any(fnmatch.fnmatch(model.name, f"models/{b}") for b in blacklist)
-        ]
-        self.models = models
-        log.debug("Registered models:", data=models)
+        # TODO: Add API returned model desc and set default model image and set that too.
+        # TODO: Activate search filter for search supported models.
 
-        return models
+        # Filter the model list based on white- and blacklist.
+        self.models = self._filter_models(self._get_genai_models())
+        log.debug("Registered models:", data=self.models)
+
+        return self.models
 
     async def pipe(
         self,
@@ -407,6 +377,7 @@ class Pipe:
         return {
             "id": "error",
             "name": "[gemini_manifold] " + error_msg,
+            "description": error_msg,
         }
 
     """ChatModel.chat.messages -> list[genai.types.Content] conversion"""
@@ -737,25 +708,6 @@ class Pipe:
             log.error("GEMINI_API_KEY is not set.")
         return client
 
-    def _get_genai_models(self):
-        """
-        Gets valid Google models from the API.
-        Returns a google.genai.pagers.Pager object.
-        """
-        google_models = []
-        if client := self.clients.get("default"):
-            try:
-                google_models = client.models.list(config={"query_base": True})
-            except Exception:
-                log.exception("Retriving models from Google API failed.")
-        log.info(f"Retrieved {len(google_models)} models from Gemini Developer API.")
-        # Filter Google models list down.
-        return [
-            model
-            for model in google_models
-            if model.supported_actions and "generateContent" in model.supported_actions
-        ]
-
     def _get_user_client(self, __user__: "UserData") -> Optional[genai.Client]:
         # Register a user spesific client if they have added their own API key.
         user_valves: Optional[Pipe.UserValves] = __user__.get("valves")
@@ -777,6 +729,65 @@ class Pipe:
         else:
             log.info("Using genai client with the default API key.")
             return self.clients.get("default")
+
+    def _get_genai_models(self) -> list[types.Model]:
+        """
+        Gets valid Google models from the API.
+        Returns a google.genai.pagers.Pager object.
+        """
+        google_models = None
+        if client := self.clients.get("default"):
+            try:
+                google_models = client.models.list(config={"query_base": True})
+            except Exception:
+                log.exception("Retriving models from Google API failed.")
+        else:
+            log.error("API key is missing, can't get the models without it.")
+            return []
+        if not google_models:
+            log.warning("API responded successfully but returned no models.")
+            return []
+        log.info(f"Retrieved {len(google_models)} models from Gemini Developer API.")
+        # Filter Google models list down to generative models only.
+        return [
+            model
+            for model in google_models
+            if model.supported_actions and "generateContent" in model.supported_actions
+        ]
+
+    def _filter_models(self, google_models: list[types.Model]) -> list["ModelData"]:
+        """
+        Filters the genai model list down based on configured white- and blacklist.
+        Returns a list[dict] that can be directly returned by the `pipes` method.
+        """
+        if not google_models:
+            error_msg = "Error during getting the models from Google API, check logs."
+            return [self._return_error_model(error_msg)]
+
+        self.last_whitelist = self.valves.MODEL_WHITELIST
+        self.last_blacklist = self.valves.MODEL_BLACKLIST
+        whitelist = (
+            self.valves.MODEL_WHITELIST.replace(" ", "").split(",")
+            if self.valves.MODEL_WHITELIST
+            else []
+        )
+        blacklist = (
+            self.valves.MODEL_BLACKLIST.replace(" ", "").split(",")
+            if self.valves.MODEL_BLACKLIST
+            else []
+        )
+        return [
+            {
+                "id": self._strip_prefix(model.name),
+                "name": model.display_name,
+                "description": model.description,
+            }
+            for model in google_models
+            if model.name
+            and model.display_name
+            and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
+            and not any(fnmatch.fnmatch(model.name, f"models/{b}") for b in blacklist)
+        ]
 
     def _get_safety_settings(self, model_name: str) -> list[types.SafetySetting]:
         """Get safety settings based on model name and permissive setting."""
