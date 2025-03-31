@@ -97,7 +97,7 @@ class Pipe:
         )
         CACHE_MODELS: bool = Field(
             default=True,
-            description="Whether to request models only on first load and when whitelist changes.",
+            description="Whether to request models only on first load and when white- or blacklist changes.",
         )
         USE_GROUNDING_SEARCH: bool = Field(
             default=False,
@@ -165,9 +165,6 @@ class Pipe:
         ):
             log.info("Models are already initialized. Returning the cached list.")
             return self.models
-
-        # TODO: Add API returned model desc and set default model image and set that too.
-        # TODO: Activate search filter for search supported models.
 
         # Filter the model list based on white- and blacklist.
         self.models = self._filter_models(self._get_genai_models())
