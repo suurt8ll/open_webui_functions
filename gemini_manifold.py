@@ -18,7 +18,7 @@ requirements: google-genai==1.8.0
 #   - Display citations in the front-end.
 #   - Image input
 #   - Streaming
-#   - Grounding with Google Search
+#   - Grounding with Google Search (this requires installing "Gemini Manifold Companion" filter, see GitHub README)
 #   - Safety settings
 #   - Each user can decide to use their own API key.
 

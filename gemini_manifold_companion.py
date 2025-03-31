@@ -1,7 +1,7 @@
 """
-title: Grounding with Google Search
-id: grounding_with_google_search
-description: Filter function that gives Gemini models search ablities. Must be used with "Gemini Manifold google_genai" pipe function!
+title: Gemini Manifold Companion
+id: gemini_manifold_companion
+description: A companion filter for "Gemini Manifold google_genai" pipe providing enhanced functionality.
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
@@ -9,9 +9,11 @@ license: MIT
 version: 0.2.0
 """
 
-import json
-from pydantic import BaseModel, Field
+# This filter can detect that a feature like web search or code execution is enabled in the front-end,
+# set the feature back to False so Open WebUI does not run it's own logic and then
+# pass custom values to "Gemini Manifold google_genai" that signal which feature was enabled and intercepted.
 
+from pydantic import BaseModel, Field
 
 # according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
 ALLOWED_GROUNDING_MODELS = [
@@ -33,7 +35,7 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
-        print("[grounding_w_google_search] Filter function has been initialized!")
+        print("[gemini_manifold_companion] Filter function has been initialized!")
 
     def inlet(self, body: dict) -> dict:
         """Modifies the incoming request payload before it's sent to the LLM. Operates on the `form_data` dictionary."""
@@ -54,7 +56,7 @@ class Filter:
 
         if web_search_enabled:
             print(
-                "Search feature is enabled, disabling it and adding custom feature called grounding_w_google_search."
+                "[gemini_manifold_companion] Search feature is enabled, disabling it and adding custom feature called grounding_w_google_search."
             )
             # Disable web_search
             features["web_search"] = False
@@ -65,9 +67,9 @@ class Filter:
             # Google suggest setting temperature to 0 if using grounding:
             # https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-with-google-search#:~:text=For%20ideal%20results%2C%20use%20a%20temperature%20of%200.0.
             if self.valves.SET_TEMP_TO_ZERO:
+                print("[gemini_manifold_companion] Setting temperature to 0.")
                 body["temperature"] = 0
 
-        print(f"Returning body:\n{json.dumps(body, indent=2, default=str)}")
         return body
 
     def stream(self, event: dict) -> dict:
