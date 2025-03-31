@@ -13,6 +13,16 @@ import json
 from pydantic import BaseModel, Field
 
 
+# according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
+ALLOWED_GROUNDING_MODELS = [
+    "gemini-2.5-pro-exp-03-25",
+    "gemini-2.0-flash",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash",
+    "gemini-1.0-pro",
+]
+
+
 class Filter:
 
     class Valves(BaseModel):
@@ -27,6 +37,16 @@ class Filter:
 
     def inlet(self, body: dict) -> dict:
         """Modifies the incoming request payload before it's sent to the LLM. Operates on the `form_data` dictionary."""
+
+        # Exit early if we are filtering an unsupported model.
+        model_name: str = body.get("model", "")
+        if (
+            "gemini_manifold_google_genai." not in model_name
+            or model_name.replace("gemini_manifold_google_genai.", "")
+            not in ALLOWED_GROUNDING_MODELS
+        ):
+            return body
+
         features = body.get("features", {})
         web_search_enabled = (
             features.get("web_search", False) if isinstance(features, dict) else False

@@ -65,15 +65,6 @@ if TYPE_CHECKING:
     from loguru._handler import Handler
     from manifold_types import *  # My personal types in a separate file for more robustness.
 
-# according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
-ALLOWED_GROUNDING_MODELS = [
-    "gemini-2.5-pro-exp-03-25",
-    "gemini-2.0-flash",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash",
-    "gemini-1.0-pro",
-]
-
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
 log = logger.bind(auditable=False)
 
