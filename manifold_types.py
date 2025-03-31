@@ -103,6 +103,8 @@ class ModelData(TypedDict):
 
     id: str
     name: str
+    # My own variables, these do not have any effect on Open WebUI's behaviour.
+    description: Optional[str]
 
 
 class ErrorData(TypedDict):
