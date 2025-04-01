@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.11.1
+version: 1.12.0
 requirements: google-genai==1.9.0
 """
 
@@ -280,11 +280,16 @@ class Pipe:
                 await self._emit_error(error_msg)
                 return None
             emit_sources = None
+            queries_status = None
             for chunk in res:
                 # TODO: Call this only on final finish chunk.
                 emit_sources = await self._get_chat_completion_event_w_sources(
                     chunk, raw_text
                 )
+                queries_status = self._get_status_event_w_queries(chunk)
+            if queries_status:
+                log.info("Sending status event with the used search queries.")
+                await __event_emitter__(queries_status)
             if emit_sources:
                 log.info("Sending chat completion event with the sources.")
                 await __event_emitter__(emit_sources)
@@ -308,6 +313,10 @@ class Pipe:
             emit_sources = await self._get_chat_completion_event_w_sources(
                 response, raw_text
             )
+            queries_status = self._get_status_event_w_queries(response)
+            if queries_status:
+                log.info("Sending status event with the used search queries.")
+                await __event_emitter__(queries_status)
             if emit_sources:
                 log.info("Sending chat completion event with the sources.")
                 await __event_emitter__(emit_sources)
@@ -954,6 +963,45 @@ class Pipe:
             "data": event_data,
         }
         return event
+
+    def _get_status_event_w_queries(
+        self,
+        data: types.GenerateContentResponse,
+    ) -> "StatusEvent | None":
+        """
+        Creates a StatusEvent with Google search URLs based on the web_search_queries
+        in the GenerateContentResponse.
+        """
+        # TODO: Merge with _get_chat_completion_event_w_sources because alotof logic is overlapping.
+        if (
+            not data.candidates
+            or not data.candidates[0].grounding_metadata
+            or not data.candidates[0].grounding_metadata.web_search_queries
+        ):
+            return None
+
+        search_queries = data.candidates[0].grounding_metadata.web_search_queries
+        if not search_queries:
+            log.debug("web_search_queries list is empty.")
+            return None
+
+        google_search_urls = [
+            f"https://www.google.com/search?q={query}" for query in search_queries
+        ]
+
+        status_event_data: StatusEventData = {
+            "action": "web_search",
+            "description": "This response was grounded with Google Search",
+            "urls": google_search_urls,
+        }
+
+        status_event: StatusEvent = {
+            "type": "status",
+            "data": status_event_data,
+        }
+
+        log.debug(f"Created StatusEvent: {status_event}")
+        return status_event
 
     def _remove_citation_markers(self, text: str, sources: list["Source"]) -> str:
         processed: set[str] = set()
