@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.10.0
+version: 1.11.0
 requirements: google-genai==1.9.0
 """
 
@@ -18,7 +18,7 @@ requirements: google-genai==1.9.0
 #   - Display citations in the front-end.
 #   - Image input
 #   - Streaming
-#   - Grounding with Google Search
+#   - Grounding with Google Search (this requires installing "Gemini Manifold Companion" filter, see GitHub README)
 #   - Safety settings
 #   - Each user can decide to use their own API key.
 
@@ -27,6 +27,7 @@ requirements: google-genai==1.9.0
 #   TODO Video input support.
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 #   TODO Display usage statistics (token counts)
+#   TODO Code execution tool.
 
 from google import genai
 from google.genai import types
@@ -52,6 +53,7 @@ from typing import (
     TYPE_CHECKING,
     cast,
 )
+
 from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
 from open_webui.models.functions import Functions
@@ -63,19 +65,6 @@ if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler
     from manifold_types import *  # My personal types in a separate file for more robustness.
-
-# according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
-ALLOWED_GROUNDING_MODELS = [
-    "gemini-2.5-pro-exp-03-25",
-    "gemini-2.0-flash",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash",
-    "gemini-1.0-pro",
-]
-
-# To avoid conflict name in the future, here use suffix not in gemini naming pattern.
-SEARCH_MODEL_SUFFIX = "++SEARCH"
-
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
 log = logger.bind(auditable=False)
@@ -109,14 +98,6 @@ class Pipe:
         CACHE_MODELS: bool = Field(
             default=True,
             description="Whether to request models only on first load and when white- or blacklist changes.",
-        )
-        USE_GROUNDING_SEARCH: bool = Field(
-            default=False,
-            description="Whether to use Grounding with Google Search. For more info: https://ai.google.dev/gemini-api/docs/grounding",
-        )
-        GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD: float = Field(
-            default=0.3,
-            description="See Google AI docs for more information. Only supported for 1.0 and 1.5 models",
         )
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=False, description="Whether to request relaxed safety filtering"
@@ -153,7 +134,6 @@ class Pipe:
 
         # Initialize the genai client with default API given in Valves.
         self.clients = {"default": self._get_genai_client()}
-
         self.models: list["ModelData"] = []
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
         self.last_blacklist = self.valves.MODEL_BLACKLIST
@@ -247,7 +227,6 @@ class Pipe:
         )
 
         # TODO: Take defaults from the general front-end config.
-        # FIXME: If the conversation has used Search, then augment the sysetm prompt by telling the model to not use [] citations in it's own respose.
         gen_content_conf = types.GenerateContentConfig(
             system_instruction=system_prompt,
             temperature=body.get("temperature"),
@@ -268,26 +247,23 @@ class Pipe:
                     "Image Generation model does not support the system prompt message! Removing the system prompt."
                 )
 
-        if self.valves.USE_GROUNDING_SEARCH:
-            if model_name.endswith(SEARCH_MODEL_SUFFIX):
-                log.info("Using grounding with Google Search.")
-                gs = None
-                # Dynamic retrieval only supported for 1.0 and 1.5 models.
-                if "1.0" in model_name or "1.5" in model_name:
-                    gs = types.GoogleSearchRetrieval(
-                        dynamic_retrieval_config=types.DynamicRetrievalConfig(
-                            dynamic_threshold=self.valves.GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD
-                        )
-                    )
-                    gen_content_conf.tools = [types.Tool(google_search_retrieval=gs)]
-                else:
-                    gs = types.GoogleSearchRetrieval()
-                    gen_content_conf.tools = [
-                        types.Tool(google_search=types.GoogleSearch())
-                    ]
+        features = __metadata__.get("features", {})
+        print(features)
+        if features.get("google_search_tool"):
+            log.info("Using grounding with Google Search as a Tool.")
+            gen_content_conf.tools = [types.Tool(google_search=types.GoogleSearch())]
+        elif features.get("google_search_retrieval"):
+            log.info("Using grounding with Google Search Retrieval.")
+            gs = types.GoogleSearchRetrieval(
+                dynamic_retrieval_config=types.DynamicRetrievalConfig(
+                    dynamic_threshold=features.get("google_search_retrieval_threshold")
+                )
+            )
+            gen_content_conf.tools = [types.Tool(google_search_retrieval=gs)]
 
+        # TODO: Log the final config that will be passed.
         gen_content_args = {
-            "model": model_name.replace(SEARCH_MODEL_SUFFIX, ""),
+            "model": model_name,
             "contents": contents,
             "config": gen_content_conf,
         }
@@ -649,7 +625,7 @@ class Pipe:
         prompt: str,
         user_id: str,
         __request__: Request,
-    ) -> str | None:
+    ) -> Optional[str]:
         """
         Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
         Returns the url to uploaded image.
@@ -946,7 +922,7 @@ class Pipe:
             end_pos = support.segment.end_index
             indices = support.grounding_chunk_indices
             # Create citation markers from associated chunk indices
-            citation_markers = "".join(f"[{index}]" for index in indices)
+            citation_markers = "".join(f"[{index + 1}]" for index in indices)
             encoded_citation_markers = citation_markers.encode()
             encoded_raw_str = (
                 encoded_raw_str[:end_pos]
@@ -1002,7 +978,7 @@ class Pipe:
                 if segment_end in processed:
                     continue
                 processed.add(segment_end)
-                citation_markers = "".join(f"[{index}]" for index in indices)
+                citation_markers = "".join(f"[{index + 1}]" for index in indices)
                 # Find the position of the citation markers in the text
                 pos = text.find(segment_text + citation_markers)
                 if pos != -1:
