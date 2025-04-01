@@ -52,6 +52,15 @@ class Filter:
 
         # Exit early if we are filtering an unsupported model.
         model_name: str = body.get("model", "")
+
+        # Extract and use base model name in case of custom Workspace models
+        metadata = body.get("metadata", {})
+        base_model_name = (
+            metadata.get("model", {}).get("info", {}).get("base_model_id", None)
+        )
+        if base_model_name:
+            model_name = base_model_name
+        
         if (
             "gemini_manifold_google_genai." not in model_name
             or model_name.replace("gemini_manifold_google_genai.", "")
