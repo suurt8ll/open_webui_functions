@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.2.0
+version: 1.0.0
 """
 
 # This filter can detect that a feature like web search or code execution is enabled in the front-end,
@@ -60,7 +60,6 @@ class Filter:
         web_search_enabled = (
             features.get("web_search", False) if isinstance(features, dict) else False
         )
-
         if web_search_enabled:
             print(
                 "[gemini_manifold_companion] Search feature is enabled, disabling it and adding custom feature called grounding_w_google_search."
