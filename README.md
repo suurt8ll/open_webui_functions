@@ -5,6 +5,7 @@ This repository contains a collection of Open WebUI plugins I personally use and
 ## Plugins and Scripts
 
 -   `gemini_manifold.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/gemini_manifold_google_genai) | This plugin provides support for Google's Gemini Studio API. See the [Detailed Documentation](docs/gemini_manifold.md) for more information.
+-   `gemini_manifold_companion.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/gemini_manifold_companion) | A companion filter for "Gemini Manifold google_genai" pipe providing enhanced functionality, such as Google Search grounding. See the [Detailed Documentation](docs/gemini_manifold_companion.md) for more information.
 -   `venice_manifold.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/venice_image_generation) | Enables image creation by using any diffusion model offered by Venice.ai API.
 -   `system_prompt_injector.py` | The idea is to allow changing chat options like system prompt and temperature from the chatbox. It would pair nicely with Prompts feature Open WebUI offers.
 -   `function_updater.py` | Monitors specified Python files (defined in the `.env` file). When a file change is detected, it automatically updates the corresponding function in the Open WebUI backend using the REST API. Requires function metadata (id, title, description) to be defined in the file's docstring.
