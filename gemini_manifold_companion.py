@@ -18,6 +18,8 @@ from pydantic import BaseModel, Field
 # according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
 ALLOWED_GROUNDING_MODELS = [
     "gemini-2.5-pro-exp-03-25",
+    "gemini-2.0-pro-exp-02-05",
+    "gemini-2.0-pro-exp",
     "gemini-2.0-flash",
     "gemini-2.0-flash-exp",
     "gemini-2.0-flash-001",
