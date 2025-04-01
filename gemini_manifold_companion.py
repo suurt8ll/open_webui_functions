@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 ALLOWED_GROUNDING_MODELS = [
     "gemini-2.5-pro-exp-03-25",
     "gemini-2.0-flash",
+    "gemini-2.0-flash-exp",
     "gemini-1.5-pro",
     "gemini-1.5-flash",
     "gemini-1.0-pro",
@@ -30,7 +31,13 @@ class Filter:
     class Valves(BaseModel):
         SET_TEMP_TO_ZERO: bool = Field(
             default=False,
-            description="Decide if you want to set the temperature to 0 for grounded answers, Google reccomends it in their docs.",
+            description="""Decide if you want to set the temperature to 0 for grounded answers, 
+            Google reccomends it in their docs.""",
+        )
+        GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD: float | None = Field(
+            default=None,
+            description="""See https://ai.google.dev/gemini-api/docs/grounding?lang=python#dynamic-threshold for more information.
+            Only supported for 1.0 and 1.5 models""",
         )
 
     def __init__(self):
@@ -63,7 +70,14 @@ class Filter:
             # Ensure metadata structure exists and add new feature
             metadata = body.setdefault("metadata", {})
             metadata_features = metadata.setdefault("features", {})
-            metadata_features["grounding_w_google_search"] = True
+            # Use "Google Search Retrieval" for 1.0 and 1.5 models and "Google Search as a Tool for >=2.0 models".
+            if "1.0" in model_name or "1.5" in model_name:
+                metadata_features["google_search_retrieval"] = True
+                metadata_features["google_search_retrieval_threshold"] = (
+                    self.valves.GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD
+                )
+            else:
+                metadata_features["google_search_tool"] = True
             # Google suggest setting temperature to 0 if using grounding:
             # https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-with-google-search#:~:text=For%20ideal%20results%2C%20use%20a%20temperature%20of%200.0.
             if self.valves.SET_TEMP_TO_ZERO:

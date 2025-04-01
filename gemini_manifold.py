@@ -254,27 +254,21 @@ class Pipe:
                     "Image Generation model does not support the system prompt message! Removing the system prompt."
                 )
 
-        use_search = __metadata__.get("features", {}).get(
-            "grounding_w_google_search", False
-        )
-        if self.valves.USE_GROUNDING_SEARCH and use_search:
-            log.info("Using grounding with Google Search.")
-            gs = None
-            # Dynamic retrieval only supported for 1.0 and 1.5 models.
-            # TODO: Google AI for Developers says: "Note: Dynamic retrieval is only compatible with Gemini 1.5 Flash. For Gemini 2.0, you should use Search as a tool, as shown above."?
-            if "1.0" in model_name or "1.5" in model_name:
-                gs = types.GoogleSearchRetrieval(
-                    dynamic_retrieval_config=types.DynamicRetrievalConfig(
-                        dynamic_threshold=self.valves.GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD
-                    )
+        features = __metadata__.get("features", {})
+        print(features)
+        if features.get("google_search_tool"):
+            log.info("Using grounding with Google Search as a Tool.")
+            gen_content_conf.tools = [types.Tool(google_search=types.GoogleSearch())]
+        elif features.get("google_search_retrieval"):
+            log.info("Using grounding with Google Search Retrieval.")
+            gs = types.GoogleSearchRetrieval(
+                dynamic_retrieval_config=types.DynamicRetrievalConfig(
+                    dynamic_threshold=features.get("google_search_retrieval_threshold")
                 )
-                gen_content_conf.tools = [types.Tool(google_search_retrieval=gs)]
-            else:
-                gen_content_conf.tools = [
-                    types.Tool(google_search=types.GoogleSearch())
-                ]
-        # TODO: Log the final config that will be passed.
+            )
+            gen_content_conf.tools = [types.Tool(google_search_retrieval=gs)]
 
+        # TODO: Log the final config that will be passed.
         gen_content_args = {
             "model": model_name,
             "contents": contents,
