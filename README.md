@@ -4,13 +4,13 @@ This repository contains a collection of Open WebUI plugins I personally use and
 
 ## Plugins and Scripts
 
--   `gemini_manifold.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/gemini_manifold) | This plugin provides support for Google's Gemini Studio API. See the [Detailed Documentation](docs/gemini_manifold.md) for more information.
+-   `gemini_manifold.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/gemini_manifold_google_genai) | This plugin provides support for Google's Gemini Studio API. See the [Detailed Documentation](docs/gemini_manifold.md) for more information.
 -   `venice_manifold.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/venice_image_generation) | Enables image creation by using any diffusion model offered by Venice.ai API.
--   `system_prompt_injector.py`: The idea is to allow changing chat options like system prompt and temperature from the chatbox. It would pair nicely with Prompts feature Open WebUI offers.
--   `function_updater.py`: Listens for file changes on selected files in `.env` file and automatically updates the functions in the backend with REST API if change is detected.
--   `smallthinker_filter.py`: At first I wanted to code a simple filter that makes output of the `smallthinker:3b` nicer but now I'm thinking of turning it into more general reasoning model formatter.
+-   `system_prompt_injector.py` | The idea is to allow changing chat options like system prompt and temperature from the chatbox. It would pair nicely with Prompts feature Open WebUI offers.
+-   `function_updater.py` | Monitors specified Python files (defined in the `.env` file). When a file change is detected, it automatically updates the corresponding function in the Open WebUI backend using the REST API. Requires function metadata (id, title, description) to be defined in the file's docstring.
+-   `smallthinker_filter.py` | At first I wanted to code a simple filter that makes output of the `smallthinker:3b` nicer but now I'm thinking of turning it into more general reasoning model formatter.
 -   `thinking_gemini.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/thinking_gemini) | An outdated script, initially developed for `gemini-2.0-flash-thinking-exp` model interactions. Superseded by `gemini_manifold.py`.
--   `test_and_example_functions/`: This directory contains different test and example plugins I usually code up when exploring what is possible.
+-   `test_and_example_functions/` | This directory contains different test and example plugins I usually code up when exploring what is possible.
 
 ## Contributing
 
