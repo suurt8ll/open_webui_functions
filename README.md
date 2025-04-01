@@ -1,6 +1,6 @@
 # Open WebUI Functions
 
-This repository contains a collection of Open WebUI plugins I personally use and find useful.
+This repository contains a collection of Open WebUI plugins I have personally coded for my own use and find useful.
 
 ## Plugins and Scripts
 
