@@ -27,6 +27,7 @@ requirements: google-genai==1.8.0
 #   TODO Video input support.
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 #   TODO Display usage statistics (token counts)
+#   TODO Code execution tool.
 
 from google import genai
 from google.genai import types
@@ -97,14 +98,6 @@ class Pipe:
         CACHE_MODELS: bool = Field(
             default=True,
             description="Whether to request models only on first load and when white- or blacklist changes.",
-        )
-        USE_GROUNDING_SEARCH: bool = Field(
-            default=False,
-            description="Whether to use Grounding with Google Search. For more info: https://ai.google.dev/gemini-api/docs/grounding",
-        )
-        GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD: float = Field(
-            default=0.3,
-            description="See Google AI docs for more information. Only supported for 1.0 and 1.5 models",
         )
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=False, description="Whether to request relaxed safety filtering"
@@ -929,7 +922,7 @@ class Pipe:
             end_pos = support.segment.end_index
             indices = support.grounding_chunk_indices
             # Create citation markers from associated chunk indices
-            citation_markers = "".join(f"[{index}]" for index in indices)
+            citation_markers = "".join(f"[{index + 1}]" for index in indices)
             encoded_citation_markers = citation_markers.encode()
             encoded_raw_str = (
                 encoded_raw_str[:end_pos]
@@ -985,7 +978,7 @@ class Pipe:
                 if segment_end in processed:
                     continue
                 processed.add(segment_end)
-                citation_markers = "".join(f"[{index}]" for index in indices)
+                citation_markers = "".join(f"[{index + 1}]" for index in indices)
                 # Find the position of the citation markers in the text
                 pos = text.find(segment_text + citation_markers)
                 if pos != -1:
