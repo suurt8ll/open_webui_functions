@@ -77,7 +77,7 @@ class Pipe:
             default=False,
             description="""Whether to require user's own API key (applies to admins too).
             User can give their own key through UserValves. 
-            Default value is False, if now user key is given then use GEMINI_API_KEY.""",
+            Default value is False.""",
         )
         GEMINI_API_BASE_URL: str = Field(
             default="https://generativelanguage.googleapis.com",
@@ -721,21 +721,23 @@ class Pipe:
     async def _get_genai_models(self) -> list[types.Model]:
         """
         Gets valid Google models from the API.
-        Returns a google.genai.pagers.Pager object.
+        Returns a list of `genai.types.Model` objects.
         """
         google_models = None
-        if client := self.clients.get("default"):
-            try:
-                google_models = await client.aio.models.list(
-                    config={"query_base": True}
-                )
-            except Exception:
-                log.exception("Retriving models from Google API failed.")
-        else:
-            log.error("API key is missing, can't get the models without it.")
-            return []
-        if not google_models:
-            log.warning("API responded successfully but returned no models.")
+        client = self.clients.get("default")
+        if not client:
+            log.warning("There is no usable genai client. Trying to create one.")
+            # Try to create a client one more time.
+            if client := self._get_genai_client():
+                self.clients["default"] = client
+            else:
+                log.error("Can't initialize the client, returning no models.")
+                return []
+        # This executes if we have a working client.
+        try:
+            google_models = await client.aio.models.list(config={"query_base": True})
+        except Exception:
+            log.exception("Retriving models from Google API failed.")
             return []
         log.info(f"Retrieved {len(google_models)} models from Gemini Developer API.")
         # Filter Google models list down to generative models only.
@@ -752,7 +754,7 @@ class Pipe:
         """
         if not google_models:
             error_msg = "Error during getting the models from Google API, check logs."
-            return [self._return_error_model(error_msg)]
+            return [self._return_error_model(error_msg, exception=False)]
 
         self.last_whitelist = self.valves.MODEL_WHITELIST
         self.last_blacklist = self.valves.MODEL_BLACKLIST
