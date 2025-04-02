@@ -285,9 +285,15 @@ class Pipe:
                 error_msg = f"Error occured during streaming: {str(e)}"
                 await self._emit_error(error_msg)
                 return None
+            # Notify the user if invalid response was gotten from the API (can sometimes happen).
+            if not res:
+                error_msg = "No response chunks received from the model."
+                await self._emit_error(error_msg)
+                return None
             emit_sources = None
             queries_status = None
             for chunk in res:
+                print(chunk.model_dump_json(indent=2))
                 # TODO: Call this only on final finish chunk.
                 emit_sources = await self._get_chat_completion_event_w_sources(
                     chunk, raw_text
@@ -585,6 +591,10 @@ class Pipe:
             if not candidate or not candidate.content or not candidate.content.parts:
                 log.warning(
                     "candidate, candidate.content or candidate.content.parts is missing. Skipping to the next chunk."
+                )
+                # FIXME: Check log level before printing this.
+                print(
+                    f"This is the full invalid chunk object:\n{chunk.model_dump_json(indent=2)}"
                 )
                 continue
             for part in candidate.content.parts:
