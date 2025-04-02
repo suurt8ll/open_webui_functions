@@ -278,18 +278,19 @@ class Pipe:
         if body.get("stream", False):
             # Streaming response.
             try:
-                res, raw_text = await self._stream_response(
+                res, raw_text, finish_reason = await self._stream_response(
                     gen_content_args, __request__, __user__, client
                 )
             except Exception as e:
                 error_msg = f"Error occured during streaming: {str(e)}"
                 await self._emit_error(error_msg)
                 return None
-            # Notify the user if invalid response was gotten from the API (can sometimes happen).
-            if not res:
-                error_msg = "No response chunks received from the model."
+            # Notify the user if the finish reason was not STOP (indicates error).
+            if finish_reason is not types.FinishReason.STOP:
+                error_msg = f"Stream did not finish normally, API gave finish_reason {finish_reason}"
                 await self._emit_error(error_msg)
                 return None
+
             emit_sources = None
             queries_status = None
             for chunk in res:
@@ -575,15 +576,17 @@ class Pipe:
         __request__: Request,
         __user__: "UserData",
         client: genai.Client,
-    ) -> tuple[list[types.GenerateContentResponse], str]:
+    ) -> tuple[list[types.GenerateContentResponse], str, types.FinishReason | None]:
         """
-        Streams the response to the front-end using `__event_emitter__` and finally returns the full aggregated response.
+        Streams the response to the front-end using `__event_emitter__` and finally returns the full aggregated response,
+        the full content, and the finish reason if present.
         """
         response_stream: AsyncIterator[types.GenerateContentResponse] = (
             await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
         )
-        aggregated_chunks: list[types.GenerateContentResponse] = []
+        aggregated_chunks = []
         content = ""
+        finish_reason = None
 
         async for chunk in response_stream:
             aggregated_chunks.append(chunk)
@@ -591,10 +594,6 @@ class Pipe:
             if not candidate or not candidate.content or not candidate.content.parts:
                 log.warning(
                     "candidate, candidate.content or candidate.content.parts is missing. Skipping to the next chunk."
-                )
-                # FIXME: Check log level before printing this.
-                print(
-                    f"This is the full invalid chunk object:\n{chunk.model_dump_json(indent=2)}"
                 )
                 continue
             for part in candidate.content.parts:
@@ -608,7 +607,11 @@ class Pipe:
                 # TODO: Streaming this way loses the support for Filter.stream() method processing for filter plugins.
                 await self._emit_completion(content)
 
-        return aggregated_chunks, content
+            # Check for finish reason in the candidate
+            if candidate and candidate.finish_reason:
+                finish_reason = candidate.finish_reason
+
+        return aggregated_chunks, content, finish_reason
 
     def _get_first_candidate(
         self, candidates: Optional[list[types.Candidate]]
