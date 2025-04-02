@@ -267,14 +267,12 @@ class Pipe:
             f"Passing this config to the Google API:\n{gen_content_conf.model_dump_json(indent=2)}"
         )
 
-        # TODO: Log the final config that will be passed.
         gen_content_args = {
             "model": model_name,
             "contents": contents,
             "config": gen_content_conf,
         }
 
-        # TODO: Handle errors related to Google Safety Settings feature.
         if body.get("stream", False):
             # Streaming response.
             try:
@@ -290,55 +288,39 @@ class Pipe:
                 error_msg = f"Stream did not finish normally, API gave finish_reason {finish_reason}"
                 await self._emit_error(error_msg)
                 return None
-
-            emit_sources = None
-            queries_status = None
-            for chunk in res:
-                print(chunk.model_dump_json(indent=2))
-                # TODO: Call this only on final finish chunk.
-                emit_sources = await self._get_chat_completion_event_w_sources(
-                    chunk, raw_text
-                )
-                queries_status = self._get_status_event_w_queries(chunk)
-            if queries_status:
-                log.info("Sending status event with the used search queries.")
-                await __event_emitter__(queries_status)
-            if emit_sources:
-                log.info("Sending chat completion event with the sources.")
-                await __event_emitter__(emit_sources)
-            return None
-
-        # Non-streaming response.
-        if "gemini-2.0-flash-exp-image-generation" in model_name:
-            warn_msg = "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
-            await self._emit_error(warn_msg, warning=True)
-            return None
-        try:
-            # FIXME: Make it async.
-            # FIXME: Support native image gen here too.
-            response = client.models.generate_content(**gen_content_args)
-        except Exception as e:
-            error_msg = f"Content generation error: {str(e)}"
-            await self._emit_error(error_msg)
-            return None
-        if raw_text := response.text:
-            # TODO: [refac] unify this logic with streaming response.
-            emit_sources = await self._get_chat_completion_event_w_sources(
-                response, raw_text
-            )
-            queries_status = self._get_status_event_w_queries(response)
-            if queries_status:
-                log.info("Sending status event with the used search queries.")
-                await __event_emitter__(queries_status)
-            if emit_sources:
-                log.info("Sending chat completion event with the sources.")
-                await __event_emitter__(emit_sources)
-                return None
         else:
-            warn_msg = "Non-stremaing response did not have any text inside it."
-            await self._emit_error(warn_msg, warning=True)
+            # Non-streaming response.
+            if "gemini-2.0-flash-exp-image-generation" in model_name:
+                warn_msg = "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
+                await self._emit_error(warn_msg, warning=True)
+                return None
+            try:
+                # FIXME: Support native image gen here too.
+                res = [await client.aio.models.generate_content(**gen_content_args)]
+            except Exception as e:
+                error_msg = f"Content generation error: {str(e)}"
+                await self._emit_error(error_msg)
+                return None
+            if raw_text := res[-1].text:
+                await self._emit_completion(raw_text)
+
+            else:
+                warn_msg = "Non-stremaing response did not have any text inside it."
+                await self._emit_error(warn_msg, warning=True)
+                return None
+        # Emit search queries and sources to the front-end if they exist.
+        if queries_status := self._get_status_event_w_queries(res[-1]):
+            log.info("Sending status event with the used search queries.")
+            await __event_emitter__(queries_status)
+        if emit_sources := await self._get_chat_completion_event_w_sources(
+            res[-1], raw_text
+        ):
+            log.info("Sending chat completion event with the sources.")
+            await __event_emitter__(emit_sources)
             return None
-        return response.text
+        await self._emit_completion(done=True)
+        log.info("pipe method has finished it's run.")
+        return None
 
     """
     ---------- Helper methods inside the Pipe class ----------
