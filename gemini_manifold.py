@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.12.1
+version: 1.13.0
 requirements: google-genai==1.9.0
 """
 
@@ -304,9 +304,9 @@ class Pipe:
                 return None
             if raw_text := res.text:
                 await self._emit_completion(raw_text)
-
             else:
                 warn_msg = "Non-stremaing response did not have any text inside it."
+                print(res)
                 await self._emit_error(warn_msg, warning=True)
                 return None
 
