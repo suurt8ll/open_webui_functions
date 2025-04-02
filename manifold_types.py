@@ -116,6 +116,7 @@ class ChatCompletionEventData(TypedDict):
     done: NotRequired[bool]
     error: NotRequired[ErrorData]
     sources: NotRequired[list[Source]]
+    usage: NotRequired[dict[str, Any]]
 
 
 class ChatCompletionEvent(TypedDict):

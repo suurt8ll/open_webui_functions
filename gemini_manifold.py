@@ -279,6 +279,7 @@ class Pipe:
                 res, raw_text, finish_reason = await self._stream_response(
                     gen_content_args, __request__, __user__, client
                 )
+                res = res[-1]
             except Exception as e:
                 error_msg = f"Error occured during streaming: {str(e)}"
                 await self._emit_error(error_msg)
@@ -296,28 +297,36 @@ class Pipe:
                 return None
             try:
                 # FIXME: Support native image gen here too.
-                res = [await client.aio.models.generate_content(**gen_content_args)]
+                res = await client.aio.models.generate_content(**gen_content_args)
             except Exception as e:
                 error_msg = f"Content generation error: {str(e)}"
                 await self._emit_error(error_msg)
                 return None
-            if raw_text := res[-1].text:
+            if raw_text := res.text:
                 await self._emit_completion(raw_text)
 
             else:
                 warn_msg = "Non-stremaing response did not have any text inside it."
                 await self._emit_error(warn_msg, warning=True)
                 return None
-        # Emit search queries and sources to the front-end if they exist.
-        if queries_status := self._get_status_event_w_queries(res[-1]):
+
+        print(res.model_dump_json(indent=2))
+        # Emit usage data.
+        if usage_event := self._get_usage_data_event(res):
+            log.info("Sending empty chat completion event with the token usage info.")
+            print(usage_event)
+            await __event_emitter__(usage_event)
+        # Emit search queries.
+        if queries_status := self._get_status_event_w_queries(res):
             log.info("Sending status event with the used search queries.")
             await __event_emitter__(queries_status)
+        # Emit sources.
         if emit_sources := await self._get_chat_completion_event_w_sources(
-            res[-1], raw_text
+            res, raw_text
         ):
             log.info("Sending chat completion event with the sources.")
             await __event_emitter__(emit_sources)
-            return None
+
         await self._emit_completion(done=True)
         log.info("pipe method has finished it's run.")
         return None
@@ -573,12 +582,17 @@ class Pipe:
         async for chunk in response_stream:
             aggregated_chunks.append(chunk)
             candidate = self._get_first_candidate(chunk.candidates)
-            if not candidate or not candidate.content or not candidate.content.parts:
+            if not candidate:
                 log.warning(
-                    "candidate, candidate.content or candidate.content.parts is missing. Skipping to the next chunk."
+                    "No ccandidate objets were returned, skipping to the next chunk."
                 )
                 continue
-            for part in candidate.content.parts:
+            parts = (
+                candidate.content.parts
+                if candidate.content and candidate.content.parts
+                else []
+            )
+            for part in parts:
                 if text_part := part.text:
                     content += text_part
                 elif inline_data := part.inline_data:
@@ -957,7 +971,7 @@ class Pipe:
         event_data: "ChatCompletionEventData" = {
             "content": encoded_raw_str.decode(),  # Content with added citations
             "sources": sources_list,  # List of resolved source references
-            "done": True,
+            "done": False,
         }
         event: "Event" = {
             "type": "chat:completion",
@@ -1039,6 +1053,48 @@ class Pipe:
                         + text[pos + len(segment_text) + len(citation_markers) :]
                     )
         return text
+
+    """Usage data"""
+
+    def _get_usage_data_event(
+        self,
+        response: types.GenerateContentResponse,
+    ) -> "ChatCompletionEvent | None":
+        """
+        Extracts usage data from a GenerateContentResponse object.
+        Returns None if any of the core metrics (prompt_tokens, completion_tokens, total_tokens)
+        cannot be reliably determined.
+
+        Args:
+            response: The GenerateContentResponse object.
+
+        Returns:
+            A dictionary containing the usage data, formatted as a ResponseUsage type,
+            or None if any core metrics are missing.
+        """
+
+        if not response.usage_metadata:
+            log.warning(
+                "Usage_metadata is missing from the response. Cannot reliably determine usage."
+            )
+            return None
+
+        usage_data = response.usage_metadata.model_dump()
+        usage_data["prompt_tokens"] = usage_data.pop("prompt_token_count")
+        usage_data["completion_tokens"] = usage_data.pop("candidates_token_count")
+        usage_data["total_tokens"] = usage_data.pop("total_token_count")
+        # Remove null values and turn ModalityTokenCount into dict.
+        for k, v in usage_data.copy().items():
+            if k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                continue
+            if not v:
+                del usage_data[k]
+
+        completion_event: "ChatCompletionEvent" = {
+            "type": "chat:completion",
+            "data": {"usage": usage_data, "done": False},
+        }
+        return completion_event
 
     """Other helpers"""
 
