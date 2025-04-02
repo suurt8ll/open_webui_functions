@@ -3,6 +3,8 @@ from uuid import UUID
 from datetime import datetime
 from open_webui.models.files import FileModelResponse
 
+# ---------- __event_emitter__ ----------
+
 
 class FileInfo(TypedDict):
     type: str  # could be "file", "image"
@@ -40,6 +42,81 @@ class Source(TypedDict):
     document: list[str]
     metadata: list[SourceMetadata]
     distances: NotRequired[list[float]]
+
+
+class ErrorData(TypedDict):
+    detail: str
+
+
+class ChatCompletionEventData(TypedDict):
+    content: NotRequired[str]
+    done: NotRequired[bool]
+    error: NotRequired[ErrorData]
+    sources: NotRequired[list[Source]]
+    usage: NotRequired[dict[str, Any]]
+
+
+class ChatCompletionEvent(TypedDict):
+    type: Literal["chat:completion"]
+    data: ChatCompletionEventData
+
+
+class StatusEventData(TypedDict):
+    action: NotRequired[Literal["web_search", "knowledge_search"]]
+    description: str
+    done: NotRequired[bool]
+    query: NotRequired[str]  # knowledge_search
+    urls: NotRequired[list[str]]  # web_search
+    hidden: NotRequired[bool]
+
+
+class StatusEvent(TypedDict):
+    type: Literal["status"]
+    data: StatusEventData
+
+
+Event = ChatCompletionEvent | StatusEvent
+
+# ---------- body ----------
+
+
+class TextContent(TypedDict):
+    type: Literal["text"]
+    text: str
+
+
+class ImageURL(TypedDict):
+    url: str  # data:image/png;base64,iVBORw0KGgoAAAA....
+
+
+class ImageContent(TypedDict):
+    type: Literal["image_url"]
+    image_url: ImageURL
+
+
+Content = TextContent | ImageContent
+
+
+class UserMessage(TypedDict):
+    role: Literal["user", "assistant"]
+    content: str | list[Content]
+
+
+class AssistantMessage(TypedDict):
+    role: Literal["assistant"]
+    content: str
+
+
+Message = UserMessage | AssistantMessage
+
+
+class Body(TypedDict):
+    stream: bool
+    model: str
+    messages: list[Message]
+
+
+# ---------- Chats.ChatModel ----------
 
 
 class MessageModel(TypedDict):
@@ -84,6 +161,9 @@ class ChatChatModel(TypedDict):
     files: list[FileInfo]  # Or a more specific type if you have file objects
 
 
+# ---------- __user__ ----------
+
+
 class UserData(TypedDict):
     """
     This is how `__user__` `dict` looks like.
@@ -96,6 +176,9 @@ class UserData(TypedDict):
     valves: NotRequired[Any]  # object of type UserValves
 
 
+# ---------- pipes return dict ----------
+
+
 class ModelData(TypedDict):
     """
     This is how the `pipes` function expects the `dict` to look like.
@@ -104,38 +187,4 @@ class ModelData(TypedDict):
     id: str
     name: str
     # My own variables, these do not have any effect on Open WebUI's behaviour.
-    description: Optional[str]
-
-
-class ErrorData(TypedDict):
-    detail: str
-
-
-class ChatCompletionEventData(TypedDict):
-    content: NotRequired[str]
-    done: NotRequired[bool]
-    error: NotRequired[ErrorData]
-    sources: NotRequired[list[Source]]
-    usage: NotRequired[dict[str, Any]]
-
-
-class ChatCompletionEvent(TypedDict):
-    type: Literal["chat:completion"]
-    data: ChatCompletionEventData
-
-
-class StatusEventData(TypedDict):
-    action: NotRequired[Literal["web_search", "knowledge_search"]]
-    description: str
-    done: NotRequired[bool]
-    query: NotRequired[str]  # knowledge_search
-    urls: NotRequired[list[str]]  # web_search
-    hidden: NotRequired[bool]
-
-
-class StatusEvent(TypedDict):
-    type: Literal["status"]
-    data: StatusEventData
-
-
-Event = ChatCompletionEvent | StatusEvent
+    description: NotRequired[Optional[str]]
