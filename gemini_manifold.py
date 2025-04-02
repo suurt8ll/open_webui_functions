@@ -212,9 +212,11 @@ class Pipe:
 
         chat_content: ChatChatModel = chat.chat  # type: ignore
         messages = chat_content.get("messages")
-        chat_params = chat_content.get("params")
-        system_prompt = chat_params.get("system")
-        log.debug(f"System prompt: {system_prompt}")
+        system_prompt = (
+            body["messages"][0]["content"]
+            if body.get("messages") and body["messages"][0].get("role") == "system"
+            else None
+        )
         contents = self._genai_contents_from_messages(messages)
 
         turn_content_dict_list: list[dict] = []
@@ -260,6 +262,10 @@ class Pipe:
                 )
             )
             gen_content_conf.tools = [types.Tool(google_search_retrieval=gs)]
+        # FIXME: Use log.debug instead.
+        print(
+            f"Passing this config to the Google API:\n{gen_content_conf.model_dump_json(indent=2)}"
+        )
 
         # TODO: Log the final config that will be passed.
         gen_content_args = {
