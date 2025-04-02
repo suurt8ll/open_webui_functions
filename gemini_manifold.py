@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.12.1
+version: 1.13.0
 requirements: google-genai==1.9.0
 """
 
@@ -267,71 +267,69 @@ class Pipe:
             f"Passing this config to the Google API:\n{gen_content_conf.model_dump_json(indent=2)}"
         )
 
-        # TODO: Log the final config that will be passed.
         gen_content_args = {
             "model": model_name,
             "contents": contents,
             "config": gen_content_conf,
         }
 
-        # TODO: Handle errors related to Google Safety Settings feature.
         if body.get("stream", False):
             # Streaming response.
             try:
-                res, raw_text = await self._stream_response(
+                res, raw_text, finish_reason = await self._stream_response(
                     gen_content_args, __request__, __user__, client
                 )
+                res = res[-1]
             except Exception as e:
                 error_msg = f"Error occured during streaming: {str(e)}"
                 await self._emit_error(error_msg)
                 return None
-            emit_sources = None
-            queries_status = None
-            for chunk in res:
-                # TODO: Call this only on final finish chunk.
-                emit_sources = await self._get_chat_completion_event_w_sources(
-                    chunk, raw_text
-                )
-                queries_status = self._get_status_event_w_queries(chunk)
-            if queries_status:
-                log.info("Sending status event with the used search queries.")
-                await __event_emitter__(queries_status)
-            if emit_sources:
-                log.info("Sending chat completion event with the sources.")
-                await __event_emitter__(emit_sources)
-            return None
-
-        # Non-streaming response.
-        if "gemini-2.0-flash-exp-image-generation" in model_name:
-            warn_msg = "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
-            await self._emit_error(warn_msg, warning=True)
-            return None
-        try:
-            # FIXME: Make it async.
-            # FIXME: Support native image gen here too.
-            response = client.models.generate_content(**gen_content_args)
-        except Exception as e:
-            error_msg = f"Content generation error: {str(e)}"
-            await self._emit_error(error_msg)
-            return None
-        if raw_text := response.text:
-            # TODO: [refac] unify this logic with streaming response.
-            emit_sources = await self._get_chat_completion_event_w_sources(
-                response, raw_text
-            )
-            queries_status = self._get_status_event_w_queries(response)
-            if queries_status:
-                log.info("Sending status event with the used search queries.")
-                await __event_emitter__(queries_status)
-            if emit_sources:
-                log.info("Sending chat completion event with the sources.")
-                await __event_emitter__(emit_sources)
+            # Notify the user if the finish reason was not STOP (indicates error).
+            if finish_reason is not types.FinishReason.STOP:
+                error_msg = f"Stream did not finish normally, API gave finish_reason {finish_reason}"
+                await self._emit_error(error_msg)
                 return None
         else:
-            warn_msg = "Non-stremaing response did not have any text inside it."
-            await self._emit_error(warn_msg, warning=True)
-            return None
-        return response.text
+            # Non-streaming response.
+            if "gemini-2.0-flash-exp-image-generation" in model_name:
+                warn_msg = "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
+                await self._emit_error(warn_msg, warning=True)
+                return None
+            try:
+                # FIXME: Support native image gen here too.
+                res = await client.aio.models.generate_content(**gen_content_args)
+            except Exception as e:
+                error_msg = f"Content generation error: {str(e)}"
+                await self._emit_error(error_msg)
+                return None
+            if raw_text := res.text:
+                await self._emit_completion(raw_text)
+            else:
+                warn_msg = "Non-stremaing response did not have any text inside it."
+                print(res)
+                await self._emit_error(warn_msg, warning=True)
+                return None
+
+        print(res.model_dump_json(indent=2))
+        # Emit usage data.
+        if usage_event := self._get_usage_data_event(res):
+            log.info("Sending empty chat completion event with the token usage info.")
+            print(usage_event)
+            await __event_emitter__(usage_event)
+        # Emit search queries.
+        if queries_status := self._get_status_event_w_queries(res):
+            log.info("Sending status event with the used search queries.")
+            await __event_emitter__(queries_status)
+        # Emit sources.
+        if emit_sources := await self._get_chat_completion_event_w_sources(
+            res, raw_text
+        ):
+            log.info("Sending chat completion event with the sources.")
+            await __event_emitter__(emit_sources)
+
+        await self._emit_completion(done=True)
+        log.info("pipe method has finished it's run.")
+        return None
 
     """
     ---------- Helper methods inside the Pipe class ----------
@@ -569,25 +567,32 @@ class Pipe:
         __request__: Request,
         __user__: "UserData",
         client: genai.Client,
-    ) -> tuple[list[types.GenerateContentResponse], str]:
+    ) -> tuple[list[types.GenerateContentResponse], str, types.FinishReason | None]:
         """
-        Streams the response to the front-end using `__event_emitter__` and finally returns the full aggregated response.
+        Streams the response to the front-end using `__event_emitter__` and finally returns the full aggregated response,
+        the full content, and the finish reason if present.
         """
         response_stream: AsyncIterator[types.GenerateContentResponse] = (
             await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
         )
-        aggregated_chunks: list[types.GenerateContentResponse] = []
+        aggregated_chunks = []
         content = ""
+        finish_reason = None
 
         async for chunk in response_stream:
             aggregated_chunks.append(chunk)
             candidate = self._get_first_candidate(chunk.candidates)
-            if not candidate or not candidate.content or not candidate.content.parts:
+            if not candidate:
                 log.warning(
-                    "candidate, candidate.content or candidate.content.parts is missing. Skipping to the next chunk."
+                    "No ccandidate objets were returned, skipping to the next chunk."
                 )
                 continue
-            for part in candidate.content.parts:
+            parts = (
+                candidate.content.parts
+                if candidate.content and candidate.content.parts
+                else []
+            )
+            for part in parts:
                 if text_part := part.text:
                     content += text_part
                 elif inline_data := part.inline_data:
@@ -598,7 +603,11 @@ class Pipe:
                 # TODO: Streaming this way loses the support for Filter.stream() method processing for filter plugins.
                 await self._emit_completion(content)
 
-        return aggregated_chunks, content
+            # Check for finish reason in the candidate
+            if candidate and candidate.finish_reason:
+                finish_reason = candidate.finish_reason
+
+        return aggregated_chunks, content, finish_reason
 
     def _get_first_candidate(
         self, candidates: Optional[list[types.Candidate]]
@@ -962,7 +971,7 @@ class Pipe:
         event_data: "ChatCompletionEventData" = {
             "content": encoded_raw_str.decode(),  # Content with added citations
             "sources": sources_list,  # List of resolved source references
-            "done": True,
+            "done": False,
         }
         event: "Event" = {
             "type": "chat:completion",
@@ -1044,6 +1053,48 @@ class Pipe:
                         + text[pos + len(segment_text) + len(citation_markers) :]
                     )
         return text
+
+    """Usage data"""
+
+    def _get_usage_data_event(
+        self,
+        response: types.GenerateContentResponse,
+    ) -> "ChatCompletionEvent | None":
+        """
+        Extracts usage data from a GenerateContentResponse object.
+        Returns None if any of the core metrics (prompt_tokens, completion_tokens, total_tokens)
+        cannot be reliably determined.
+
+        Args:
+            response: The GenerateContentResponse object.
+
+        Returns:
+            A dictionary containing the usage data, formatted as a ResponseUsage type,
+            or None if any core metrics are missing.
+        """
+
+        if not response.usage_metadata:
+            log.warning(
+                "Usage_metadata is missing from the response. Cannot reliably determine usage."
+            )
+            return None
+
+        usage_data = response.usage_metadata.model_dump()
+        usage_data["prompt_tokens"] = usage_data.pop("prompt_token_count")
+        usage_data["completion_tokens"] = usage_data.pop("candidates_token_count")
+        usage_data["total_tokens"] = usage_data.pop("total_token_count")
+        # Remove null values and turn ModalityTokenCount into dict.
+        for k, v in usage_data.copy().items():
+            if k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                continue
+            if not v:
+                del usage_data[k]
+
+        completion_event: "ChatCompletionEvent" = {
+            "type": "chat:completion",
+            "data": {"usage": usage_data, "done": False},
+        }
+        return completion_event
 
     """Other helpers"""
 
