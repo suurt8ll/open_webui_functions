@@ -1,6 +1,6 @@
 """
 title: Advanced Prompt Injector
-description: Filter that will detect and inject prompt configurations from user input.
+description: Filter that will detect and inject prompt configurations from user input using a <details> block.
 id: system_prompt_injector
 author: suurt8ll
 author_url: https://github.com/suurt8ll
@@ -18,175 +18,283 @@ version: 0.6.0
 {{content}}
 """
 
-from pydantic import BaseModel
-from typing import Optional
-import json
+# IMPORTANT: Disable "Rich Text Input for Chat" in Open WebUI settings for this plugin to work correctly.
+# TODO: Keep the latest prompt template settings if no setting were given in the last message.
 
-DEBUG = True
+from pydantic import BaseModel
+from typing import Any
+import json
+import re
+
+# --- Constants ---
+# Regex to find the entire details block and capture its components
+# - Group 1: Full <details> block
+# - Group 2: Content inside <summary> tag (prompt title)
+# - Group 3: Content between </summary> and </details> (parameters)
+DETAILS_BLOCK_REGEX = re.compile(
+    r'(<details type="prompt">\s*<summary>(.*?)</summary>(.*?)^\s*</details>)',
+    re.DOTALL | re.MULTILINE,
+)
+# Regex to find key-value pairs within the parameters block
+PARAM_REGEX = re.compile(r"^\s*>\s*(\w+):\s*(.*)", re.MULTILINE)
 
 
 class Filter:
     class Valves(BaseModel):
+        # Pass configuration options here if needed in the future
+        # Example: default_system_prompt: str = "Default prompt"
         pass
 
     def __init__(self):
+        # Valves are not used in this version but kept for potential future config
         self.valves = self.Valves()
-        self.prompt_title = None
+        # Store the prompt title extracted during inlet for use in outlet
+        self.prompt_title: str | None = None
+        self.debug = True  # Enable or disable debug prints
 
-    def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        if DEBUG:
-            print("\n--- Inlet Filter ---")
-            print("Original User Input Body:")
-            print(json.dumps(body, indent=4))
+    def inlet(
+        self, body: dict[str, Any], __user__: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """
+        Processes incoming request body.
+        Detects and extracts prompt injection details from the latest user message.
+        Applies extracted system prompt (if not empty) and temperature.
+        Removes the injection block from the user message.
+        """
+        if self.debug:
+            print(f"\n--- Inlet Filter ---")
+            print(f"Original Request Body:\n{json.dumps(body, indent=2)}")
 
-        latest_system_prompt = None
-        latest_temperature = None
-        modified_messages = []
+        latest_system_prompt: str | None = None
+        latest_temperature: float | None = None
+        injection_found_in_last_message = False
 
-        # Loop throught messages to extract injection tags and remove them.
-        # Also removes the prompt title headers from assistant messages.
-        for message in body["messages"]:
-            if message["role"] == "user":
-                system_prompt, temperature, injection_block, modified_content = (
-                    self._extract_injection_params(message["content"])
-                )
-                message["content"] = modified_content  # Update user message content
+        messages: list[dict[str, Any]] = body.get("messages", [])
+        if not messages:
+            print(f"Warning: No messages found in the body.")
+            return body
 
-                if injection_block:  # Only update if injection was found
-                    if DEBUG:
-                        print("\nInjection Tags Detected in User Message.")
-                        print("Injection Block Content:\n", injection_block)
-                    if system_prompt:
-                        latest_system_prompt = system_prompt
-                    if temperature is not None:
-                        latest_temperature = temperature
-                    if DEBUG:
-                        print(
-                            "User Message Body Updated (Tags and Injection Block Removed)."
-                        )
-                else:
-                    if DEBUG:
-                        print("\nInjection Tags Not Detected in User Message.")
+        # Process only the *last* message if it's from the user for injection
+        last_message = messages[-1]
+        if last_message.get("role") == "user":
+            content = last_message.get("content", "")
+            (
+                extracted_system_prompt,
+                extracted_temperature,
+                extracted_title,
+                modified_content,
+                injection_block_content,  # Keep track of the raw block for debugging
+            ) = self._extract_injection_params(content)
 
-            modified_messages.append(self._remove_prompt_title_header(message))
+            if extracted_title is not None:  # Check if extraction was successful
+                injection_found_in_last_message = True
+                self.prompt_title = extracted_title  # Store for outlet
+                last_message["content"] = modified_content  # Update message content
 
-        body["messages"] = modified_messages
+                if self.debug:
+                    print(f"Injection block detected in the last user message.")
+                    print(f"Extracted Title: {extracted_title}")
+                    print(f"Raw Injection Block:\n{injection_block_content}")
 
-        # TODO If the system prompt exists but is empty string, then start using the default system prompt that is set in the frontend.
-        self._apply_system_prompt(body, latest_system_prompt)
-        # FIXME Groq models break if temperature is set like this.
-        if latest_temperature is not None:
-            self._update_options(body, "temperature", latest_temperature)
-        if not latest_system_prompt and latest_temperature is None:
+                # Store extracted system prompt, including empty string
+                if extracted_system_prompt is not None:
+                    latest_system_prompt = extracted_system_prompt
+                    if self.debug:
+                        if latest_system_prompt == "":
+                            print(
+                                f"Extracted empty System Prompt. System prompt will NOT be set."
+                            )
+                        else:
+                            print(f"Extracted System Prompt: {latest_system_prompt}")
+
+                if extracted_temperature is not None:
+                    latest_temperature = extracted_temperature
+                    if self.debug:
+                        print(f"Extracted Temperature: {latest_temperature}")
+
+                if self.debug:
+                    print(f"User message content updated (injection block removed).")
+            else:
+                if self.debug:
+                    print(f"Injection block not detected in the last user message.")
+                # Reset prompt title if no injection found in the current turn
+                self.prompt_title = None
+        else:
+            # Reset prompt title if the last message isn't from the user
             self.prompt_title = None
 
-        if DEBUG:
-            print("\nModified User Input Body:")
-            print(json.dumps(body, indent=4))
-
-        return body
-
-    def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-
-        # TODO Reasoning model support, put the prompt title before the collapsible reasoning content.
-
-        # Add prompt title to the latest assistant message, indicating which preset was used in the response.
-        for message in reversed(body["messages"]):
-            if message["role"] == "assistant" and self.prompt_title:
-                message["content"] = (
-                    f"*{self.prompt_title}*\n\n***\n\n{message['content']}"
+        # Apply the extracted parameters to the request body
+        if injection_found_in_last_message:
+            # Only apply system prompt if it's not None AND not an empty string
+            if (
+                latest_system_prompt
+            ):  # This evaluates to False if latest_system_prompt is None or ""
+                self._apply_system_prompt(body, latest_system_prompt)
+            elif latest_system_prompt == "" and self.debug:
+                print(
+                    "Skipping system prompt application because extracted value was empty."
                 )
-                break
+
+            if latest_temperature is not None:
+                # FIXME: Groq models might break if temperature is set like this.
+                # This is the standard way to set options for OpenAI-compatible APIs.
+                # If Groq fails, it might require a different option key or not support it.
+                self._update_options(body, "temperature", latest_temperature)
+                if self.debug:
+                    print(f"Set temperature to: {latest_temperature}")
+
+        if self.debug:
+            print(
+                f"\nModified Request Body (before sending to LLM):\n{json.dumps(body, indent=2)}"
+            )
+
         return body
 
-    def _update_options(self, body: dict, key: str, value):
-        if "options" in body:
-            body["options"][key] = value
-        else:
-            body["options"] = {key: value}
+    def outlet(
+        self, body: dict[str, Any], __user__: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """
+        Processes the response body from the LLM.
+        Adds the stored prompt title as a header to the latest assistant message.
+        """
+        if self.debug:
+            print(f"\n--- Outlet Filter ---")
+            print(f"Original Response Body:\n{json.dumps(body, indent=2)}")
 
-    def _remove_prompt_title_header(self, message: dict) -> dict:
-        if message["role"] == "assistant" and self.prompt_title:
-            header = f"*{self.prompt_title}*\n\n***\n\n"
-            message["content"] = message["content"].replace(
-                header, ""
-            )  # replace all occurrences
-        return message
+        # Only add header if a prompt title was set during inlet
+        if self.prompt_title:
+            messages: list[dict[str, Any]] = body.get("messages", [])
+            # Find the latest assistant message and prepend the title
+            for message in reversed(messages):
+                if message.get("role") == "assistant":
+                    original_content = message.get("content", "")
+                    # Simple formatting for the header
+                    header = f"*{self.prompt_title}*\n\n***\n\n"
+                    message["content"] = f"{header}{original_content}"
+                    if self.debug:
+                        print(
+                            f"Added header for prompt title '{self.prompt_title}' to the last assistant message."
+                        )
+                    break  # Stop after modifying the latest one
+            # Reset prompt title after adding it to the response
+            # self.prompt_title = None # Optional: Reset state if desired after use
+
+        if self.debug:
+            print(
+                f"\nModified Response Body (after adding header):\n{json.dumps(body, indent=2)}"
+            )
+
+        return body
+
+    """
+    ---------- Helper methods inside the Pipe class ----------
+    """
+
+    def _update_options(self, body: dict[str, Any], key: str, value: Any):
+        """Safely updates the 'options' dictionary in the request body."""
+        if "options" not in body:
+            body["options"] = {}
+        body["options"][key] = value
+        if self.debug:
+            print(f"Updated options: set '{key}' to {value}")
 
     def _extract_injection_params(
         self, user_message_content: str
-    ) -> tuple[Optional[str], Optional[float], Optional[str], str]:
-        inject_start_tag = '<details type="prompt">'
-        inject_end_tag = "</details>"
-        system_prompt = None
-        temperature = None
-        injection_block = None
-        modified_user_message_content = user_message_content
+    ) -> tuple[str | None, float | None, str | None, str, str | None]:
+        """
+        Extracts parameters (system prompt, temperature, title) from the injection block
+        using regex and removes the block from the content.
 
-        if (
-            inject_start_tag in user_message_content
-            and inject_end_tag in user_message_content
-        ):
-            start_index = user_message_content.find(inject_start_tag)
-            end_index = user_message_content.find(inject_end_tag, start_index) + len(
-                inject_end_tag
-            )
-            injection_block = user_message_content[start_index:end_index]
+        Returns:
+            - system_prompt (str | None): Extracted system prompt. None if not found. Can be empty string.
+            - temperature (float | None): Extracted temperature. None if not found or invalid.
+            - prompt_title (str | None): Extracted prompt title. None if block not found.
+            - modified_content (str): Original content with the injection block removed.
+            - injection_block (str | None): The raw content of the matched injection block for debugging.
+        """
+        system_prompt: str | None = None
+        temperature: float | None = None
+        prompt_title: str | None = None
+        modified_content: str = user_message_content
+        injection_block: str | None = None
 
-            lines = injection_block.split("\n")
-            if len(lines) >= 3:
-                content_lines = lines[
-                    1:-1
-                ]  # Exclude first (start tag) and last (end tag) lines
+        match = DETAILS_BLOCK_REGEX.search(user_message_content)
 
-                if content_lines:
-                    # Extract prompt_title from summary line
-                    summary_line = content_lines[0]
-                    summary_part = summary_line.split("</summary>", 1)[0]
-                    prompt_title_part = summary_part.split(">", 1)[1]
-                    self.prompt_title = prompt_title_part.strip()
+        if match:
+            injection_block = match.group(
+                1
+            )  # Full matched block <details>...</details>
+            prompt_title = match.group(2).strip()  # Content of <summary>
+            params_block = match.group(3)  # Content between </summary> and </details>
 
-                    # Process parameter lines
-                    for line in content_lines[1:]:
-                        stripped_line = line.strip()
-                        if stripped_line.startswith("> "):
-                            param_line = stripped_line[2:]  # Remove the '> ' prefix
-                            key, value = param_line.split(":", 1)
-                            key = key.strip().lower()
-                            value = value.strip()
-                            if key == "system_prompt":
-                                system_prompt = value
-                            elif key == "temperature":
-                                try:
-                                    temperature = float(value)
-                                except ValueError:
-                                    print(
-                                        f"Warning: Invalid temperature value: {value}"
-                                    )
+            # Remove the injection block from the original content
+            # Be careful with potential leading/trailing whitespace after removal
+            if injection_block:  # Check if injection_block is not None
+                modified_content = user_message_content.replace(
+                    injection_block, ""
+                ).strip()
+            else:
+                # This case should ideally not happen if match is successful, but added for safety
+                print(f"Warning: injection_block is None after regex match.")
 
-                    # Remove the entire details block from the user's message
-                    modified_user_message_content = (
-                        user_message_content[:start_index]
-                        + user_message_content[end_index:]
-                    )
+            # Extract key-value pairs from the parameters block
+            for param_match in PARAM_REGEX.finditer(params_block):
+                key = param_match.group(1).strip().lower()
+                value = param_match.group(2).strip()
+
+                if key == "system_prompt":
+                    # Allow empty string as a valid system prompt value
+                    system_prompt = value
+                elif key == "temperature":
+                    try:
+                        temperature = float(value)
+                    except ValueError:
+                        print(
+                            f"Warning: Invalid temperature value '{value}' found in injection block. Ignoring."
+                        )
 
         return (
             system_prompt,
             temperature,
+            prompt_title,
+            modified_content,
             injection_block,
-            modified_user_message_content,
         )
 
-    def _apply_system_prompt(self, body: dict, latest_system_prompt: Optional[str]):
-        if latest_system_prompt:
-            system_message_exists = False
-            for message in body["messages"]:
-                if message["role"] == "system":
-                    message["content"] = latest_system_prompt
-                    system_message_exists = True
-                    break
-            if not system_message_exists:
-                body["messages"].insert(
-                    0, {"role": "system", "content": latest_system_prompt}
+    def _apply_system_prompt(self, body: dict[str, Any], system_prompt_content: str):
+        """
+        Applies a *non-empty* system prompt to the request body.
+        Updates the existing system message or inserts a new one at the beginning.
+        Also updates the 'system' key in the 'options' dictionary if present.
+        """
+        # This function should only be called with non-empty system_prompt_content
+        # due to the check in the inlet method.
+        if not system_prompt_content:
+            if self.debug:
+                print(
+                    "Internal Warning: _apply_system_prompt called with empty content. This should not happen."
                 )
-            self._update_options(body, "system", latest_system_prompt)
+            return  # Do nothing if called with empty string despite the check
+
+        messages: list[dict[str, Any]] = body.get("messages", [])
+        system_message_found = False
+
+        # Iterate through messages to find and update the system message
+        for message in messages:
+            if message.get("role") == "system":
+                message["content"] = system_prompt_content
+                system_message_found = True
+                if self.debug:
+                    print(f"Updated existing system message.")
+                break
+
+        # If no system message exists, insert one at the beginning
+        if not system_message_found:
+            messages.insert(0, {"role": "system", "content": system_prompt_content})
+            body["messages"] = messages  # Ensure the body reflects the change
+            if self.debug:
+                print(f"Inserted new system message at the beginning.")
+
+        # Also update the 'system' option if it exists (some backends might use this)
+        # We update this even if the message was pre-existing, to ensure consistency
+        self._update_options(body, "system", system_prompt_content)
