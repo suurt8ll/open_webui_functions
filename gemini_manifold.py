@@ -212,13 +212,6 @@ class Pipe:
         contents, system_prompt = self._genai_contents_from_messages(
             body.get("messages"), messages_db
         )
-        log.debug(
-            "list[google.genai.types.Content] object that will be given to the Gemini API:",
-        )
-        # FIXME: use log.debug for this too.
-        print(
-            f"\nlist[types.Content]:\n{self._truncate_long_strings(contents, max_length=256)}\n"
-        )
 
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
@@ -253,16 +246,15 @@ class Pipe:
                 )
             )
             gen_content_conf.tools = [types.Tool(google_search_retrieval=gs)]
-        # FIXME: Use log.debug instead.
-        print(
-            f"Passing this config to the Google API:\n{gen_content_conf.model_dump_json(indent=2)}"
-        )
 
         gen_content_args = {
             "model": model_name,
             "contents": contents,
             "config": gen_content_conf,
         }
+        # FIXME: Use log.debug instead.
+        log.debug("Passing these args to the Google API:")
+        print(self._truncate_long_strings(gen_content_args, max_length=512))
 
         if body.get("stream", False):
             # Streaming response.
@@ -301,21 +293,24 @@ class Pipe:
                 await self._emit_error(warn_msg, warning=True)
                 return None
 
-        print(res.model_dump_json(indent=2))
+        log.debug("Got response from the api (last chunk for streaming response):")
+        print(self._truncate_long_strings(res))
         # Emit usage data.
         if usage_event := self._get_usage_data_event(res):
             log.info("Sending empty chat completion event with the token usage info.")
-            print(usage_event)
+            print(self._truncate_long_strings(usage_event))
             await __event_emitter__(usage_event)
         # Emit search queries.
         if queries_status := self._get_status_event_w_queries(res):
             log.info("Sending status event with the used search queries.")
+            print(self._truncate_long_strings(queries_status))
             await __event_emitter__(queries_status)
         # Emit sources.
         if emit_sources := await self._get_chat_completion_event_w_sources(
             res, raw_text
         ):
             log.info("Sending chat completion event with the sources.")
+            print(self._truncate_long_strings(emit_sources))
             await __event_emitter__(emit_sources)
 
         await self._emit_completion(done=True)
@@ -420,6 +415,9 @@ class Pipe:
                 message = cast("AssistantMessage", message)
                 # Google API's assistant role is "model"
                 role = "model"
+                # Offset to correct location if system prompt was inside the body's messages list.
+                if system_prompt:
+                    i -= 1
                 sources = None
                 if messages_db:
                     message_db = cast("AssistantMessageModel", messages_db[i])
@@ -1090,9 +1088,7 @@ class Pipe:
 
     """Other helpers"""
 
-    def _truncate_long_strings(
-        self, data: dict | list | BaseModel, max_length: int = 50
-    ) -> str:
+    def _truncate_long_strings(self, data: Any, max_length: int = 64) -> str:
         """
         Recursively truncates all string and bytes fields within a dictionary or list that exceed
         the specified maximum length. Handles Pydantic BaseModel instances by converting them to dicts.
