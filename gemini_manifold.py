@@ -200,31 +200,30 @@ class Pipe:
 
         # Get the message history directly from the backend.
         # This allows us to see data about sources and files data.
-        chat_id = __metadata__.get("chat_id")
-        if not chat_id:
-            error_msg = "Chat ID not found in request body or metadata."
-            await self._emit_error(error_msg, exception=False)
-            return None
-        chat = Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=__user__["id"])
+        chat_id = __metadata__.get("chat_id", "")
+        if chat := Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=__user__["id"]):
+            chat_content: ChatChatModel = chat.chat  # type: ignore
+            # Last message is the upcoming assistant response, at this point in the logic it's empty.
+            messages_db = chat_content.get("messages")[:-1]
+        else:
+            warn_msg = f"Chat with ID - {chat_id} - not found. Can't filter out the citation marks."
+            log.warning(warn_msg)
+            messages_db = None
 
-        if not chat:
-            error_msg = f"Chat with ID {chat_id} not found."
-            await self._emit_error(error_msg, exception=False)
-            return None
-        print(f"\nChats.ChatModel:\n{self._truncate_long_strings(chat)}\n")
-
-        chat_content: ChatChatModel = chat.chat  # type: ignore
-        messages = chat_content.get("messages")
-        system_prompt = (
-            body["messages"][0]["content"]
-            if body.get("messages") and body["messages"][0].get("role") == "system"
-            else None
-        )
-        contents = self._genai_contents_from_messages(messages)
+        contents = self._genai_contents_from_messages(body.get("messages"), messages_db)
         log.debug(
             "list[google.genai.types.Content] object that will be given to the Gemini API:",
         )
-        print(self._truncate_long_strings(contents))
+        # FIXME: use log.debug for this too.
+        print(
+            f"\nlist[types.Content]:\n{self._truncate_long_strings(contents, max_length=256)}\n"
+        )
+
+        system_prompt: str | None = (
+            body["messages"][0]["content"]
+            if body.get("messages") and body["messages"][0].get("role") == "system"
+            else None
+        )  # type: ignore
 
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
@@ -382,61 +381,60 @@ class Pipe:
     """ChatModel.chat.messages -> list[genai.types.Content] conversion"""
 
     def _genai_contents_from_messages(
-        self, messages: list["MessageModel"]
+        self, messages_body: list["Message"], messages_db: list["MessageModel"] | None
     ) -> list[types.Content]:
-        """
-        Transforms `ChatModel.chat.messages` list into `genai.types.Content`.
-        """
+        """Transforms `body.messages` list into list of `genai.types.Content` objects"""
 
-        def process_user_message(message: "UserMessageModel") -> list[types.Part]:
-            """
-            Processes user message, extracts image parts.
-            """
-            parts: list[types.Part] = []
-            if files := message.get("files"):
-                for file in files:
-                    if file.get("type") == "image":
-                        if image_part := self._genai_part_from_image_url(
-                            file.get("url")
+        def process_user_message(message: "UserMessage") -> list[types.Part]:
+            user_parts = []
+            user_content = message.get("content")
+            if isinstance(user_content, str):
+                user_parts.extend(self._genai_parts_from_text(user_content))
+            elif isinstance(user_content, list):
+                for c in user_content:
+                    c_type = c.get("type")
+                    if c_type == "text":
+                        c = cast("TextContent", c)
+                        # Don't process empty strings.
+                        if c_text := c.get("text"):
+                            user_parts.extend(self._genai_parts_from_text(c_text))
+                    elif c_type == "image_url":
+                        c = cast("ImageContent", c)
+                        if img_part := self._genai_part_from_image_url(
+                            c.get("image_url").get("url")
                         ):
-                            parts.append(image_part)
-            return parts
+                            user_parts.append(img_part)
+            return user_parts
 
         def process_assistant_message(
-            message: "AssistantMessageModel",
-        ) -> tuple[list[types.Part], str]:
-            """
-            Processes assistant message sources. Removes citation markers if they exsist.
-            """
-            parts: list[types.Part] = []
-            filtered_content = content
-            if sources := message.get("sources"):
-                filtered_content = self._remove_citation_markers(content, sources)
-                log.debug(
-                    "Removed source markers from the assistant message.",
-                    new_text=filtered_content,
-                )
-            return parts, filtered_content
+            message: "AssistantMessage", sources: list["Source"] | None
+        ) -> list[types.Part]:
+            # TODO: Remove citation markers from grounded responses.
+            assistant_text = message.get("content")
+            if sources:
+                assistant_text = self._remove_citation_markers(assistant_text, sources)
+            return self._genai_parts_from_text(assistant_text)
 
-        contents: list[types.Content] = []
-        for message in messages:
-            content = message.get("content")
+        contents = []
+        parts = []
+        for i, message in enumerate(messages_body):
             role = message.get("role")
-            parts: list[types.Part] = []
             if role == "user":
-                parts = process_user_message(cast("UserMessageModel", message))
+                message = cast("UserMessage", message)
+                parts = process_user_message(message)
             elif role == "assistant":
-                message = cast("AssistantMessageModel", message)
-                if not message.get("done"):
-                    continue
+                message = cast("AssistantMessage", message)
+                # Google API's assistant role is "model"
                 role = "model"
-                parts, content = process_assistant_message(message)
+                sources = None
+                if messages_db:
+                    message_db = cast("AssistantMessageModel", messages_db[i])
+                    sources = message_db.get("sources")
+                parts = process_assistant_message(message, sources)
             else:
-                log.warning(f"{role} is an unsupported role, skipping this message.")
+                log.warning(f"Role {role} is not valid, skipping to the next message.")
                 continue
-            parts += self._genai_parts_from_text(content)
             contents.append(types.Content(role=role, parts=parts))
-
         return contents
 
     def _genai_part_from_image_url(self, image_url: str) -> Optional[types.Part]:
@@ -453,8 +451,6 @@ class Pipe:
             elif image_url.startswith("data:image"):
                 match = re.match(r"data:(image/\w+);base64,(.+)", image_url)
                 if match:
-                    print(match.group(1))
-                    print(f"{match.group(2)[:20]}[...]{match.group(2)[-20:]}")
                     return types.Part.from_bytes(
                         data=base64.b64decode(match.group(2)),
                         mime_type=match.group(1),
