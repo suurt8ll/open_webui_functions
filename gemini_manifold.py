@@ -21,14 +21,16 @@ requirements: google-genai==1.9.0
 #   - Grounding with Google Search (this requires installing "Gemini Manifold Companion" filter, see GitHub README)
 #   - Safety settings
 #   - Each user can decide to use their own API key.
+#   - Token usage data
 
 # Features that are supported by API but not yet implemented in the manifold:
 #   TODO Audio input support.
 #   TODO Video input support.
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
-#   TODO Display usage statistics (token counts)
 #   TODO Code execution tool.
 
+import copy
+import json
 from google import genai
 from google.genai import types
 import asyncio
@@ -102,8 +104,7 @@ class Pipe:
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=False, description="Whether to request relaxed safety filtering"
         )
-        # FIXME: remove OFF and add TRACE, CRITICAL
-        LOG_LEVEL: Literal["INFO", "WARNING", "ERROR", "DEBUG", "OFF"] = Field(
+        LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
@@ -165,7 +166,7 @@ class Pipe:
 
     async def pipe(
         self,
-        body: dict[str, Any],
+        body: "Body",
         __user__: "UserData",
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]],
@@ -198,34 +199,18 @@ class Pipe:
 
         # Get the message history directly from the backend.
         # This allows us to see data about sources and files data.
-        chat_id = __metadata__.get("chat_id")
-        if not chat_id:
-            error_msg = "Chat ID not found in request body or metadata."
-            await self._emit_error(error_msg, exception=False)
-            return None
-        chat = Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=__user__["id"])
+        chat_id = __metadata__.get("chat_id", "")
+        if chat := Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=__user__["id"]):
+            chat_content: ChatChatModel = chat.chat  # type: ignore
+            # Last message is the upcoming assistant response, at this point in the logic it's empty.
+            messages_db = chat_content.get("messages")[:-1]
+        else:
+            warn_msg = f"Chat with ID - {chat_id} - not found. Can't filter out the citation marks."
+            log.warning(warn_msg)
+            messages_db = None
 
-        if not chat:
-            error_msg = f"Chat with ID {chat_id} not found."
-            await self._emit_error(error_msg, exception=False)
-            return None
-
-        chat_content: ChatChatModel = chat.chat  # type: ignore
-        messages = chat_content.get("messages")
-        system_prompt = (
-            body["messages"][0]["content"]
-            if body.get("messages") and body["messages"][0].get("role") == "system"
-            else None
-        )
-        contents = self._genai_contents_from_messages(messages)
-
-        turn_content_dict_list: list[dict] = []
-        for content in contents:
-            truncated_content = self._truncate_long_strings(content.model_dump())
-            turn_content_dict_list.append(truncated_content)
-        log.debug(
-            "list[google.genai.types.Content] object that will be given to the Gemini API:",
-            content_list=str(turn_content_dict_list),
+        contents, system_prompt = self._genai_contents_from_messages(
+            body.get("messages"), messages_db
         )
 
         # TODO: Take defaults from the general front-end config.
@@ -250,7 +235,6 @@ class Pipe:
                 )
 
         features = __metadata__.get("features", {})
-        print(features)
         if features.get("google_search_tool"):
             log.info("Using grounding with Google Search as a Tool.")
             gen_content_conf.tools = [types.Tool(google_search=types.GoogleSearch())]
@@ -262,16 +246,15 @@ class Pipe:
                 )
             )
             gen_content_conf.tools = [types.Tool(google_search_retrieval=gs)]
-        # FIXME: Use log.debug instead.
-        print(
-            f"Passing this config to the Google API:\n{gen_content_conf.model_dump_json(indent=2)}"
-        )
 
         gen_content_args = {
             "model": model_name,
             "contents": contents,
             "config": gen_content_conf,
         }
+        # FIXME: Use log.debug instead.
+        log.debug("Passing these args to the Google API:")
+        print(self._truncate_long_strings(gen_content_args, max_length=512))
 
         if body.get("stream", False):
             # Streaming response.
@@ -310,21 +293,24 @@ class Pipe:
                 await self._emit_error(warn_msg, warning=True)
                 return None
 
-        print(res.model_dump_json(indent=2))
+        log.debug("Got response from the api (last chunk for streaming response):")
+        print(self._truncate_long_strings(res))
         # Emit usage data.
         if usage_event := self._get_usage_data_event(res):
             log.info("Sending empty chat completion event with the token usage info.")
-            print(usage_event)
+            print(self._truncate_long_strings(usage_event))
             await __event_emitter__(usage_event)
         # Emit search queries.
         if queries_status := self._get_status_event_w_queries(res):
             log.info("Sending status event with the used search queries.")
+            print(self._truncate_long_strings(queries_status))
             await __event_emitter__(queries_status)
         # Emit sources.
         if emit_sources := await self._get_chat_completion_event_w_sources(
             res, raw_text
         ):
             log.info("Sending chat completion event with the sources.")
+            print(self._truncate_long_strings(emit_sources))
             await __event_emitter__(emit_sources)
 
         await self._emit_completion(done=True)
@@ -384,62 +370,68 @@ class Pipe:
     """ChatModel.chat.messages -> list[genai.types.Content] conversion"""
 
     def _genai_contents_from_messages(
-        self, messages: list["MessageModel"]
-    ) -> list[types.Content]:
-        """
-        Transforms `ChatModel.chat.messages` list into `genai.types.Content`.
-        """
+        self, messages_body: list["Message"], messages_db: list["MessageModel"] | None
+    ) -> tuple[list[types.Content], str | None]:
+        """Transforms `body.messages` list into list of `genai.types.Content` objects"""
 
-        def process_user_message(message: "UserMessageModel") -> list[types.Part]:
-            """
-            Processes user message, extracts image parts.
-            """
-            parts: list[types.Part] = []
-            if files := message.get("files"):
-                for file in files:
-                    if file.get("type") == "image":
-                        if image_part := self._genai_part_from_image_url(
-                            file.get("url")
+        def process_user_message(message: "UserMessage") -> list[types.Part]:
+            user_parts = []
+            user_content = message.get("content")
+            if isinstance(user_content, str):
+                user_parts.extend(self._genai_parts_from_text(user_content))
+            elif isinstance(user_content, list):
+                for c in user_content:
+                    c_type = c.get("type")
+                    if c_type == "text":
+                        c = cast("TextContent", c)
+                        # Don't process empty strings.
+                        if c_text := c.get("text"):
+                            user_parts.extend(self._genai_parts_from_text(c_text))
+                    elif c_type == "image_url":
+                        c = cast("ImageContent", c)
+                        if img_part := self._genai_part_from_image_url(
+                            c.get("image_url").get("url")
                         ):
-                            parts.append(image_part)
-            return parts
+                            user_parts.append(img_part)
+            return user_parts
 
         def process_assistant_message(
-            message: "AssistantMessageModel",
-        ) -> tuple[list[types.Part], str]:
-            """
-            Processes assistant message sources. Removes citation markers if they exsist.
-            """
-            parts: list[types.Part] = []
-            filtered_content = content
-            if sources := message.get("sources"):
-                filtered_content = self._remove_citation_markers(content, sources)
-                log.debug(
-                    "Removed source markers from the assistant message.",
-                    new_text=filtered_content,
-                )
-            return parts, filtered_content
+            message: "AssistantMessage", sources: list["Source"] | None
+        ) -> list[types.Part]:
+            assistant_text = message.get("content")
+            if sources:
+                assistant_text = self._remove_citation_markers(assistant_text, sources)
+            return self._genai_parts_from_text(assistant_text)
 
-        contents: list[types.Content] = []
-        for message in messages:
-            content = message.get("content")
+        system_prompt = None
+        contents = []
+        parts = []
+        for i, message in enumerate(messages_body):
             role = message.get("role")
-            parts: list[types.Part] = []
             if role == "user":
-                parts = process_user_message(cast("UserMessageModel", message))
+                message = cast("UserMessage", message)
+                parts = process_user_message(message)
             elif role == "assistant":
-                message = cast("AssistantMessageModel", message)
-                if not message.get("done"):
-                    continue
+                message = cast("AssistantMessage", message)
+                # Google API's assistant role is "model"
                 role = "model"
-                parts, content = process_assistant_message(message)
-            else:
-                log.warning(f"{role} is an unsupported role, skipping this message.")
+                # Offset to correct location if system prompt was inside the body's messages list.
+                if system_prompt:
+                    i -= 1
+                sources = None
+                if messages_db:
+                    message_db = cast("AssistantMessageModel", messages_db[i])
+                    sources = message_db.get("sources")
+                parts = process_assistant_message(message, sources)
+            elif role == "system":
+                message = cast("SystemMessage", message)
+                system_prompt = message.get("content")
                 continue
-            parts += self._genai_parts_from_text(content)
+            else:
+                log.warning(f"Role {role} is not valid, skipping to the next message.")
+                continue
             contents.append(types.Content(role=role, parts=parts))
-
-        return contents
+        return contents, system_prompt
 
     def _genai_part_from_image_url(self, image_url: str) -> Optional[types.Part]:
         """
@@ -455,8 +447,6 @@ class Pipe:
             elif image_url.startswith("data:image"):
                 match = re.match(r"data:(image/\w+);base64,(.+)", image_url)
                 if match:
-                    print(match.group(1))
-                    print(f"{match.group(2)[:20]}[...]{match.group(2)[-20:]}")
                     return types.Part.from_bytes(
                         data=base64.b64decode(match.group(2)),
                         mime_type=match.group(1),
@@ -879,6 +869,7 @@ class Pipe:
             """Asynchronously resolves a URL by following redirects to get final destination URL
             Returns original URL if resolution fails.
             """
+            # FIXME: Handle timeouts.
             try:
                 async with session.get(url, allow_redirects=True) as response:
                     return str(response.url)
@@ -902,7 +893,6 @@ class Pipe:
         ):
             return None
 
-        # TODO: Add the used search queries as status message.
         supports = grounding_metadata.grounding_supports
         grounding_chunks = grounding_metadata.grounding_chunks
 
@@ -987,7 +977,7 @@ class Pipe:
         Creates a StatusEvent with Google search URLs based on the web_search_queries
         in the GenerateContentResponse.
         """
-        # TODO: Merge with _get_chat_completion_event_w_sources because alotof logic is overlapping.
+        # TODO: Merge with _get_chat_completion_event_w_sources because a lot of logic is overlapping.
         if (
             not data.candidates
             or not data.candidates[0].grounding_metadata
@@ -1098,41 +1088,50 @@ class Pipe:
 
     """Other helpers"""
 
-    def _truncate_long_strings(
-        self, data: dict[str, Any], max_length: int = 50
-    ) -> dict[str, Any]:
+    def _truncate_long_strings(self, data: Any, max_length: int = 64) -> str:
         """
-        Recursively truncates all string and bytes fields within a dictionary that exceed
-        the specified maximum length. Bytes are converted to strings before truncation.
+        Recursively truncates all string and bytes fields within a dictionary or list that exceed
+        the specified maximum length. Handles Pydantic BaseModel instances by converting them to dicts.
+        The original input data remains unmodified.
 
         Args:
-            data: A dictionary representing the JSON data.
+            data: A dictionary, list, or Pydantic BaseModel instance containing data that may include Pydantic models or dictionaries.
             max_length: The maximum length of strings before truncation.
 
         Returns:
-            The modified dictionary with long strings truncated.
+            A nicely formatted string representation of the modified data with long strings truncated.
         """
-        for key, value in data.items():
-            if isinstance(value, str) and len(value) > max_length:
-                truncated_length = len(value) - max_length
-                data[key] = value[:max_length] + f"[{truncated_length} chars truncated]"
-            elif isinstance(value, bytes) and len(value) > max_length:
-                truncated_length = len(value) - max_length
-                data[key] = (
-                    value.hex()[:max_length]
-                    + f"[{truncated_length} hex chars truncated]"
-                )
-            elif isinstance(value, dict):
-                self._truncate_long_strings(
-                    value, max_length
-                )  # Recursive call for nested dictionaries
-            elif isinstance(value, list):
-                # Iterate through the list and process each element if it's a dictionary
-                for item in value:
-                    if isinstance(item, dict):
-                        self._truncate_long_strings(item, max_length)
 
-        return data
+        def process_data(data: Any, max_length: int) -> Any:
+            if isinstance(data, BaseModel):
+                data_dict = data.model_dump()
+                return process_data(data_dict, max_length)
+            elif isinstance(data, dict):
+                for key, value in list(data.items()):
+                    data[key] = process_data(value, max_length)
+                return data
+            elif isinstance(data, list):
+                for idx, item in enumerate(data):
+                    data[idx] = process_data(item, max_length)
+                return data
+            elif isinstance(data, str):
+                if len(data) > max_length:
+                    truncated_length = len(data) - max_length
+                    return f"{data[:max_length]}[{truncated_length} chars truncated]"
+                return data
+            elif isinstance(data, bytes):
+                hex_str = data.hex()
+                if len(hex_str) > max_length:
+                    truncated_length = len(hex_str) - max_length
+                    return f"{hex_str[:max_length]}[{truncated_length} chars truncated]"
+                else:
+                    return hex_str
+            else:
+                return data
+
+        copied_data = copy.deepcopy(data)
+        processed = process_data(copied_data, max_length)
+        return json.dumps(processed, indent=2, default=str)
 
     def _add_log_handler(self):
         """Adds handler to the root loguru instance for this plugin if one does not exist already."""
