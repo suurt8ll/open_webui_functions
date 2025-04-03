@@ -10,18 +10,11 @@ version: 0.6.0
 
 # The injection must follow this format (without triple quotes).
 """
-**###INJECT_START###**
-
-prompt_title:{{prompt_title}}
-
-system_prompt:{{system_prompt}}
-
-temperature:{{temperature}}
-
-**###INJECT_END###**
-
-***
-
+<details type="prompt">
+<summary>{{prompt_title}}</summary>
+> system_prompt:{{system_prompt}}
+> temperature:{{temperature}}
+</details>
 {{content}}
 """
 
@@ -57,8 +50,8 @@ class Filter:
     def _extract_injection_params(
         self, user_message_content: str
     ) -> tuple[Optional[str], Optional[float], Optional[str], str]:
-        inject_start_tag = "**###INJECT_START###**\n"
-        inject_end_tag = "**###INJECT_END###**\n* * *\n"
+        inject_start_tag = '<details type="prompt">'
+        inject_end_tag = "</details>"
         system_prompt = None
         temperature = None
         injection_block = None
@@ -68,37 +61,48 @@ class Filter:
             inject_start_tag in user_message_content
             and inject_end_tag in user_message_content
         ):
-            start_index = user_message_content.find(inject_start_tag) + len(
-                inject_start_tag
+            start_index = user_message_content.find(inject_start_tag)
+            end_index = user_message_content.find(inject_end_tag, start_index) + len(
+                inject_end_tag
             )
-            end_index = user_message_content.find(inject_end_tag)
-            injection_block = user_message_content[start_index:end_index].strip()
+            injection_block = user_message_content[start_index:end_index]
 
-            for line in injection_block.strip().split("\n"):
-                if ":" in line:
-                    key, value = line.split(":", 1)
-                    key = key.strip().lower()
-                    value = value.strip()
-                    if key == "prompt_title":
-                        self.prompt_title = value
-                    elif key == "system_prompt":
-                        system_prompt = value
-                    elif key == "temperature":
-                        try:
-                            temperature = float(value)
-                        except ValueError:
-                            print(
-                                f"Warning: Invalid temperature value: {value}"
-                            )  # Keep warning but avoid print in core logic for modularity
+            lines = injection_block.split("\n")
+            if len(lines) >= 3:
+                content_lines = lines[
+                    1:-1
+                ]  # Exclude first (start tag) and last (end tag) lines
 
-            modified_user_message_content = (
-                user_message_content[
-                    : start_index - len(inject_start_tag)
-                ].strip()  # Correctly remove tags
-                + user_message_content[
-                    end_index + len(inject_end_tag) :
-                ].strip()  # Correctly remove tags
-            )
+                if content_lines:
+                    # Extract prompt_title from summary line
+                    summary_line = content_lines[0]
+                    summary_part = summary_line.split("</summary>", 1)[0]
+                    prompt_title_part = summary_part.split(">", 1)[1]
+                    self.prompt_title = prompt_title_part.strip()
+
+                    # Process parameter lines
+                    for line in content_lines[1:]:
+                        stripped_line = line.strip()
+                        if stripped_line.startswith("> "):
+                            param_line = stripped_line[2:]  # Remove the '> ' prefix
+                            key, value = param_line.split(":", 1)
+                            key = key.strip().lower()
+                            value = value.strip()
+                            if key == "system_prompt":
+                                system_prompt = value
+                            elif key == "temperature":
+                                try:
+                                    temperature = float(value)
+                                except ValueError:
+                                    print(
+                                        f"Warning: Invalid temperature value: {value}"
+                                    )
+
+                    # Remove the entire details block from the user's message
+                    modified_user_message_content = (
+                        user_message_content[:start_index]
+                        + user_message_content[end_index:]
+                    )
 
         return (
             system_prompt,
