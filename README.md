@@ -9,8 +9,7 @@ This repository contains a collection of Open WebUI plugins I have personally co
 -   `venice_manifold.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/venice_image_generation) | Enables image creation by using any diffusion model offered by Venice.ai API.
 -   `system_prompt_injector.py` | The idea is to allow changing chat options like system prompt and temperature from the chatbox. It would pair nicely with Prompts feature Open WebUI offers.
 -   `function_updater.py` | Monitors specified Python files (defined in the `.env` file). When a file change is detected, it automatically updates the corresponding function in the Open WebUI backend using the REST API. Requires function metadata (id, title, description) to be defined in the file's docstring.
--   `smallthinker_filter.py` | At first I wanted to code a simple filter that makes output of the `smallthinker:3b` nicer but now I'm thinking of turning it into more general reasoning model formatter.
--   `thinking_gemini.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/thinking_gemini) | An outdated script, initially developed for `gemini-2.0-flash-thinking-exp` model interactions. Superseded by `gemini_manifold.py`.
+-   `archived_functions/` | This directory contains old functions that I'm not developing anymore.
 -   `test_and_example_functions/` | This directory contains different test and example plugins I usually code up when exploring what is possible.
 
 ## Contributing
