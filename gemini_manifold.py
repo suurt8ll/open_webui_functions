@@ -29,6 +29,8 @@ requirements: google-genai==1.9.0
 #   TODO Display usage statistics (token counts)
 #   TODO Code execution tool.
 
+import copy
+import json
 from google import genai
 from google.genai import types
 import asyncio
@@ -165,7 +167,7 @@ class Pipe:
 
     async def pipe(
         self,
-        body: dict[str, Any],
+        body: "Body",
         __user__: "UserData",
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]],
@@ -209,6 +211,7 @@ class Pipe:
             error_msg = f"Chat with ID {chat_id} not found."
             await self._emit_error(error_msg, exception=False)
             return None
+        print(f"\nChats.ChatModel:\n{self._truncate_long_strings(chat)}\n")
 
         chat_content: ChatChatModel = chat.chat  # type: ignore
         messages = chat_content.get("messages")
@@ -218,15 +221,10 @@ class Pipe:
             else None
         )
         contents = self._genai_contents_from_messages(messages)
-
-        turn_content_dict_list: list[dict] = []
-        for content in contents:
-            truncated_content = self._truncate_long_strings(content.model_dump())
-            turn_content_dict_list.append(truncated_content)
         log.debug(
             "list[google.genai.types.Content] object that will be given to the Gemini API:",
-            content_list=str(turn_content_dict_list),
         )
+        print(self._truncate_long_strings(contents))
 
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
@@ -1099,40 +1097,51 @@ class Pipe:
     """Other helpers"""
 
     def _truncate_long_strings(
-        self, data: dict[str, Any], max_length: int = 50
-    ) -> dict[str, Any]:
+        self, data: dict | list | BaseModel, max_length: int = 50
+    ) -> str:
         """
-        Recursively truncates all string and bytes fields within a dictionary that exceed
-        the specified maximum length. Bytes are converted to strings before truncation.
+        Recursively truncates all string and bytes fields within a dictionary or list that exceed
+        the specified maximum length. Handles Pydantic BaseModel instances by converting them to dicts.
+        The original input data remains unmodified.
 
         Args:
-            data: A dictionary representing the JSON data.
+            data: A dictionary, list, or Pydantic BaseModel instance containing data that may include Pydantic models or dictionaries.
             max_length: The maximum length of strings before truncation.
 
         Returns:
-            The modified dictionary with long strings truncated.
+            A nicely formatted string representation of the modified data with long strings truncated.
         """
-        for key, value in data.items():
-            if isinstance(value, str) and len(value) > max_length:
-                truncated_length = len(value) - max_length
-                data[key] = value[:max_length] + f"[{truncated_length} chars truncated]"
-            elif isinstance(value, bytes) and len(value) > max_length:
-                truncated_length = len(value) - max_length
-                data[key] = (
-                    value.hex()[:max_length]
-                    + f"[{truncated_length} hex chars truncated]"
-                )
-            elif isinstance(value, dict):
-                self._truncate_long_strings(
-                    value, max_length
-                )  # Recursive call for nested dictionaries
-            elif isinstance(value, list):
-                # Iterate through the list and process each element if it's a dictionary
-                for item in value:
-                    if isinstance(item, dict):
-                        self._truncate_long_strings(item, max_length)
 
-        return data
+        def process_data(data: Any, max_length: int) -> Any:
+            if isinstance(data, BaseModel):
+                data_dict = data.model_dump()
+                return process_data(data_dict, max_length)
+            elif isinstance(data, dict):
+                for key, value in list(data.items()):
+                    data[key] = process_data(value, max_length)
+                return data
+            elif isinstance(data, list):
+                for idx, item in enumerate(data):
+                    data[idx] = process_data(item, max_length)
+                return data
+            elif isinstance(data, str):
+                if len(data) > max_length:
+                    truncated_length = len(data) - max_length
+                    return f"{data[:max_length]}[{truncated_length} chars truncated]"
+                return data
+            elif isinstance(data, bytes):
+                hex_str = data.hex()
+                if len(hex_str) > max_length:
+                    truncated_length = len(hex_str) - max_length
+                    return f"{hex_str[:max_length]}[{truncated_length} chars truncated]"
+                else:
+                    return hex_str
+            else:
+                return data
+
+        copied_data = copy.deepcopy(data)
+        processed = process_data(copied_data, max_length)
+        return json.dumps(processed, indent=2, default=str)
 
     def _add_log_handler(self):
         """Adds handler to the root loguru instance for this plugin if one does not exist already."""

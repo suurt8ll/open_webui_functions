@@ -98,7 +98,7 @@ Content = TextContent | ImageContent
 
 
 class UserMessage(TypedDict):
-    role: Literal["user", "assistant"]
+    role: Literal["user"]
     content: str | list[Content]
 
 
