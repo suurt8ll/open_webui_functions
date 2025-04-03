@@ -21,12 +21,12 @@ requirements: google-genai==1.9.0
 #   - Grounding with Google Search (this requires installing "Gemini Manifold Companion" filter, see GitHub README)
 #   - Safety settings
 #   - Each user can decide to use their own API key.
+#   - Token usage data
 
 # Features that are supported by API but not yet implemented in the manifold:
 #   TODO Audio input support.
 #   TODO Video input support.
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
-#   TODO Display usage statistics (token counts)
 #   TODO Code execution tool.
 
 import copy
@@ -104,8 +104,7 @@ class Pipe:
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=False, description="Whether to request relaxed safety filtering"
         )
-        # FIXME: remove OFF and add TRACE, CRITICAL
-        LOG_LEVEL: Literal["INFO", "WARNING", "ERROR", "DEBUG", "OFF"] = Field(
+        LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
@@ -210,7 +209,9 @@ class Pipe:
             log.warning(warn_msg)
             messages_db = None
 
-        contents = self._genai_contents_from_messages(body.get("messages"), messages_db)
+        contents, system_prompt = self._genai_contents_from_messages(
+            body.get("messages"), messages_db
+        )
         log.debug(
             "list[google.genai.types.Content] object that will be given to the Gemini API:",
         )
@@ -218,12 +219,6 @@ class Pipe:
         print(
             f"\nlist[types.Content]:\n{self._truncate_long_strings(contents, max_length=256)}\n"
         )
-
-        system_prompt: str | None = (
-            body["messages"][0]["content"]
-            if body.get("messages") and body["messages"][0].get("role") == "system"
-            else None
-        )  # type: ignore
 
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
@@ -247,7 +242,6 @@ class Pipe:
                 )
 
         features = __metadata__.get("features", {})
-        print(features)
         if features.get("google_search_tool"):
             log.info("Using grounding with Google Search as a Tool.")
             gen_content_conf.tools = [types.Tool(google_search=types.GoogleSearch())]
@@ -382,7 +376,7 @@ class Pipe:
 
     def _genai_contents_from_messages(
         self, messages_body: list["Message"], messages_db: list["MessageModel"] | None
-    ) -> list[types.Content]:
+    ) -> tuple[list[types.Content], str | None]:
         """Transforms `body.messages` list into list of `genai.types.Content` objects"""
 
         def process_user_message(message: "UserMessage") -> list[types.Part]:
@@ -409,12 +403,12 @@ class Pipe:
         def process_assistant_message(
             message: "AssistantMessage", sources: list["Source"] | None
         ) -> list[types.Part]:
-            # TODO: Remove citation markers from grounded responses.
             assistant_text = message.get("content")
             if sources:
                 assistant_text = self._remove_citation_markers(assistant_text, sources)
             return self._genai_parts_from_text(assistant_text)
 
+        system_prompt = None
         contents = []
         parts = []
         for i, message in enumerate(messages_body):
@@ -431,11 +425,15 @@ class Pipe:
                     message_db = cast("AssistantMessageModel", messages_db[i])
                     sources = message_db.get("sources")
                 parts = process_assistant_message(message, sources)
+            elif role == "system":
+                message = cast("SystemMessage", message)
+                system_prompt = message.get("content")
+                continue
             else:
                 log.warning(f"Role {role} is not valid, skipping to the next message.")
                 continue
             contents.append(types.Content(role=role, parts=parts))
-        return contents
+        return contents, system_prompt
 
     def _genai_part_from_image_url(self, image_url: str) -> Optional[types.Part]:
         """
@@ -873,6 +871,7 @@ class Pipe:
             """Asynchronously resolves a URL by following redirects to get final destination URL
             Returns original URL if resolution fails.
             """
+            # FIXME: Handle timeouts.
             try:
                 async with session.get(url, allow_redirects=True) as response:
                     return str(response.url)
@@ -896,7 +895,6 @@ class Pipe:
         ):
             return None
 
-        # TODO: Add the used search queries as status message.
         supports = grounding_metadata.grounding_supports
         grounding_chunks = grounding_metadata.grounding_chunks
 
@@ -981,7 +979,7 @@ class Pipe:
         Creates a StatusEvent with Google search URLs based on the web_search_queries
         in the GenerateContentResponse.
         """
-        # TODO: Merge with _get_chat_completion_event_w_sources because alotof logic is overlapping.
+        # TODO: Merge with _get_chat_completion_event_w_sources because a lot of logic is overlapping.
         if (
             not data.candidates
             or not data.candidates[0].grounding_metadata

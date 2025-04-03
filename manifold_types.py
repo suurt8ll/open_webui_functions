@@ -107,7 +107,12 @@ class AssistantMessage(TypedDict):
     content: str
 
 
-Message = UserMessage | AssistantMessage
+class SystemMessage(TypedDict):
+    role: Literal["system"]
+    content: str
+
+
+Message = UserMessage | AssistantMessage | SystemMessage
 
 
 class Body(TypedDict):
