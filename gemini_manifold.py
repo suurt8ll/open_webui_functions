@@ -225,8 +225,12 @@ class Pipe:
         )
 
         gen_content_conf.response_modalities = ["Text"]
-        if "gemini-2.0-flash-exp-image-generation" in model_name:
-            gen_content_conf.response_modalities.append("Image")
+        if (
+            "gemini-2.0-flash-exp-image-generation" in model_name
+            or "gemma" in model_name
+        ):
+            if "gemini-2.0-flash-exp-image-generation" in model_name:
+                gen_content_conf.response_modalities.append("Image")
             # FIXME: append to user message instead.
             if gen_content_conf.system_instruction:
                 gen_content_conf.system_instruction = None
