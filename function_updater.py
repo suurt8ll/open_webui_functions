@@ -313,17 +313,22 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    shutdown_event = asyncio.Event()  # Create an event for shutdown signal
+    shutdown_event = asyncio.Event()
 
     def signal_handler(signum, frame):
         logger.warning(f"Received signal {signum}. Shutting down...")
         shutdown_event.set()
 
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, signal_handler, sig, None)
+    async def main_wrapper():
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, signal_handler, sig, None)
+
+        await main()
 
     try:
-        loop.run_until_complete(main())
+        asyncio.run(main_wrapper())
+    except Exception:
+        logger.exception(f"An error occurred:")
     finally:
-        loop.close()
+        logger.info("Shutting down...")
