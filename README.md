@@ -33,7 +33,7 @@ The `dev/` directory contains tools and configuration files used for developing 
 
 ## Archived Functions
 
-The `archived_functions/` directory contains old functions that are no longer actively developed.
+The `plugins/archived/` directory contains old functions that are no longer actively developed.
 
 ## Contributing
 
