@@ -8,19 +8,16 @@ set -euo pipefail
 # --- Configuration ---
 
 # Project structure definition
-# Get the directory containing this script
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
-PROJECT_ROOT="$SCRIPT_DIR" # Assuming this script is at the project root
+PROJECT_ROOT="$SCRIPT_DIR"
 FRONTEND_DIR="$PROJECT_ROOT/submodules/open-webui"
-BACKEND_DIR="$FRONTEND_DIR/backend" # OpenWebUI's backend is inside its own dir
+BACKEND_DIR="$FRONTEND_DIR/backend"
 
 # Virtual environment paths (adjust if different)
 BACKEND_VENV_DIR="$BACKEND_DIR/.venv"
-UPDATER_VENV_DIR="$PROJECT_ROOT/.venv" # Assumes a separate venv for the updater
+UPDATER_VENV_DIR="$PROJECT_ROOT/.venv"
 
 # --- Helper Functions ---
-
-# Function to check and install npm dependencies
 check_and_install_npm() {
     local target_dir="$1"
     local needs_install=false
@@ -140,7 +137,6 @@ check_updater_venv() {
     echo "Updater venv found."
 }
 
-
 # --- Main Setup ---
 
 echo "Starting development environment setup..."
@@ -160,37 +156,33 @@ echo "Setup complete. Launching tmux session..."
 # --- tmux Launch ---
 
 # Check if already inside tmux
-set +u  # Disable "nounset" temporarily
+set +u
 if [ -n "$TMUX" ]; then
     echo "Already inside a tmux session. Skipping new session creation."
     exit 0
 fi
-set -u  # Re-enable "nounset"
+set -u
 
-SESSION_NAME="openwebui_dev_session" # Use a more descriptive name
+SESSION_NAME="openwebui_dev_session"
 
-# Start a new tmux session, detached (-d), with a specific name (-s)
-# The first window is created automatically.
-tmux new-session -d -s "$SESSION_NAME" -n "backend" # Name the first window 'backend'
-
-# Send commands to the first window (index 0: backend)
-# Activate venv and use 'exec' to run the main backend command.
-# When the backend command exits, the shell running it exits, closing the pane/window.
+# Backend start command
 PORT="${PORT:-8080}"
 BACKEND_START_COMMAND="uvicorn open_webui.main:app --port $PORT --host 127.0.0.1 --forwarded-allow-ips '*' --reload"
-tmux send-keys -t "$SESSION_NAME:backend" "cd '$BACKEND_DIR'" Enter
-tmux send-keys -t "$SESSION_NAME:backend" ". '$BACKEND_VENV_DIR/bin/activate'" Enter
-tmux send-keys -t "$SESSION_NAME:backend" "echo '--- Starting Backend ---'" Enter
-tmux send-keys -t "$SESSION_NAME:backend" "exec $BACKEND_START_COMMAND" Enter
 
-# Create the second window for function_updater.py
-# Pass the command directly to new-window. Use 'exec' for auto-closing.
-UPDATER_COMMAND="python function_updater.py"
-tmux new-window -t "$SESSION_NAME" -n "function-updater" \
-    "cd '$PROJECT_ROOT' && \
-     . '$UPDATER_VENV_DIR/bin/activate' && \
-     echo '--- Starting Function Updater ---' && \
-     exec $UPDATER_COMMAND"
+# Construct the full command for the backend window
+BACKEND_COMMAND="cd '$BACKEND_DIR' && \
+                   . '$BACKEND_VENV_DIR/bin/activate' && \
+                   echo '--- Starting Backend ---' && \
+                   exec $BACKEND_START_COMMAND"
+
+# Construct the full command for the function updater window
+UPDATER_COMMAND="cd '$PROJECT_ROOT' && \
+                   . '$UPDATER_VENV_DIR/bin/activate' && \
+                   echo '--- Starting Function Updater ---' && \
+                   exec python function_updater.py"
+
+# Create a new tmux session with two windows, executing the commands directly
+tmux new-session -d -s "$SESSION_NAME" -n "backend" "$BACKEND_COMMAND" \; new-window -n "function-updater" "$UPDATER_COMMAND"
 
 # Select the first window (backend) to be active when attaching
 tmux select-window -t "$SESSION_NAME:backend"
