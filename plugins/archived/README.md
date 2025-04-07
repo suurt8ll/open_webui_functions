@@ -1,4 +1,4 @@
-# Archived Functions
+# Archived Plugins
 
 Functions here are discontinued, I'm not developing them anymore.
 
