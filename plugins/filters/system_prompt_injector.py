@@ -22,9 +22,12 @@ version: 0.6.0
 # TODO: Keep the latest prompt template settings if no setting were given in the last message.
 
 from pydantic import BaseModel
-from typing import Any
+from typing import Any, Awaitable, Callable, TYPE_CHECKING
 import json
 import re
+
+if TYPE_CHECKING:
+    from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 # --- Constants ---
 # Regex to find the entire details block and capture its components
@@ -150,8 +153,11 @@ class Filter:
 
         return body
 
-    def outlet(
-        self, body: dict[str, Any], __user__: dict[str, Any] | None = None
+    async def outlet(
+        self,
+        body: dict[str, Any],
+        __event_emitter__: Callable[["Event"], Awaitable[None]],
+        __user__: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Processes the response body from the LLM.
@@ -163,19 +169,11 @@ class Filter:
 
         # Only add header if a prompt title was set during inlet
         if self.prompt_title:
-            messages: list[dict[str, Any]] = body.get("messages", [])
-            # Find the latest assistant message and prepend the title
-            for message in reversed(messages):
-                if message.get("role") == "assistant":
-                    original_content = message.get("content", "")
-                    # Simple formatting for the header
-                    header = f"*{self.prompt_title}*\n\n***\n\n"
-                    message["content"] = f"{header}{original_content}"
-                    if self.debug:
-                        print(
-                            f"Added header for prompt title '{self.prompt_title}' to the last assistant message."
-                        )
-                    break  # Stop after modifying the latest one
+            status_event: "StatusEvent" = {
+                "type": "status",
+                "data": {"description": self.prompt_title},
+            }
+            await __event_emitter__(status_event)
             # Reset prompt title after adding it to the response
             # self.prompt_title = None # Optional: Reset state if desired after use
 
