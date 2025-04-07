@@ -1,60 +1,12 @@
 import hashlib
 import os
-from typing import Optional
-from dotenv import load_dotenv
-import aiohttp  # For asynchronous HTTP requests
-import aiofiles  # For asynchronous file operations
-import logging
 import asyncio
-import coloredlogs
-import signal  # Import the signal module for handling signals
+import signal
 
-
-class CustomFormatter(logging.Formatter):
-    """Custom formatter to add thread name."""
-
-    def format(self, record):
-        if asyncio.iscoroutinefunction(record.funcName):
-            record.funcName = f"{record.funcName} [coroutine]"
-        return super().format(record)
-
-
-# Configure logging
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)  # Set the root logger level
-
-# Create a handler for console output
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)  # Set the console handler level
-
-# Create a formatter and set it for the handler
-formatter = CustomFormatter(
-    "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s - %(message)s"
-)
-console_handler.setFormatter(formatter)
-
-# Add the handler to the logger
-logger.addHandler(console_handler)
-
-# Install coloredlogs with custom format and level styles
-coloredlogs.install(
-    level="DEBUG",
-    logger=logger,
-    fmt="%(asctime)s - %(name)s - %(levelname)s - %(funcName)s - %(message)s",
-    level_styles={
-        "debug": {"color": "white"},
-        "info": {"color": "green"},
-        "warning": {"color": "yellow"},
-        "error": {"color": "red"},
-        "critical": {"color": "red", "bold": True},
-    },
-    field_styles={
-        "asctime": {"color": "blue"},
-        "name": {"color": "cyan"},
-        "levelname": {"color": "white"},
-        "funcName": {"color": "cyan"},
-    },
-)
+import aiohttp
+import aiofiles
+from dotenv import load_dotenv
+from loguru import logger
 
 
 async def file_hash(filename: str) -> str:
@@ -264,13 +216,20 @@ async def process_file(
     path: str,
     api_endpoint: str,
     api_key: str,
-    file_states: dict[str, Optional[str]],
+    file_states: dict[str, str | None],
     session: aiohttp.ClientSession,
+    missing_file_logged: set[str],
 ):
     """Process a single file, checking for changes and updating/creating."""
     if not os.path.exists(path):
-        logger.warning(f"Missing file: {path}")
+        if path not in missing_file_logged:
+            logger.warning(f"Missing file: {path}")
+            missing_file_logged.add(path)
         return
+
+    # If the file exists, ensure it's removed from the missing_file_logged set
+    if path in missing_file_logged:
+        missing_file_logged.remove(path)
 
     current_hash = await file_hash(path)
     if not current_hash:
@@ -309,7 +268,8 @@ async def main() -> None:
     api_key = env_vars["API_KEY"]
     polling_interval = int(env_vars["POLLING_INTERVAL"])
 
-    file_states: dict[str, Optional[str]] = {path: None for path in filepaths}
+    file_states: dict[str, str | None] = {path: None for path in filepaths}
+    missing_file_logged: set[str] = set()  # Keep track of files we've warned about
 
     api_available = True  # Assume API is available at startup
     api_unavailable_logged = False  # Flag to track if "API unavailable" has been logged
@@ -338,7 +298,12 @@ async def main() -> None:
             if api_available:  # Only process files if API is available
                 tasks = [
                     process_file(
-                        path, api_endpoint + "/api/v1", api_key, file_states, session
+                        path,
+                        api_endpoint + "/api/v1",
+                        api_key,
+                        file_states,
+                        session,
+                        missing_file_logged,
                     )
                     for path in filepaths
                 ]
@@ -348,17 +313,22 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    shutdown_event = asyncio.Event()  # Create an event for shutdown signal
+    shutdown_event = asyncio.Event()
 
     def signal_handler(signum, frame):
         logger.warning(f"Received signal {signum}. Shutting down...")
         shutdown_event.set()
 
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, signal_handler, sig, None)
+    async def main_wrapper():
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, signal_handler, sig, None)
+
+        await main()
 
     try:
-        loop.run_until_complete(main())
+        asyncio.run(main_wrapper())
+    except Exception:
+        logger.exception(f"An error occurred:")
     finally:
-        loop.close()
+        logger.info("Shutting down...")
