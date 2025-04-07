@@ -37,24 +37,7 @@ The `archived_functions/` directory contains old functions that are no longer ac
 
 ## Contributing
 
-Contributions are welcome! Here's how to contribute:
-
-1.  **Fork the repository** to your own GitHub account.
-2.  **Create a feature branch** based on the `master` branch.  Name your branch something descriptive, like `feature/add-new-functionality` or `fix/bug-description`.
-
-    ```bash
-    git checkout master
-    git checkout -b feature/your-feature-name
-    ```
-
-3.  **Commit your changes** with clear and informative commit messages.
-4.  **Push your feature branch** to your forked repository.
-
-    ```bash
-    git push origin feature/your-feature-name
-    ```
-
-5.  **Open a pull request** on GitHub, targeting the **`master` branch** of the main repository.
+Contributions are welcome! Please see the [CONTRIBUTING.md](CONTRIBUTING.md) file for guidelines on how to contribute to this project.
 
 ## License
 
