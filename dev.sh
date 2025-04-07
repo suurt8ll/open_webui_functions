@@ -119,13 +119,24 @@ setup_backend_venv() {
 # Function to check updater python environment
 check_updater_venv() {
     local venv_dir="$1"
+    local requirements_file="$PROJECT_ROOT/requirements.txt"
     echo "Checking function_updater environment..."
     if [ ! -f "$venv_dir/bin/activate" ]; then
         echo "ERROR: Updater virtual environment not found at '$venv_dir'."
         echo "Please create it first (e.g., python -m venv $venv_dir)"
         exit 1
     fi
-     # You could add a pip install here too if function_updater has requirements
+
+    if [ -f "$requirements_file" ]; then
+        echo "Activating updater venv and installing/updating dependencies..."
+        (
+            source "$venv_dir/bin/activate"
+            pip install -r "$requirements_file" || { echo "ERROR: pip install failed for updater"; exit 1; }
+            echo "Updater dependencies installed/updated."
+        )
+    else
+        echo "Warning: requirements.txt not found in project root. Skipping dependency installation for updater."
+    fi
     echo "Updater venv found."
 }
 
