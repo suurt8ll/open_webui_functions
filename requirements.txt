@@ -1,4 +1,4 @@
 aiohttp
 aiofiles
 python-dotenv
-coloredlogs
+loguru
