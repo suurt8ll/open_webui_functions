@@ -218,11 +218,18 @@ async def process_file(
     api_key: str,
     file_states: dict[str, str | None],
     session: aiohttp.ClientSession,
+    missing_file_logged: set[str],
 ):
     """Process a single file, checking for changes and updating/creating."""
     if not os.path.exists(path):
-        logger.warning(f"Missing file: {path}")
+        if path not in missing_file_logged:
+            logger.warning(f"Missing file: {path}")
+            missing_file_logged.add(path)
         return
+
+    # If the file exists, ensure it's removed from the missing_file_logged set
+    if path in missing_file_logged:
+        missing_file_logged.remove(path)
 
     current_hash = await file_hash(path)
     if not current_hash:
@@ -262,6 +269,7 @@ async def main() -> None:
     polling_interval = int(env_vars["POLLING_INTERVAL"])
 
     file_states: dict[str, str | None] = {path: None for path in filepaths}
+    missing_file_logged: set[str] = set()  # Keep track of files we've warned about
 
     api_available = True  # Assume API is available at startup
     api_unavailable_logged = False  # Flag to track if "API unavailable" has been logged
@@ -290,7 +298,12 @@ async def main() -> None:
             if api_available:  # Only process files if API is available
                 tasks = [
                     process_file(
-                        path, api_endpoint + "/api/v1", api_key, file_states, session
+                        path,
+                        api_endpoint + "/api/v1",
+                        api_key,
+                        file_states,
+                        session,
+                        missing_file_logged,
                     )
                     for path in filepaths
                 ]
