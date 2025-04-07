@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
 if TYPE_CHECKING:
-    from manifold_types import *  # My personal types in a separate file for more robustness.
+    from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 
 class Pipe:

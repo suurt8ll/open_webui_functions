@@ -29,7 +29,7 @@ from loguru import logger
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler
-    from manifold_types import (
+    from utils.manifold_types import (
         UserData,
     )  # My personal types in a separate file for more robustness.
 

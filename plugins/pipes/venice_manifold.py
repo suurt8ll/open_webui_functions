@@ -45,7 +45,7 @@ from loguru import logger
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler
-    from manifold_types import *  # My personal types in a separate file for more robustness.
+    from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
