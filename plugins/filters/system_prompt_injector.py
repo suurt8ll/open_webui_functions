@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from typing import Any, Awaitable, Callable, TYPE_CHECKING, cast
 import json
 import re
+import copy
 
 if TYPE_CHECKING:
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
@@ -66,7 +67,9 @@ class Filter:
         """
         if self.debug:
             print(f"\n--- Inlet Filter ---")
-            print(f"Original Request Body:\n{json.dumps(body, indent=2)}")
+            print(
+                f"Original Request Body:\n{json.dumps(self._sanitize_body(body), indent=2)}"
+            )
 
         messages: list["Message"] = body.get("messages", [])
         if not messages:
@@ -75,35 +78,72 @@ class Filter:
 
         latest_system_prompt: str | None = None
         latest_temperature: float | None = None
+        prompt_title: str | None = None
         self.prompt_title = None  # Reset stored title
 
         # Process all user messages to remove injections and track latest parameters
         for message in messages:
             if message.get("role") == "user":
+                message = cast("UserMessage", message)
                 content = message.get("content", "")
-                if not isinstance(content, str):
-                    # FIXME: Handle non-string content (like images)
-                    print(
-                        f"Warning: User message content is not a string: {type(content)}. Skipping."
+                if isinstance(content, list):  # Handle messages with images and text
+                    text_segments = []
+                    non_text_content = []
+                    # Separate text and non-text content
+                    for item in content:
+                        if item.get("type") == "text":
+                            item = cast("TextContent", item)
+                            text_segments.append(item["text"])
+                        else:
+                            non_text_content.append(item)
+
+                    system_prompt_found = None
+                    temperature_found = None
+                    title_found = None
+                    new_text_segments = []
+
+                    # Process each text segment for injections
+                    for ts in text_segments:
+                        sp, temp, title, mod_ts, _ = self._extract_injection_params(ts)
+                        if title is not None:  # Injection found in this segment
+                            system_prompt_found = sp
+                            temperature_found = temp
+                            title_found = title
+                        new_text_segments.append(mod_ts)
+
+                    # Rebuild the content with processed text and original non-text parts
+                    new_content = []
+                    text_idx = 0
+                    non_text_idx = 0
+                    for item in content:
+                        if item.get("type") == "text":
+                            new_content.append(
+                                {"type": "text", "text": new_text_segments[text_idx]}
+                            )
+                            text_idx += 1
+                        else:
+                            new_content.append(non_text_content[non_text_idx])
+                            non_text_idx += 1
+
+                    # Update message content
+                    message["content"] = new_content
+
+                    # Track parameters from this message
+                    system_prompt = system_prompt_found
+                    temperature = temperature_found
+                    prompt_title = title_found
+
+                else:  # Handle traditional text-only messages
+                    system_prompt, temperature, title, modified_content, _ = (
+                        self._extract_injection_params(content)
                     )
-                    continue
+                    message["content"] = modified_content
 
-                (
-                    system_prompt,
-                    temperature,
-                    title,
-                    modified_content,
-                    injection_block,
-                ) = self._extract_injection_params(content)
-
-                # Update the message content to remove the injection
-                message["content"] = modified_content
-
-                # Track parameters if injection was found
-                if title is not None:
+                # Update latest parameters if injection was found in this message
+                if prompt_title is not None:
                     latest_system_prompt = system_prompt
                     latest_temperature = temperature
-                    self.prompt_title = title  # Keep the latest title
+                    self.prompt_title = prompt_title
 
         # Apply the latest parameters if any were found
         if latest_system_prompt is not None:
@@ -120,24 +160,23 @@ class Filter:
 
         if self.debug:
             print(
-                f"\nModified Request Body (before sending to LLM):\n{json.dumps(body, indent=2)}"
+                f"\nModified Request Body (before sending to LLM):\n{json.dumps(self._sanitize_body(body), indent=2)}"
             )
 
         return body
 
     async def outlet(
-        self,
-        body: dict[str, Any],
-        __event_emitter__: Callable[["Event"], Awaitable[None]],
-        __user__: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+        self, body: "Body", __event_emitter__: Callable[["Event"], Awaitable[None]]
+    ) -> "Body":
         """
         Processes the response body from the LLM.
         Adds the stored prompt title as a header to the latest assistant message.
         """
         if self.debug:
             print(f"\n--- Outlet Filter ---")
-            print(f"Original Response Body:\n{json.dumps(body, indent=2)}")
+            print(
+                f"Original Response Body:\n{json.dumps(self._sanitize_body(body), indent=2)}"
+            )
 
         # Only add header if a prompt title was set during inlet
         if self.prompt_title:
@@ -151,7 +190,7 @@ class Filter:
 
         if self.debug:
             print(
-                f"\nModified Response Body (after adding header):\n{json.dumps(body, indent=2)}"
+                f"\nModified Response Body (after adding header):\n{json.dumps(self._sanitize_body(body), indent=2)}"
             )
 
         return body
@@ -159,6 +198,31 @@ class Filter:
     """
     ---------- Helper methods inside the Pipe class ----------
     """
+
+    def _sanitize_body(self, body: "Body") -> "Body":
+        """
+        Creates a sanitized copy of the body with image data truncated for debugging.
+        """
+        sanitized_body = copy.deepcopy(body)
+        for message in sanitized_body.get("messages", []):
+            if message.get("role") == "user":
+                message = cast("UserMessage", message)
+                content = message.get("content")
+                if isinstance(content, list):
+                    sanitized_content = []
+                    for item in content:
+                        if item.get("type") == "image_url":
+                            item = cast("ImageContent", item)
+                            # Replace the image URL with a placeholder
+                            sanitized_item = item.copy()
+                            sanitized_item["image_url"][
+                                "url"
+                            ] = "[Image data truncated]"
+                            sanitized_content.append(sanitized_item)
+                        else:
+                            sanitized_content.append(item)
+                    message["content"] = sanitized_content
+        return sanitized_body
 
     def _update_options(self, body: "Body", key: str, value: Any):
         """Safely updates the 'options' dictionary in the request body."""
