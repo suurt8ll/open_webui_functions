@@ -14,7 +14,7 @@ version: 0.6.0
 <summary>{{prompt_title}}</summary>
 ```json
 {
-    system_prompt: "{{system_prompt}}",
+    system: "{{system_prompt}}",
     temperature: {{temperature}}
 }
 ```
@@ -177,6 +177,7 @@ class PluginLogger:
 
 
 class Filter:
+
     class Valves(BaseModel):
         LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = (
             Field(
@@ -196,12 +197,7 @@ class Filter:
         self.log.info("Function has been initialized.")
 
     def inlet(self, body: "Body") -> "Body":
-        """
-        Processes incoming request body.
-        Detects and extracts prompt injection details from all user messages.
-        Applies extracted system prompt (if not empty) and temperature.
-        Removes the injection block from all user messages.
-        """
+
         self.log.debug(f"\n--- Inlet Filter ---")
         self.log.debug("Original Request Body:", body)
 
@@ -211,101 +207,84 @@ class Filter:
             return body
 
         latest_system_prompt: str | None = None
-        latest_temperature: float | None = None
+        latest_options: "Options | None" = None
         prompt_title: str | None = None
         self.prompt_title = None  # Reset stored title
 
-        # Process all user messages to remove injections and track latest parameters
         for message in messages:
             if message.get("role") == "user":
                 message = cast("UserMessage", message)
                 content = message.get("content", "")
-                if isinstance(content, list):  # Handle messages with images and text
-                    text_segments = []
-                    non_text_content = []
-                    # Separate text and non-text content
-                    for item in content:
-                        if item.get("type") == "text":
-                            item = cast("TextContent", item)
-                            text_segments.append(item["text"])
-                        else:
-                            non_text_content.append(item)
 
-                    system_prompt_found = None
-                    temperature_found = None
-                    title_found = None
-                    new_text_segments = []
+                if isinstance(content, list):  # Handle messages with images and text
+                    # Separate non-text (images) and text parts
+                    non_text_content = [
+                        item for item in content if item.get("type") != "text"
+                    ]
+                    text_segments = [
+                        cast("TextContent", item)["text"]
+                        for item in content
+                        if item.get("type") == "text"
+                    ]
 
                     # Process each text segment for injections
+                    new_text_segments: list[str] = []
+                    system_prompt_found, options_found, title_found = None, None, None
                     for ts in text_segments:
-                        sp, temp, title, mod_ts, _ = self._extract_injection_params(ts)
-                        if title is not None:  # Injection found in this segment
-                            system_prompt_found = sp
-                            temperature_found = temp
-                            title_found = title
+                        sp, title, mod_ts, opt = self._extract_injection_params(ts)
                         new_text_segments.append(mod_ts)
+                        if title is not None:
+                            system_prompt_found = sp
+                            options_found = opt
+                            title_found = title
 
-                    # Rebuild the content with processed text and original non-text parts
-                    new_content = []
-                    text_idx = 0
-                    non_text_idx = 0
-                    for item in content:
-                        if item.get("type") == "text":
-                            new_content.append(
-                                {"type": "text", "text": new_text_segments[text_idx]}
-                            )
-                            text_idx += 1
-                        else:
-                            new_content.append(non_text_content[non_text_idx])
-                            non_text_idx += 1
+                    # Combine text into a single part (as per your assumption)
+                    combined_text = (
+                        "".join(new_text_segments) if new_text_segments else None
+                    )  # Use appropriate join method if needed
 
-                    # Update message content
+                    # Rebuild content: all images first, then single text part
+                    new_content = non_text_content
+                    if combined_text:
+                        new_content.append({"type": "text", "text": combined_text})
                     message["content"] = new_content
 
                     # Track parameters from this message
-                    system_prompt = system_prompt_found
-                    temperature = temperature_found
-                    prompt_title = title_found
+                    if title_found is not None:
+                        latest_system_prompt = system_prompt_found
+                        latest_options = options_found
+                        prompt_title = title_found
 
                 else:  # Handle traditional text-only messages
-                    system_prompt, temperature, title, modified_content, _ = (
+                    system_prompt, title, modified_content, options = (
                         self._extract_injection_params(content)
                     )
                     message["content"] = modified_content
 
-                # Update latest parameters if injection was found in this message
-                if prompt_title is not None:
-                    latest_system_prompt = system_prompt
-                    latest_temperature = temperature
-                    self.prompt_title = prompt_title
+                    if title is not None:
+                        latest_system_prompt = system_prompt
+                        latest_options = options
+                        prompt_title = title
 
-        # Apply the latest parameters if any were found
-        if latest_system_prompt is not None:
-            if latest_system_prompt:  # Check if it's a non-empty string
-                self._apply_system_prompt(body, latest_system_prompt)
-            else:
-                self.log.debug(
-                    "Extracted empty system prompt; will not set system prompt."
-                )
+        # Apply latest parameters if found
+        if latest_system_prompt is not None and latest_system_prompt.strip():
+            self._apply_system_prompt(body, latest_system_prompt)
+        else:
+            self.log.debug("No valid system prompt found.")
 
-        if latest_temperature is not None:
-            self._update_options(body, "temperature", latest_temperature)
-            self.log.debug(f"Set temperature to: {latest_temperature}")
+        if latest_options:
+            for k, v in latest_options.items():
+                self._update_options(body, k, v)
+                self.log.debug(f"Set {k} to: {v}")
+        self.prompt_title = prompt_title
 
-        self.log.debug(
-            "Modified Request Body (before sending to LLM):",
-            data=body,
-        )
-
+        self.log.debug("Modified Request Body (before sending to LLM):", data=body)
         return body
 
     async def outlet(
         self, body: "Body", __event_emitter__: Callable[["Event"], Awaitable[None]]
     ) -> "Body":
-        """
-        Processes the response body from the LLM.
-        Adds the stored prompt title as a header to the latest assistant message.
-        """
+
         self.log.debug(f"\n--- Outlet Filter ---")
         self.log.debug(
             "Original Response Body:",
@@ -319,8 +298,6 @@ class Filter:
                 "data": {"description": self.prompt_title},
             }
             await __event_emitter__(status_event)
-            # Reset prompt title after adding it to the response
-            # self.prompt_title = None # Optional: Reset state if desired after use
 
         self.log.debug(
             "Modified Response Body (after adding header):",
@@ -340,12 +317,12 @@ class Filter:
 
     def _extract_injection_params(
         self, user_message_content: str
-    ) -> tuple[str | None, float | None, str | None, str, str | None]:
+    ) -> tuple[str | None, str | None, str, "Options | None"]:
 
         system_prompt = None
-        temperature = None
         prompt_title = None
         modified_content = user_message_content
+        json_data: "Options | None" = None
         injection_block = None
 
         match = DETAILS_BLOCK_REGEX.search(user_message_content)
@@ -365,24 +342,14 @@ class Filter:
                     json_data = json.loads(json_str)
                 except json.JSONDecodeError as e:
                     self.log.exception("JSON Parse Error.", exception=e)
-                    return (None, None, prompt_title, modified_content, injection_block)
+                if not json_data:
+                    return (None, prompt_title, modified_content, None)
 
-                system_prompt = json_data.get("system_prompt")
-                temp_value = json_data.get("temperature")
-                if isinstance(temp_value, (int, float)):
-                    temperature = float(temp_value)
-                else:
-                    self.log.warning(f"Invalid temperature type: {type(temp_value)}")
+                system_prompt = json_data.get("system")
             else:
                 self.log.warning("No JSON block found in parameters section")
 
-        return (
-            system_prompt,
-            temperature,
-            prompt_title,
-            modified_content,
-            injection_block,
-        )
+        return (system_prompt, prompt_title, modified_content, json_data)
 
     def _apply_system_prompt(self, body: "Body", system_prompt_content: str):
         """
