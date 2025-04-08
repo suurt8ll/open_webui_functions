@@ -9,6 +9,7 @@ version: 0.6.0
 """
 
 # The injection must follow this format (without triple quotes).
+# Temperature is not the only adjustable parameter, many others can be changed.
 """
 <details type="prompt">
 <summary>{{prompt_title}}</summary>
@@ -31,6 +32,7 @@ import sys
 from loguru import logger
 from pydantic import BaseModel, Field
 from typing import Any, Awaitable, Callable, Literal, cast, TYPE_CHECKING
+
 from open_webui.models.functions import Functions
 from open_webui.utils.logger import stdout_format
 
@@ -197,7 +199,6 @@ class Filter:
         self.log.info("Function has been initialized.")
 
     def inlet(self, body: "Body") -> "Body":
-
         self.log.debug(f"\n--- Inlet Filter ---")
         self.log.debug("Original Request Body:", body)
 
@@ -206,77 +207,28 @@ class Filter:
             self.log.warning("No messages found in the body.")
             return body
 
-        latest_system_prompt: str | None = None
-        latest_options: "Options | None" = None
-        prompt_title: str | None = None
-        self.prompt_title = None  # Reset stored title
+        latest_system_prompt, latest_options, prompt_title = None, None, None
 
-        for message in messages:
+        # Process each user message to extract parameters
+        for idx, message in enumerate(messages):
             if message.get("role") == "user":
                 message = cast("UserMessage", message)
-                content = message.get("content", "")
+                processed_message, (sp, opt, title) = self._process_user_message(
+                    message
+                )
+                messages[idx] = processed_message  # Update message in-place
 
-                if isinstance(content, list):  # Handle messages with images and text
-                    # Separate non-text (images) and text parts
-                    non_text_content = [
-                        item for item in content if item.get("type") != "text"
-                    ]
-                    text_segments = [
-                        cast("TextContent", item)["text"]
-                        for item in content
-                        if item.get("type") == "text"
-                    ]
+                # Track parameters only when title is found
+                if title is not None:
+                    latest_system_prompt = sp
+                    latest_options = opt
+                    prompt_title = title
 
-                    # Process each text segment for injections
-                    new_text_segments: list[str] = []
-                    system_prompt_found, options_found, title_found = None, None, None
-                    for ts in text_segments:
-                        sp, title, mod_ts, opt = self._extract_injection_params(ts)
-                        new_text_segments.append(mod_ts)
-                        if title is not None:
-                            system_prompt_found = sp
-                            options_found = opt
-                            title_found = title
-
-                    # Combine text into a single part (as per your assumption)
-                    combined_text = (
-                        "".join(new_text_segments) if new_text_segments else None
-                    )  # Use appropriate join method if needed
-
-                    # Rebuild content: all images first, then single text part
-                    new_content = non_text_content
-                    if combined_text:
-                        new_content.append({"type": "text", "text": combined_text})
-                    message["content"] = new_content
-
-                    # Track parameters from this message
-                    if title_found is not None:
-                        latest_system_prompt = system_prompt_found
-                        latest_options = options_found
-                        prompt_title = title_found
-
-                else:  # Handle traditional text-only messages
-                    system_prompt, title, modified_content, options = (
-                        self._extract_injection_params(content)
-                    )
-                    message["content"] = modified_content
-
-                    if title is not None:
-                        latest_system_prompt = system_prompt
-                        latest_options = options
-                        prompt_title = title
-
-        # Apply latest parameters if found
-        if latest_system_prompt is not None and latest_system_prompt.strip():
-            self._apply_system_prompt(body, latest_system_prompt)
-        else:
-            self.log.debug("No valid system prompt found.")
-
+        # Apply extracted parameters
+        self._handle_system_prompt(body, latest_system_prompt)
         if latest_options:
-            for k, v in latest_options.items():
-                self._update_options(body, k, v)
-                self.log.debug(f"Set {k} to: {v}")
-        self.prompt_title = prompt_title
+            self._handle_options(body, latest_options)
+        self.prompt_title = prompt_title  # Store title for later use
 
         self.log.debug("Modified Request Body (before sending to LLM):", data=body)
         return body
@@ -308,12 +260,43 @@ class Filter:
 
     # region Helper methods inside the Pipe class
 
-    def _update_options(self, body: "Body", key: str, value: Any):
-        """Safely updates the 'options' dictionary in the request body."""
-        if "options" not in body:
-            body["options"] = {}
-        body["options"][key] = value
-        self.log.debug(f"Updated options: set '{key}' to {value}")
+    def _process_user_message(
+        self, user_message: "UserMessage"
+    ) -> tuple["UserMessage", tuple[str | None, "Options | None", str | None]]:
+        content = user_message.get("content", "")
+
+        if isinstance(content, list):  # Handle mixed content (images + text)
+            non_text_content = [item for item in content if item.get("type") != "text"]
+            text_segments = [
+                cast("TextContent", item)["text"]
+                for item in content
+                if item.get("type") == "text"
+            ]
+
+            new_text_segments = []
+            system_prompt, title, options = None, None, None
+            for ts in text_segments:
+                sp, ti, mod_ts, opt = self._extract_injection_params(ts)
+                new_text_segments.append(mod_ts)
+                if ti is not None:
+                    system_prompt = sp
+                    options = opt
+                    title = ti
+
+            # Rebuild content structure
+            combined_text = "".join(new_text_segments) if new_text_segments else None
+            new_content = non_text_content.copy()
+            if combined_text:
+                new_content.append({"type": "text", "text": combined_text})
+            user_message["content"] = new_content
+
+        else:  # Handle traditional text-only content
+            system_prompt, title, modified_content, options = (
+                self._extract_injection_params(content)
+            )
+            user_message["content"] = modified_content
+
+        return user_message, (system_prompt, options, title)
 
     def _extract_injection_params(
         self, user_message_content: str
@@ -351,7 +334,14 @@ class Filter:
 
         return (system_prompt, prompt_title, modified_content, json_data)
 
-    def _apply_system_prompt(self, body: "Body", system_prompt_content: str):
+    def _handle_options(self, body: "Body", options: "Options"):
+        for key, value in options.items():
+            if "options" not in body:
+                body["options"] = {}
+            body["options"][key] = value
+            self.log.debug(f"Set {key} to: {value}")
+
+    def _handle_system_prompt(self, body: "Body", system_prompt: str | None):
         """
         Applies a *non-empty* system prompt to the request body.
         Updates the existing system message or inserts a new one at the beginning.
@@ -359,10 +349,11 @@ class Filter:
         """
         # This function should only be called with non-empty system_prompt_content
         # due to the check in the inlet method.
-        if not system_prompt_content:
+        if not system_prompt:
             self.log.warning(
                 "_apply_system_prompt called with empty content. This should not happen."
             )
+            # TODO: if no system prompt defined: use default, if None or "" wipe.
             return  # Do nothing if called with empty string despite the check
 
         messages: list["Message"] = body.get("messages", [])
@@ -371,19 +362,15 @@ class Filter:
         # Iterate through messages to find and update the system message
         for message in messages:
             if message.get("role") == "system":
-                message["content"] = system_prompt_content
+                message["content"] = system_prompt
                 system_message_found = True
                 self.log.debug("Updated existing system message.")
                 break
 
         # If no system message exists, insert one at the beginning
         if not system_message_found:
-            messages.insert(0, {"role": "system", "content": system_prompt_content})
+            messages.insert(0, {"role": "system", "content": system_prompt})
             body["messages"] = messages  # Ensure the body reflects the change
             self.log.debug("Inserted new system message at the beginning.")
-
-        # Also update the 'system' option if it exists (some backends might use this)
-        # We update this even if the message was pre-existing, to ensure consistency
-        self._update_options(body, "system", system_prompt_content)
 
     # endregion
