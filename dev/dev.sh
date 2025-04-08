@@ -9,7 +9,7 @@ set -euo pipefail
 
 # Project structure definition
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
-PROJECT_ROOT="$SCRIPT_DIR"
+PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
 FRONTEND_DIR="$PROJECT_ROOT/submodules/open-webui"
 BACKEND_DIR="$FRONTEND_DIR/backend"
 
@@ -18,7 +18,7 @@ BACKEND_VENV_DIR="$BACKEND_DIR/.venv"
 UPDATER_VENV_DIR="$PROJECT_ROOT/.venv"
 
 # Single State directory
-STATE_DIR="$PROJECT_ROOT/.dev_state"
+STATE_DIR="$SCRIPT_DIR/.dev_state"
 
 # --- Helper Functions ---
 
@@ -319,7 +319,7 @@ BACKEND_COMMAND="cd '$BACKEND_DIR' && \
                    exec $BACKEND_START_COMMAND"
 
 # Construct the full command for the function updater window
-UPDATER_COMMAND="cd '$PROJECT_ROOT' && \
+UPDATER_COMMAND="cd '$SCRIPT_DIR' && \
                    echo 'Activating updater venv...' && \
                    . '$UPDATER_VENV_DIR/bin/activate' && \
                    echo '--- Starting Function Updater ---' && \
