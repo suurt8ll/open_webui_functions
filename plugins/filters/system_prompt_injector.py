@@ -26,7 +26,7 @@ version: 0.6.0
 # TODO: Keep the latest prompt template settings if no setting were given in the last message.
 
 from pydantic import BaseModel
-from typing import Any, Awaitable, Callable, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, TYPE_CHECKING, cast
 import json
 import re
 
@@ -42,8 +42,6 @@ DETAILS_BLOCK_REGEX = re.compile(
     r'(<details type="prompt">\s*<summary>(.*?)</summary>(.*?)^\s*</details>)',
     re.DOTALL | re.MULTILINE,
 )
-# Regex to find key-value pairs within the parameters block
-PARAM_REGEX = re.compile(r"^\s*>\s*(\w+):\s*(.*)", re.MULTILINE)
 
 
 class Filter:
@@ -59,9 +57,7 @@ class Filter:
         self.prompt_title: str | None = None
         self.debug = True  # Enable or disable debug prints
 
-    def inlet(
-        self, body: dict[str, Any], __user__: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
+    def inlet(self, body: "Body") -> "Body":
         """
         Processes incoming request body.
         Detects and extracts prompt injection details from the latest user message.
@@ -76,7 +72,7 @@ class Filter:
         latest_temperature: float | None = None
         injection_found_in_last_message = False
 
-        messages: list[dict[str, Any]] = body.get("messages", [])
+        messages: list["Message"] = body.get("messages", [])
         if not messages:
             print(f"Warning: No messages found in the body.")
             return body
@@ -84,7 +80,13 @@ class Filter:
         # Process only the *last* message if it's from the user for injection
         last_message = messages[-1]
         if last_message.get("role") == "user":
+            last_message = cast("UserMessage", last_message)
             content = last_message.get("content", "")
+            if not isinstance(content, str):
+                print(
+                    f"Warning: Last message content object is not of type str: type(content) is {type(content)}."
+                )
+                return body
             (
                 extracted_system_prompt,
                 extracted_temperature,
@@ -192,7 +194,7 @@ class Filter:
     ---------- Helper methods inside the Pipe class ----------
     """
 
-    def _update_options(self, body: dict[str, Any], key: str, value: Any):
+    def _update_options(self, body: "Body", key: str, value: Any):
         """Safely updates the 'options' dictionary in the request body."""
         if "options" not in body:
             body["options"] = {}
@@ -246,7 +248,7 @@ class Filter:
             injection_block,
         )
 
-    def _apply_system_prompt(self, body: dict[str, Any], system_prompt_content: str):
+    def _apply_system_prompt(self, body: "Body", system_prompt_content: str):
         """
         Applies a *non-empty* system prompt to the request body.
         Updates the existing system message or inserts a new one at the beginning.
@@ -261,7 +263,7 @@ class Filter:
                 )
             return  # Do nothing if called with empty string despite the check
 
-        messages: list[dict[str, Any]] = body.get("messages", [])
+        messages: list["Message"] = body.get("messages", [])
         system_message_found = False
 
         # Iterate through messages to find and update the system message
