@@ -60,97 +60,63 @@ class Filter:
     def inlet(self, body: "Body") -> "Body":
         """
         Processes incoming request body.
-        Detects and extracts prompt injection details from the latest user message.
+        Detects and extracts prompt injection details from all user messages.
         Applies extracted system prompt (if not empty) and temperature.
-        Removes the injection block from the user message.
+        Removes the injection block from all user messages.
         """
         if self.debug:
             print(f"\n--- Inlet Filter ---")
             print(f"Original Request Body:\n{json.dumps(body, indent=2)}")
-
-        latest_system_prompt: str | None = None
-        latest_temperature: float | None = None
-        injection_found_in_last_message = False
 
         messages: list["Message"] = body.get("messages", [])
         if not messages:
             print(f"Warning: No messages found in the body.")
             return body
 
-        # Process only the *last* message if it's from the user for injection
-        last_message = messages[-1]
-        if last_message.get("role") == "user":
-            last_message = cast("UserMessage", last_message)
-            content = last_message.get("content", "")
-            if not isinstance(content, str):
-                print(
-                    f"Warning: Last message content object is not of type str: type(content) is {type(content)}."
-                )
-                return body
-            (
-                extracted_system_prompt,
-                extracted_temperature,
-                extracted_title,
-                modified_content,
-                injection_block_content,  # Keep track of the raw block for debugging
-            ) = self._extract_injection_params(content)
+        latest_system_prompt: str | None = None
+        latest_temperature: float | None = None
+        self.prompt_title = None  # Reset stored title
 
-            if extracted_title is not None:  # Check if extraction was successful
-                injection_found_in_last_message = True
-                self.prompt_title = extracted_title  # Store for outlet
-                last_message["content"] = modified_content  # Update message content
+        # Process all user messages to remove injections and track latest parameters
+        for message in messages:
+            if message.get("role") == "user":
+                content = message.get("content", "")
+                if not isinstance(content, str):
+                    # FIXME: Handle non-string content (like images)
+                    print(
+                        f"Warning: User message content is not a string: {type(content)}. Skipping."
+                    )
+                    continue
 
-                if self.debug:
-                    print(f"Injection block detected in the last user message.")
-                    print(f"Extracted Title: {extracted_title}")
-                    print(f"Raw Injection Block:\n{injection_block_content}")
+                (
+                    system_prompt,
+                    temperature,
+                    title,
+                    modified_content,
+                    injection_block,
+                ) = self._extract_injection_params(content)
 
-                # Store extracted system prompt, including empty string
-                if extracted_system_prompt is not None:
-                    latest_system_prompt = extracted_system_prompt
-                    if self.debug:
-                        if latest_system_prompt == "":
-                            print(
-                                f"Extracted empty System Prompt. System prompt will NOT be set."
-                            )
-                        else:
-                            print(f"Extracted System Prompt: {latest_system_prompt}")
+                # Update the message content to remove the injection
+                message["content"] = modified_content
 
-                if extracted_temperature is not None:
-                    latest_temperature = extracted_temperature
-                    if self.debug:
-                        print(f"Extracted Temperature: {latest_temperature}")
+                # Track parameters if injection was found
+                if title is not None:
+                    latest_system_prompt = system_prompt
+                    latest_temperature = temperature
+                    self.prompt_title = title  # Keep the latest title
 
-                if self.debug:
-                    print(f"User message content updated (injection block removed).")
+        # Apply the latest parameters if any were found
+        if latest_system_prompt is not None:
+            if latest_system_prompt:  # Check if it's a non-empty string
+                self._apply_system_prompt(body, latest_system_prompt)
             else:
                 if self.debug:
-                    print(f"Injection block not detected in the last user message.")
-                # Reset prompt title if no injection found in the current turn
-                self.prompt_title = None
-        else:
-            # Reset prompt title if the last message isn't from the user
-            self.prompt_title = None
+                    print("Extracted empty system prompt; will not set system prompt.")
 
-        # Apply the extracted parameters to the request body
-        if injection_found_in_last_message:
-            # Only apply system prompt if it's not None AND not an empty string
-            if (
-                latest_system_prompt
-            ):  # This evaluates to False if latest_system_prompt is None or ""
-                self._apply_system_prompt(body, latest_system_prompt)
-            elif latest_system_prompt == "" and self.debug:
-                print(
-                    "Skipping system prompt application because extracted value was empty."
-                )
-
-            if latest_temperature is not None:
-                # FIXME: Groq models might break if temperature is set like this.
-                # This is the standard way to set options for OpenAI-compatible APIs.
-                # If Groq fails, it might require a different option key or not support it.
-                self._update_options(body, "temperature", latest_temperature)
-                if self.debug:
-                    print(f"Set temperature to: {latest_temperature}")
+        if latest_temperature is not None:
+            self._update_options(body, "temperature", latest_temperature)
+            if self.debug:
+                print(f"Set temperature to: {latest_temperature}")
 
         if self.debug:
             print(
