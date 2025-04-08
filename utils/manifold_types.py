@@ -119,6 +119,7 @@ class Body(TypedDict):
     stream: bool
     model: str
     messages: list[Message]
+    options: NotRequired[dict[str, Any]]
 
 
 # ---------- Chats.ChatModel ----------

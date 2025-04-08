@@ -12,8 +12,12 @@ version: 0.6.0
 """
 <details type="prompt">
 <summary>{{prompt_title}}</summary>
-> system_prompt:{{system_prompt}}
-> temperature:{{temperature}}
+```json
+{
+    system_prompt: "{{system_prompt}}",
+    temperature: {{temperature}}
+}
+```
 </details>
 {{content}}
 """
@@ -199,57 +203,40 @@ class Filter:
     def _extract_injection_params(
         self, user_message_content: str
     ) -> tuple[str | None, float | None, str | None, str, str | None]:
-        """
-        Extracts parameters (system prompt, temperature, title) from the injection block
-        using regex and removes the block from the content.
 
-        Returns:
-            - system_prompt (str | None): Extracted system prompt. None if not found. Can be empty string.
-            - temperature (float | None): Extracted temperature. None if not found or invalid.
-            - prompt_title (str | None): Extracted prompt title. None if block not found.
-            - modified_content (str): Original content with the injection block removed.
-            - injection_block (str | None): The raw content of the matched injection block for debugging.
-        """
-        system_prompt: str | None = None
-        temperature: float | None = None
-        prompt_title: str | None = None
-        modified_content: str = user_message_content
-        injection_block: str | None = None
+        system_prompt = None
+        temperature = None
+        prompt_title = None
+        modified_content = user_message_content
+        injection_block = None
 
         match = DETAILS_BLOCK_REGEX.search(user_message_content)
-
         if match:
-            injection_block = match.group(
-                1
-            )  # Full matched block <details>...</details>
-            prompt_title = match.group(2).strip()  # Content of <summary>
-            params_block = match.group(3)  # Content between </summary> and </details>
+            injection_block = match.group(1)
+            prompt_title = match.group(2).strip()
+            params_block = match.group(3).strip()
 
-            # Remove the injection block from the original content
-            # Be careful with potential leading/trailing whitespace after removal
-            if injection_block:  # Check if injection_block is not None
-                modified_content = user_message_content.replace(
-                    injection_block, ""
-                ).strip()
+            # Remove injection block from content
+            modified_content = user_message_content.replace(injection_block, "").strip()
+
+            # Extract JSON content from code block
+            json_match = re.search(r"```json\s*(.*?)\s*```", params_block, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1).strip()
+                try:
+                    json_data = json.loads(json_str)
+                except json.JSONDecodeError as e:
+                    print(f"JSON Parse Error: {e}")
+                    return (None, None, prompt_title, modified_content, injection_block)
+
+                system_prompt = json_data.get("system_prompt")
+                temp_value = json_data.get("temperature")
+                if isinstance(temp_value, (int, float)):
+                    temperature = float(temp_value)
+                else:
+                    print(f"Invalid temperature type: {type(temp_value)}")
             else:
-                # This case should ideally not happen if match is successful, but added for safety
-                print(f"Warning: injection_block is None after regex match.")
-
-            # Extract key-value pairs from the parameters block
-            for param_match in PARAM_REGEX.finditer(params_block):
-                key = param_match.group(1).strip().lower()
-                value = param_match.group(2).strip()
-
-                if key == "system_prompt":
-                    # Allow empty string as a valid system prompt value
-                    system_prompt = value
-                elif key == "temperature":
-                    try:
-                        temperature = float(value)
-                    except ValueError:
-                        print(
-                            f"Warning: Invalid temperature value '{value}' found in injection block. Ignoring."
-                        )
+                print("No JSON block found in parameters section")
 
         return (
             system_prompt,
