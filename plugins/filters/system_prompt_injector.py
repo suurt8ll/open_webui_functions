@@ -36,7 +36,7 @@ from open_webui.utils.logger import stdout_format
 
 if TYPE_CHECKING:
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
-    from loguru import Record, Logger
+    from loguru import Record
     from loguru._handler import Handler
 
 # --- Constants ---
@@ -66,6 +66,7 @@ class PluginLogger:
         # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
         self.logger = logger.bind(auditable=False)
         self.log_level = log_level
+        print(f"Got log level: {log_level}")
         self.truncate = truncate
         self.max_length = max_length
         self._add_handler()
@@ -100,41 +101,46 @@ class PluginLogger:
             f"Added new handler to loguru with level {self.log_level} and filter {__name__}."
         )
 
-    def log_data(
+    def _log_with_data(
         self,
-        level: Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         message: str,
-        data: Any | None = None,
+        level: Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        exception: Exception | None = None,
+        data: Any = None,
     ):
-        log_method = getattr(
-            self.logger, level.lower()
-        )  # Get the appropriate log method
-        log_method(message)  # Log the main message
+        self.logger.opt(depth=2, exception=exception).log(level, message)
+        if not data:
+            return
+        if self.logger.level(level) >= self.logger.level(self.log_level):
+            if self.truncate is True:
+                self.logger.opt(depth=2, exception=exception, raw=True).log(
+                    level, self._truncate_long_strings(data) + "\n"
+                )
+            else:
+                self.logger.opt(depth=2, exception=exception, raw=True).log(
+                    level, json.dumps(data, indent=2, default=str) + "\n"
+                )
 
-        if data:
-            if self.logger.level(level) >= self.logger.level(self.log_level):
-                if self.truncate is True:
-                    print(self._truncate_long_strings(data))
-                else:
-                    print(json.dumps(data, indent=2, default=str))
+    def trace(self, message: str, data: Any = None):
+        self._log_with_data(message, level="TRACE", data=data)
 
-    def trace(self, message: str, data: Any | None = None):
-        self.log_data("TRACE", message, data)
+    def debug(self, message: str, data: Any = None):
+        self._log_with_data(message, level="DEBUG", data=data)
 
-    def debug(self, message: str, data: Any | None = None):
-        self.log_data("DEBUG", message, data)
+    def info(self, message: str, data: Any = None):
+        self._log_with_data(message, level="INFO", data=data)
 
-    def info(self, message: str, data: Any | None = None):
-        self.log_data("INFO", message, data)
+    def warning(self, message: str, data: Any = None):
+        self._log_with_data(message, level="WARNING", data=data)
 
-    def warning(self, message: str, data: Any | None = None):
-        self.log_data("WARNING", message, data)
+    def error(self, message: str, data: Any = None):
+        self._log_with_data(message, level="ERROR", data=data)
 
-    def error(self, message: str, data: Any | None = None):
-        self.log_data("ERROR", message, data)
+    def exception(self, message: str, exception: Exception, data: Any = None):
+        self._log_with_data(message, level="ERROR", exception=exception, data=data)
 
-    def critical(self, message: str, data: Any | None = None):
-        self.log_data("CRITICAL", message, data)
+    def critical(self, message: str, data: Any = None):
+        self._log_with_data(message, level="CRITICAL", data=data)
 
     def _truncate_long_strings(self, data: Any, max_length: int = 64) -> str:
 
@@ -185,11 +191,9 @@ class Filter:
         self.valves = self.Valves(**(valves if valves else {}))
         # Store the prompt title extracted during inlet for use in outlet
         self.prompt_title: str | None = None
+        # FIXME: If log level is changes inside the valve, it does not have effect until the module reloads.
         self.log = PluginLogger(self.valves.LOG_LEVEL, truncate=True, max_length=128)
-        self.log.debug(
-            "Function has been initialized:",
-            data=[json.dumps(self.__dict__, indent=2, default=str)],
-        )
+        self.log.info("Function has been initialized.")
 
     def inlet(self, body: "Body") -> "Body":
         """
@@ -360,8 +364,7 @@ class Filter:
                 try:
                     json_data = json.loads(json_str)
                 except json.JSONDecodeError as e:
-                    # FIXME: Use log.exeption
-                    self.log.error(f"JSON Parse Error: {e}")
+                    self.log.exception("JSON Parse Error.", exception=e)
                     return (None, None, prompt_title, modified_content, injection_block)
 
                 system_prompt = json_data.get("system_prompt")
