@@ -24,6 +24,7 @@ version: 0.6.0
 """
 
 # IMPORTANT: Disable "Rich Text Input for Chat" in Open WebUI settings for this plugin to work correctly.
+# See https://github.com/open-webui/open-webui/issues/9759 for more.
 
 import json
 import re
@@ -227,8 +228,12 @@ class Filter:
         # Apply extracted parameters
         self._handle_system_prompt(body, latest_system_prompt)
         if latest_options:
-            self._handle_options(body, latest_options)
-        self.prompt_title = prompt_title  # Store title for later use
+            self._handle_options(body, latest_options)  # type: ignore
+        # Display title only when params where changed.
+        if latest_options:
+            self.prompt_title = prompt_title  # Store title for later use
+        else:
+            self.prompt_title = None
 
         self.log.debug("Modified Request Body (before sending to LLM):", data=body)
         return body
@@ -238,10 +243,7 @@ class Filter:
     ) -> "Body":
 
         self.log.debug(f"\n--- Outlet Filter ---")
-        self.log.debug(
-            "Original Response Body:",
-            data=body,
-        )
+        self.log.debug("Response Body:", data=body)
 
         # Only add header if a prompt title was set during inlet
         if self.prompt_title:
@@ -251,18 +253,13 @@ class Filter:
             }
             await __event_emitter__(status_event)
 
-        self.log.debug(
-            "Modified Response Body (after adding header):",
-            data=body,
-        )
-
         return body
 
     # region Helper methods inside the Pipe class
 
     def _process_user_message(
         self, user_message: "UserMessage"
-    ) -> tuple["UserMessage", tuple[str | None, "Options | None", str | None]]:
+    ) -> tuple["UserMessage", tuple[str | None, dict[str, Any] | None, str | None]]:
         content = user_message.get("content", "")
 
         if isinstance(content, list):  # Handle mixed content (images + text)
@@ -300,12 +297,12 @@ class Filter:
 
     def _extract_injection_params(
         self, user_message_content: str
-    ) -> tuple[str | None, str | None, str, "Options | None"]:
+    ) -> tuple[str | None, str | None, str, dict[str, Any] | None]:
 
         system_prompt = None
         prompt_title = None
         modified_content = user_message_content
-        json_data: "Options | None" = None
+        json_data: dict[str, Any] | None = None
         injection_block = None
 
         match = DETAILS_BLOCK_REGEX.search(user_message_content)
@@ -328,49 +325,67 @@ class Filter:
                 if not json_data:
                     return (None, prompt_title, modified_content, None)
 
-                system_prompt = json_data.get("system")
+                system_prompt = json_data.pop("system", None)
             else:
                 self.log.warning("No JSON block found in parameters section")
 
+        # Remove keys that have value None.
+        if json_data:
+            for k, v in json_data.copy().items():
+                if v is None:
+                    json_data.pop(k)
+
         return (system_prompt, prompt_title, modified_content, json_data)
 
-    def _handle_options(self, body: "Body", options: "Options"):
+    def _handle_options(self, body: dict[str, Any], options: dict[str, Any]):
+        body_options: dict[str, Any] = body.setdefault("options", {})
         for key, value in options.items():
-            if "options" not in body:
-                body["options"] = {}
-            body["options"][key] = value
-            self.log.debug(f"Set {key} to: {value}")
+            if value:
+                body_options[key] = value
+                body[key] = value
+                self.log.debug(f"Set {key} to: {value}")
+            else:
+                body_options.pop(key, None)
+                body.pop(key, None)
+                self.log.debug(f"Removed key {key}")
 
-    def _handle_system_prompt(self, body: "Body", system_prompt: str | None):
+    def _handle_system_prompt(self, body: "Body", system_prompt: str | None) -> None:
         """
         Applies a *non-empty* system prompt to the request body.
         Updates the existing system message or inserts a new one at the beginning.
         Also updates the 'system' key in the 'options' dictionary if present.
         """
-        # This function should only be called with non-empty system_prompt_content
-        # due to the check in the inlet method.
-        if not system_prompt:
-            self.log.warning(
-                "_apply_system_prompt called with empty content. This should not happen."
-            )
-            # TODO: if no system prompt defined: use default, if None or "" wipe.
-            return  # Do nothing if called with empty string despite the check
-
         messages: list["Message"] = body.get("messages", [])
-        system_message_found = False
+        body_options = body.setdefault("options", {})
+        if system_prompt is None:
+            self.log.info(
+                f"System prompt is {system_prompt}, using a front-end provided system prompt."
+            )
+        elif system_prompt == "":
+            self.log.info(
+                f"System prompt is {system_prompt}, wiping the system prompt."
+            )
+            body_options.pop("system", None)
+            for message in messages:
+                if message.get("role") == "system":
+                    messages.pop(0)
+                    break
+        else:
+            system_message_found = False
+            # Iterate through messages to find and update the system message
+            for message in messages:
+                if message.get("role") == "system":
+                    message["content"] = system_prompt
+                    system_message_found = True
+                    self.log.debug("Updated existing system message.")
+                    break
 
-        # Iterate through messages to find and update the system message
-        for message in messages:
-            if message.get("role") == "system":
-                message["content"] = system_prompt
-                system_message_found = True
-                self.log.debug("Updated existing system message.")
-                break
+            # If no system message exists, insert one at the beginning
+            if not system_message_found:
+                messages.insert(0, {"role": "system", "content": system_prompt})
+                body["messages"] = messages  # Ensure the body reflects the change
+                self.log.debug("Inserted new system message at the beginning.")
 
-        # If no system message exists, insert one at the beginning
-        if not system_message_found:
-            messages.insert(0, {"role": "system", "content": system_prompt})
-            body["messages"] = messages  # Ensure the body reflects the change
-            self.log.debug("Inserted new system message at the beginning.")
+            body_options["system"] = system_prompt
 
     # endregion
