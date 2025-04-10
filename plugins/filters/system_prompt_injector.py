@@ -26,7 +26,6 @@ temperature:{{temperature}}
 """
 
 from pydantic import BaseModel
-from typing import Optional
 import json
 
 DEBUG = True
@@ -56,7 +55,7 @@ class Filter:
 
     def _extract_injection_params(
         self, user_message_content: str
-    ) -> tuple[Optional[str], Optional[float], Optional[str], str]:
+    ) -> tuple[str | None, float | None, str | None, str]:
         inject_start_tag = "**###INJECT_START###**\n"
         inject_end_tag = "**###INJECT_END###**\n* * *\n"
         system_prompt = None
@@ -107,7 +106,7 @@ class Filter:
             modified_user_message_content,
         )
 
-    def _apply_system_prompt(self, body: dict, latest_system_prompt: Optional[str]):
+    def _apply_system_prompt(self, body: dict, latest_system_prompt: str | None):
         if latest_system_prompt:
             system_message_exists = False
             for message in body["messages"]:
@@ -121,7 +120,7 @@ class Filter:
                 )
             self._update_options(body, "system", latest_system_prompt)
 
-    def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+    def inlet(self, body: dict, __user__: dict | None = None) -> dict:
         if DEBUG:
             print("\n--- Inlet Filter ---")
             print("Original User Input Body:")
@@ -174,7 +173,7 @@ class Filter:
 
         return body
 
-    def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+    def outlet(self, body: dict, __user__: dict | None = None) -> dict:
 
         # TODO Reasoning model support, put the prompt title before the collapsible reasoning content.
 

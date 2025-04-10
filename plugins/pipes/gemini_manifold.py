@@ -45,13 +45,10 @@ import fnmatch
 import sys
 from fastapi import Request
 from pydantic import BaseModel, Field
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import (
     Any,
-    AsyncIterator,
-    Awaitable,
-    Callable,
     Literal,
-    Optional,
     TYPE_CHECKING,
     cast,
 )
@@ -74,7 +71,7 @@ log = logger.bind(auditable=False)
 
 class Pipe:
     class Valves(BaseModel):
-        GEMINI_API_KEY: Optional[str] = Field(default=None)
+        GEMINI_API_KEY: str | None = Field(default=None)
         REQUIRE_USER_API_KEY: bool = Field(
             default=False,
             description="""Whether to require user's own API key (applies to admins too).
@@ -91,7 +88,7 @@ class Pipe:
             Supports `fnmatch` patterns: *, ?, [seq], [!seq]. 
             Default value is * (all models allowed).""",
         )
-        MODEL_BLACKLIST: Optional[str] = Field(
+        MODEL_BLACKLIST: str | None = Field(
             default=None,
             description="""Comma-separated list of blacklisted model names. 
             Supports `fnmatch` patterns: *, ?, [seq], [!seq]. 
@@ -115,7 +112,7 @@ class Pipe:
         )
 
     class UserValves(BaseModel):
-        GEMINI_API_KEY: Optional[str] = Field(default=None)
+        GEMINI_API_KEY: str | None = Field(default=None)
         GEMINI_API_BASE_URL: str = Field(
             default="https://generativelanguage.googleapis.com",
             description="The base URL for calling the Gemini API",
@@ -171,7 +168,7 @@ class Pipe:
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __metadata__: dict[str, Any],
-    ) -> Optional[str]:
+    ) -> str | None:
 
         self.__event_emitter__ = __event_emitter__
 
@@ -329,10 +326,10 @@ class Pipe:
 
     async def _emit_completion(
         self,
-        content: Optional[str] = None,
+        content: str | None = None,
         done: bool = False,
-        error: Optional[str] = None,
-        sources: Optional[list["Source"]] = None,
+        error: str | None = None,
+        sources: list["Source"] | None = None,
     ):
         """Constructs and emits completion event."""
         emission: "ChatCompletionEvent" = {
@@ -437,7 +434,7 @@ class Pipe:
             contents.append(types.Content(role=role, parts=parts))
         return contents, system_prompt
 
-    def _genai_part_from_image_url(self, image_url: str) -> Optional[types.Part]:
+    def _genai_part_from_image_url(self, image_url: str) -> types.Part | None:
         """
         Processes an image URL and returns a genai.types.Part object from it
         Handles GCS, data URIs, and standard URLs.
@@ -604,8 +601,8 @@ class Pipe:
         return aggregated_chunks, content, finish_reason
 
     def _get_first_candidate(
-        self, candidates: Optional[list[types.Candidate]]
-    ) -> Optional[types.Candidate]:
+        self, candidates: list[types.Candidate] | None
+    ) -> types.Candidate | None:
         """Selects the first candidate, logging a warning if multiple exist."""
         if not candidates:
             log.warning("Received chunk with no candidates, skipping processing.")
@@ -616,7 +613,7 @@ class Pipe:
 
     def _process_image_part(
         self, inline_data, gen_content_args: dict, user: "UserData", request: Request
-    ) -> Optional[str]:
+    ) -> str | None:
         """Handles image data conversion to markdown."""
         mime_type = inline_data.mime_type
         image_data = inline_data.data
@@ -643,7 +640,7 @@ class Pipe:
         prompt: str,
         user_id: str,
         __request__: Request,
-    ) -> Optional[str]:
+    ) -> str | None:
         """
         Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
         Returns the url to uploaded image.
@@ -695,8 +692,8 @@ class Pipe:
     """Client initialization and model retrival from Google API"""
 
     def _get_genai_client(
-        self, api_key: Optional[str] = None, base_url: Optional[str] = None
-    ) -> Optional[genai.Client]:
+        self, api_key: str | None = None, base_url: str | None = None
+    ) -> genai.Client | None:
         client = None
         api_key = api_key if api_key else self.valves.GEMINI_API_KEY
         base_url = base_url if base_url else self.valves.GEMINI_API_BASE_URL
@@ -714,9 +711,9 @@ class Pipe:
             log.error("GEMINI_API_KEY is not set.")
         return client
 
-    def _get_user_client(self, __user__: "UserData") -> Optional[genai.Client]:
+    def _get_user_client(self, __user__: "UserData") -> genai.Client | None:
         # Register a user specific client if they have added their own API key.
-        user_valves: Optional[Pipe.UserValves] = __user__.get("valves")
+        user_valves: Pipe.UserValves | None = __user__.get("valves")
         if (
             user_valves
             and user_valves.GEMINI_API_KEY
@@ -866,7 +863,7 @@ class Pipe:
 
     async def _get_chat_completion_event_w_sources(
         self, data: types.GenerateContentResponse, raw_str: str
-    ) -> Optional["ChatCompletionEvent"]:
+    ) -> "ChatCompletionEvent | None":
         """Adds citation markers and source references to raw_str based on grounding metadata"""
 
         async def resolve_url(session: aiohttp.ClientSession, url: str) -> str:
@@ -964,7 +961,7 @@ class Pipe:
         # Prepare final event structure with modified content and sources
         event_data: "ChatCompletionEventData" = {
             "content": encoded_raw_str.decode(),  # Content with added citations
-            "sources": sources_list,  # List of resolved source references
+            "sources": sources_list,  # list of resolved source references
             "done": False,
         }
         event: "Event" = {

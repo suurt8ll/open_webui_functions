@@ -1,4 +1,4 @@
-from typing import Any, Literal, NotRequired, Optional, TypedDict
+from typing import Any, NotRequired, Literal, TypedDict
 from uuid import UUID
 from datetime import datetime
 from open_webui.models.files import FileModelResponse
@@ -12,7 +12,7 @@ class FileInfo(TypedDict):
     id: str
     url: str
     name: str
-    collection_name: Optional[str]
+    collection_name: str | None
     status: str
     size: int
     error: str
@@ -126,7 +126,7 @@ class Body(TypedDict):
 
 class MessageModel(TypedDict):
     id: UUID
-    parentId: Optional[UUID]
+    parentId: UUID | None
     childrenIds: list[UUID]
     role: Literal["user", "assistant"]
     content: str
@@ -192,4 +192,4 @@ class ModelData(TypedDict):
     id: str
     name: str
     # My own variables, these do not have any effect on Open WebUI's behaviour.
-    description: NotRequired[Optional[str]]
+    description: NotRequired[str | None]
