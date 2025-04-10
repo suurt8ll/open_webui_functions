@@ -864,50 +864,49 @@ class Pipe:
 
     """Citations"""
 
+    async def _resolve_url(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        timeout: aiohttp.ClientTimeout = DEFAULT_URL_TIMEOUT,
+    ) -> str:
+        """
+        Asynchronously resolves a URL by following redirects.
+
+        Args:
+            session: The aiohttp client session.
+            url: The URL to resolve.
+            timeout: The timeout configuration for the request.
+
+        Returns:
+            The final destination URL after redirects, or the original URL if
+            resolution fails or times out.
+        """
+        if not url:
+            return ""  # Handle empty URLs gracefully
+        try:
+            async with session.get(
+                url, allow_redirects=True, timeout=timeout
+            ) as response:
+                # Ensure the response URL is treated as a string
+                final_url = str(response.url)
+                log.debug(f"Resolved URL '{url}' to '{final_url}'")
+                return final_url
+        except asyncio.TimeoutError:
+            log.warning(f"Timeout resolving URL: {url}")
+            return url
+        except aiohttp.ClientError as e:
+            log.warning(f"Client error resolving URL {url}: {e}")
+            return url
+        except Exception:
+            # Catching broader exceptions can be useful but log the specifics
+            log.exception(f"Unexpected error resolving URL {url}, returning original.")
+            return url
+
     async def _get_chat_completion_event_w_sources(
         self, data: types.GenerateContentResponse, raw_str: str
     ) -> "ChatCompletionEvent | None":
         """Adds citation markers and source references to raw_str based on grounding metadata"""
-
-        async def resolve_url(
-            session: aiohttp.ClientSession,
-            url: str,
-            timeout: aiohttp.ClientTimeout = DEFAULT_URL_TIMEOUT,
-        ) -> str:
-            """
-            Asynchronously resolves a URL by following redirects.
-
-            Args:
-                session: The aiohttp client session.
-                url: The URL to resolve.
-                timeout: The timeout configuration for the request.
-
-            Returns:
-                The final destination URL after redirects, or the original URL if
-                resolution fails or times out.
-            """
-            if not url:
-                return ""  # Handle empty URLs gracefully
-            try:
-                async with session.get(
-                    url, allow_redirects=True, timeout=timeout
-                ) as response:
-                    # Ensure the response URL is treated as a string
-                    final_url = str(response.url)
-                    log.debug(f"Resolved URL '{url}' to '{final_url}'")
-                    return final_url
-            except asyncio.TimeoutError:
-                log.warning(f"Timeout resolving URL: {url}")
-                return url
-            except aiohttp.ClientError as e:
-                log.warning(f"Client error resolving URL {url}: {e}")
-                return url
-            except Exception:
-                # Catching broader exceptions can be useful but log the specifics
-                log.exception(
-                    f"Unexpected error resolving URL {url}, returning original."
-                )
-                return url
 
         # Early exit if no candidate content exists
         if not data.candidates:
@@ -940,7 +939,7 @@ class Pipe:
         async with aiohttp.ClientSession() as session:
             # Create list of async URL resolution tasks
             resolution_tasks = [
-                resolve_url(session, metadata["source"])
+                self._resolve_url(session, metadata["source"])
                 for metadata in source_metadatas
                 if metadata["source"]
             ]
