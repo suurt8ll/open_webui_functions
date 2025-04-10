@@ -68,6 +68,9 @@ if TYPE_CHECKING:
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
 log = logger.bind(auditable=False)
 
+# Default timeout for URL resolution
+DEFAULT_URL_TIMEOUT = aiohttp.ClientTimeout(total=10)  # 10 seconds total timeout
+
 
 class Pipe:
     class Valves(BaseModel):
@@ -866,17 +869,43 @@ class Pipe:
     ) -> "ChatCompletionEvent | None":
         """Adds citation markers and source references to raw_str based on grounding metadata"""
 
-        async def resolve_url(session: aiohttp.ClientSession, url: str) -> str:
-            """Asynchronously resolves a URL by following redirects to get final destination URL
-            Returns original URL if resolution fails.
+        async def resolve_url(
+            session: aiohttp.ClientSession,
+            url: str,
+            timeout: aiohttp.ClientTimeout = DEFAULT_URL_TIMEOUT,
+        ) -> str:
             """
-            # FIXME: Handle timeouts.
+            Asynchronously resolves a URL by following redirects.
+
+            Args:
+                session: The aiohttp client session.
+                url: The URL to resolve.
+                timeout: The timeout configuration for the request.
+
+            Returns:
+                The final destination URL after redirects, or the original URL if
+                resolution fails or times out.
+            """
+            if not url:
+                return ""  # Handle empty URLs gracefully
             try:
-                async with session.get(url, allow_redirects=True) as response:
-                    return str(response.url)
+                async with session.get(
+                    url, allow_redirects=True, timeout=timeout
+                ) as response:
+                    # Ensure the response URL is treated as a string
+                    final_url = str(response.url)
+                    log.debug(f"Resolved URL '{url}' to '{final_url}'")
+                    return final_url
+            except asyncio.TimeoutError:
+                log.warning(f"Timeout resolving URL: {url}")
+                return url
+            except aiohttp.ClientError as e:
+                log.warning(f"Client error resolving URL {url}: {e}")
+                return url
             except Exception:
+                # Catching broader exceptions can be useful but log the specifics
                 log.exception(
-                    f"Error resolving URL, returning the original url.", url=url
+                    f"Unexpected error resolving URL {url}, returning original."
                 )
                 return url
 
