@@ -973,6 +973,42 @@ class Pipe:
         }
         return event
 
+    def _remove_citation_markers(self, text: str, sources: list["Source"]) -> str:
+        processed: set[str] = set()
+        for source in sources:
+            supports = [
+                metadata["supports"]
+                for metadata in source.get("metadata", [])
+                if "supports" in metadata
+            ]
+            supports = [item for sublist in supports for item in sublist]
+            for support in supports:
+                support = types.GroundingSupport(**support)
+                indices = support.grounding_chunk_indices
+                segment = support.segment
+                if not (indices and segment):
+                    continue
+                segment_text = segment.text
+                if not segment_text:
+                    continue
+                # Using a shortened version because user could edit the assistant message in the front-end.
+                # If citation segment get's edited, then the markers would not be removed. Shortening reduces the
+                # chances of this happening.
+                segment_end = segment_text[-32:]
+                if segment_end in processed:
+                    continue
+                processed.add(segment_end)
+                citation_markers = "".join(f"[{index + 1}]" for index in indices)
+                # Find the position of the citation markers in the text
+                pos = text.find(segment_text + citation_markers)
+                if pos != -1:
+                    # Remove the citation markers
+                    text = (
+                        text[: pos + len(segment_text)]
+                        + text[pos + len(segment_text) + len(citation_markers) :]
+                    )
+        return text
+
     def _get_status_event_w_queries(
         self,
         data: types.GenerateContentResponse,
@@ -1011,42 +1047,6 @@ class Pipe:
 
         log.debug(f"Created StatusEvent: {status_event}")
         return status_event
-
-    def _remove_citation_markers(self, text: str, sources: list["Source"]) -> str:
-        processed: set[str] = set()
-        for source in sources:
-            supports = [
-                metadata["supports"]
-                for metadata in source.get("metadata", [])
-                if "supports" in metadata
-            ]
-            supports = [item for sublist in supports for item in sublist]
-            for support in supports:
-                support = types.GroundingSupport(**support)
-                indices = support.grounding_chunk_indices
-                segment = support.segment
-                if not (indices and segment):
-                    continue
-                segment_text = segment.text
-                if not segment_text:
-                    continue
-                # Using a shortened version because user could edit the assistant message in the front-end.
-                # If citation segment get's edited, then the markers would not be removed. Shortening reduces the
-                # chances of this happening.
-                segment_end = segment_text[-32:]
-                if segment_end in processed:
-                    continue
-                processed.add(segment_end)
-                citation_markers = "".join(f"[{index + 1}]" for index in indices)
-                # Find the position of the citation markers in the text
-                pos = text.find(segment_text + citation_markers)
-                if pos != -1:
-                    # Remove the citation markers
-                    text = (
-                        text[: pos + len(segment_text)]
-                        + text[pos + len(segment_text) + len(citation_markers) :]
-                    )
-        return text
 
     """Usage data"""
 
