@@ -910,46 +910,59 @@ class Pipe:
 
         # Early exit if no candidate content exists
         if not data.candidates:
+            log.warning("No candidates found in the response.")
             return None
 
         candidate = data.candidates[0]
         grounding_metadata = candidate.grounding_metadata if candidate else None
-        # Require valid metadata structure to proceed
-        if (
-            not grounding_metadata
-            or not grounding_metadata.grounding_supports
-            or not grounding_metadata.grounding_chunks
-        ):
+        if not grounding_metadata:
+            log.info("No grounding metadata found.")
             return None
 
         supports = grounding_metadata.grounding_supports
         grounding_chunks = grounding_metadata.grounding_chunks
-
-        # Collect all available URIs from grounding chunks and format them into a list of dicts
-        source_metadatas: list[SourceMetadata] = [
-            {"source": g_c.web.uri, "supports": []}
-            for g_c in grounding_chunks
-            if g_c.web and g_c.web.uri
-        ]
-        if not source_metadatas:
-            log.warning("No URLs were found in grounding_metadata.")
+        if not supports or not grounding_chunks:
+            log.info("Grounding metadata missing supports or chunks.")
             return None
 
-        log.info("Resolving all the source URLs asyncronously.")
-        async with aiohttp.ClientSession() as session:
-            # Create list of async URL resolution tasks
-            resolution_tasks = [
-                self._resolve_url(session, metadata["source"])
-                for metadata in source_metadatas
-                if metadata["source"]
-            ]
-            # Wait for all resolutions to complete
-            resolved_uris = await asyncio.gather(*resolution_tasks)
+        # 1. Collect and Prepare Source URLs
+        initial_metadatas: list[tuple[int, str]] = []  # Store index and URL
+        for i, g_c in enumerate(grounding_chunks):
+            web_info = g_c.web
+            if web_info and web_info.uri:
+                initial_metadatas.append((i, web_info.uri))
+
+        if not initial_metadatas:
+            log.warning("No source URIs found in grounding chunks.")
+            return None
+
+        # Initialize source_metadatas structure based on *all* chunks
+        # This ensures indices align correctly later, even if some chunks lack URIs
+        source_metadatas: list["SourceMetadata"] = [
+            {"source": None, "original_url": None, "supports": []}
+            for _ in grounding_chunks
+        ]
+
+        # 2. Resolve URLs Asynchronously
+        urls_to_resolve = [url for _, url in initial_metadatas]
+        resolved_uris: list[str] = []
+
+        async def _resolve_all():
+            nonlocal resolved_uris  # Modify outer scope variable
+            async with aiohttp.ClientSession() as session:
+                tasks = [self._resolve_url(session, url) for url in urls_to_resolve]
+                resolved_uris = await asyncio.gather(*tasks)
+
+        log.info(f"Resolving {len(urls_to_resolve)} source URLs asynchronously...")
+        await _resolve_all()
         log.info("URL resolution completed.")
-        # Replace original urls with resolved ones and store old urls in a separate key.
-        for index, metadata in enumerate(source_metadatas):
-            metadata["original_url"] = metadata["source"]
-            metadata["source"] = resolved_uris[index]
+
+        # 3. Populate source_metadatas with resolved URLs
+        resolved_uris_map = dict(zip(urls_to_resolve, resolved_uris))
+        for chunk_index, original_uri in initial_metadatas:
+            resolved_uri = resolved_uris_map.get(original_uri, original_uri)  # Fallback
+            source_metadatas[chunk_index]["original_url"] = original_uri
+            source_metadatas[chunk_index]["source"] = resolved_uri
 
         encoded_raw_str = raw_str.encode()
         # Starting the injection from the end ensures that end_pos variables
