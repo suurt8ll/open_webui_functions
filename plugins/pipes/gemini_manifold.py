@@ -964,51 +964,70 @@ class Pipe:
             source_metadatas[chunk_index]["original_url"] = original_uri
             source_metadatas[chunk_index]["source"] = resolved_uri
 
-        encoded_raw_str = raw_str.encode()
-        # Starting the injection from the end ensures that end_pos variables
-        # do not get shifted by next insertions.
-        for support in reversed(supports):
-            if not (
-                support.grounding_chunk_indices
-                and support.confidence_scores
-                and support.segment
-                and support.segment.end_index
-                and support.segment.start_index
-                and support.segment.text
-            ):
-                continue
-            end_pos = support.segment.end_index
-            indices = support.grounding_chunk_indices
-            # Create citation markers from associated chunk indices
-            citation_markers = "".join(f"[{index + 1}]" for index in indices)
-            encoded_citation_markers = citation_markers.encode()
-            encoded_raw_str = (
-                encoded_raw_str[:end_pos]
-                + encoded_citation_markers
-                + encoded_raw_str[end_pos:]
-            )
-            for indice in indices:
-                source_metadatas[indice]["supports"].append(support.model_dump())
+        # 4. Inject Citation Markers using bytearray for efficiency
+        modified_content_bytes = bytearray(raw_str.encode("utf-8"))
 
-        # Structure sources with resolved URLs
-        sources_list: list[Source] = [
-            {
-                "source": {"name": "web_search"},
-                "document": [""]
-                * len(source_metadatas),  # We do not have website content
-                "metadata": [metadata for metadata in source_metadatas],
-            }
+        for support in reversed(supports):
+            segment = support.segment
+            indices = support.grounding_chunk_indices
+
+            # Validate necessary fields for this support
+            if not (
+                indices is not None  # Check for existence (could be empty list)
+                and segment
+                and segment.end_index is not None
+            ):
+                log.debug(f"Skipping support due to missing data: {support}")
+                continue
+            end_pos = segment.end_index
+
+            # Create citation markers like "[1][2]"
+            citation_markers = "".join(f"[{index + 1}]" for index in indices)
+            encoded_citation_markers = citation_markers.encode("utf-8")
+
+            # Insert into bytearray. The insertion point remains relative to the
+            # *original* string's indices if we process in reverse.
+            modified_content_bytes[end_pos:end_pos] = encoded_citation_markers
+
+            # Add support metadata to the corresponding sources
+            for index in indices:
+                if 0 <= index < len(source_metadatas):
+                    source_metadatas[index]["supports"].append(support.model_dump())
+                else:
+                    log.warning(
+                        f"Invalid grounding chunk index {index} found in support."
+                    )
+
+        # 5. Final Assembly
+        final_content = modified_content_bytes.decode("utf-8")
+
+        # Filter out metadata entries that didn't have an original URL
+        # (though step 1 should prevent this unless grounding_chunks had gaps)
+        valid_source_metadatas = [
+            m for m in source_metadatas if m["original_url"] is not None
         ]
-        # Prepare final event structure with modified content and sources
+
+        sources_list: list["Source"] = []
+        if valid_source_metadatas:  # Only add sources if we have valid metadata
+            sources_list.append(
+                {
+                    "source": {"name": "web_search"},
+                    "document": [""] * len(valid_source_metadatas),
+                    "metadata": valid_source_metadatas,
+                }
+            )
+
         event_data: "ChatCompletionEventData" = {
-            "content": encoded_raw_str.decode(),  # Content with added citations
-            "sources": sources_list,  # list of resolved source references
+            "content": final_content,
+            "sources": sources_list,
             "done": False,
         }
-        event: "Event" = {
+
+        event: "ChatCompletionEvent" = {
             "type": "chat:completion",
             "data": event_data,
         }
+
         return event
 
     def _remove_citation_markers(self, text: str, sources: list["Source"]) -> str:
