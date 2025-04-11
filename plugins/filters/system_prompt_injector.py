@@ -5,7 +5,7 @@ id: system_prompt_injector
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
-version: 0.6.0
+version: 0.7.0
 """
 
 # The injection must follow this format (without triple quotes).
