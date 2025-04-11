@@ -28,6 +28,16 @@ ALLOWED_GROUNDING_MODELS = [
     "gemini-1.0-pro",
 ]
 
+# according to https://ai.google.dev/gemini-api/docs/code-execution
+ALLOWED_CODE_EXECUTION_MODELS = [
+    "gemini-2.5-pro-exp-03-25",
+    "gemini-2.0-pro-exp-02-05",
+    "gemini-2.0-pro-exp",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-exp",
+    "gemini-2.0-flash-001",
+]
+
 
 class Filter:
 
@@ -60,40 +70,63 @@ class Filter:
         )
         if base_model_name:
             model_name = base_model_name
-        
+
+        canonical_model_name = model_name.replace("gemini_manifold_google_genai.", "")
+
         if (
             "gemini_manifold_google_genai." not in model_name
-            or model_name.replace("gemini_manifold_google_genai.", "")
-            not in ALLOWED_GROUNDING_MODELS
+            or canonical_model_name not in ALLOWED_GROUNDING_MODELS
+            or canonical_model_name not in ALLOWED_CODE_EXECUTION_MODELS
         ):
             return body
 
         features = body.get("features", {})
-        web_search_enabled = (
-            features.get("web_search", False) if isinstance(features, dict) else False
-        )
-        if web_search_enabled:
-            print(
-                "[gemini_manifold_companion] Search feature is enabled, disabling it and adding custom feature called grounding_w_google_search."
+        print(f"!!!!!!! Features: {features}")
+
+        # Ensure metadata structure exists and add new feature
+        metadata = body.setdefault("metadata", {})
+        metadata_features = metadata.setdefault("features", {})
+
+        if canonical_model_name in ALLOWED_GROUNDING_MODELS:
+            web_search_enabled = (
+                features.get("web_search", False)
+                if isinstance(features, dict)
+                else False
             )
-            # Disable web_search
-            features["web_search"] = False
-            # Ensure metadata structure exists and add new feature
-            metadata = body.setdefault("metadata", {})
-            metadata_features = metadata.setdefault("features", {})
-            # Use "Google Search Retrieval" for 1.0 and 1.5 models and "Google Search as a Tool for >=2.0 models".
-            if "1.0" in model_name or "1.5" in model_name:
-                metadata_features["google_search_retrieval"] = True
-                metadata_features["google_search_retrieval_threshold"] = (
-                    self.valves.GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD
+            if web_search_enabled:
+                print(
+                    "[gemini_manifold_companion] Search feature is enabled, disabling it and adding custom feature called grounding_w_google_search."
                 )
-            else:
-                metadata_features["google_search_tool"] = True
-            # Google suggest setting temperature to 0 if using grounding:
-            # https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-with-google-search#:~:text=For%20ideal%20results%2C%20use%20a%20temperature%20of%200.0.
-            if self.valves.SET_TEMP_TO_ZERO:
-                print("[gemini_manifold_companion] Setting temperature to 0.")
-                body["temperature"] = 0
+                # Disable web_search
+                features["web_search"] = False
+                # Use "Google Search Retrieval" for 1.0 and 1.5 models and "Google Search as a Tool for >=2.0 models".
+                if "1.0" in model_name or "1.5" in model_name:
+                    metadata_features["google_search_retrieval"] = True
+                    metadata_features["google_search_retrieval_threshold"] = (
+                        self.valves.GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD
+                    )
+                else:
+                    metadata_features["google_search_tool"] = True
+                # Google suggest setting temperature to 0 if using grounding:
+                # https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-with-google-search#:~:text=For%20ideal%20results%2C%20use%20a%20temperature%20of%200.0.
+                if self.valves.SET_TEMP_TO_ZERO:
+                    print("[gemini_manifold_companion] Setting temperature to 0.")
+                    body["temperature"] = 0
+
+        if canonical_model_name in ALLOWED_CODE_EXECUTION_MODELS:
+            code_execution_enabled = (
+                features.get("code_interpreter", False)
+                if isinstance(features, dict)
+                else False
+            )
+            if code_execution_enabled:
+                print(
+                    "[gemini_manifold_companion] Code interpreter feature is enabled, disabling it and adding custom feature called google_code_execution."
+                )
+                # Disable code_interpreter
+                features["code_interpreter"] = False
+                # Use "Google Search Retrieval" for 1.0 and 1.5 models and "Google Search as a Tool for >=2.0 models".
+                metadata_features["google_code_execution"] = True
 
         return body
 
