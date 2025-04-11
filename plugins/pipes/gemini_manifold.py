@@ -18,11 +18,11 @@ requirements: google-genai==1.9.0
 #   - Display citations in the front-end.
 #   - Image input
 #   - Streaming
-#   - Grounding with Google Search (this requires installing "Gemini Manifold Companion" filter, see GitHub README)
+#   - Grounding with Google Search (this requires installing "Gemini Manifold Companion" >= 1.0.0 filter, see GitHub README)
 #   - Safety settings
 #   - Each user can decide to use their own API key.
 #   - Token usage data
-#   - Code execution tool.
+#   - Code execution tool. (Gemini Manifold Companion >= 1.1.0 required)
 
 # Features that are supported by API but not yet implemented in the manifold:
 #   TODO Audio input support.
