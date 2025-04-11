@@ -91,13 +91,14 @@ class Filter:
                     latest_system_prompt = sp
                     latest_options = opt
                     prompt_title = title
+        print(f"\n{latest_system_prompt=}\n{latest_options=}\n{prompt_title=}\n")
 
         # Apply extracted parameters
         self._handle_system_prompt(body, latest_system_prompt)
         if latest_options:
             self._handle_options(body, latest_options)  # type: ignore
         # Display title only when params where changed.
-        if latest_options:
+        if latest_options or latest_system_prompt:
             self.prompt_title = prompt_title  # Store title for later use
         else:
             self.prompt_title = None
