@@ -333,12 +333,9 @@ class Pipe:
         log.info("pipe method has finished it's run.")
         return None
 
-    """
-    ---------- Helper methods inside the Pipe class ----------
-    """
+    # region Helper methods inside the Pipe class
 
-    """Event emission and error logging"""
-
+    # region Event emission and error logging
     async def _emit_completion(
         self,
         content: Optional[str] = None,
@@ -383,8 +380,9 @@ class Pipe:
             "description": error_msg,
         }
 
-    """ChatModel.chat.messages -> list[genai.types.Content] conversion"""
+    # endregion
 
+    # region ChatModel.chat.messages -> list[genai.types.Content] conversion
     def _genai_contents_from_messages(
         self, messages_body: list["Message"], messages_db: list["MessageModel"] | None
     ) -> tuple[list[types.Content], str | None]:
@@ -565,8 +563,9 @@ class Pipe:
 
         return parts
 
-    """Model response streaming"""
+    # endregion
 
+    # region Model response streaming
     async def _stream_response(
         self,
         gen_content_args: dict,
@@ -729,8 +728,9 @@ class Pipe:
         )
         return image_url
 
-    """Client initialization and model retrival from Google API"""
+    # endregion
 
+    # region Client initialization and model retrival from Google API
     def _get_genai_client(
         self, api_key: Optional[str] = None, base_url: Optional[str] = None
     ) -> Optional[genai.Client]:
@@ -899,8 +899,9 @@ class Pipe:
             log.exception(error_msg)
             return model_name
 
-    """Citations"""
+    # endregion
 
+    # region Citations
     async def _get_chat_completion_event_w_sources(
         self, data: types.GenerateContentResponse, raw_str: str
     ) -> Optional["ChatCompletionEvent"]:
@@ -1085,8 +1086,9 @@ class Pipe:
                     )
         return text
 
-    """Usage data"""
+    # endregion
 
+    # region Usage data
     def _get_usage_data_event(
         self,
         response: types.GenerateContentResponse,
@@ -1127,8 +1129,9 @@ class Pipe:
         }
         return completion_event
 
-    """Other helpers"""
+    # endregion
 
+    # region Other helpers
     def _truncate_long_strings(self, data: Any, max_length: int = 64) -> str:
         """
         Recursively truncates all string and bytes fields within a dictionary or list that exceed
@@ -1212,3 +1215,7 @@ class Pipe:
         if mime_type is None:
             return "application/octet-stream"  # Default MIME type if unknown
         return mime_type
+
+    # endregion
+
+    # endregion
