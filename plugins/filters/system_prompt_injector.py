@@ -214,10 +214,15 @@ class Filter:
         return (system_prompt, prompt_title, modified_content, json_data)
 
     def _handle_options(self, body: dict[str, Any], options: dict[str, Any]):
-        body_options: dict[str, Any] = body.setdefault("options", {})
+        if body.get("metadata", {}).get("model", {}).get("owned_by") == "ollama":
+            body_options: dict[str, Any] = body.setdefault("options", {})
         for key, value in options.items():
             if value:
-                body_options[key] = value
+                if (
+                    body.get("metadata", {}).get("model", {}).get("owned_by")
+                    == "ollama"
+                ):
+                    body_options[key] = value
                 body[key] = value
                 print(f"Set {key} to: {value}")
             else:
@@ -232,7 +237,8 @@ class Filter:
         Also updates the 'system' key in the 'options' dictionary if present.
         """
         messages: list["Message"] = body.get("messages", [])
-        body_options = body.setdefault("options", {})
+        if body.get("metadata", {}).get("model", {}).get("owned_by") == "ollama":
+            body_options = body.setdefault("options", {})
         if system_prompt is None:
             print(
                 f"System prompt is {system_prompt}, using a front-end provided system prompt."
@@ -261,6 +267,7 @@ class Filter:
                 body["messages"] = messages  # Ensure the body reflects the change
                 print("Inserted new system message at the beginning.")
 
-            body_options["system"] = system_prompt
+            if body.get("metadata", {}).get("model", {}).get("owned_by") == "ollama":
+                body_options["system"] = system_prompt
 
     # endregion
