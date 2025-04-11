@@ -131,7 +131,7 @@ class Filter:
 
         return body
 
-    # region Helper methods inside the Pipe class
+    # region ----- Helper methods inside the Pipe class -----
 
     def _process_user_message(
         self, user_message: "UserMessage"
@@ -213,61 +213,88 @@ class Filter:
 
         return (system_prompt, prompt_title, modified_content, json_data)
 
-    def _handle_options(self, body: dict[str, Any], options: dict[str, Any]):
-        if body.get("metadata", {}).get("model", {}).get("owned_by") == "ollama":
-            body_options: dict[str, Any] = body.setdefault("options", {})
+    def _is_ollama_model(self, body: "Body") -> bool:
+        """Checks if the model specified in the body is owned by Ollama."""
+        return body.get("metadata", {}).get("model", {}).get("owned_by") == "ollama"
+
+    def _handle_options(self, body: "Body", options: dict[str, Any]):
+        """
+        Applies options to the request body.
+
+        Updates top-level keys in the body. If the model is owned by Ollama,
+        it also updates the nested 'options' dictionary within the body.
+        Falsy values in the input 'options' lead to key removal.
+        """
+        is_ollama = self._is_ollama_model(body)
+        body_options: dict[str, Any] | None = None
+
+        if is_ollama:
+            body_options = body.setdefault("options", {})
+
         for key, value in options.items():
             if value:
-                if (
-                    body.get("metadata", {}).get("model", {}).get("owned_by")
-                    == "ollama"
-                ):
-                    body_options[key] = value
                 body[key] = value
-                print(f"Set {key} to: {value}")
+                if is_ollama and body_options is not None:
+                    body_options[key] = value
+                print(f"Set option '{key}' to: {value}")
             else:
-                body_options.pop(key, None)
                 body.pop(key, None)
-                print(f"Removed key {key}")
+                if is_ollama and body_options is not None:
+                    body_options.pop(key, None)
+                print(f"Removed option '{key}' due to falsy value.")
 
     def _handle_system_prompt(self, body: "Body", system_prompt: str | None) -> None:
         """
-        Applies a *non-empty* system prompt to the request body.
-        Updates the existing system message or inserts a new one at the beginning.
-        Also updates the 'system' key in the 'options' dictionary if present.
+        Adds, updates, or removes the system prompt in the body's 'messages' list.
+
+        - If system_prompt is a non-empty string: Adds or updates the system message.
+        - If system_prompt is an empty string (""): Removes the system message.
+        - If system_prompt is None: Does nothing to the messages list.
+
+        If the model is owned by Ollama, it also updates/removes the 'system' key
+        in the nested 'options' dictionary accordingly.
         """
-        messages: list["Message"] = body.get("messages", [])
-        if body.get("metadata", {}).get("model", {}).get("owned_by") == "ollama":
-            body_options = body.setdefault("options", {})
+        is_ollama = self._is_ollama_model(body)
+        messages: list[Message] = body.setdefault("messages", [])
+
+        system_message_index = -1
+        for i, message in enumerate(messages):
+            if message.get("role") == "system":
+                system_message_index = i
+                break
+
+        body_options: dict[str, Any] | None = None
+        if is_ollama:
+            if system_prompt is not None:
+                body_options = body.setdefault("options", {})
+
         if system_prompt is None:
-            print(
-                f"System prompt is {system_prompt}, using a front-end provided system prompt."
-            )
+            print("No system prompt provided; leaving existing messages unchanged.")
+
         elif system_prompt == "":
-            print(f"System prompt is {system_prompt}, wiping the system prompt.")
-            body_options.pop("system", None)
-            # Use reversed iteration for safe removal
-            for i in range(len(messages) - 1, -1, -1):
-                if messages[i].get("role") == "system":
-                    messages.pop(i)
-                    break  # Assume only one system message needs removal
+            print("Empty system prompt provided; removing existing system message.")
+            if system_message_index != -1:
+                messages.pop(system_message_index)
+                print("Removed system message from 'messages' list.")
+            if is_ollama and body_options is not None:
+                body_options.pop("system", None)
+                print("Removed 'system' key from Ollama options.")
+
         else:
-            system_message_found = False
-            # Iterate through messages to find and update the system message
-            for message in messages:
-                if message.get("role") == "system":
-                    message["content"] = system_prompt
-                    system_message_found = True
-                    print("Updated existing system message.")
-                    break
+            print(f"Applying system prompt: '{system_prompt[:50]}...'")
+            system_message: Message = {"role": "system", "content": system_prompt}
 
-            # If no system message exists, insert one at the beginning
-            if not system_message_found:
-                messages.insert(0, {"role": "system", "content": system_prompt})
-                body["messages"] = messages  # Ensure the body reflects the change
-                print("Inserted new system message at the beginning.")
+            if system_message_index != -1:
+                messages[system_message_index] = system_message
+                print("Updated existing system message in 'messages' list.")
+            else:
+                messages.insert(0, system_message)
+                print(
+                    "Inserted new system message at the beginning of 'messages' list."
+                )
 
-            if body.get("metadata", {}).get("model", {}).get("owned_by") == "ollama":
+            if is_ollama and body_options is not None:
                 body_options["system"] = system_prompt
+                print("Set 'system' key in Ollama options.")
 
     # endregion
