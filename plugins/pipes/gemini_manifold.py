@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.13.1
+version: 1.14.0
 requirements: google-genai==1.9.0
 """
 
@@ -22,12 +22,12 @@ requirements: google-genai==1.9.0
 #   - Safety settings
 #   - Each user can decide to use their own API key.
 #   - Token usage data
+#   - Code execution tool.
 
 # Features that are supported by API but not yet implemented in the manifold:
 #   TODO Audio input support.
 #   TODO Video input support.
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
-#   TODO Code execution tool.
 
 import copy
 import json
@@ -66,7 +66,7 @@ from loguru import logger
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler
-    from utils.manifold_types import *  # My personal types in a separate file for more robustness.
+    from open_webui.utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
 log = logger.bind(auditable=False)
@@ -239,9 +239,13 @@ class Pipe:
                 )
 
         features = __metadata__.get("features", {})
+        gen_content_conf.tools = []
+
         if features.get("google_search_tool"):
             log.info("Using grounding with Google Search as a Tool.")
-            gen_content_conf.tools = [types.Tool(google_search=types.GoogleSearch())]
+            gen_content_conf.tools.append(
+                types.Tool(google_search=types.GoogleSearch())
+            )
         elif features.get("google_search_retrieval"):
             log.info("Using grounding with Google Search Retrieval.")
             gs = types.GoogleSearchRetrieval(
@@ -249,7 +253,15 @@ class Pipe:
                     dynamic_threshold=features.get("google_search_retrieval_threshold")
                 )
             )
-            gen_content_conf.tools = [types.Tool(google_search_retrieval=gs)]
+            gen_content_conf.tools.append(types.Tool(google_search_retrieval=gs))
+
+        # NB: It is not possible to use both Search and Code execution at the same time,
+        # however, it can be changed later, so let's just handle it as a common error
+        if features.get("google_code_execution"):
+            log.info("Using code execution on Google side.")
+            gen_content_conf.tools.append(
+                types.Tool(code_execution=types.ToolCodeExecution)
+            )
 
         gen_content_args = {
             "model": model_name,
@@ -594,6 +606,31 @@ class Pipe:
                         inline_data, gen_content_args, __user__, __request__
                     ):
                         content += img_url
+                elif executable_code_part := part.executable_code:
+                    executable_code_part_lang_enum = getattr(
+                        executable_code_part, "language", None
+                    )
+                    lang_name = "python"  # would be python in 99% cases anyway
+                    if executable_code_part_lang_enum and hasattr(
+                        executable_code_part_lang_enum, "name"
+                    ):
+                        lang_name = executable_code_part_lang_enum.name.lower()
+                    else:
+                        log.warning(
+                            f"Could not extract language name from {executable_code_part_lang_enum}. Default to python."
+                        )
+
+                    executable_code_part_code = getattr(
+                        executable_code_part, "code", ""
+                    )
+                    if executable_code_part_code:
+                        content += f"\n```{lang_name}\n{executable_code_part_code}```\n"
+                elif code_execution_result_part := part.code_execution_result:
+                    code_execution_result_part_output = getattr(
+                        code_execution_result_part, "output", ""
+                    )
+                    if code_execution_result_part_output:
+                        content += f"\n**Output:**\n```\n{code_execution_result_part_output}```\n"
                 # TODO: Streaming this way loses the support for Filter.stream() method processing for filter plugins.
                 await self._emit_completion(content)
 
