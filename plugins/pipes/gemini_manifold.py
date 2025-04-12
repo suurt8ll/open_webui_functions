@@ -296,6 +296,7 @@ class Pipe:
                 return None
             try:
                 # FIXME: Support native image gen here too.
+                # FIXME: Support code execution here too.
                 res = await client.aio.models.generate_content(**gen_content_args)
             except Exception as e:
                 error_msg = f"Content generation error: {str(e)}"
@@ -645,7 +646,7 @@ class Pipe:
             log.warning("Language Enum is None, defaulting to python.")
 
         if executable_code_part_code := executable_code_part.code:
-            return f"\n```{lang_name}\n{executable_code_part_code}```\n"
+            return f"```{lang_name}\n{executable_code_part_code.rstrip()}\n```\n\n"
         return ""
 
     def _process_code_execution_result_part(
@@ -659,7 +660,7 @@ class Pipe:
             return None
 
         if code_execution_result_part_output := code_execution_result_part.output:
-            return f"\n**Output:**\n```\n{code_execution_result_part_output}```\n"
+            return f"**Output:**\n\n```\n{code_execution_result_part_output.rstrip()}\n```\n\n"
         else:
             return None
 
