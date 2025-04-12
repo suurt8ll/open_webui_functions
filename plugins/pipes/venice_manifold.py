@@ -26,12 +26,10 @@ import asyncio
 import uuid
 import aiohttp
 import base64
+from collections.abc import Awaitable, Callable
 from typing import (
     Any,
     Literal,
-    Callable,
-    Awaitable,
-    Optional,
     TYPE_CHECKING,
 )
 from pydantic import BaseModel, Field
@@ -54,7 +52,7 @@ log = logger.bind(auditable=False)
 
 class Pipe:
     class Valves(BaseModel):
-        VENICE_API_TOKEN: Optional[str] = Field(
+        VENICE_API_TOKEN: str | None = Field(
             default=None, description="Venice.ai API Token"
         )
         HEIGHT: int = Field(default=1024, description="Image height")
@@ -116,7 +114,7 @@ class Pipe:
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __task__: str,
         __metadata__: dict[str, Any],
-    ) -> Optional[str]:
+    ) -> str | None:
 
         # TODO: [refac] Move __user__ to self like that also.
         self.__event_emitter__ = __event_emitter__
@@ -249,7 +247,7 @@ class Pipe:
             error_msg = f"An unexpected error occurred: {str(e)}"
             return [self._return_error_model(error_msg)]
 
-    async def _generate_image(self, model: str, prompt: str) -> Optional[dict]:
+    async def _generate_image(self, model: str, prompt: str) -> dict | None:
         try:
             async with aiohttp.ClientSession() as session:
                 log.info(

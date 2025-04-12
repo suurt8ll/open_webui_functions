@@ -61,7 +61,7 @@ class Pipe:
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __user__: "UserData",
         __metadata__: dict[str, Any],
-    ) -> Optional[str]:
+    ) -> str | None:
 
         self.__event_emitter__ = __event_emitter__
 
@@ -88,10 +88,10 @@ class Pipe:
 
     async def _emit_completion(
         self,
-        content: Optional[str] = None,
+        content: str | None = None,
         done: bool = False,
-        error: Optional[str] = None,
-        sources: Optional[list["Source"]] = None,
+        error: str | None = None,
+        sources: list["Source"] | None = None,
     ):
         """Constructs and emits completion event."""
         emission: "ChatCompletionEvent" = {

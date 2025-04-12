@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 1.14.1
-requirements: google-genai==1.9.0
+requirements: google-genai==1.10.0
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API.
@@ -45,13 +45,10 @@ import fnmatch
 import sys
 from fastapi import Request
 from pydantic import BaseModel, Field
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import (
     Any,
-    AsyncIterator,
-    Awaitable,
-    Callable,
     Literal,
-    Optional,
     TYPE_CHECKING,
     cast,
 )
@@ -68,13 +65,16 @@ if TYPE_CHECKING:
     from loguru._handler import Handler
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
-# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
+# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
+
+# Default timeout for URL resolution
+DEFAULT_URL_TIMEOUT = aiohttp.ClientTimeout(total=10)  # 10 seconds total timeout
 
 
 class Pipe:
     class Valves(BaseModel):
-        GEMINI_API_KEY: Optional[str] = Field(default=None)
+        GEMINI_API_KEY: str | None = Field(default=None)
         REQUIRE_USER_API_KEY: bool = Field(
             default=False,
             description="""Whether to require user's own API key (applies to admins too).
@@ -91,7 +91,7 @@ class Pipe:
             Supports `fnmatch` patterns: *, ?, [seq], [!seq]. 
             Default value is * (all models allowed).""",
         )
-        MODEL_BLACKLIST: Optional[str] = Field(
+        MODEL_BLACKLIST: str | None = Field(
             default=None,
             description="""Comma-separated list of blacklisted model names. 
             Supports `fnmatch` patterns: *, ?, [seq], [!seq]. 
@@ -115,7 +115,7 @@ class Pipe:
         )
 
     class UserValves(BaseModel):
-        GEMINI_API_KEY: Optional[str] = Field(default=None)
+        GEMINI_API_KEY: str | None = Field(default=None)
         GEMINI_API_BASE_URL: str = Field(
             default="https://generativelanguage.googleapis.com",
             description="The base URL for calling the Gemini API",
@@ -171,7 +171,7 @@ class Pipe:
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __metadata__: dict[str, Any],
-    ) -> Optional[str]:
+    ) -> str | None:
 
         self.__event_emitter__ = __event_emitter__
 
@@ -322,14 +322,8 @@ class Pipe:
             log.info("Sending status event with the used search queries.")
             print(self._truncate_long_strings(queries_status))
             await __event_emitter__(queries_status)
-        # Emit sources.
-        if emit_sources := await self._get_chat_completion_event_w_sources(
-            res, raw_text
-        ):
-            log.info("Sending chat completion event with the sources.")
-            print(self._truncate_long_strings(emit_sources))
-            await __event_emitter__(emit_sources)
-
+        # Inject markers.
+        await self._process_citations_and_emit_events(res, raw_text)
         await self._emit_completion(done=True)
         log.info("pipe method has finished it's run.")
         return None
@@ -339,10 +333,10 @@ class Pipe:
     # region Event emission and error logging
     async def _emit_completion(
         self,
-        content: Optional[str] = None,
+        content: str | None = None,
         done: bool = False,
-        error: Optional[str] = None,
-        sources: Optional[list["Source"]] = None,
+        error: str | None = None,
+        sources: list["Source"] | None = None,
     ):
         """Constructs and emits completion event."""
         emission: "ChatCompletionEvent" = {
@@ -448,7 +442,7 @@ class Pipe:
             contents.append(types.Content(role=role, parts=parts))
         return contents, system_prompt
 
-    def _genai_part_from_image_url(self, image_url: str) -> Optional[types.Part]:
+    def _genai_part_from_image_url(self, image_url: str) -> types.Part | None:
         """
         Processes an image URL and returns a genai.types.Part object from it
         Handles GCS, data URIs, and standard URLs.
@@ -624,9 +618,20 @@ class Pipe:
 
         return aggregated_chunks, content, finish_reason
 
+    def _get_first_candidate(
+        self, candidates: list[types.Candidate] | None
+    ) -> types.Candidate | None:
+        """Selects the first candidate, logging a warning if multiple exist."""
+        if not candidates:
+            log.warning("Received chunk with no candidates, skipping processing.")
+            return None
+        if len(candidates) > 1:
+            log.warning("Multiple candidates found, defaulting to first candidate.")
+        return candidates[0]
+
     def _process_image_part(
         self, inline_data, gen_content_args: dict, user: "UserData", request: Request
-    ) -> Optional[str]:
+    ) -> str | None:
         """Handles image data conversion to markdown."""
         mime_type = inline_data.mime_type
         image_data = inline_data.data
@@ -685,17 +690,6 @@ class Pipe:
         else:
             return None
 
-    def _get_first_candidate(
-        self, candidates: Optional[list[types.Candidate]]
-    ) -> Optional[types.Candidate]:
-        """Selects the first candidate, logging a warning if multiple exist."""
-        if not candidates:
-            log.warning("Received chunk with no candidates, skipping processing.")
-            return None
-        if len(candidates) > 1:
-            log.warning("Multiple candidates found, defaulting to first candidate.")
-        return candidates[0]
-
     def _upload_image(
         self,
         image_data: bytes,
@@ -704,7 +698,7 @@ class Pipe:
         prompt: str,
         user_id: str,
         __request__: Request,
-    ) -> Optional[str]:
+    ) -> str | None:
         """
         Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
         Returns the url to uploaded image.
@@ -757,8 +751,8 @@ class Pipe:
 
     # region Client initialization and model retrival from Google API
     def _get_genai_client(
-        self, api_key: Optional[str] = None, base_url: Optional[str] = None
-    ) -> Optional[genai.Client]:
+        self, api_key: str | None = None, base_url: str | None = None
+    ) -> genai.Client | None:
         client = None
         api_key = api_key if api_key else self.valves.GEMINI_API_KEY
         base_url = base_url if base_url else self.valves.GEMINI_API_BASE_URL
@@ -776,9 +770,9 @@ class Pipe:
             log.error("GEMINI_API_KEY is not set.")
         return client
 
-    def _get_user_client(self, __user__: "UserData") -> Optional[genai.Client]:
+    def _get_user_client(self, __user__: "UserData") -> genai.Client | None:
         # Register a user specific client if they have added their own API key.
-        user_valves: Optional[Pipe.UserValves] = __user__.get("valves")
+        user_valves: Pipe.UserValves | None = __user__.get("valves")
         if (
             user_valves
             and user_valves.GEMINI_API_KEY
@@ -927,114 +921,257 @@ class Pipe:
     # endregion
 
     # region Citations
-    async def _get_chat_completion_event_w_sources(
-        self, data: types.GenerateContentResponse, raw_str: str
-    ) -> Optional["ChatCompletionEvent"]:
-        """Adds citation markers and source references to raw_str based on grounding metadata"""
+    async def _resolve_url(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        timeout: aiohttp.ClientTimeout = DEFAULT_URL_TIMEOUT,
+        max_retries: int = 3,
+        base_delay: float = 0.5,
+    ) -> str:
+        """Resolves a given URL using the provided aiohttp session, with multiple retries on failure."""
 
-        async def resolve_url(session: aiohttp.ClientSession, url: str) -> str:
-            """Asynchronously resolves a URL by following redirects to get final destination URL
-            Returns original URL if resolution fails.
-            """
-            # FIXME: Handle timeouts.
+        if not url:
+            return ""
+
+        for attempt in range(max_retries + 1):
             try:
-                async with session.get(url, allow_redirects=True) as response:
-                    return str(response.url)
-            except Exception:
-                log.exception(
-                    f"Error resolving URL, returning the original url.", url=url
-                )
+                async with session.get(
+                    url,
+                    allow_redirects=True,
+                    timeout=timeout,
+                ) as response:
+                    final_url = str(response.url)
+                    log.debug(
+                        f"Resolved URL '{url}' to '{final_url}' after {attempt} retries"
+                    )
+                    return final_url
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                if attempt == max_retries:
+                    log.error(
+                        f"Failed to resolve URL '{url}' after {max_retries + 1} attempts: {e}"
+                    )
+                    return url
+                else:
+                    delay = min(base_delay * (2**attempt), 10.0)
+                    log.warning(
+                        f"Retry {attempt + 1}/{max_retries + 1} for URL '{url}': {e}. Waiting {delay:.1f}s..."
+                    )
+                    await asyncio.sleep(delay)
+            except Exception as e:
+                log.exception(f"Unexpected error resolving URL '{url}': {e}")
                 return url
+        return url  # Shouldn't reach here if loop is correct
 
-        # Early exit if no candidate content exists
-        if not data.candidates:
-            return None
+    async def _resolve_and_emit_sources(
+        self,
+        initial_metadatas: list[tuple[int, str]],
+        source_metadatas_template: list["SourceMetadata"],
+        supports: list[types.GroundingSupport],
+    ):
+        """
+        Resolves URLs in the background and emits a chat completion event
+        containing only the source information.
+        """
 
-        candidate = data.candidates[0]
-        grounding_metadata = candidate.grounding_metadata if candidate else None
-        # Require valid metadata structure to proceed
-        if (
-            not grounding_metadata
-            or not grounding_metadata.grounding_supports
-            or not grounding_metadata.grounding_chunks
-        ):
-            return None
+        urls_to_resolve = [url for _, url in initial_metadatas]
+        resolved_uris: list[str] = []
 
-        supports = grounding_metadata.grounding_supports
-        grounding_chunks = grounding_metadata.grounding_chunks
-
-        # Collect all available URIs from grounding chunks and format them into a list of dicts
-        source_metadatas: list[SourceMetadata] = [
-            {"source": g_c.web.uri, "supports": []}
-            for g_c in grounding_chunks
-            if g_c.web and g_c.web.uri
-        ]
-        if not source_metadatas:
-            log.warning("No URLs were found in grounding_metadata.")
-            return None
-
-        log.info("Resolving all the source URLs asyncronously.")
+        log.info(f"Background task: Resolving {len(urls_to_resolve)} source URLs...")
         async with aiohttp.ClientSession() as session:
-            # Create list of async URL resolution tasks
-            resolution_tasks = [
-                resolve_url(session, metadata["source"])
-                for metadata in source_metadatas
-                if metadata["source"]
-            ]
-            # Wait for all resolutions to complete
-            resolved_uris = await asyncio.gather(*resolution_tasks)
-        log.info("URL resolution completed.")
-        # Replace original urls with resolved ones and store old urls in a separate key.
-        for index, metadata in enumerate(source_metadatas):
-            metadata["original_url"] = metadata["source"]
-            metadata["source"] = resolved_uris[index]
+            tasks = [self._resolve_url(session, url) for url in urls_to_resolve]
+            resolved_uris = await asyncio.gather(*tasks)
+        log.info("Background task: URL resolution completed.")
 
-        encoded_raw_str = raw_str.encode()
-        # Starting the injection from the end ensures that end_pos variables
-        # do not get shifted by next insertions.
-        for support in reversed(supports):
-            if not (
-                support.grounding_chunk_indices
-                and support.confidence_scores
-                and support.segment
-                and support.segment.end_index
-                and support.segment.start_index
-                and support.segment.text
-            ):
-                continue
-            end_pos = support.segment.end_index
+        # Populate a *copy* of the template to avoid race conditions if needed,
+        # though direct modification might be okay if structure is pre-allocated.
+        populated_metadatas = [m.copy() for m in source_metadatas_template]
+
+        resolved_uris_map = dict(zip(urls_to_resolve, resolved_uris))
+        for chunk_index, original_uri in initial_metadatas:
+            resolved_uri = resolved_uris_map.get(original_uri, original_uri)  # Fallback
+            if 0 <= chunk_index < len(populated_metadatas):
+                populated_metadatas[chunk_index]["original_url"] = original_uri
+                populated_metadatas[chunk_index]["source"] = resolved_uri
+            else:
+                log.warning(
+                    f"Chunk index {chunk_index} out of bounds when populating resolved URLs."
+                )
+
+        # Add support metadata back to the corresponding sources
+        # This needs to be done *after* resolution completes and we have the final metadata list
+        for support in supports:
+            segment = support.segment
             indices = support.grounding_chunk_indices
-            # Create citation markers from associated chunk indices
-            citation_markers = "".join(f"[{index + 1}]" for index in indices)
-            encoded_citation_markers = citation_markers.encode()
-            encoded_raw_str = (
-                encoded_raw_str[:end_pos]
-                + encoded_citation_markers
-                + encoded_raw_str[end_pos:]
-            )
-            for indice in indices:
-                source_metadatas[indice]["supports"].append(support.model_dump())
+            if not (indices is not None and segment and segment.end_index is not None):
+                continue  # Skip if essential data missing
 
-        # Structure sources with resolved URLs
-        sources_list: list[Source] = [
-            {
-                "source": {"name": "web_search"},
-                "document": [""]
-                * len(source_metadatas),  # We do not have website content
-                "metadata": [metadata for metadata in source_metadatas],
-            }
+            for index in indices:
+                if 0 <= index < len(populated_metadatas):
+                    populated_metadatas[index].setdefault("supports", []).append(
+                        support.model_dump()
+                    )
+                else:
+                    log.warning(
+                        f"Invalid grounding chunk index {index} found in support during background processing."
+                    )
+
+        # Filter out metadata entries that didn't have an original URL resolved
+        valid_source_metadatas = [
+            m for m in populated_metadatas if m.get("original_url") is not None
         ]
-        # Prepare final event structure with modified content and sources
+
+        sources_list: list["Source"] = []
+        if valid_source_metadatas:
+            sources_list.append(
+                {
+                    "source": {"name": "web_search"},
+                    "document": [""] * len(valid_source_metadatas),
+                    "metadata": valid_source_metadatas,
+                }
+            )
+
+        # Prepare and emit the sources-only event
         event_data: "ChatCompletionEventData" = {
-            "content": encoded_raw_str.decode(),  # Content with added citations
-            "sources": sources_list,  # List of resolved source references
+            "sources": sources_list,
             "done": False,
         }
-        event: "Event" = {
+        event: "ChatCompletionEvent" = {
             "type": "chat:completion",
             "data": event_data,
         }
-        return event
+        await self.__event_emitter__(event)
+        log.info("Background task: Emitted sources event.")
+
+    async def _process_citations_and_emit_events(
+        self, data: types.GenerateContentResponse, raw_str: str
+    ) -> None:
+        """
+        Injects citation markers into raw_str, emits the text content immediately,
+        and launches a background task to resolve and emit sources later.
+        """
+
+        # --- 1. Extract necessary data ---
+        if not data.candidates:
+            log.warning("No candidates found in the response.")
+            return
+
+        candidate = data.candidates[0]
+        grounding_metadata = candidate.grounding_metadata if candidate else None
+        if not grounding_metadata:
+            log.info("No grounding metadata found, skipping citation processing.")
+            return
+
+        supports = grounding_metadata.grounding_supports
+        grounding_chunks = grounding_metadata.grounding_chunks
+        if not supports or not grounding_chunks:
+            log.info(
+                "Grounding metadata missing supports or chunks, skipping citation processing."
+            )
+            return
+
+        # --- 2. Prepare data for background task & initial metadata structure ---
+        initial_metadatas: list[tuple[int, str]] = (
+            []
+        )  # Store index and URL for resolver
+        for i, g_c in enumerate(grounding_chunks):
+            web_info = g_c.web
+            if web_info and web_info.uri:
+                initial_metadatas.append((i, web_info.uri))
+
+        # Create a template structure. The background task will populate this.
+        # We only need original_url and source set to None initially. Supports added later.
+        source_metadatas_template: list["SourceMetadata"] = [
+            {
+                "source": None,
+                "original_url": None,
+                "supports": [],
+            }  # Initialize supports list here
+            for _ in grounding_chunks
+        ]
+
+        # --- 3. Inject Citation Markers ---
+        modified_content_bytes = bytearray(raw_str.encode("utf-8"))
+        for support in reversed(supports):
+            segment = support.segment
+            indices = support.grounding_chunk_indices
+
+            if not (indices is not None and segment and segment.end_index is not None):
+                log.debug(f"Skipping support due to missing data: {support}")
+                continue
+
+            end_pos = segment.end_index
+            citation_markers = "".join(f"[{index + 1}]" for index in indices)
+            encoded_citation_markers = citation_markers.encode("utf-8")
+
+            modified_content_bytes[end_pos:end_pos] = encoded_citation_markers
+
+        final_content_with_markers = modified_content_bytes.decode("utf-8")
+
+        # --- 4. Emit Text + Markers Event ---
+        # This event contains the text with markers but no sources yet.
+        text_event_data: "ChatCompletionEventData" = {
+            "content": final_content_with_markers,
+            "done": False,
+        }
+        text_event: "ChatCompletionEvent" = {
+            "type": "chat:completion",
+            "data": text_event_data,
+        }
+        await self.__event_emitter__(text_event)
+        log.debug("Emitted text content event with citation markers.")
+
+        # --- 5. Launch Background Task for URL Resolution and Source Emission ---
+        if initial_metadatas:  # Only launch if there are URLs to resolve
+            asyncio.create_task(
+                self._resolve_and_emit_sources(
+                    initial_metadatas=initial_metadatas,
+                    source_metadatas_template=source_metadatas_template,
+                    supports=supports,
+                )
+            )
+            log.info("Launched background task for URL resolution.")
+        else:
+            log.info("No source URIs found, skipping background URL resolution task.")
+
+        # This function now returns None as events are emitted directly.
+        return None
+
+    def _remove_citation_markers(self, text: str, sources: list["Source"]) -> str:
+        processed: set[str] = set()
+        for source in sources:
+            supports = [
+                metadata["supports"]
+                for metadata in source.get("metadata", [])
+                if "supports" in metadata
+            ]
+            supports = [item for sublist in supports for item in sublist]
+            for support in supports:
+                support = types.GroundingSupport(**support)
+                indices = support.grounding_chunk_indices
+                segment = support.segment
+                if not (indices and segment):
+                    continue
+                segment_text = segment.text
+                if not segment_text:
+                    continue
+                # Using a shortened version because user could edit the assistant message in the front-end.
+                # If citation segment get's edited, then the markers would not be removed. Shortening reduces the
+                # chances of this happening.
+                segment_end = segment_text[-32:]
+                if segment_end in processed:
+                    continue
+                processed.add(segment_end)
+                citation_markers = "".join(f"[{index + 1}]" for index in indices)
+                # Find the position of the citation markers in the text
+                pos = text.find(segment_text + citation_markers)
+                if pos != -1:
+                    # Remove the citation markers
+                    text = (
+                        text[: pos + len(segment_text)]
+                        + text[pos + len(segment_text) + len(citation_markers) :]
+                    )
+        return text
 
     def _get_status_event_w_queries(
         self,
@@ -1074,42 +1211,6 @@ class Pipe:
 
         log.debug(f"Created StatusEvent: {status_event}")
         return status_event
-
-    def _remove_citation_markers(self, text: str, sources: list["Source"]) -> str:
-        processed: set[str] = set()
-        for source in sources:
-            supports = [
-                metadata["supports"]
-                for metadata in source.get("metadata", [])
-                if "supports" in metadata
-            ]
-            supports = [item for sublist in supports for item in sublist]
-            for support in supports:
-                support = types.GroundingSupport(**support)
-                indices = support.grounding_chunk_indices
-                segment = support.segment
-                if not (indices and segment):
-                    continue
-                segment_text = segment.text
-                if not segment_text:
-                    continue
-                # Using a shortened version because user could edit the assistant message in the front-end.
-                # If citation segment get's edited, then the markers would not be removed. Shortening reduces the
-                # chances of this happening.
-                segment_end = segment_text[-32:]
-                if segment_end in processed:
-                    continue
-                processed.add(segment_end)
-                citation_markers = "".join(f"[{index + 1}]" for index in indices)
-                # Find the position of the citation markers in the text
-                pos = text.find(segment_text + citation_markers)
-                if pos != -1:
-                    # Remove the citation markers
-                    text = (
-                        text[: pos + len(segment_text)]
-                        + text[pos + len(segment_text) + len(citation_markers) :]
-                    )
-        return text
 
     # endregion
 
@@ -1209,8 +1310,8 @@ class Pipe:
             """Filter function to only allow logs from this plugin (based on module name)."""
             return record["name"] == __name__  # Filter by module name
 
-        # Access the internal state of the logger
-        handlers: dict[int, "Handler"] = logger._core.handlers  # type: ignore
+        # Access the internal state of the log
+        handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
         for key, handler in handlers.items():
             existing_filter = handler._filter
             if (
@@ -1222,7 +1323,7 @@ class Pipe:
                 log.debug("Handler for this plugin is already present!")
                 return
 
-        logger.add(
+        log.add(
             sys.stdout,
             level=self.valves.LOG_LEVEL,
             format=stdout_format,

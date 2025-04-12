@@ -84,7 +84,7 @@ class Pipe:
         sources_test: "ChatCompletionEvent" = {
             "type": "chat:completion",
             "data": {
-                "content": "This is an example response [0][1]. This sentence has citations from the second query [2][3].",
+                "content": "This is an example response [1][2]. This sentence has citations from the second query [3][4].",
                 "done": True,
                 "sources": sources,
             },
