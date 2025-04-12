@@ -863,26 +863,42 @@ class Pipe:
         session: aiohttp.ClientSession,
         url: str,
         timeout: aiohttp.ClientTimeout = DEFAULT_URL_TIMEOUT,
+        max_retries: int = 3,
+        base_delay: float = 0.5,
     ) -> str:
-        # Keep your existing _resolve_url implementation
+        """Resolves a given URL using the provided aiohttp session, with multiple retries on failure."""
+
         if not url:
             return ""
-        try:
-            async with session.get(
-                url, allow_redirects=True, timeout=timeout
-            ) as response:
-                final_url = str(response.url)
-                log.debug(f"Resolved URL '{url}' to '{final_url}'")
-                return final_url
-        except asyncio.TimeoutError:
-            log.warning(f"Timeout resolving URL: {url}")
-            return url
-        except aiohttp.ClientError as e:
-            log.warning(f"Client error resolving URL {url}: {e}")
-            return url
-        except Exception:
-            log.exception(f"Unexpected error resolving URL {url}, returning original.")
-            return url
+
+        for attempt in range(max_retries + 1):
+            try:
+                async with session.get(
+                    url,
+                    allow_redirects=True,
+                    timeout=timeout,
+                ) as response:
+                    final_url = str(response.url)
+                    log.debug(
+                        f"Resolved URL '{url}' to '{final_url}' after {attempt} retries"
+                    )
+                    return final_url
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                if attempt == max_retries:
+                    log.error(
+                        f"Failed to resolve URL '{url}' after {max_retries + 1} attempts: {e}"
+                    )
+                    return url
+                else:
+                    delay = min(base_delay * (2**attempt), 10.0)
+                    log.warning(
+                        f"Retry {attempt + 1}/{max_retries + 1} for URL '{url}': {e}. Waiting {delay:.1f}s..."
+                    )
+                    await asyncio.sleep(delay)
+            except Exception as e:
+                log.exception(f"Unexpected error resolving URL '{url}': {e}")
+                return url
+        return url  # Shouldn't reach here if loop is correct
 
     async def _resolve_and_emit_sources(
         self,
