@@ -947,14 +947,10 @@ class Pipe:
         urls_to_resolve = [url for _, url in initial_metadatas]
         resolved_uris: list[str] = []
 
-        async def _resolve_all():
-            nonlocal resolved_uris  # Modify outer scope variable
-            async with aiohttp.ClientSession() as session:
-                tasks = [self._resolve_url(session, url) for url in urls_to_resolve]
-                resolved_uris = await asyncio.gather(*tasks)
-
         log.info(f"Resolving {len(urls_to_resolve)} source URLs asynchronously...")
-        await _resolve_all()
+        async with aiohttp.ClientSession() as session:
+            tasks = [self._resolve_url(session, url) for url in urls_to_resolve]
+            resolved_uris = await asyncio.gather(*tasks)
         log.info("URL resolution completed.")
 
         # 3. Populate source_metadatas with resolved URLs
