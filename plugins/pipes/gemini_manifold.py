@@ -260,7 +260,7 @@ class Pipe:
         if features.get("google_code_execution"):
             log.info("Using code execution on Google side.")
             gen_content_conf.tools.append(
-                types.Tool(code_execution=types.ToolCodeExecution)
+                types.Tool(code_execution=types.ToolCodeExecution())
             )
 
         gen_content_args = {
@@ -296,6 +296,7 @@ class Pipe:
                 return None
             try:
                 # FIXME: Support native image gen here too.
+                # FIXME: Support code execution here too.
                 res = await client.aio.models.generate_content(**gen_content_args)
             except Exception as e:
                 error_msg = f"Content generation error: {str(e)}"
@@ -589,7 +590,7 @@ class Pipe:
             candidate = self._get_first_candidate(chunk.candidates)
             if not candidate:
                 log.warning(
-                    "No ccandidate objets were returned, skipping to the next chunk."
+                    "No candidate objects were returned, skipping to the next chunk."
                 )
                 continue
             parts = (
@@ -605,31 +606,15 @@ class Pipe:
                         inline_data, gen_content_args, __user__, __request__
                     ):
                         content += img_url
-                elif executable_code_part := part.executable_code:
-                    executable_code_part_lang_enum = getattr(
-                        executable_code_part, "language", None
-                    )
-                    lang_name = "python"  # would be python in 99% cases anyway
-                    if executable_code_part_lang_enum and hasattr(
-                        executable_code_part_lang_enum, "name"
-                    ):
-                        lang_name = executable_code_part_lang_enum.name.lower()
-                    else:
-                        log.warning(
-                            f"Could not extract language name from {executable_code_part_lang_enum}. Default to python."
-                        )
+                elif executable_code_str := self._process_executable_code_part(
+                    part.executable_code
+                ):
+                    content += executable_code_str
+                elif code_execution_result_str := self._process_code_execution_result_part(
+                    part.code_execution_result
+                ):
+                    content += code_execution_result_str
 
-                    executable_code_part_code = getattr(
-                        executable_code_part, "code", ""
-                    )
-                    if executable_code_part_code:
-                        content += f"\n```{lang_name}\n{executable_code_part_code}```\n"
-                elif code_execution_result_part := part.code_execution_result:
-                    code_execution_result_part_output = getattr(
-                        code_execution_result_part, "output", ""
-                    )
-                    if code_execution_result_part_output:
-                        content += f"\n**Output:**\n```\n{code_execution_result_part_output}```\n"
                 # TODO: Streaming this way loses the support for Filter.stream() method processing for filter plugins.
                 await self._emit_completion(content)
 
@@ -638,17 +623,6 @@ class Pipe:
                 finish_reason = candidate.finish_reason
 
         return aggregated_chunks, content, finish_reason
-
-    def _get_first_candidate(
-        self, candidates: Optional[list[types.Candidate]]
-    ) -> Optional[types.Candidate]:
-        """Selects the first candidate, logging a warning if multiple exist."""
-        if not candidates:
-            log.warning("Received chunk with no candidates, skipping processing.")
-            return None
-        if len(candidates) > 1:
-            log.warning("Multiple candidates found, defaulting to first candidate.")
-        return candidates[0]
 
     def _process_image_part(
         self, inline_data, gen_content_args: dict, user: "UserData", request: Request
@@ -670,6 +644,57 @@ class Pipe:
         else:
             encoded = base64.b64encode(image_data).decode()
             return f"![Generated Image](data:{mime_type};base64,{encoded})"
+
+    def _process_executable_code_part(
+        self, executable_code_part: types.ExecutableCode | None
+    ) -> str | None:
+        """
+        Processes an executable code part and returns the formatted string representation.
+        """
+
+        if not executable_code_part:
+            return None
+
+        lang_name = "python"  # Default language
+        if executable_code_part_lang_enum := executable_code_part.language:
+            if lang_name := executable_code_part_lang_enum.name:
+                lang_name = executable_code_part_lang_enum.name.lower()
+            else:
+                log.warning(
+                    f"Could not extract language name from {executable_code_part_lang_enum}. Default to python."
+                )
+        else:
+            log.warning("Language Enum is None, defaulting to python.")
+
+        if executable_code_part_code := executable_code_part.code:
+            return f"```{lang_name}\n{executable_code_part_code.rstrip()}\n```\n\n"
+        return ""
+
+    def _process_code_execution_result_part(
+        self, code_execution_result_part: types.CodeExecutionResult | None
+    ) -> str | None:
+        """
+        Processes a code execution result part and returns the formatted string representation.
+        """
+
+        if not code_execution_result_part:
+            return None
+
+        if code_execution_result_part_output := code_execution_result_part.output:
+            return f"**Output:**\n\n```\n{code_execution_result_part_output.rstrip()}\n```\n\n"
+        else:
+            return None
+
+    def _get_first_candidate(
+        self, candidates: Optional[list[types.Candidate]]
+    ) -> Optional[types.Candidate]:
+        """Selects the first candidate, logging a warning if multiple exist."""
+        if not candidates:
+            log.warning("Received chunk with no candidates, skipping processing.")
+            return None
+        if len(candidates) > 1:
+            log.warning("Multiple candidates found, defaulting to first candidate.")
+        return candidates[0]
 
     def _upload_image(
         self,
