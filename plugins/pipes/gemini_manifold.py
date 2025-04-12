@@ -624,6 +624,27 @@ class Pipe:
 
         return aggregated_chunks, content, finish_reason
 
+    def _process_image_part(
+        self, inline_data, gen_content_args: dict, user: "UserData", request: Request
+    ) -> Optional[str]:
+        """Handles image data conversion to markdown."""
+        mime_type = inline_data.mime_type
+        image_data = inline_data.data
+
+        if self.valves.USE_FILES_API:
+            image_url = self._upload_image(
+                image_data,
+                mime_type,
+                gen_content_args.get("model", ""),
+                "Not implemented yet. TAKE IT FROM gen_content_args contents",
+                user["id"],
+                request,
+            )
+            return f"![Generated Image]({image_url})" if image_url else None
+        else:
+            encoded = base64.b64encode(image_data).decode()
+            return f"![Generated Image](data:{mime_type};base64,{encoded})"
+
     def _process_executable_code_part(
         self, executable_code_part: types.ExecutableCode | None
     ) -> str | None:
@@ -674,27 +695,6 @@ class Pipe:
         if len(candidates) > 1:
             log.warning("Multiple candidates found, defaulting to first candidate.")
         return candidates[0]
-
-    def _process_image_part(
-        self, inline_data, gen_content_args: dict, user: "UserData", request: Request
-    ) -> Optional[str]:
-        """Handles image data conversion to markdown."""
-        mime_type = inline_data.mime_type
-        image_data = inline_data.data
-
-        if self.valves.USE_FILES_API:
-            image_url = self._upload_image(
-                image_data,
-                mime_type,
-                gen_content_args.get("model", ""),
-                "Not implemented yet. TAKE IT FROM gen_content_args contents",
-                user["id"],
-                request,
-            )
-            return f"![Generated Image]({image_url})" if image_url else None
-        else:
-            encoded = base64.b64encode(image_data).decode()
-            return f"![Generated Image](data:{mime_type};base64,{encoded})"
 
     def _upload_image(
         self,
