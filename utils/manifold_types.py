@@ -116,10 +116,18 @@ class SystemMessage(TypedDict):
 Message = UserMessage | AssistantMessage | SystemMessage
 
 
+class Options(TypedDict):
+    temperature: NotRequired[float]
+    top_p: NotRequired[float]
+    min_p: NotRequired[float]
+    top_k: NotRequired[float]
+
+
 class Body(TypedDict):
     stream: bool
     model: str
     messages: list[Message]
+    options: NotRequired[Options]
 
 
 # ---------- Chats.ChatModel ----------

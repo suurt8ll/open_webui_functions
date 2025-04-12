@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.13.1
+version: 1.14.1
 requirements: google-genai==1.10.0
 """
 
@@ -18,16 +18,16 @@ requirements: google-genai==1.10.0
 #   - Display citations in the front-end.
 #   - Image input
 #   - Streaming
-#   - Grounding with Google Search (this requires installing "Gemini Manifold Companion" filter, see GitHub README)
+#   - Grounding with Google Search (this requires installing "Gemini Manifold Companion" >= 1.0.0 filter, see GitHub README)
 #   - Safety settings
 #   - Each user can decide to use their own API key.
 #   - Token usage data
+#   - Code execution tool. (Gemini Manifold Companion >= 1.1.0 required)
 
 # Features that are supported by API but not yet implemented in the manifold:
 #   TODO Audio input support.
 #   TODO Video input support.
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
-#   TODO Code execution tool.
 
 import copy
 import json
@@ -239,9 +239,13 @@ class Pipe:
                 )
 
         features = __metadata__.get("features", {})
+        gen_content_conf.tools = []
+
         if features.get("google_search_tool"):
             log.info("Using grounding with Google Search as a Tool.")
-            gen_content_conf.tools = [types.Tool(google_search=types.GoogleSearch())]
+            gen_content_conf.tools.append(
+                types.Tool(google_search=types.GoogleSearch())
+            )
         elif features.get("google_search_retrieval"):
             log.info("Using grounding with Google Search Retrieval.")
             gs = types.GoogleSearchRetrieval(
@@ -249,7 +253,15 @@ class Pipe:
                     dynamic_threshold=features.get("google_search_retrieval_threshold")
                 )
             )
-            gen_content_conf.tools = [types.Tool(google_search_retrieval=gs)]
+            gen_content_conf.tools.append(types.Tool(google_search_retrieval=gs))
+
+        # NB: It is not possible to use both Search and Code execution at the same time,
+        # however, it can be changed later, so let's just handle it as a common error
+        if features.get("google_code_execution"):
+            log.info("Using code execution on Google side.")
+            gen_content_conf.tools.append(
+                types.Tool(code_execution=types.ToolCodeExecution())
+            )
 
         gen_content_args = {
             "model": model_name,
@@ -284,6 +296,7 @@ class Pipe:
                 return None
             try:
                 # FIXME: Support native image gen here too.
+                # FIXME: Support code execution here too.
                 res = await client.aio.models.generate_content(**gen_content_args)
             except Exception as e:
                 error_msg = f"Content generation error: {str(e)}"
@@ -315,12 +328,9 @@ class Pipe:
         log.info("pipe method has finished it's run.")
         return None
 
-    """
-    ---------- Helper methods inside the Pipe class ----------
-    """
+    # region Helper methods inside the Pipe class
 
-    """Event emission and error logging"""
-
+    # region Event emission and error logging
     async def _emit_completion(
         self,
         content: str | None = None,
@@ -365,8 +375,9 @@ class Pipe:
             "description": error_msg,
         }
 
-    """ChatModel.chat.messages -> list[genai.types.Content] conversion"""
+    # endregion
 
+    # region ChatModel.chat.messages -> list[genai.types.Content] conversion
     def _genai_contents_from_messages(
         self, messages_body: list["Message"], messages_db: list["MessageModel"] | None
     ) -> tuple[list[types.Content], str | None]:
@@ -547,8 +558,9 @@ class Pipe:
 
         return parts
 
-    """Model response streaming"""
+    # endregion
 
+    # region Model response streaming
     async def _stream_response(
         self,
         gen_content_args: dict,
@@ -572,7 +584,7 @@ class Pipe:
             candidate = self._get_first_candidate(chunk.candidates)
             if not candidate:
                 log.warning(
-                    "No ccandidate objets were returned, skipping to the next chunk."
+                    "No candidate objects were returned, skipping to the next chunk."
                 )
                 continue
             parts = (
@@ -588,6 +600,15 @@ class Pipe:
                         inline_data, gen_content_args, __user__, __request__
                     ):
                         content += img_url
+                elif executable_code_str := self._process_executable_code_part(
+                    part.executable_code
+                ):
+                    content += executable_code_str
+                elif code_execution_result_str := self._process_code_execution_result_part(
+                    part.code_execution_result
+                ):
+                    content += code_execution_result_str
+
                 # TODO: Streaming this way loses the support for Filter.stream() method processing for filter plugins.
                 await self._emit_completion(content)
 
@@ -628,6 +649,46 @@ class Pipe:
         else:
             encoded = base64.b64encode(image_data).decode()
             return f"![Generated Image](data:{mime_type};base64,{encoded})"
+
+    def _process_executable_code_part(
+        self, executable_code_part: types.ExecutableCode | None
+    ) -> str | None:
+        """
+        Processes an executable code part and returns the formatted string representation.
+        """
+
+        if not executable_code_part:
+            return None
+
+        lang_name = "python"  # Default language
+        if executable_code_part_lang_enum := executable_code_part.language:
+            if lang_name := executable_code_part_lang_enum.name:
+                lang_name = executable_code_part_lang_enum.name.lower()
+            else:
+                log.warning(
+                    f"Could not extract language name from {executable_code_part_lang_enum}. Default to python."
+                )
+        else:
+            log.warning("Language Enum is None, defaulting to python.")
+
+        if executable_code_part_code := executable_code_part.code:
+            return f"```{lang_name}\n{executable_code_part_code.rstrip()}\n```\n\n"
+        return ""
+
+    def _process_code_execution_result_part(
+        self, code_execution_result_part: types.CodeExecutionResult | None
+    ) -> str | None:
+        """
+        Processes a code execution result part and returns the formatted string representation.
+        """
+
+        if not code_execution_result_part:
+            return None
+
+        if code_execution_result_part_output := code_execution_result_part.output:
+            return f"**Output:**\n\n```\n{code_execution_result_part_output.rstrip()}\n```\n\n"
+        else:
+            return None
 
     def _upload_image(
         self,
@@ -686,8 +747,9 @@ class Pipe:
         )
         return image_url
 
-    """Client initialization and model retrival from Google API"""
+    # endregion
 
+    # region Client initialization and model retrival from Google API
     def _get_genai_client(
         self, api_key: str | None = None, base_url: str | None = None
     ) -> genai.Client | None:
@@ -856,8 +918,9 @@ class Pipe:
             log.exception(error_msg)
             return model_name
 
-    """Citations"""
+    # endregion
 
+    # region Citations
     async def _resolve_url(
         self,
         session: aiohttp.ClientSession,
@@ -1149,8 +1212,9 @@ class Pipe:
         log.debug(f"Created StatusEvent: {status_event}")
         return status_event
 
-    """Usage data"""
+    # endregion
 
+    # region Usage data
     def _get_usage_data_event(
         self,
         response: types.GenerateContentResponse,
@@ -1191,8 +1255,9 @@ class Pipe:
         }
         return completion_event
 
-    """Other helpers"""
+    # endregion
 
+    # region Other helpers
     def _truncate_long_strings(self, data: Any, max_length: int = 64) -> str:
         """
         Recursively truncates all string and bytes fields within a dictionary or list that exceed
@@ -1276,3 +1341,7 @@ class Pipe:
         if mime_type is None:
             return "application/octet-stream"  # Default MIME type if unknown
         return mime_type
+
+    # endregion
+
+    # endregion
