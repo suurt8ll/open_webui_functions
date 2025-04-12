@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     from loguru._handler import Handler
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
-# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
+# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
 
 # Default timeout for URL resolution
@@ -309,14 +309,8 @@ class Pipe:
             log.info("Sending status event with the used search queries.")
             print(self._truncate_long_strings(queries_status))
             await __event_emitter__(queries_status)
-        # Emit sources.
-        if emit_sources := await self._get_chat_completion_event_w_sources(
-            res, raw_text
-        ):
-            log.info("Sending chat completion event with the sources.")
-            print(self._truncate_long_strings(emit_sources))
-            await __event_emitter__(emit_sources)
-
+        # Inject markers.
+        await self._process_citations_and_emit_events(res, raw_text)
         await self._emit_completion(done=True)
         log.info("pipe method has finished it's run.")
         return None
@@ -870,25 +864,13 @@ class Pipe:
         url: str,
         timeout: aiohttp.ClientTimeout = DEFAULT_URL_TIMEOUT,
     ) -> str:
-        """
-        Asynchronously resolves a URL by following redirects.
-
-        Args:
-            session: The aiohttp client session.
-            url: The URL to resolve.
-            timeout: The timeout configuration for the request.
-
-        Returns:
-            The final destination URL after redirects, or the original URL if
-            resolution fails or times out.
-        """
+        # Keep your existing _resolve_url implementation
         if not url:
-            return ""  # Handle empty URLs gracefully
+            return ""
         try:
             async with session.get(
                 url, allow_redirects=True, timeout=timeout
             ) as response:
-                # Ensure the response URL is treated as a string
                 final_url = str(response.url)
                 log.debug(f"Resolved URL '{url}' to '{final_url}'")
                 return final_url
@@ -899,112 +881,69 @@ class Pipe:
             log.warning(f"Client error resolving URL {url}: {e}")
             return url
         except Exception:
-            # Catching broader exceptions can be useful but log the specifics
             log.exception(f"Unexpected error resolving URL {url}, returning original.")
             return url
 
-    async def _get_chat_completion_event_w_sources(
-        self, data: types.GenerateContentResponse, raw_str: str
-    ) -> "ChatCompletionEvent | None":
-        """Adds citation markers and source references to raw_str based on grounding metadata"""
+    async def _resolve_and_emit_sources(
+        self,
+        initial_metadatas: list[tuple[int, str]],
+        source_metadatas_template: list["SourceMetadata"],
+        supports: list[types.GroundingSupport],
+    ):
+        """
+        Resolves URLs in the background and emits a chat completion event
+        containing only the source information.
+        """
 
-        # Early exit if no candidate content exists
-        if not data.candidates:
-            log.warning("No candidates found in the response.")
-            return None
-
-        candidate = data.candidates[0]
-        grounding_metadata = candidate.grounding_metadata if candidate else None
-        if not grounding_metadata:
-            log.info("No grounding metadata found.")
-            return None
-
-        supports = grounding_metadata.grounding_supports
-        grounding_chunks = grounding_metadata.grounding_chunks
-        if not supports or not grounding_chunks:
-            log.info("Grounding metadata missing supports or chunks.")
-            return None
-
-        # 1. Collect and Prepare Source URLs
-        initial_metadatas: list[tuple[int, str]] = []  # Store index and URL
-        for i, g_c in enumerate(grounding_chunks):
-            web_info = g_c.web
-            if web_info and web_info.uri:
-                initial_metadatas.append((i, web_info.uri))
-
-        if not initial_metadatas:
-            log.warning("No source URIs found in grounding chunks.")
-            return None
-
-        # Initialize source_metadatas structure based on *all* chunks
-        # This ensures indices align correctly later, even if some chunks lack URIs
-        source_metadatas: list["SourceMetadata"] = [
-            {"source": None, "original_url": None, "supports": []}
-            for _ in grounding_chunks
-        ]
-
-        # 2. Resolve URLs Asynchronously
         urls_to_resolve = [url for _, url in initial_metadatas]
         resolved_uris: list[str] = []
 
-        log.info(f"Resolving {len(urls_to_resolve)} source URLs asynchronously...")
+        log.info(f"Background task: Resolving {len(urls_to_resolve)} source URLs...")
         async with aiohttp.ClientSession() as session:
             tasks = [self._resolve_url(session, url) for url in urls_to_resolve]
             resolved_uris = await asyncio.gather(*tasks)
-        log.info("URL resolution completed.")
+        log.info("Background task: URL resolution completed.")
 
-        # 3. Populate source_metadatas with resolved URLs
+        # Populate a *copy* of the template to avoid race conditions if needed,
+        # though direct modification might be okay if structure is pre-allocated.
+        populated_metadatas = [m.copy() for m in source_metadatas_template]
+
         resolved_uris_map = dict(zip(urls_to_resolve, resolved_uris))
         for chunk_index, original_uri in initial_metadatas:
             resolved_uri = resolved_uris_map.get(original_uri, original_uri)  # Fallback
-            source_metadatas[chunk_index]["original_url"] = original_uri
-            source_metadatas[chunk_index]["source"] = resolved_uri
+            if 0 <= chunk_index < len(populated_metadatas):
+                populated_metadatas[chunk_index]["original_url"] = original_uri
+                populated_metadatas[chunk_index]["source"] = resolved_uri
+            else:
+                log.warning(
+                    f"Chunk index {chunk_index} out of bounds when populating resolved URLs."
+                )
 
-        # 4. Inject Citation Markers using bytearray for efficiency
-        modified_content_bytes = bytearray(raw_str.encode("utf-8"))
-
-        for support in reversed(supports):
+        # Add support metadata back to the corresponding sources
+        # This needs to be done *after* resolution completes and we have the final metadata list
+        for support in supports:
             segment = support.segment
             indices = support.grounding_chunk_indices
+            if not (indices is not None and segment and segment.end_index is not None):
+                continue  # Skip if essential data missing
 
-            # Validate necessary fields for this support
-            if not (
-                indices is not None  # Check for existence (could be empty list)
-                and segment
-                and segment.end_index is not None
-            ):
-                log.debug(f"Skipping support due to missing data: {support}")
-                continue
-            end_pos = segment.end_index
-
-            # Create citation markers like "[1][2]"
-            citation_markers = "".join(f"[{index + 1}]" for index in indices)
-            encoded_citation_markers = citation_markers.encode("utf-8")
-
-            # Insert into bytearray. The insertion point remains relative to the
-            # *original* string's indices if we process in reverse.
-            modified_content_bytes[end_pos:end_pos] = encoded_citation_markers
-
-            # Add support metadata to the corresponding sources
             for index in indices:
-                if 0 <= index < len(source_metadatas):
-                    source_metadatas[index]["supports"].append(support.model_dump())
+                if 0 <= index < len(populated_metadatas):
+                    populated_metadatas[index].setdefault("supports", []).append(
+                        support.model_dump()
+                    )
                 else:
                     log.warning(
-                        f"Invalid grounding chunk index {index} found in support."
+                        f"Invalid grounding chunk index {index} found in support during background processing."
                     )
 
-        # 5. Final Assembly
-        final_content = modified_content_bytes.decode("utf-8")
-
-        # Filter out metadata entries that didn't have an original URL
-        # (though step 1 should prevent this unless grounding_chunks had gaps)
+        # Filter out metadata entries that didn't have an original URL resolved
         valid_source_metadatas = [
-            m for m in source_metadatas if m["original_url"] is not None
+            m for m in populated_metadatas if m.get("original_url") is not None
         ]
 
         sources_list: list["Source"] = []
-        if valid_source_metadatas:  # Only add sources if we have valid metadata
+        if valid_source_metadatas:
             sources_list.append(
                 {
                     "source": {"name": "web_search"},
@@ -1013,18 +952,111 @@ class Pipe:
                 }
             )
 
+        # Prepare and emit the sources-only event
         event_data: "ChatCompletionEventData" = {
-            "content": final_content,
             "sources": sources_list,
             "done": False,
         }
-
         event: "ChatCompletionEvent" = {
             "type": "chat:completion",
             "data": event_data,
         }
+        await self.__event_emitter__(event)
+        log.info("Background task: Emitted sources event.")
 
-        return event
+    async def _process_citations_and_emit_events(
+        self, data: types.GenerateContentResponse, raw_str: str
+    ) -> None:
+        """
+        Injects citation markers into raw_str, emits the text content immediately,
+        and launches a background task to resolve and emit sources later.
+        """
+
+        # --- 1. Extract necessary data ---
+        if not data.candidates:
+            log.warning("No candidates found in the response.")
+            return
+
+        candidate = data.candidates[0]
+        grounding_metadata = candidate.grounding_metadata if candidate else None
+        if not grounding_metadata:
+            log.info("No grounding metadata found, skipping citation processing.")
+            return
+
+        supports = grounding_metadata.grounding_supports
+        grounding_chunks = grounding_metadata.grounding_chunks
+        if not supports or not grounding_chunks:
+            log.info(
+                "Grounding metadata missing supports or chunks, skipping citation processing."
+            )
+            return
+
+        # --- 2. Prepare data for background task & initial metadata structure ---
+        initial_metadatas: list[tuple[int, str]] = (
+            []
+        )  # Store index and URL for resolver
+        for i, g_c in enumerate(grounding_chunks):
+            web_info = g_c.web
+            if web_info and web_info.uri:
+                initial_metadatas.append((i, web_info.uri))
+
+        # Create a template structure. The background task will populate this.
+        # We only need original_url and source set to None initially. Supports added later.
+        source_metadatas_template: list["SourceMetadata"] = [
+            {
+                "source": None,
+                "original_url": None,
+                "supports": [],
+            }  # Initialize supports list here
+            for _ in grounding_chunks
+        ]
+
+        # --- 3. Inject Citation Markers ---
+        modified_content_bytes = bytearray(raw_str.encode("utf-8"))
+        for support in reversed(supports):
+            segment = support.segment
+            indices = support.grounding_chunk_indices
+
+            if not (indices is not None and segment and segment.end_index is not None):
+                log.debug(f"Skipping support due to missing data: {support}")
+                continue
+
+            end_pos = segment.end_index
+            citation_markers = "".join(f"[{index + 1}]" for index in indices)
+            encoded_citation_markers = citation_markers.encode("utf-8")
+
+            modified_content_bytes[end_pos:end_pos] = encoded_citation_markers
+
+        final_content_with_markers = modified_content_bytes.decode("utf-8")
+
+        # --- 4. Emit Text + Markers Event ---
+        # This event contains the text with markers but no sources yet.
+        text_event_data: "ChatCompletionEventData" = {
+            "content": final_content_with_markers,
+            "done": False,
+        }
+        text_event: "ChatCompletionEvent" = {
+            "type": "chat:completion",
+            "data": text_event_data,
+        }
+        await self.__event_emitter__(text_event)
+        log.debug("Emitted text content event with citation markers.")
+
+        # --- 5. Launch Background Task for URL Resolution and Source Emission ---
+        if initial_metadatas:  # Only launch if there are URLs to resolve
+            asyncio.create_task(
+                self._resolve_and_emit_sources(
+                    initial_metadatas=initial_metadatas,
+                    source_metadatas_template=source_metadatas_template,
+                    supports=supports,
+                )
+            )
+            log.info("Launched background task for URL resolution.")
+        else:
+            log.info("No source URIs found, skipping background URL resolution task.")
+
+        # This function now returns None as events are emitted directly.
+        return None
 
     def _remove_citation_markers(self, text: str, sources: list["Source"]) -> str:
         processed: set[str] = set()
@@ -1197,8 +1229,8 @@ class Pipe:
             """Filter function to only allow logs from this plugin (based on module name)."""
             return record["name"] == __name__  # Filter by module name
 
-        # Access the internal state of the logger
-        handlers: dict[int, "Handler"] = logger._core.handlers  # type: ignore
+        # Access the internal state of the log
+        handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
         for key, handler in handlers.items():
             existing_filter = handler._filter
             if (
@@ -1210,7 +1242,7 @@ class Pipe:
                 log.debug("Handler for this plugin is already present!")
                 return
 
-        logger.add(
+        log.add(
             sys.stdout,
             level=self.valves.LOG_LEVEL,
             format=stdout_format,
