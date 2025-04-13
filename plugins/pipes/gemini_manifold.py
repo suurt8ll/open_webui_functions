@@ -48,6 +48,7 @@ from pydantic import BaseModel, Field
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import (
     Any,
+    AsyncGenerator,
     Literal,
     TYPE_CHECKING,
     cast,
@@ -171,7 +172,7 @@ class Pipe:
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __metadata__: dict[str, Any],
-    ) -> str | None:
+    ) -> AsyncGenerator | str | None:
 
         self.__event_emitter__ = __event_emitter__
 
@@ -272,20 +273,21 @@ class Pipe:
         log.debug("Passing these args to the Google API:")
         print(self._truncate_long_strings(gen_content_args, max_length=512))
 
+        # --- Main Logic Split ---
         if body.get("stream", False):
-            # Streaming response.
+            # --- Streaming Response ---
             try:
-                res, raw_text, finish_reason = await self._stream_response(
-                    gen_content_args, __request__, __user__, client
+                response_stream: AsyncIterator[types.GenerateContentResponse] = (
+                    await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
                 )
-                res = res[-1]
+                log.info("Streaming enabled. Returning AsyncGenerator.")
+                # FIXME: Bring back post-processing.
+                return self._stream_response_generator(
+                    response_stream, __request__, __user__, gen_content_args
+                )
             except Exception as e:
-                error_msg = f"Error occured during streaming: {str(e)}"
-                await self._emit_error(error_msg)
-                return None
-            # Notify the user if the finish reason was not STOP (indicates error).
-            if finish_reason is not types.FinishReason.STOP:
-                error_msg = f"Stream did not finish normally, API gave finish_reason {finish_reason}"
+                error_msg = f"Error starting stream generation: {str(e)}"
+                log.exception(error_msg)
                 await self._emit_error(error_msg)
                 return None
         else:
@@ -561,62 +563,95 @@ class Pipe:
     # endregion
 
     # region Model response streaming
-    async def _stream_response(
+    async def _stream_response_generator(
         self,
-        gen_content_args: dict,
+        response_stream: AsyncIterator[types.GenerateContentResponse],
         __request__: Request,
         __user__: "UserData",
-        client: genai.Client,
-    ) -> tuple[list[types.GenerateContentResponse], str, types.FinishReason | None]:
+        gen_content_args: dict,
+    ) -> AsyncGenerator[str, None]:
         """
-        Streams the response to the front-end using `__event_emitter__` and finally returns the full aggregated response,
-        the full content, and the finish reason if present.
+        Yields text chunks from the stream and spawns metadata processing task on completion.
         """
-        response_stream: AsyncIterator[types.GenerateContentResponse] = (
-            await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
-        )
-        aggregated_chunks = []
-        content = ""
-        finish_reason = None
+        aggregated_chunks: list[types.GenerateContentResponse] = []
+        aggregated_content: str = ""
+        finish_reason: types.FinishReason | None = None
 
-        async for chunk in response_stream:
-            aggregated_chunks.append(chunk)
-            candidate = self._get_first_candidate(chunk.candidates)
-            if not candidate:
-                log.warning(
-                    "No candidate objects were returned, skipping to the next chunk."
+        try:
+            async for chunk in response_stream:
+                aggregated_chunks.append(chunk)
+                candidate = self._get_first_candidate(chunk.candidates)
+
+                if not candidate:
+                    log.warning("Stream chunk has no candidates, skipping.")
+                    continue
+
+                # Process parts and yield text
+                chunk_content = ""
+                parts = (
+                    candidate.content.parts
+                    if candidate.content and candidate.content.parts
+                    else []
                 )
-                continue
-            parts = (
-                candidate.content.parts
-                if candidate.content and candidate.content.parts
-                else []
+                for part in parts:
+                    part_text = ""
+                    if part.text:
+                        part_text = part.text
+                    elif part.inline_data:
+                        # Assuming _process_image_part returns a string placeholder/URL
+                        part_text = (
+                            self._process_image_part(
+                                part.inline_data,
+                                gen_content_args,
+                                __user__,
+                                __request__,
+                            )
+                            or ""
+                        )
+                    elif part.executable_code:
+                        part_text = (
+                            self._process_executable_code_part(part.executable_code)
+                            or ""
+                        )
+                    elif part.code_execution_result:
+                        part_text = (
+                            self._process_code_execution_result_part(
+                                part.code_execution_result
+                            )
+                            or ""
+                        )
+                    # Add other part types if necessary (e.g., function calls)
+
+                    if part_text:
+                        yield part_text
+                        chunk_content += part_text
+
+                aggregated_content += chunk_content
+
+                # Update finish reason if present in this chunk's candidate
+                if (
+                    candidate.finish_reason is not None
+                    and candidate.finish_reason
+                    is not types.FinishReason.FINISH_REASON_UNSPECIFIED
+                ):
+                    finish_reason = candidate.finish_reason
+                    log.debug(f"Stream finish reason updated: {finish_reason}")
+        except Exception:
+            error_msg = "Error during stream processing"
+            log.exception(error_msg)
+            # We might not be able to emit via the standard mechanism if the connection broke
+            # Consider logging prominently or alternative error reporting
+            # We still want to try and process metadata if possible from chunks received so far.
+            try:
+                # FIXME: use _emit_error
+                # Yield an error message to the client if possible
+                yield f"\n\n[STREAM ERROR: {error_msg}]"
+            except Exception:  # Handle cases where yield is not possible anymore
+                log.error("Could not yield stream error message to client.")
+        finally:
+            log.info(
+                f"Stream finished. Final reason: {finish_reason}. AsyncGenerator finished."
             )
-            for part in parts:
-                if text_part := part.text:
-                    content += text_part
-                elif inline_data := part.inline_data:
-                    if img_url := self._process_image_part(
-                        inline_data, gen_content_args, __user__, __request__
-                    ):
-                        content += img_url
-                elif executable_code_str := self._process_executable_code_part(
-                    part.executable_code
-                ):
-                    content += executable_code_str
-                elif code_execution_result_str := self._process_code_execution_result_part(
-                    part.code_execution_result
-                ):
-                    content += code_execution_result_str
-
-                # TODO: Streaming this way loses the support for Filter.stream() method processing for filter plugins.
-                await self._emit_completion(content)
-
-            # Check for finish reason in the candidate
-            if candidate and candidate.finish_reason:
-                finish_reason = candidate.finish_reason
-
-        return aggregated_chunks, content, finish_reason
 
     def _get_first_candidate(
         self, candidates: list[types.Candidate] | None
