@@ -10,6 +10,7 @@ version: 0.0.0
 requirements:
 """
 
+import json
 from typing import (
     Any,
     AsyncGenerator,
@@ -93,6 +94,8 @@ class Pipe:
             "__tools__": __tools__,
         }
 
-        print(f"{[__name__]} Returning all parameters as JSON: {all_params}")
+        print(
+            f"{[__name__]} Returning all parameters as JSON:\n{json.dumps(all_params, indent=2, default=str)}"
+        )
 
         return f"Message from: {[__name__]}."
