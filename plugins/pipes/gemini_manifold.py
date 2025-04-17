@@ -556,33 +556,27 @@ class Pipe:
         """
         Yields text chunks from the stream and spawns metadata processing task on completion.
         """
-        aggregated_chunks: list[types.GenerateContentResponse] = []
-        final_response_data: types.GenerateContentResponse | None = None
+        final_response_chunk: types.GenerateContentResponse | None = None
         error_occurred = False
         try:
             async for chunk in response_stream:
-                aggregated_chunks.append(chunk)
-                final_response_data = chunk
-
+                final_response_chunk = chunk
                 if not (candidate := self._get_first_candidate(chunk.candidates)):
                     log.warning("Stream chunk has no candidates, skipping.")
                     continue
-
+                if not (parts := candidate.content and candidate.content.parts):
+                    log.warning(
+                        "candidate does not contain content or content.parts, skipping."
+                    )
+                    continue
                 # Process parts and yield text
-                chunk_content = ""
-                parts = (
-                    candidate.content.parts
-                    if candidate.content and candidate.content.parts
-                    else []
-                )
-                # TODO: [refactor] simply use yield in each if branch.
                 for part in parts:
-                    part_text = ""
+                    # To my knowledge it's not possible for a part to have multiple fields below at the same time.
                     if part.text:
-                        part_text = part.text
+                        yield part.text
                     elif part.inline_data:
                         # _process_image_part returns a Markdown URL.
-                        part_text = (
+                        yield (
                             self._process_image_part(
                                 part.inline_data,
                                 gen_content_args,
@@ -592,29 +586,26 @@ class Pipe:
                             or ""
                         )
                     elif part.executable_code:
-                        part_text = (
+                        yield (
                             self._process_executable_code_part(part.executable_code)
                             or ""
                         )
                     elif part.code_execution_result:
-                        part_text = (
+                        yield (
                             self._process_code_execution_result_part(
                                 part.code_execution_result
                             )
                             or ""
                         )
-                    # Add other part types if necessary (e.g., function calls)
-                    if part_text:
-                        yield part_text
-                        chunk_content += part_text
         except Exception:
             error_occurred = True
             log.exception("Error during stream processing")
             raise
         finally:
             log.info(f"Stream finished.")
+            # Metadata about the model response is always in the final chunk of the stream.
             await self._do_post_processing(
-                final_response_data,
+                final_response_chunk,
                 event_emitter,
                 metadata,
                 __request__,
@@ -624,7 +615,7 @@ class Pipe:
 
     async def _do_post_processing(
         self,
-        final_response_data: types.GenerateContentResponse | None,
+        model_response: types.GenerateContentResponse | None,
         event_emitter: Callable[["Event"], Awaitable[None]],
         metadata: dict[str, Any],
         request: Request,
@@ -638,10 +629,10 @@ class Pipe:
             )
             # All the needed metadata is always in the last chunk, so if error happened then we cannot do anything.
             return
-        if not final_response_data:
-            log.warning("final_response_data is empty, cannot do post-processing.")
+        if not model_response:
+            log.warning("model_response is empty, cannot do post-processing.")
             return
-        if not (candidate := self._get_first_candidate(final_response_data.candidates)):
+        if not (candidate := self._get_first_candidate(model_response.candidates)):
             log.warning(
                 "Response does not contain any canditates. Cannot do post-processing."
             )
@@ -660,14 +651,14 @@ class Pipe:
             log.info(f"Response has correct finish reason: {finish_reason}.")
 
         # Emit token usage data.
-        if usage_event := self._get_usage_data_event(final_response_data):
+        if usage_event := self._get_usage_data_event(model_response):
             log.info("Emitting usage data.")
             print(self._truncate_long_strings(usage_event))
             await event_emitter(usage_event)
         # Save grounding metadata to `__request__.app.state` is it exists.
         # App scope is used because the companion filter's outlet is activated by different request.
         # So we cannot store the grounding data in this particular request sadly.
-        self._add_grounding_data_to_state(final_response_data, metadata, request)
+        self._add_grounding_data_to_state(model_response, metadata, request)
 
     def _add_grounding_data_to_state(
         self,
