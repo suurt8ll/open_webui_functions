@@ -655,9 +655,6 @@ class Pipe:
             log.info("Emitting usage data.")
             print(self._truncate_long_strings(usage_event))
             await event_emitter(usage_event)
-        # Save grounding metadata to `__request__.app.state` is it exists.
-        # App scope is used because the companion filter's outlet is activated by different request.
-        # So we cannot store the grounding data in this particular request sadly.
         self._add_grounding_data_to_state(model_response, metadata, request)
 
     def _add_grounding_data_to_state(
@@ -677,6 +674,10 @@ class Pipe:
             log.info(
                 f"Found grounding metadata. Storing in in request's app state using key {storage_key}."
             )
+            # Using shared `request.app.state` to pass grounding metadata to Filter.outlet.
+            # This is necessary because the Pipe finishes during the initial `/api/completion` request,
+            # while Filter.outlet is invoked by a separate, later `/api/chat/completed` request.
+            # `request.state` does not persist across these distinct request lifecycles.
             app_state: State = request.app.state
             app_state._state[storage_key] = grounding_metadata_obj
         else:
