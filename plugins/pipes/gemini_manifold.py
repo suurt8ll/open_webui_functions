@@ -34,12 +34,10 @@ import json
 from fastapi.datastructures import State
 from google import genai
 from google.genai import types
-import asyncio
 import io
 import mimetypes
 import os
 import uuid
-import aiohttp
 import base64
 import re
 import fnmatch
@@ -295,22 +293,8 @@ class Pipe:
             # FIXME: Support code execution here too.
             res = await client.aio.models.generate_content(**gen_content_args)
             if raw_text := res.text:
-                # TODO: [refactor] repeating code that is also in the stream method.
-                candidate = self._get_first_candidate(res.candidates)
-                grounding_metadata_obj = (
-                    candidate.grounding_metadata if candidate else None
-                )
-
-                chat_id: str = __metadata__.get("chat_id", "")
-                message_id: str = __metadata__.get("message_id", "")
-                storage_key = f"grounding_{chat_id}_{message_id}"
-
-                if grounding_metadata_obj:
-                    log.info(
-                        "Found grounding metadata. Storing in in request's app state."
-                    )
-                    app_state: State = __request__.app.state
-                    app_state._state[storage_key] = grounding_metadata_obj
+                # FIXME: Emit usage data.
+                self._add_grounding_data_to_state(res, __metadata__, __request__)
                 log.info("pipe method has finished it's run.")
                 return raw_text
             else:
@@ -688,23 +672,37 @@ class Pipe:
                 await self._emit_error(
                     error_msg, warning=True, event_emitter=event_emitter
                 )
-
+        # Emit token usage data.
         if usage_event := self._get_usage_data_event(final_response_data):
             log.info("Emitting usage data.")
             print(self._truncate_long_strings(usage_event))
             await event_emitter(usage_event)
+        # Save grounding metadata to `__request__.app.state` is it exists.
+        # App scope is used because the companion filter's outlet is activated by different request.
+        # So we cannot store the grounding data in this particular request sadly.
+        self._add_grounding_data_to_state(final_response_data, metadata, request)
 
-        candidate = self._get_first_candidate(final_response_data.candidates)
+    def _add_grounding_data_to_state(
+        self,
+        response: types.GenerateContentResponse,
+        chat_metadata: dict[str, Any],
+        request: Request,
+    ):
+        candidate = self._get_first_candidate(response.candidates)
         grounding_metadata_obj = candidate.grounding_metadata if candidate else None
 
-        chat_id: str = metadata.get("chat_id", "")
-        message_id: str = metadata.get("message_id", "")
+        chat_id: str = chat_metadata.get("chat_id", "")
+        message_id: str = chat_metadata.get("message_id", "")
         storage_key = f"grounding_{chat_id}_{message_id}"
 
         if grounding_metadata_obj:
-            log.info("Found grounding metadata. Storing in in request's app state.")
+            log.info(
+                f"Found grounding metadata. Storing in in request's app state using key {storage_key}."
+            )
             app_state: State = request.app.state
             app_state._state[storage_key] = grounding_metadata_obj
+        else:
+            log.info(f"Response {message_id} does not have grounding metadata.")
 
     def _get_first_candidate(
         self, candidates: list[types.Candidate] | None
