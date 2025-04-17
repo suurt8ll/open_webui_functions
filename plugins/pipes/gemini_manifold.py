@@ -31,14 +31,13 @@ requirements: google-genai==1.10.0
 
 import copy
 import json
+from fastapi.datastructures import State
 from google import genai
 from google.genai import types
-import asyncio
 import io
 import mimetypes
 import os
 import uuid
-import aiohttp
 import base64
 import re
 import fnmatch
@@ -48,6 +47,7 @@ from pydantic import BaseModel, Field
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import (
     Any,
+    AsyncGenerator,
     Literal,
     TYPE_CHECKING,
     cast,
@@ -67,9 +67,6 @@ if TYPE_CHECKING:
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
-
-# Default timeout for URL resolution
-DEFAULT_URL_TIMEOUT = aiohttp.ClientTimeout(total=10)  # 10 seconds total timeout
 
 
 class Pipe:
@@ -171,7 +168,7 @@ class Pipe:
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __metadata__: dict[str, Any],
-    ) -> str | None:
+    ) -> AsyncGenerator | str | None:
 
         self.__event_emitter__ = __event_emitter__
 
@@ -238,6 +235,7 @@ class Pipe:
                     "Image Generation model does not support the system prompt message! Removing the system prompt."
                 )
 
+        # BUG: Can be None, make sure to convert to {} in this case.
         features = __metadata__.get("features", {})
         gen_content_conf.tools = []
 
@@ -268,65 +266,42 @@ class Pipe:
             "contents": contents,
             "config": gen_content_conf,
         }
-        # FIXME: Use log.debug instead.
         log.debug("Passing these args to the Google API:")
         print(self._truncate_long_strings(gen_content_args, max_length=512))
 
         if body.get("stream", False):
-            # Streaming response.
-            try:
-                res, raw_text, finish_reason = await self._stream_response(
-                    gen_content_args, __request__, __user__, client
-                )
-                res = res[-1]
-            except Exception as e:
-                error_msg = f"Error occured during streaming: {str(e)}"
-                await self._emit_error(error_msg)
-                return None
-            # Notify the user if the finish reason was not STOP (indicates error).
-            if finish_reason is not types.FinishReason.STOP:
-                error_msg = f"Stream did not finish normally, API gave finish_reason {finish_reason}"
-                await self._emit_error(error_msg)
-                return None
+            # Streaming response
+            response_stream: AsyncIterator[types.GenerateContentResponse] = (
+                await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
+            )
+            log.info("Streaming enabled. Returning AsyncGenerator.")
+            return self._stream_response_generator(
+                response_stream,
+                __request__,
+                __user__,
+                gen_content_args,
+                __event_emitter__,
+                __metadata__,
+            )
         else:
             # Non-streaming response.
             if "gemini-2.0-flash-exp-image-generation" in model_name:
                 warn_msg = "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
-                await self._emit_error(warn_msg, warning=True)
-                return None
-            try:
-                # FIXME: Support native image gen here too.
-                # FIXME: Support code execution here too.
-                res = await client.aio.models.generate_content(**gen_content_args)
-            except Exception as e:
-                error_msg = f"Content generation error: {str(e)}"
-                await self._emit_error(error_msg)
-                return None
+                log.warning(warn_msg)
+                raise NotImplementedError(warn_msg)
+            # FIXME: Support native image gen here too.
+            # FIXME: Support code execution here too.
+            res = await client.aio.models.generate_content(**gen_content_args)
             if raw_text := res.text:
-                await self._emit_completion(raw_text)
+                await self._do_post_processing(
+                    res, __event_emitter__, __metadata__, __request__
+                )
+                log.info("pipe method has finished it's run.")
+                return raw_text
             else:
                 warn_msg = "Non-stremaing response did not have any text inside it."
-                print(res)
-                await self._emit_error(warn_msg, warning=True)
-                return None
-
-        log.debug("Got response from the api (last chunk for streaming response):")
-        print(self._truncate_long_strings(res))
-        # Emit usage data.
-        if usage_event := self._get_usage_data_event(res):
-            log.info("Sending empty chat completion event with the token usage info.")
-            print(self._truncate_long_strings(usage_event))
-            await __event_emitter__(usage_event)
-        # Emit search queries.
-        if queries_status := self._get_status_event_w_queries(res):
-            log.info("Sending status event with the used search queries.")
-            print(self._truncate_long_strings(queries_status))
-            await __event_emitter__(queries_status)
-        # Inject markers.
-        await self._process_citations_and_emit_events(res, raw_text)
-        await self._emit_completion(done=True)
-        log.info("pipe method has finished it's run.")
-        return None
+                log.warning(warn_msg)
+                raise ValueError(warn_msg)
 
     # region Helper methods inside the Pipe class
 
@@ -352,9 +327,17 @@ class Pipe:
         await self.__event_emitter__(emission)
 
     async def _emit_error(
-        self, error_msg: str, warning: bool = False, exception: bool = True
+        self,
+        error_msg: str,
+        warning: bool = False,
+        exception: bool = True,
+        event_emitter: Callable[["Event"], Awaitable[None]] | None = None,
     ) -> None:
         """Emits an event to the front-end that causes it to display a nice red error message."""
+
+        if not event_emitter:
+            event_emitter = self.__event_emitter__
+
         if warning:
             log.opt(depth=1, exception=False).warning(error_msg)
         else:
@@ -561,62 +544,144 @@ class Pipe:
     # endregion
 
     # region Model response streaming
-    async def _stream_response(
+    async def _stream_response_generator(
         self,
-        gen_content_args: dict,
+        response_stream: AsyncIterator[types.GenerateContentResponse],
         __request__: Request,
         __user__: "UserData",
-        client: genai.Client,
-    ) -> tuple[list[types.GenerateContentResponse], str, types.FinishReason | None]:
+        gen_content_args: dict,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        metadata: dict[str, Any],
+    ) -> AsyncGenerator[str, None]:
         """
-        Streams the response to the front-end using `__event_emitter__` and finally returns the full aggregated response,
-        the full content, and the finish reason if present.
+        Yields text chunks from the stream and spawns metadata processing task on completion.
         """
-        response_stream: AsyncIterator[types.GenerateContentResponse] = (
-            await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
-        )
-        aggregated_chunks = []
-        content = ""
-        finish_reason = None
-
-        async for chunk in response_stream:
-            aggregated_chunks.append(chunk)
-            candidate = self._get_first_candidate(chunk.candidates)
-            if not candidate:
-                log.warning(
-                    "No candidate objects were returned, skipping to the next chunk."
-                )
-                continue
-            parts = (
-                candidate.content.parts
-                if candidate.content and candidate.content.parts
-                else []
+        final_response_chunk: types.GenerateContentResponse | None = None
+        error_occurred = False
+        try:
+            async for chunk in response_stream:
+                final_response_chunk = chunk
+                if not (candidate := self._get_first_candidate(chunk.candidates)):
+                    log.warning("Stream chunk has no candidates, skipping.")
+                    continue
+                if not (parts := candidate.content and candidate.content.parts):
+                    log.warning(
+                        "candidate does not contain content or content.parts, skipping."
+                    )
+                    continue
+                # Process parts and yield text
+                for part in parts:
+                    # To my knowledge it's not possible for a part to have multiple fields below at the same time.
+                    if part.text:
+                        yield part.text
+                    elif part.inline_data:
+                        # _process_image_part returns a Markdown URL.
+                        yield (
+                            self._process_image_part(
+                                part.inline_data,
+                                gen_content_args,
+                                __user__,
+                                __request__,
+                            )
+                            or ""
+                        )
+                    elif part.executable_code:
+                        yield (
+                            self._process_executable_code_part(part.executable_code)
+                            or ""
+                        )
+                    elif part.code_execution_result:
+                        yield (
+                            self._process_code_execution_result_part(
+                                part.code_execution_result
+                            )
+                            or ""
+                        )
+        except Exception:
+            error_occurred = True
+            log.exception("Error during stream processing")
+            raise
+        finally:
+            log.info(f"Stream finished.")
+            # Metadata about the model response is always in the final chunk of the stream.
+            await self._do_post_processing(
+                final_response_chunk,
+                event_emitter,
+                metadata,
+                __request__,
+                error_occurred,
             )
-            for part in parts:
-                if text_part := part.text:
-                    content += text_part
-                elif inline_data := part.inline_data:
-                    if img_url := self._process_image_part(
-                        inline_data, gen_content_args, __user__, __request__
-                    ):
-                        content += img_url
-                elif executable_code_str := self._process_executable_code_part(
-                    part.executable_code
-                ):
-                    content += executable_code_str
-                elif code_execution_result_str := self._process_code_execution_result_part(
-                    part.code_execution_result
-                ):
-                    content += code_execution_result_str
+            log.debug("AsyncGenerator finished.")
 
-                # TODO: Streaming this way loses the support for Filter.stream() method processing for filter plugins.
-                await self._emit_completion(content)
+    async def _do_post_processing(
+        self,
+        model_response: types.GenerateContentResponse | None,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        metadata: dict[str, Any],
+        request: Request,
+        stream_error_happened: bool = False,
+    ):
+        """Handles emitting usage, grounding, and sources after the main response/stream is done."""
+        log.info("Post-processing the model response.")
+        if stream_error_happened:
+            log.warning(
+                "An error occured during the stream, cannot do post-processing."
+            )
+            # All the needed metadata is always in the last chunk, so if error happened then we cannot do anything.
+            return
+        if not model_response:
+            log.warning("model_response is empty, cannot do post-processing.")
+            return
+        if not (candidate := self._get_first_candidate(model_response.candidates)):
+            log.warning(
+                "Response does not contain any canditates. Cannot do post-processing."
+            )
+            return
 
-            # Check for finish reason in the candidate
-            if candidate and candidate.finish_reason:
-                finish_reason = candidate.finish_reason
+        finish_reason = candidate.finish_reason
+        if finish_reason not in (
+            types.FinishReason.STOP,
+            types.FinishReason.MAX_TOKENS,
+        ):
+            # MAX_TOKENS is often acceptable, but others might indicate issues.
+            error_msg = f"Stream finished with reason: {finish_reason}."
+            log.warning(error_msg)
+            await self._emit_error(error_msg, warning=True, event_emitter=event_emitter)
+        else:
+            log.info(f"Response has correct finish reason: {finish_reason}.")
 
-        return aggregated_chunks, content, finish_reason
+        # Emit token usage data.
+        if usage_event := self._get_usage_data_event(model_response):
+            log.info("Emitting usage data.")
+            print(self._truncate_long_strings(usage_event))
+            await event_emitter(usage_event)
+        self._add_grounding_data_to_state(model_response, metadata, request)
+
+    def _add_grounding_data_to_state(
+        self,
+        response: types.GenerateContentResponse,
+        chat_metadata: dict[str, Any],
+        request: Request,
+    ):
+        candidate = self._get_first_candidate(response.candidates)
+        grounding_metadata_obj = candidate.grounding_metadata if candidate else None
+
+        chat_id: str = chat_metadata.get("chat_id", "")
+        message_id: str = chat_metadata.get("message_id", "")
+        storage_key = f"grounding_{chat_id}_{message_id}"
+
+        if grounding_metadata_obj:
+            log.info(
+                f"Found grounding metadata. Storing in in request's app state using key {storage_key}."
+            )
+            # Using shared `request.app.state` to pass grounding metadata to Filter.outlet.
+            # This is necessary because the Pipe finishes during the initial `/api/completion` request,
+            # while Filter.outlet is invoked by a separate, later `/api/chat/completed` request.
+            # `request.state` does not persist across these distinct request lifecycles.
+            app_state: State = request.app.state
+            app_state._state[storage_key] = grounding_metadata_obj
+        else:
+            log.info(f"Response {message_id} does not have grounding metadata.")
 
     def _get_first_candidate(
         self, candidates: list[types.Candidate] | None
@@ -921,221 +986,6 @@ class Pipe:
     # endregion
 
     # region Citations
-    async def _resolve_url(
-        self,
-        session: aiohttp.ClientSession,
-        url: str,
-        timeout: aiohttp.ClientTimeout = DEFAULT_URL_TIMEOUT,
-        max_retries: int = 3,
-        base_delay: float = 0.5,
-    ) -> str:
-        """Resolves a given URL using the provided aiohttp session, with multiple retries on failure."""
-
-        if not url:
-            return ""
-
-        for attempt in range(max_retries + 1):
-            try:
-                async with session.get(
-                    url,
-                    allow_redirects=True,
-                    timeout=timeout,
-                ) as response:
-                    final_url = str(response.url)
-                    log.debug(
-                        f"Resolved URL '{url}' to '{final_url}' after {attempt} retries"
-                    )
-                    return final_url
-            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-                if attempt == max_retries:
-                    log.error(
-                        f"Failed to resolve URL '{url}' after {max_retries + 1} attempts: {e}"
-                    )
-                    return url
-                else:
-                    delay = min(base_delay * (2**attempt), 10.0)
-                    log.warning(
-                        f"Retry {attempt + 1}/{max_retries + 1} for URL '{url}': {e}. Waiting {delay:.1f}s..."
-                    )
-                    await asyncio.sleep(delay)
-            except Exception as e:
-                log.exception(f"Unexpected error resolving URL '{url}': {e}")
-                return url
-        return url  # Shouldn't reach here if loop is correct
-
-    async def _resolve_and_emit_sources(
-        self,
-        initial_metadatas: list[tuple[int, str]],
-        source_metadatas_template: list["SourceMetadata"],
-        supports: list[types.GroundingSupport],
-    ):
-        """
-        Resolves URLs in the background and emits a chat completion event
-        containing only the source information.
-        """
-
-        urls_to_resolve = [url for _, url in initial_metadatas]
-        resolved_uris: list[str] = []
-
-        log.info(f"Background task: Resolving {len(urls_to_resolve)} source URLs...")
-        async with aiohttp.ClientSession() as session:
-            tasks = [self._resolve_url(session, url) for url in urls_to_resolve]
-            resolved_uris = await asyncio.gather(*tasks)
-        log.info("Background task: URL resolution completed.")
-
-        # Populate a *copy* of the template to avoid race conditions if needed,
-        # though direct modification might be okay if structure is pre-allocated.
-        populated_metadatas = [m.copy() for m in source_metadatas_template]
-
-        resolved_uris_map = dict(zip(urls_to_resolve, resolved_uris))
-        for chunk_index, original_uri in initial_metadatas:
-            resolved_uri = resolved_uris_map.get(original_uri, original_uri)  # Fallback
-            if 0 <= chunk_index < len(populated_metadatas):
-                populated_metadatas[chunk_index]["original_url"] = original_uri
-                populated_metadatas[chunk_index]["source"] = resolved_uri
-            else:
-                log.warning(
-                    f"Chunk index {chunk_index} out of bounds when populating resolved URLs."
-                )
-
-        # Add support metadata back to the corresponding sources
-        # This needs to be done *after* resolution completes and we have the final metadata list
-        for support in supports:
-            segment = support.segment
-            indices = support.grounding_chunk_indices
-            if not (indices is not None and segment and segment.end_index is not None):
-                continue  # Skip if essential data missing
-
-            for index in indices:
-                if 0 <= index < len(populated_metadatas):
-                    populated_metadatas[index].setdefault("supports", []).append(
-                        support.model_dump()
-                    )
-                else:
-                    log.warning(
-                        f"Invalid grounding chunk index {index} found in support during background processing."
-                    )
-
-        # Filter out metadata entries that didn't have an original URL resolved
-        valid_source_metadatas = [
-            m for m in populated_metadatas if m.get("original_url") is not None
-        ]
-
-        sources_list: list["Source"] = []
-        if valid_source_metadatas:
-            sources_list.append(
-                {
-                    "source": {"name": "web_search"},
-                    "document": [""] * len(valid_source_metadatas),
-                    "metadata": valid_source_metadatas,
-                }
-            )
-
-        # Prepare and emit the sources-only event
-        event_data: "ChatCompletionEventData" = {
-            "sources": sources_list,
-            "done": False,
-        }
-        event: "ChatCompletionEvent" = {
-            "type": "chat:completion",
-            "data": event_data,
-        }
-        await self.__event_emitter__(event)
-        log.info("Background task: Emitted sources event.")
-
-    async def _process_citations_and_emit_events(
-        self, data: types.GenerateContentResponse, raw_str: str
-    ) -> None:
-        """
-        Injects citation markers into raw_str, emits the text content immediately,
-        and launches a background task to resolve and emit sources later.
-        """
-
-        # --- 1. Extract necessary data ---
-        if not data.candidates:
-            log.warning("No candidates found in the response.")
-            return
-
-        candidate = data.candidates[0]
-        grounding_metadata = candidate.grounding_metadata if candidate else None
-        if not grounding_metadata:
-            log.info("No grounding metadata found, skipping citation processing.")
-            return
-
-        supports = grounding_metadata.grounding_supports
-        grounding_chunks = grounding_metadata.grounding_chunks
-        if not supports or not grounding_chunks:
-            log.info(
-                "Grounding metadata missing supports or chunks, skipping citation processing."
-            )
-            return
-
-        # --- 2. Prepare data for background task & initial metadata structure ---
-        initial_metadatas: list[tuple[int, str]] = (
-            []
-        )  # Store index and URL for resolver
-        for i, g_c in enumerate(grounding_chunks):
-            web_info = g_c.web
-            if web_info and web_info.uri:
-                initial_metadatas.append((i, web_info.uri))
-
-        # Create a template structure. The background task will populate this.
-        # We only need original_url and source set to None initially. Supports added later.
-        source_metadatas_template: list["SourceMetadata"] = [
-            {
-                "source": None,
-                "original_url": None,
-                "supports": [],
-            }  # Initialize supports list here
-            for _ in grounding_chunks
-        ]
-
-        # --- 3. Inject Citation Markers ---
-        modified_content_bytes = bytearray(raw_str.encode("utf-8"))
-        for support in reversed(supports):
-            segment = support.segment
-            indices = support.grounding_chunk_indices
-
-            if not (indices is not None and segment and segment.end_index is not None):
-                log.debug(f"Skipping support due to missing data: {support}")
-                continue
-
-            end_pos = segment.end_index
-            citation_markers = "".join(f"[{index + 1}]" for index in indices)
-            encoded_citation_markers = citation_markers.encode("utf-8")
-
-            modified_content_bytes[end_pos:end_pos] = encoded_citation_markers
-
-        final_content_with_markers = modified_content_bytes.decode("utf-8")
-
-        # --- 4. Emit Text + Markers Event ---
-        # This event contains the text with markers but no sources yet.
-        text_event_data: "ChatCompletionEventData" = {
-            "content": final_content_with_markers,
-            "done": False,
-        }
-        text_event: "ChatCompletionEvent" = {
-            "type": "chat:completion",
-            "data": text_event_data,
-        }
-        await self.__event_emitter__(text_event)
-        log.debug("Emitted text content event with citation markers.")
-
-        # --- 5. Launch Background Task for URL Resolution and Source Emission ---
-        if initial_metadatas:  # Only launch if there are URLs to resolve
-            asyncio.create_task(
-                self._resolve_and_emit_sources(
-                    initial_metadatas=initial_metadatas,
-                    source_metadatas_template=source_metadatas_template,
-                    supports=supports,
-                )
-            )
-            log.info("Launched background task for URL resolution.")
-        else:
-            log.info("No source URIs found, skipping background URL resolution task.")
-
-        # This function now returns None as events are emitted directly.
-        return None
 
     def _remove_citation_markers(self, text: str, sources: list["Source"]) -> str:
         processed: set[str] = set()
@@ -1172,45 +1022,6 @@ class Pipe:
                         + text[pos + len(segment_text) + len(citation_markers) :]
                     )
         return text
-
-    def _get_status_event_w_queries(
-        self,
-        data: types.GenerateContentResponse,
-    ) -> "StatusEvent | None":
-        """
-        Creates a StatusEvent with Google search URLs based on the web_search_queries
-        in the GenerateContentResponse.
-        """
-        # TODO: Merge with _get_chat_completion_event_w_sources because a lot of logic is overlapping.
-        if (
-            not data.candidates
-            or not data.candidates[0].grounding_metadata
-            or not data.candidates[0].grounding_metadata.web_search_queries
-        ):
-            return None
-
-        search_queries = data.candidates[0].grounding_metadata.web_search_queries
-        if not search_queries:
-            log.debug("web_search_queries list is empty.")
-            return None
-
-        google_search_urls = [
-            f"https://www.google.com/search?q={query}" for query in search_queries
-        ]
-
-        status_event_data: StatusEventData = {
-            "action": "web_search",
-            "description": "This response was grounded with Google Search",
-            "urls": google_search_urls,
-        }
-
-        status_event: StatusEvent = {
-            "type": "status",
-            "data": status_event_data,
-        }
-
-        log.debug(f"Created StatusEvent: {status_event}")
-        return status_event
 
     # endregion
 
@@ -1251,7 +1062,7 @@ class Pipe:
 
         completion_event: "ChatCompletionEvent" = {
             "type": "chat:completion",
-            "data": {"usage": usage_data, "done": False},
+            "data": {"usage": usage_data},
         }
         return completion_event
 
