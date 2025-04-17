@@ -16,7 +16,7 @@ Here's a breakdown of implemented and planned features for the Gemini Manifold p
 -   [x] Display citations in the front-end.
 -   [x] Image input
 -   [x] Streaming
--   [x] Grounding with Google Search (requires installing the "Gemini Manifold Companion" >= 1.0.0 filter - see [it's doc](../filters/gemini_manifold_companion.md))
+-   [x] Grounding with Google Search (requires installing the "Gemini Manifold Companion" >= 1.2.0 filter - see [it's doc](../filters/gemini_manifold_companion.md))
 -   [x] Safety settings
 -   [x] Each user can decide to use their own API key.
 -   [x] White- and blacklist based model retrieval and registration.

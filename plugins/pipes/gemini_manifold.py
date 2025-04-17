@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.14.2
+version: 1.15.0
 requirements: google-genai==1.10.0
 """
 
@@ -18,7 +18,7 @@ requirements: google-genai==1.10.0
 #   - Display citations in the front-end.
 #   - Image input
 #   - Streaming
-#   - Grounding with Google Search (this requires installing "Gemini Manifold Companion" >= 1.0.0 filter, see GitHub README)
+#   - Grounding with Google Search (this requires installing "Gemini Manifold Companion" >= 1.2.0 filter, see GitHub README)
 #   - Safety settings
 #   - Each user can decide to use their own API key.
 #   - Token usage data
