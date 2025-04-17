@@ -293,8 +293,9 @@ class Pipe:
             # FIXME: Support code execution here too.
             res = await client.aio.models.generate_content(**gen_content_args)
             if raw_text := res.text:
-                # FIXME: Emit usage data.
-                self._add_grounding_data_to_state(res, __metadata__, __request__)
+                await self._do_post_processing(
+                    res, __event_emitter__, __metadata__, __request__
+                )
                 log.info("pipe method has finished it's run.")
                 return raw_text
             else:
@@ -556,18 +557,14 @@ class Pipe:
         Yields text chunks from the stream and spawns metadata processing task on completion.
         """
         aggregated_chunks: list[types.GenerateContentResponse] = []
-        aggregated_content: str = ""
-        finish_reason: types.FinishReason | None = None
         final_response_data: types.GenerateContentResponse | None = None
         error_occurred = False
-
         try:
             async for chunk in response_stream:
                 aggregated_chunks.append(chunk)
-                final_response_data = chunk  # Keep track of the latest chunk
-                candidate = self._get_first_candidate(chunk.candidates)
+                final_response_data = chunk
 
-                if not candidate:
+                if not (candidate := self._get_first_candidate(chunk.candidates)):
                     log.warning("Stream chunk has no candidates, skipping.")
                     continue
 
@@ -578,12 +575,13 @@ class Pipe:
                     if candidate.content and candidate.content.parts
                     else []
                 )
+                # TODO: [refactor] simply use yield in each if branch.
                 for part in parts:
                     part_text = ""
                     if part.text:
                         part_text = part.text
                     elif part.inline_data:
-                        # Assuming _process_image_part returns a string placeholder/URL
+                        # _process_image_part returns a Markdown URL.
                         part_text = (
                             self._process_image_part(
                                 part.inline_data,
@@ -606,72 +604,61 @@ class Pipe:
                             or ""
                         )
                     # Add other part types if necessary (e.g., function calls)
-
                     if part_text:
                         yield part_text
                         chunk_content += part_text
-
-                aggregated_content += chunk_content
-
-                # Update finish reason if present in this chunk's candidate
-                if (
-                    candidate.finish_reason is not None
-                    and candidate.finish_reason
-                    is not types.FinishReason.FINISH_REASON_UNSPECIFIED
-                ):
-                    finish_reason = candidate.finish_reason
-                    log.debug(f"Stream finish reason updated: {finish_reason}")
         except Exception:
             error_occurred = True
             log.exception("Error during stream processing")
             raise
         finally:
-            log.info(f"Stream finished. Final reason: {finish_reason}.")
-            await self._handle_steam_end(
-                final_response_data=final_response_data,
-                aggregated_raw_text=aggregated_content,
-                finish_reason=finish_reason,
-                event_emitter=event_emitter,
-                stream_error=error_occurred,
-                request=__request__,
-                metadata=metadata,
+            log.info(f"Stream finished.")
+            await self._do_post_processing(
+                final_response_data,
+                event_emitter,
+                metadata,
+                __request__,
+                error_occurred,
             )
             log.debug("AsyncGenerator finished.")
 
-    async def _handle_steam_end(
+    async def _do_post_processing(
         self,
         final_response_data: types.GenerateContentResponse | None,
-        aggregated_raw_text: str,
-        finish_reason: types.FinishReason | None,
         event_emitter: Callable[["Event"], Awaitable[None]],
-        request: Request,
         metadata: dict[str, Any],
-        stream_error: bool = False,
+        request: Request,
+        stream_error_happened: bool = False,
     ):
-        """
-        Handles emitting usage, grounding, and sources after the main response/stream is done.
-        Runs as a background task.
-        """
-
-        log.info("Processing final response metadata.")
+        """Handles emitting usage, grounding, and sources after the main response/stream is done."""
+        log.info("Post-processing the model response.")
+        if stream_error_happened:
+            log.warning(
+                "An error occured during the stream, cannot do post-processing."
+            )
+            # All the needed metadata is always in the last chunk, so if error happened then we cannot do anything.
+            return
         if not final_response_data:
             log.warning("final_response_data is empty, cannot do post-processing.")
             return
+        if not (candidate := self._get_first_candidate(final_response_data.candidates)):
+            log.warning(
+                "Response does not contain any canditates. Cannot do post-processing."
+            )
+            return
 
-        # Check finish reason if streaming (and no prior error occurred)
-        if (
-            finish_reason is not None and not stream_error
-        ):  # Check if finish_reason was set (i.e. streaming)
-            if finish_reason not in (
-                types.FinishReason.STOP,
-                types.FinishReason.MAX_TOKENS,
-            ):
-                # MAX_TOKENS is often acceptable, but others might indicate issues.
-                error_msg = f"Stream finished with reason: {finish_reason}. Raw text length: {len(aggregated_raw_text)}"
-                log.warning(error_msg)
-                await self._emit_error(
-                    error_msg, warning=True, event_emitter=event_emitter
-                )
+        finish_reason = candidate.finish_reason
+        if finish_reason not in (
+            types.FinishReason.STOP,
+            types.FinishReason.MAX_TOKENS,
+        ):
+            # MAX_TOKENS is often acceptable, but others might indicate issues.
+            error_msg = f"Stream finished with reason: {finish_reason}."
+            log.warning(error_msg)
+            await self._emit_error(error_msg, warning=True, event_emitter=event_emitter)
+        else:
+            log.info(f"Response has correct finish reason: {finish_reason}.")
+
         # Emit token usage data.
         if usage_event := self._get_usage_data_event(final_response_data):
             log.info("Emitting usage data.")
