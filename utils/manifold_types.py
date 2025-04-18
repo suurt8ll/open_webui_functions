@@ -3,6 +3,8 @@ from uuid import UUID
 from datetime import datetime
 from open_webui.models.files import FileModelResponse
 
+# TODO Contruct a type for `__metadata__`.
+
 # ---------- __event_emitter__ ----------
 
 

@@ -166,9 +166,6 @@ class Pipe:
         __metadata__: dict[str, Any],
     ) -> AsyncGenerator | str | None:
 
-        # BUG: Not good. Each message get's it's own emitter.
-        self.__event_emitter__ = __event_emitter__
-
         if not (client := self._get_user_client(__user__)):
             error_msg = "There are no usable genai clients, check the logs."
             log.error(error_msg)
@@ -296,6 +293,7 @@ class Pipe:
     # region Event emission and error logging
     async def _emit_completion(
         self,
+        event_emitter: Callable[["Event"], Awaitable[None]],
         content: str | None = None,
         done: bool = False,
         error: str | None = None,
@@ -312,25 +310,24 @@ class Pipe:
             emission["data"]["error"] = {"detail": error}
         if sources:
             emission["data"]["sources"] = sources
-        await self.__event_emitter__(emission)
+        await event_emitter(emission)
 
     async def _emit_error(
         self,
         error_msg: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
         warning: bool = False,
         exception: bool = True,
-        event_emitter: Callable[["Event"], Awaitable[None]] | None = None,
     ) -> None:
         """Emits an event to the front-end that causes it to display a nice red error message."""
-
-        if not event_emitter:
-            event_emitter = self.__event_emitter__
 
         if warning:
             log.opt(depth=1, exception=False).warning(error_msg)
         else:
             log.opt(depth=1, exception=exception).error(error_msg)
-        await self._emit_completion(error=f"\n{error_msg}", done=True)
+        await self._emit_completion(
+            error=f"\n{error_msg}", event_emitter=event_emitter, done=True
+        )
 
     def _return_error_model(
         self, error_msg: str, warning: bool = False, exception: bool = True
@@ -585,10 +582,10 @@ class Pipe:
                             )
                             or ""
                         )
-        except Exception:
+        except Exception as e:
             error_occurred = True
-            log.exception("Error during stream processing")
-            raise
+            error_msg = f"Error during stream processing: {e}"
+            await self._emit_error(error_msg, event_emitter)
         finally:
             log.info(f"Stream finished.")
             # Metadata about the model response is always in the final chunk of the stream.
@@ -634,14 +631,14 @@ class Pipe:
             # MAX_TOKENS is often acceptable, but others might indicate issues.
             error_msg = f"Stream finished with reason: {finish_reason}."
             log.warning(error_msg)
-            await self._emit_error(error_msg, warning=True, event_emitter=event_emitter)
+            await self._emit_error(error_msg, event_emitter=event_emitter)
+            return
         else:
             log.info(f"Response has correct finish reason: {finish_reason}.")
 
         # Emit token usage data.
         if usage_event := self._get_usage_data_event(model_response):
             log.info("Emitting usage data.")
-            print(self._truncate_long_strings(usage_event))
             await event_emitter(usage_event)
         self._add_grounding_data_to_state(model_response, metadata, request)
 
