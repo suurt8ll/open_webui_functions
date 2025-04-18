@@ -166,29 +166,21 @@ class Pipe:
         __metadata__: dict[str, Any],
     ) -> AsyncGenerator | str | None:
 
+        # BUG: Not good. Each message get's it's own emitter.
         self.__event_emitter__ = __event_emitter__
 
         if not (client := self._get_user_client(__user__)):
             error_msg = "There are no usable genai clients, check the logs."
-            await self._emit_error(error_msg, exception=False)
-            return None
-
+            log.error(error_msg)
+            raise ValueError(error_msg)
         if self.clients.get("default") == client and self.valves.REQUIRE_USER_API_KEY:
             error_msg = "You have not defined your own API key in UserValves. You need to define in to continue."
-            await self._emit_error(error_msg, exception=False)
-            return None
-        model_name = body.get("model")
-        if not model_name:
-            error_msg = "body object does not contain model name."
-            await self._emit_error(error_msg, exception=False)
-            return None
-        model_name = self._strip_prefix(model_name)
-
-        # TODO Contruct a type for `__metadata__`.
+            log.error(error_msg)
+            raise ValueError(error_msg)
         if "error" in __metadata__["model"]["id"]:
             error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
-            await self._emit_error(error_msg, exception=False)
-            return None
+            log.error(error_msg)
+            raise ValueError(error_msg)
 
         # Get the message history directly from the backend.
         # This allows us to see data about sources and files data.
@@ -205,7 +197,7 @@ class Pipe:
         contents, system_prompt = self._genai_contents_from_messages(
             body.get("messages"), messages_db
         )
-
+        model_name = self._strip_prefix(body.get("model", ""))
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
             system_instruction=system_prompt,
@@ -295,7 +287,7 @@ class Pipe:
                 log.info("pipe method has finished it's run.")
                 return raw_text
             else:
-                warn_msg = "Non-stremaing response did not have any text inside it."
+                warn_msg = "Non-streaming response did not have any text inside it."
                 log.warning(warn_msg)
                 raise ValueError(warn_msg)
 
