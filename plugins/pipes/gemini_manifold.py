@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.15.0
+version: 1.16.0
 requirements: google-genai==1.11.0
 """
 
@@ -23,6 +23,7 @@ requirements: google-genai==1.11.0
 #   - Each user can decide to use their own API key.
 #   - Token usage data
 #   - Code execution tool. (Gemini Manifold Companion >= 1.1.0 required)
+#   - Set thinking budget for Gemini 2.5 models
 
 # Features that are supported by API but not yet implemented in the manifold:
 #   TODO Audio input support.
