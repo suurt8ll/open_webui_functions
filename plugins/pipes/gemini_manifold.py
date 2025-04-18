@@ -17,6 +17,7 @@ requirements: google-genai==1.11.0
 #   - Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
 #   - Display citations in the front-end.
 #   - Image input
+#   - YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
 #   - Streaming
 #   - Grounding with Google Search (this requires installing "Gemini Manifold Companion" >= 1.2.0 filter, see GitHub README)
 #   - Safety settings
@@ -26,7 +27,7 @@ requirements: google-genai==1.11.0
 
 # Features that are supported by API but not yet implemented in the manifold:
 #   TODO Audio input support.
-#   TODO Video input support.
+#   TODO Video input support (other than YouTube URLs).
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 
 import asyncio
@@ -76,7 +77,7 @@ class Pipe:
         REQUIRE_USER_API_KEY: bool = Field(
             default=False,
             description="""Whether to require user's own API key (applies to admins too).
-            User can give their own key through UserValves. 
+            User can give their own key through UserValves.
             Default value is False.""",
         )
         GEMINI_API_BASE_URL: str = Field(
@@ -85,14 +86,14 @@ class Pipe:
         )
         MODEL_WHITELIST: str = Field(
             default="*",
-            description="""Comma-separated list of allowed model names. 
-            Supports `fnmatch` patterns: *, ?, [seq], [!seq]. 
+            description="""Comma-separated list of allowed model names.
+            Supports `fnmatch` patterns: *, ?, [seq], [!seq].
             Default value is * (all models allowed).""",
         )
         MODEL_BLACKLIST: str | None = Field(
             default=None,
-            description="""Comma-separated list of blacklisted model names. 
-            Supports `fnmatch` patterns: *, ?, [seq], [!seq]. 
+            description="""Comma-separated list of blacklisted model names.
+            Supports `fnmatch` patterns: *, ?, [seq], [!seq].
             Default value is None (no blacklist).""",
         )
         CACHE_MODELS: bool = Field(
@@ -368,6 +369,15 @@ class Pipe:
             user_parts = []
             user_content = message.get("content")
             if isinstance(user_content, str):
+                # Check for YouTube URLs in text content
+                youtube_urls = self._extract_youtube_urls(user_content)
+                if youtube_urls:
+                    for url in youtube_urls:
+                        user_parts.append(
+                            types.Part(file_data=types.FileData(file_uri=url))
+                        )
+
+                # Add text content as usual
                 user_parts.extend(self._genai_parts_from_text(user_content))
             elif isinstance(user_content, list):
                 for c in user_content:
@@ -376,6 +386,16 @@ class Pipe:
                         c = cast("TextContent", c)
                         # Don't process empty strings.
                         if c_text := c.get("text"):
+                            # Check for YouTube URLs in text content
+                            youtube_urls = self._extract_youtube_urls(c_text)
+                            if youtube_urls:
+                                for url in youtube_urls:
+                                    user_parts.append(
+                                        types.Part(
+                                            file_data=types.FileData(file_uri=url)
+                                        )
+                                    )
+
                             user_parts.extend(self._genai_parts_from_text(c_text))
                     elif c_type == "image_url":
                         c = cast("ImageContent", c)
@@ -1157,6 +1177,26 @@ class Pipe:
         if mime_type is None:
             return "application/octet-stream"  # Default MIME type if unknown
         return mime_type
+
+    def _extract_youtube_urls(self, text: str) -> list[str]:
+        """
+        Extracts YouTube URLs from a given text.
+        Supports standard youtube.com/watch?v= URLs and shortened youtu.be URLs
+        """
+        youtube_urls = []
+        # Match standard YouTube URLs
+        for match in re.finditer(
+            r"https?://(?:www\.)?youtube\.com/watch\?v=[^&\s]+", text
+        ):
+            youtube_urls.append(match.group(0))
+        # Match shortened YouTube URLs
+        for match in re.finditer(r"https?://(?:www\.)?youtu\.be/[^&\s]+", text):
+            youtube_urls.append(match.group(0))
+
+        if youtube_urls:
+            log.info(f"Extracted YouTube URLs: {youtube_urls}")
+
+        return youtube_urls
 
     # endregion
 
