@@ -124,6 +124,7 @@ class Pipe:
         EMIT_STATUS_UPDATES: bool = Field(
             default=False,
             description="Whether to emit status updates during model thinking.",
+        )
         LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = (
             Field(
                 default="INFO",
