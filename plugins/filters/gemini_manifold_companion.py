@@ -33,33 +33,33 @@ if TYPE_CHECKING:
     from loguru._handler import Handler
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
-# according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
-ALLOWED_GROUNDING_MODELS = [
+# According to https://ai.google.dev/gemini-api/docs/models
+ALLOWED_GROUNDING_MODELS = {
     "gemini-2.5-flash-preview-04-17",
     "gemini-2.5-pro-preview-03-25",
     "gemini-2.5-pro-exp-03-25",
-    "gemini-2.0-pro-exp-02-05",
     "gemini-2.0-pro-exp",
+    "gemini-2.0-pro-exp-02-05",
+    "gemini-exp-1206",
     "gemini-2.0-flash",
     "gemini-2.0-flash-exp",
     "gemini-2.0-flash-001",
     "gemini-1.5-pro",
     "gemini-1.5-flash",
     "gemini-1.0-pro",
-]
-
-# according to https://ai.google.dev/gemini-api/docs/code-execution
-ALLOWED_CODE_EXECUTION_MODELS = [
+}
+ALLOWED_CODE_EXECUTION_MODELS = {
     "gemini-2.5-flash-preview-04-17",
     "gemini-2.5-pro-preview-03-25",
     "gemini-2.5-pro-exp-03-25",
-    "gemini-2.0-pro-exp-02-05",
     "gemini-2.0-pro-exp",
+    "gemini-2.0-pro-exp-02-05",
+    "gemini-exp-1206",
+    "gemini-2.0-flash-thinking-exp-01-21",
     "gemini-2.0-flash",
     "gemini-2.0-flash-exp",
     "gemini-2.0-flash-001",
-]
-
+}
 
 # Default timeout for URL resolution
 # TODO: Move to Pipe.Valves.
@@ -116,11 +116,13 @@ class Filter:
 
         canonical_model_name = model_name.replace("gemini_manifold_google_genai.", "")
 
-        if (
-            "gemini_manifold_google_genai." not in model_name
-            or canonical_model_name not in ALLOWED_GROUNDING_MODELS
-            or canonical_model_name not in ALLOWED_CODE_EXECUTION_MODELS
-        ):
+        # Check if it's a relevant model (supports either feature)
+        is_grounding_model = canonical_model_name in ALLOWED_GROUNDING_MODELS
+        is_code_exec_model = canonical_model_name in ALLOWED_CODE_EXECUTION_MODELS
+
+        if "gemini_manifold_google_genai." not in model_name or (
+            not is_grounding_model and not is_code_exec_model
+        ):  # Check if it supports *any* of the features we filter on
             return body
 
         features = body.get("features", {})
@@ -130,7 +132,7 @@ class Filter:
         metadata = body.setdefault("metadata", {})
         metadata_features = metadata.setdefault("features", {})
 
-        if canonical_model_name in ALLOWED_GROUNDING_MODELS:
+        if is_grounding_model:
             web_search_enabled = (
                 features.get("web_search", False)
                 if isinstance(features, dict)
@@ -155,8 +157,7 @@ class Filter:
                 if self.valves.SET_TEMP_TO_ZERO:
                     log.info("Setting temperature to 0.")
                     body["temperature"] = 0
-
-        if canonical_model_name in ALLOWED_CODE_EXECUTION_MODELS:
+        if is_code_exec_model:
             code_execution_enabled = (
                 features.get("code_interpreter", False)
                 if isinstance(features, dict)
