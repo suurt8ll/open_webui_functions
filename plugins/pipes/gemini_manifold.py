@@ -98,8 +98,17 @@ class Pipe:
             default=True,
             description="Whether to request models only on first load and when white- or blacklist changes.",
         )
+        THINKING_BUDGET: int | None = Field(
+            default=None,
+            description="Indicates the thinking budget in tokens. Default value is None.",
+        )
         USE_PERMISSIVE_SAFETY: bool = Field(
-            default=False, description="Whether to request relaxed safety filtering"
+            default=False, description="Whether to request relaxed safety filtering."
+        )
+        USE_FILES_API: bool = Field(
+            title="Use Files API",
+            default=True,
+            description="Save the image files using Open WebUI's API for files.",
         )
         LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = (
             Field(
@@ -107,17 +116,16 @@ class Pipe:
                 description="Select logging level. Use `docker logs -f open-webui` to view logs.",
             )
         )
-        USE_FILES_API: bool = Field(
-            title="Use Files API",
-            default=True,
-            description="Save the image files using Open WebUI's API for files.",
-        )
 
     class UserValves(BaseModel):
         GEMINI_API_KEY: str | None = Field(default=None)
         GEMINI_API_BASE_URL: str = Field(
             default="https://generativelanguage.googleapis.com",
             description="The base URL for calling the Gemini API",
+        )
+        THINKING_BUDGET: int | None = Field(
+            default=None,
+            description="Indicates the thinking budget in tokens. Default value is None.",
         )
         # TODO: Add more options that can be changed by the user.
 
@@ -195,6 +203,10 @@ class Pipe:
             body.get("messages"), messages_db
         )
         model_name = self._strip_prefix(body.get("model", ""))
+        # API does not stream thoughts sadly. See https://github.com/googleapis/python-genai/issues/226#issuecomment-2631657100
+        thinking_conf = types.ThinkingConfig(
+            thinking_budget=self.valves.THINKING_BUDGET, include_thoughts=None
+        )
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
             system_instruction=system_prompt,
@@ -204,6 +216,7 @@ class Pipe:
             max_output_tokens=body.get("max_tokens"),
             stop_sequences=body.get("stop"),
             safety_settings=self._get_safety_settings(model_name),
+            thinking_config=thinking_conf,
         )
 
         gen_content_conf.response_modalities = ["Text"]
