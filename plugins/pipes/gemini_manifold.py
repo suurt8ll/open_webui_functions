@@ -219,9 +219,12 @@ class Pipe:
         )
         model_name = self._strip_prefix(body.get("model", ""))
         # API does not stream thoughts sadly. See https://github.com/googleapis/python-genai/issues/226#issuecomment-2631657100
-        thinking_conf = types.ThinkingConfig(
-            thinking_budget=self.valves.THINKING_BUDGET, include_thoughts=None
-        )
+        thinking_conf = None
+        if self.is_thinking_model(model_name):
+            log.info("This is a thinking model. Adding thinking_config options.")
+            thinking_conf = types.ThinkingConfig(
+                thinking_budget=self.valves.THINKING_BUDGET, include_thoughts=None
+            )
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
             system_instruction=system_prompt,
