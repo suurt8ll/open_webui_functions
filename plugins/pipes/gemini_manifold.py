@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 1.15.0
-requirements: google-genai==1.10.0
+requirements: google-genai==1.11.0
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API.
@@ -17,6 +17,7 @@ requirements: google-genai==1.10.0
 #   - Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
 #   - Display citations in the front-end.
 #   - Image input
+#   - YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
 #   - Streaming
 #   - Grounding with Google Search (this requires installing "Gemini Manifold Companion" >= 1.2.0 filter, see GitHub README)
 #   - Safety settings
@@ -26,7 +27,7 @@ requirements: google-genai==1.10.0
 
 # Features that are supported by API but not yet implemented in the manifold:
 #   TODO Audio input support.
-#   TODO Video input support.
+#   TODO Video input support (other than YouTube URLs).
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 
 import asyncio
@@ -77,7 +78,7 @@ class Pipe:
         REQUIRE_USER_API_KEY: bool = Field(
             default=False,
             description="""Whether to require user's own API key (applies to admins too).
-            User can give their own key through UserValves. 
+            User can give their own key through UserValves.
             Default value is False.""",
         )
         GEMINI_API_BASE_URL: str = Field(
@@ -86,26 +87,26 @@ class Pipe:
         )
         MODEL_WHITELIST: str = Field(
             default="*",
-            description="""Comma-separated list of allowed model names. 
-            Supports `fnmatch` patterns: *, ?, [seq], [!seq]. 
+            description="""Comma-separated list of allowed model names.
+            Supports `fnmatch` patterns: *, ?, [seq], [!seq].
             Default value is * (all models allowed).""",
         )
         MODEL_BLACKLIST: str | None = Field(
             default=None,
-            description="""Comma-separated list of blacklisted model names. 
-            Supports `fnmatch` patterns: *, ?, [seq], [!seq]. 
+            description="""Comma-separated list of blacklisted model names.
+            Supports `fnmatch` patterns: *, ?, [seq], [!seq].
             Default value is None (no blacklist).""",
         )
         CACHE_MODELS: bool = Field(
             default=True,
             description="Whether to request models only on first load and when white- or blacklist changes.",
         )
-        USE_PERMISSIVE_SAFETY: bool = Field(
-            default=False, description="Whether to request relaxed safety filtering"
+        THINKING_BUDGET: int | None = Field(
+            default=None,
+            description="Indicates the thinking budget in tokens. Default value is None.",
         )
-        LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
-            default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+        USE_PERMISSIVE_SAFETY: bool = Field(
+            default=False, description="Whether to request relaxed safety filtering."
         )
         USE_FILES_API: bool = Field(
             title="Use Files API",
@@ -123,6 +124,11 @@ class Pipe:
         EMIT_STATUS_UPDATES: bool = Field(
             default=False,
             description="Whether to emit status updates during model thinking.",
+        LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = (
+            Field(
+                default="INFO",
+                description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+            )
         )
 
     class UserValves(BaseModel):
@@ -130,6 +136,10 @@ class Pipe:
         GEMINI_API_BASE_URL: str = Field(
             default="https://generativelanguage.googleapis.com",
             description="The base URL for calling the Gemini API",
+        )
+        THINKING_BUDGET: int | None = Field(
+            default=None,
+            description="Indicates the thinking budget in tokens. Default value is None.",
         )
         # TODO: Add more options that can be changed by the user.
 
@@ -139,10 +149,8 @@ class Pipe:
         # TODO: Get the id from the frontmatter instead of hardcoding it.
         valves = Functions.get_function_valves_by_id("gemini_manifold_google_genai")
         self.valves = self.Valves(**(valves if valves else {}))
-        # FIXME: Is logging out the API key a bad idea?
-        print(
-            f"[gemini_manifold] self.valves initialized:\n{self.valves.model_dump_json(indent=2)}"
-        )
+        # FIXME: There is no trigger for changing the log level if it changes inside Pipe.Valves
+        self._add_log_handler()
 
         # Initialize the genai client with default API given in Valves.
         self.clients = {"default": self._get_genai_client()}
@@ -150,14 +158,10 @@ class Pipe:
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
         self.last_blacklist = self.valves.MODEL_BLACKLIST
 
-        print(f"[gemini_manifold] Function has been initialized:\n{self.__dict__}")
+        log.info("Function has been initialized.")
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
-
-        # TODO: Move into `__init__`.
-        self._add_log_handler()
-
         # Return existing models if all conditions are met and no error models are present
         if (
             self.models
@@ -184,29 +188,18 @@ class Pipe:
         __metadata__: dict[str, Any],
     ) -> AsyncGenerator | str | None:
 
-        self.__event_emitter__ = __event_emitter__
-
         if not (client := self._get_user_client(__user__)):
             error_msg = "There are no usable genai clients, check the logs."
-            await self._emit_error(error_msg, exception=False)
-            return None
-
+            log.error(error_msg)
+            raise ValueError(error_msg)
         if self.clients.get("default") == client and self.valves.REQUIRE_USER_API_KEY:
             error_msg = "You have not defined your own API key in UserValves. You need to define in to continue."
-            await self._emit_error(error_msg, exception=False)
-            return None
-        model_name = body.get("model")
-        if not model_name:
-            error_msg = "body object does not contain model name."
-            await self._emit_error(error_msg, exception=False)
-            return None
-        model_name = self._strip_prefix(model_name)
-
-        # TODO Contruct a type for `__metadata__`.
+            log.error(error_msg)
+            raise ValueError(error_msg)
         if "error" in __metadata__["model"]["id"]:
             error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
-            await self._emit_error(error_msg, exception=False)
-            return None
+            log.error(error_msg)
+            raise ValueError(error_msg)
 
         # Get the message history directly from the backend.
         # This allows us to see data about sources and files data.
@@ -223,7 +216,11 @@ class Pipe:
         contents, system_prompt = self._genai_contents_from_messages(
             body.get("messages"), messages_db
         )
-
+        model_name = self._strip_prefix(body.get("model", ""))
+        # API does not stream thoughts sadly. See https://github.com/googleapis/python-genai/issues/226#issuecomment-2631657100
+        thinking_conf = types.ThinkingConfig(
+            thinking_budget=self.valves.THINKING_BUDGET, include_thoughts=None
+        )
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
             system_instruction=system_prompt,
@@ -233,6 +230,7 @@ class Pipe:
             max_output_tokens=body.get("max_tokens"),
             stop_sequences=body.get("stop"),
             safety_settings=self._get_safety_settings(model_name),
+            thinking_config=thinking_conf,
         )
 
         gen_content_conf.response_modalities = ["Text"]
@@ -313,7 +311,7 @@ class Pipe:
                 log.info("pipe method has finished it's run.")
                 return raw_text
             else:
-                warn_msg = "Non-stremaing response did not have any text inside it."
+                warn_msg = "Non-streaming response did not have any text inside it."
                 log.warning(warn_msg)
                 raise ValueError(warn_msg)
 
@@ -322,6 +320,7 @@ class Pipe:
     # region Event emission and error logging
     async def _emit_completion(
         self,
+        event_emitter: Callable[["Event"], Awaitable[None]],
         content: str | None = None,
         done: bool = False,
         error: str | None = None,
@@ -338,7 +337,7 @@ class Pipe:
             emission["data"]["error"] = {"detail": error}
         if sources:
             emission["data"]["sources"] = sources
-        await self.__event_emitter__(emission)
+        await event_emitter(emission)
 
     def is_thinking_model(self, model_id: str) -> bool:
         """Check if the model is a thinking model based on the valve pattern."""
@@ -401,20 +400,31 @@ class Pipe:
     async def _emit_error(
         self,
         error_msg: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
         warning: bool = False,
         exception: bool = True,
-        event_emitter: Callable[["Event"], Awaitable[None]] | None = None,
     ) -> None:
         """Emits an event to the front-end that causes it to display a nice red error message."""
-
-        if not event_emitter:
-            event_emitter = self.__event_emitter__
 
         if warning:
             log.opt(depth=1, exception=False).warning(error_msg)
         else:
             log.opt(depth=1, exception=exception).error(error_msg)
-        await self._emit_completion(error=f"\n{error_msg}", done=True)
+        await self._emit_completion(
+            error=f"\n{error_msg}", event_emitter=event_emitter, done=True
+        )
+
+    async def _emit_toast(
+        self,
+        msg: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        toastType: Literal["info", "success", "warning", "error"] = "info",
+    ) -> None:
+        event: NotificationEvent = {
+            "type": "notification",
+            "data": {"type": toastType, "content": msg},
+        }
+        await event_emitter(event)
 
     def _return_error_model(
         self, error_msg: str, warning: bool = False, exception: bool = True
@@ -442,6 +452,15 @@ class Pipe:
             user_parts = []
             user_content = message.get("content")
             if isinstance(user_content, str):
+                # Check for YouTube URLs in text content
+                youtube_urls = self._extract_youtube_urls(user_content)
+                if youtube_urls:
+                    for url in youtube_urls:
+                        user_parts.append(
+                            types.Part(file_data=types.FileData(file_uri=url))
+                        )
+
+                # Add text content as usual
                 user_parts.extend(self._genai_parts_from_text(user_content))
             elif isinstance(user_content, list):
                 for c in user_content:
@@ -450,6 +469,16 @@ class Pipe:
                         c = cast("TextContent", c)
                         # Don't process empty strings.
                         if c_text := c.get("text"):
+                            # Check for YouTube URLs in text content
+                            youtube_urls = self._extract_youtube_urls(c_text)
+                            if youtube_urls:
+                                for url in youtube_urls:
+                                    user_parts.append(
+                                        types.Part(
+                                            file_data=types.FileData(file_uri=url)
+                                        )
+                                    )
+
                             user_parts.extend(self._genai_parts_from_text(c_text))
                     elif c_type == "image_url":
                         c = cast("ImageContent", c)
@@ -718,10 +747,10 @@ class Pipe:
                             )
                             or ""
                         )
-        except Exception:
+        except Exception as e:
             error_occurred = True
-            log.exception("Error during stream processing")
-            raise
+            error_msg = f"Error during stream processing: {e}"
+            await self._emit_error(error_msg, event_emitter)
         finally:
             # Cancel the timer task if it exists and wasn't already cancelled
             if thinking_timer_task:
@@ -734,14 +763,20 @@ class Pipe:
                     log.exception("Error cancelling timer task in finally block")
             
             log.info(f"Stream finished.")
-            # Metadata about the model response is always in the final chunk of the stream.
-            await self._do_post_processing(
-                final_response_chunk,
-                event_emitter,
-                metadata,
-                __request__,
-                error_occurred,
-            )
+            try:
+                # Catch and emit any errors that might happen here as a toast message.
+                await self._do_post_processing(
+                    # Metadata about the model response is always in the final chunk of the stream.
+                    final_response_chunk,
+                    event_emitter,
+                    metadata,
+                    __request__,
+                    error_occurred,
+                )
+            except Exception as e:
+                error_msg = f"Post-processing failed with error:\n\n{e}"
+                await self._emit_toast(error_msg, event_emitter, "error")
+                log.exception(error_msg)
             log.debug("AsyncGenerator finished.")
 
     async def _do_post_processing(
@@ -775,16 +810,16 @@ class Pipe:
             types.FinishReason.MAX_TOKENS,
         ):
             # MAX_TOKENS is often acceptable, but others might indicate issues.
-            error_msg = f"Stream finished with reason: {finish_reason}."
-            log.warning(error_msg)
-            await self._emit_error(error_msg, warning=True, event_emitter=event_emitter)
+            error_msg = f"Stream finished with sus reason:\n\n{finish_reason}."
+            await self._emit_toast(error_msg, event_emitter, "error")
+            log.error(error_msg)
+            return
         else:
             log.info(f"Response has correct finish reason: {finish_reason}.")
 
         # Emit token usage data.
         if usage_event := self._get_usage_data_event(model_response):
             log.info("Emitting usage data.")
-            print(self._truncate_long_strings(usage_event))
             await event_emitter(usage_event)
         self._add_grounding_data_to_state(model_response, metadata, request)
 
@@ -1256,6 +1291,7 @@ class Pipe:
         handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
         for key, handler in handlers.items():
             existing_filter = handler._filter
+            # FIXME: Check log level too.
             if (
                 hasattr(existing_filter, "__name__")
                 and existing_filter.__name__ == plugin_filter.__name__
@@ -1283,6 +1319,26 @@ class Pipe:
         if mime_type is None:
             return "application/octet-stream"  # Default MIME type if unknown
         return mime_type
+
+    def _extract_youtube_urls(self, text: str) -> list[str]:
+        """
+        Extracts YouTube URLs from a given text.
+        Supports standard youtube.com/watch?v= URLs and shortened youtu.be URLs
+        """
+        youtube_urls = []
+        # Match standard YouTube URLs
+        for match in re.finditer(
+            r"https?://(?:www\.)?youtube\.com/watch\?v=[^&\s]+", text
+        ):
+            youtube_urls.append(match.group(0))
+        # Match shortened YouTube URLs
+        for match in re.finditer(r"https?://(?:www\.)?youtu\.be/[^&\s]+", text):
+            youtube_urls.append(match.group(0))
+
+        if youtube_urls:
+            log.info(f"Extracted YouTube URLs: {youtube_urls}")
+
+        return youtube_urls
 
     # endregion
 
