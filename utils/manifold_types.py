@@ -51,6 +51,16 @@ class ErrorData(TypedDict):
     detail: str
 
 
+class NotificationEventData(TypedDict):
+    type: Literal["info", "success", "warning", "error"]
+    content: str
+
+
+class NotificationEvent(TypedDict):
+    type: Literal["notification"]
+    data: NotificationEventData
+
+
 class ChatCompletionEventData(TypedDict):
     content: NotRequired[str]
     done: NotRequired[bool]
@@ -78,7 +88,7 @@ class StatusEvent(TypedDict):
     data: StatusEventData
 
 
-Event = ChatCompletionEvent | StatusEvent
+Event = ChatCompletionEvent | StatusEvent | NotificationEvent
 
 # ---------- body ----------
 

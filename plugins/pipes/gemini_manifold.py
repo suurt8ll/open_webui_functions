@@ -29,6 +29,7 @@ requirements: google-genai==1.10.0
 #   TODO Video input support.
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 
+import asyncio
 import copy
 import json
 from fastapi.datastructures import State
@@ -329,6 +330,18 @@ class Pipe:
             error=f"\n{error_msg}", event_emitter=event_emitter, done=True
         )
 
+    async def _emit_toast(
+        self,
+        msg: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        toastType: Literal["info", "success", "warning", "error"] = "info",
+    ) -> None:
+        event: NotificationEvent = {
+            "type": "notification",
+            "data": {"type": toastType, "content": msg},
+        }
+        await event_emitter(event)
+
     def _return_error_model(
         self, error_msg: str, warning: bool = False, exception: bool = True
     ) -> "ModelData":
@@ -588,14 +601,20 @@ class Pipe:
             await self._emit_error(error_msg, event_emitter)
         finally:
             log.info(f"Stream finished.")
-            # Metadata about the model response is always in the final chunk of the stream.
-            await self._do_post_processing(
-                final_response_chunk,
-                event_emitter,
-                metadata,
-                __request__,
-                error_occurred,
-            )
+            try:
+                # Catch and emit any errors that might happen here as a toast message.
+                await self._do_post_processing(
+                    # Metadata about the model response is always in the final chunk of the stream.
+                    final_response_chunk,
+                    event_emitter,
+                    metadata,
+                    __request__,
+                    error_occurred,
+                )
+            except Exception as e:
+                error_msg = f"Post-processing failed with error:\n\n{e}"
+                await self._emit_toast(error_msg, event_emitter, "error")
+                log.exception(error_msg)
             log.debug("AsyncGenerator finished.")
 
     async def _do_post_processing(
@@ -629,9 +648,9 @@ class Pipe:
             types.FinishReason.MAX_TOKENS,
         ):
             # MAX_TOKENS is often acceptable, but others might indicate issues.
-            error_msg = f"Stream finished with reason: {finish_reason}."
-            log.warning(error_msg)
-            await self._emit_error(error_msg, event_emitter=event_emitter)
+            error_msg = f"Stream finished with sus reason:\n\n{finish_reason}."
+            await self._emit_toast(error_msg, event_emitter, "error")
+            log.error(error_msg)
             return
         else:
             log.info(f"Response has correct finish reason: {finish_reason}.")
