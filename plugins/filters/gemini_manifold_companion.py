@@ -13,19 +13,24 @@ version: 1.2.0
 # set the feature back to False so Open WebUI does not run it's own logic and then
 # pass custom values to "Gemini Manifold google_genai" that signal which feature was enabled and intercepted.
 
+from google.genai import types
+
+import sys
 import asyncio
-from collections.abc import Awaitable, Callable
-import inspect
-from datetime import datetime
-from typing import Any, TYPE_CHECKING, cast
 import aiohttp
 from fastapi import Request
 from fastapi.datastructures import State
+from loguru import logger
 from pydantic import BaseModel, Field
+from collections.abc import Awaitable, Callable
+from typing import Any, Literal, TYPE_CHECKING, cast
 
-from google.genai import types
+from open_webui.utils.logger import stdout_format
+from open_webui.models.functions import Functions
 
 if TYPE_CHECKING:
+    from loguru import Record
+    from loguru._handler import Handler
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 # according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
@@ -53,41 +58,11 @@ ALLOWED_CODE_EXECUTION_MODELS = [
 
 
 # Default timeout for URL resolution
+# TODO: Move to Pipe.Valves.
 DEFAULT_URL_TIMEOUT = aiohttp.ClientTimeout(total=10)  # 10 seconds total timeout
 
-
-class Logger:
-    def __init__(self):
-        # TODO: Log level control.
-        pass  # No configuration needed
-
-    def _get_caller(self):
-        stack = inspect.stack()
-        if len(stack) < 4:
-            return "UNKNOWN"
-        caller_frame = stack[3]
-        func_name = caller_frame.function
-        return f"{__name__}:{func_name}"
-
-    def _log(self, level, message):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        caller = self._get_caller()
-        print(f"[{timestamp}] [{level}] {caller} - {message}")
-
-    def debug(self, message):
-        self._log("DEBUG", message)
-
-    def info(self, message):
-        self._log("INFO", message)
-
-    def warning(self, message):
-        self._log("WARNING", message)
-
-    def error(self, message):
-        self._log("ERROR", message)
-
-
-log = Logger()
+# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
+log = logger.bind(auditable=False)
 
 
 class Filter:
@@ -103,9 +78,22 @@ class Filter:
             description="""See https://ai.google.dev/gemini-api/docs/grounding?lang=python#dynamic-threshold for more information.
             Only supported for 1.0 and 1.5 models""",
         )
+        LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = (
+            Field(
+                default="INFO",
+                description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+            )
+        )
+
+    # TODO: Support user settting through UserValves.
 
     def __init__(self):
-        self.valves = self.Valves()
+        # This hack makes the valves values available to the `__init__` method.
+        # TODO: Get the id from the frontmatter instead of hardcoding it.
+        valves = Functions.get_function_valves_by_id("gemini_manifold_companion")
+        self.valves = self.Valves(**(valves if valves else {}))
+        # FIXME: There is no trigger for changing the log level if it changes inside Pipe.Valves
+        self._add_log_handler()
         log.info("Filter function has been initialized!")
 
     def inlet(self, body: dict) -> dict:
@@ -495,5 +483,36 @@ class Filter:
         if len(candidates) > 1:
             log.warning("Multiple candidates found, defaulting to first candidate.")
         return candidates[0]
+
+    def _add_log_handler(self):
+        """Adds handler to the root loguru instance for this plugin if one does not exist already."""
+
+        def plugin_filter(record: "Record"):
+            """Filter function to only allow logs from this plugin (based on module name)."""
+            return record["name"] == __name__  # Filter by module name
+
+        # Access the internal state of the log
+        handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
+        for key, handler in handlers.items():
+            existing_filter = handler._filter
+            # FIXME: Check log level too.
+            if (
+                hasattr(existing_filter, "__name__")
+                and existing_filter.__name__ == plugin_filter.__name__
+                and hasattr(existing_filter, "__module__")
+                and existing_filter.__module__ == plugin_filter.__module__
+            ):
+                log.debug("Handler for this plugin is already present!")
+                return
+
+        log.add(
+            sys.stdout,
+            level=self.valves.LOG_LEVEL,
+            format=stdout_format,
+            filter=plugin_filter,
+        )
+        log.info(
+            f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
+        )
 
     # endregion
