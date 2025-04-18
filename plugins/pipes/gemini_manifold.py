@@ -29,6 +29,7 @@ requirements: google-genai==1.10.0
 #   TODO Video input support.
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 
+import asyncio
 import copy
 import json
 from fastapi.datastructures import State
@@ -101,9 +102,11 @@ class Pipe:
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=False, description="Whether to request relaxed safety filtering"
         )
-        LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
-            default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+        LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = (
+            Field(
+                default="INFO",
+                description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+            )
         )
         USE_FILES_API: bool = Field(
             title="Use Files API",
@@ -125,10 +128,8 @@ class Pipe:
         # TODO: Get the id from the frontmatter instead of hardcoding it.
         valves = Functions.get_function_valves_by_id("gemini_manifold_google_genai")
         self.valves = self.Valves(**(valves if valves else {}))
-        # FIXME: Is logging out the API key a bad idea?
-        print(
-            f"[gemini_manifold] self.valves initialized:\n{self.valves.model_dump_json(indent=2)}"
-        )
+        # FIXME: There is no trigger for changing the log level if it changes inside Pipe.Valves
+        self._add_log_handler()
 
         # Initialize the genai client with default API given in Valves.
         self.clients = {"default": self._get_genai_client()}
@@ -136,14 +137,10 @@ class Pipe:
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
         self.last_blacklist = self.valves.MODEL_BLACKLIST
 
-        print(f"[gemini_manifold] Function has been initialized:\n{self.__dict__}")
+        log.info("Function has been initialized.")
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
-
-        # TODO: Move into `__init__`.
-        self._add_log_handler()
-
         # Return existing models if all conditions are met and no error models are present
         if (
             self.models
@@ -170,29 +167,18 @@ class Pipe:
         __metadata__: dict[str, Any],
     ) -> AsyncGenerator | str | None:
 
-        self.__event_emitter__ = __event_emitter__
-
         if not (client := self._get_user_client(__user__)):
             error_msg = "There are no usable genai clients, check the logs."
-            await self._emit_error(error_msg, exception=False)
-            return None
-
+            log.error(error_msg)
+            raise ValueError(error_msg)
         if self.clients.get("default") == client and self.valves.REQUIRE_USER_API_KEY:
             error_msg = "You have not defined your own API key in UserValves. You need to define in to continue."
-            await self._emit_error(error_msg, exception=False)
-            return None
-        model_name = body.get("model")
-        if not model_name:
-            error_msg = "body object does not contain model name."
-            await self._emit_error(error_msg, exception=False)
-            return None
-        model_name = self._strip_prefix(model_name)
-
-        # TODO Contruct a type for `__metadata__`.
+            log.error(error_msg)
+            raise ValueError(error_msg)
         if "error" in __metadata__["model"]["id"]:
             error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
-            await self._emit_error(error_msg, exception=False)
-            return None
+            log.error(error_msg)
+            raise ValueError(error_msg)
 
         # Get the message history directly from the backend.
         # This allows us to see data about sources and files data.
@@ -209,7 +195,7 @@ class Pipe:
         contents, system_prompt = self._genai_contents_from_messages(
             body.get("messages"), messages_db
         )
-
+        model_name = self._strip_prefix(body.get("model", ""))
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
             system_instruction=system_prompt,
@@ -299,7 +285,7 @@ class Pipe:
                 log.info("pipe method has finished it's run.")
                 return raw_text
             else:
-                warn_msg = "Non-stremaing response did not have any text inside it."
+                warn_msg = "Non-streaming response did not have any text inside it."
                 log.warning(warn_msg)
                 raise ValueError(warn_msg)
 
@@ -308,6 +294,7 @@ class Pipe:
     # region Event emission and error logging
     async def _emit_completion(
         self,
+        event_emitter: Callable[["Event"], Awaitable[None]],
         content: str | None = None,
         done: bool = False,
         error: str | None = None,
@@ -324,25 +311,36 @@ class Pipe:
             emission["data"]["error"] = {"detail": error}
         if sources:
             emission["data"]["sources"] = sources
-        await self.__event_emitter__(emission)
+        await event_emitter(emission)
 
     async def _emit_error(
         self,
         error_msg: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
         warning: bool = False,
         exception: bool = True,
-        event_emitter: Callable[["Event"], Awaitable[None]] | None = None,
     ) -> None:
         """Emits an event to the front-end that causes it to display a nice red error message."""
-
-        if not event_emitter:
-            event_emitter = self.__event_emitter__
 
         if warning:
             log.opt(depth=1, exception=False).warning(error_msg)
         else:
             log.opt(depth=1, exception=exception).error(error_msg)
-        await self._emit_completion(error=f"\n{error_msg}", done=True)
+        await self._emit_completion(
+            error=f"\n{error_msg}", event_emitter=event_emitter, done=True
+        )
+
+    async def _emit_toast(
+        self,
+        msg: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        toastType: Literal["info", "success", "warning", "error"] = "info",
+    ) -> None:
+        event: NotificationEvent = {
+            "type": "notification",
+            "data": {"type": toastType, "content": msg},
+        }
+        await event_emitter(event)
 
     def _return_error_model(
         self, error_msg: str, warning: bool = False, exception: bool = True
@@ -597,20 +595,26 @@ class Pipe:
                             )
                             or ""
                         )
-        except Exception:
+        except Exception as e:
             error_occurred = True
-            log.exception("Error during stream processing")
-            raise
+            error_msg = f"Error during stream processing: {e}"
+            await self._emit_error(error_msg, event_emitter)
         finally:
             log.info(f"Stream finished.")
-            # Metadata about the model response is always in the final chunk of the stream.
-            await self._do_post_processing(
-                final_response_chunk,
-                event_emitter,
-                metadata,
-                __request__,
-                error_occurred,
-            )
+            try:
+                # Catch and emit any errors that might happen here as a toast message.
+                await self._do_post_processing(
+                    # Metadata about the model response is always in the final chunk of the stream.
+                    final_response_chunk,
+                    event_emitter,
+                    metadata,
+                    __request__,
+                    error_occurred,
+                )
+            except Exception as e:
+                error_msg = f"Post-processing failed with error:\n\n{e}"
+                await self._emit_toast(error_msg, event_emitter, "error")
+                log.exception(error_msg)
             log.debug("AsyncGenerator finished.")
 
     async def _do_post_processing(
@@ -644,16 +648,16 @@ class Pipe:
             types.FinishReason.MAX_TOKENS,
         ):
             # MAX_TOKENS is often acceptable, but others might indicate issues.
-            error_msg = f"Stream finished with reason: {finish_reason}."
-            log.warning(error_msg)
-            await self._emit_error(error_msg, warning=True, event_emitter=event_emitter)
+            error_msg = f"Stream finished with sus reason:\n\n{finish_reason}."
+            await self._emit_toast(error_msg, event_emitter, "error")
+            log.error(error_msg)
+            return
         else:
             log.info(f"Response has correct finish reason: {finish_reason}.")
 
         # Emit token usage data.
         if usage_event := self._get_usage_data_event(model_response):
             log.info("Emitting usage data.")
-            print(self._truncate_long_strings(usage_event))
             await event_emitter(usage_event)
         self._add_grounding_data_to_state(model_response, metadata, request)
 
@@ -1125,6 +1129,7 @@ class Pipe:
         handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
         for key, handler in handlers.items():
             existing_filter = handler._filter
+            # FIXME: Check log level too.
             if (
                 hasattr(existing_filter, "__name__")
                 and existing_filter.__name__ == plugin_filter.__name__
