@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.15.0
+version: 1.16.0
 requirements: google-genai==1.11.0
 """
 
@@ -248,8 +248,7 @@ class Pipe:
                     "Image Generation model does not support the system prompt message! Removing the system prompt."
                 )
 
-        # BUG: Can be None, make sure to convert to {} in this case.
-        features = __metadata__.get("features", {})
+        features = __metadata__.get("features", {}) or {}
         gen_content_conf.tools = []
 
         if features.get("google_search_tool"):
@@ -353,31 +352,29 @@ class Pipe:
             return False
 
     async def _emit_status(
-        self, 
-        message: str, 
+        self,
+        message: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
         done: bool = False,
-        event_emitter: Callable[["Event"], Awaitable[None]] | None = None
     ) -> None:
         """Emit status updates asynchronously."""
         try:
             if self.valves.EMIT_STATUS_UPDATES:
-                if not event_emitter:
-                    event_emitter = self.__event_emitter__
-                
-                status_event = {
+                status_event: "StatusEvent" = {
                     "type": "status",
                     "data": {"description": message, "done": done},
                 }
                 await event_emitter(status_event)
-                log.debug(f"Emitted status: '{message}', done={done}")
+                log.debug(f"Emitted status: '{message}', {done=}")
             else:
-                log.debug(f"EMIT_STATUS_UPDATES is disabled. Skipping status: '{message}'")
+                log.debug(
+                    f"EMIT_STATUS_UPDATES is disabled. Skipping status: '{message}'"
+                )
         except Exception:
             log.exception("Error emitting status")
 
     async def thinking_timer(
-        self, 
-        event_emitter: Callable[["Event"], Awaitable[None]]
+        self, event_emitter: Callable[["Event"], Awaitable[None]]
     ) -> None:
         """Asynchronous task to emit periodic status updates."""
         elapsed = 0
@@ -392,7 +389,9 @@ class Pipe:
                     minutes, seconds = divmod(elapsed, 60)
                     time_str = f"{minutes}m {seconds}s"
                 status_message = f"Thinking... ({time_str} elapsed)"
-                await self._emit_status(status_message, done=False, event_emitter=event_emitter)
+                await self._emit_status(
+                    status_message, event_emitter=event_emitter, done=False
+                )
         except asyncio.CancelledError:
             log.debug("Timer task cancelled.")
         except Exception:
@@ -660,34 +659,41 @@ class Pipe:
         """
         final_response_chunk: types.GenerateContentResponse | None = None
         error_occurred = False
-        
+
         # Initialize timer variables
         thinking_timer_task = None
         start_time = None
         model_name = gen_content_args.get("model", "")
         first_chunk_received = False
-        
+
         # Check if this is a thinking model and initialize timer if needed
         if self.is_thinking_model(model_name):
             # Emit initial 'Thinking' status
             if self.valves.EMIT_STATUS_UPDATES:
-                await self._emit_status("Thinking...", done=False, event_emitter=event_emitter)
-            
+                await self._emit_status(
+                    "Thinking...", event_emitter=event_emitter, done=False
+                )
+
             # Record the start time
             start_time = time.time()
-            
+
             # Start the thinking timer
+            # NOTE: It's important to note that the model could not be actually thinking
+            # when the status message starts. API could be just slow or the chat data
+            # payload could still be uploading.
             if self.valves.EMIT_STATUS_UPDATES:
-                thinking_timer_task = asyncio.create_task(self.thinking_timer(event_emitter))
-        
+                thinking_timer_task = asyncio.create_task(
+                    self.thinking_timer(event_emitter)
+                )
+
         try:
             async for chunk in response_stream:
                 final_response_chunk = chunk
-                
+
                 # Stop the timer when we receive the first chunk
                 if not first_chunk_received and thinking_timer_task and start_time:
                     first_chunk_received = True
-                    
+
                     # Cancel the timer task
                     thinking_timer_task.cancel()
                     try:
@@ -696,7 +702,7 @@ class Pipe:
                         log.debug("Timer task successfully cancelled on first chunk.")
                     except Exception:
                         log.exception("Error cancelling timer task on first chunk")
-                    
+
                     # Calculate elapsed time and emit final status message
                     if self.valves.EMIT_STATUS_UPDATES:
                         total_elapsed = int(time.time() - start_time)
@@ -705,13 +711,15 @@ class Pipe:
                         else:
                             minutes, seconds = divmod(total_elapsed, 60)
                             total_time_str = f"{minutes}m {seconds}s"
-                        
+
                         final_status = f"Thinking completed in {total_time_str}."
-                        await self._emit_status(final_status, done=True, event_emitter=event_emitter)
-                    
+                        await self._emit_status(
+                            final_status, event_emitter=event_emitter, done=True
+                        )
+
                     # Set timer task to None to avoid duplicate cancellation in finally block
                     thinking_timer_task = None
-                
+
                 if not (candidate := self._get_first_candidate(chunk.candidates)):
                     log.warning("Stream chunk has no candidates, skipping.")
                     continue
@@ -762,7 +770,7 @@ class Pipe:
                     log.debug("Timer task successfully cancelled in finally block.")
                 except Exception:
                     log.exception("Error cancelling timer task in finally block")
-            
+
             log.info(f"Stream finished.")
             try:
                 # Catch and emit any errors that might happen here as a toast message.
