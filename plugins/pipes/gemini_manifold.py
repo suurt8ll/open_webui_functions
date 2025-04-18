@@ -102,6 +102,10 @@ class Pipe:
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=False, description="Whether to request relaxed safety filtering"
         )
+        THINKING_BUDGET: int = Field(
+            default=24576,
+            description="The maximum number of tokens the model can use to think. Set to 0 to disable thinking.",
+        )
         LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = (
             Field(
                 default="INFO",
@@ -206,6 +210,11 @@ class Pipe:
             stop_sequences=body.get("stop"),
             safety_settings=self._get_safety_settings(model_name),
         )
+
+        if "gemini-2.5" in model_name:
+            gen_content_conf.thinking_config = types.ThinkingConfig(
+                thinking_budget=self.valves.THINKING_BUDGET
+            )
 
         gen_content_conf.response_modalities = ["Text"]
         if (
