@@ -29,8 +29,10 @@ requirements: google-genai==1.10.0
 #   TODO Video input support.
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 
+import asyncio
 import copy
 import json
+import time
 from fastapi.datastructures import State
 from google import genai
 from google.genai import types
@@ -109,6 +111,18 @@ class Pipe:
             title="Use Files API",
             default=True,
             description="Save the image files using Open WebUI's API for files.",
+        )
+        THINKING_MODEL_PATTERN: str = Field(
+            default=r"thinking|gemini-2.5",
+            description="Regex pattern to identify thinking models.",
+        )
+        EMIT_INTERVAL: int = Field(
+            default=1,
+            description="Interval in seconds between status updates during thinking.",
+        )
+        EMIT_STATUS_UPDATES: bool = Field(
+            default=False,
+            description="Whether to emit status updates during model thinking.",
         )
 
     class UserValves(BaseModel):
@@ -325,6 +339,64 @@ class Pipe:
         if sources:
             emission["data"]["sources"] = sources
         await self.__event_emitter__(emission)
+
+    def is_thinking_model(self, model_id: str) -> bool:
+        """Check if the model is a thinking model based on the valve pattern."""
+        try:
+            result = bool(
+                re.search(self.valves.THINKING_MODEL_PATTERN, model_id, re.IGNORECASE)
+            )
+            log.debug(f"Model ID '{model_id}' is a thinking model: {result}")
+            return result
+        except Exception:
+            log.exception("Error checking if model is a thinking model")
+            return False
+
+    async def _emit_status(
+        self, 
+        message: str, 
+        done: bool = False,
+        event_emitter: Callable[["Event"], Awaitable[None]] | None = None
+    ) -> None:
+        """Emit status updates asynchronously."""
+        try:
+            if self.valves.EMIT_STATUS_UPDATES:
+                if not event_emitter:
+                    event_emitter = self.__event_emitter__
+                
+                status_event = {
+                    "type": "status",
+                    "data": {"description": message, "done": done},
+                }
+                await event_emitter(status_event)
+                log.debug(f"Emitted status: '{message}', done={done}")
+            else:
+                log.debug(f"EMIT_STATUS_UPDATES is disabled. Skipping status: '{message}'")
+        except Exception:
+            log.exception("Error emitting status")
+
+    async def thinking_timer(
+        self, 
+        event_emitter: Callable[["Event"], Awaitable[None]]
+    ) -> None:
+        """Asynchronous task to emit periodic status updates."""
+        elapsed = 0
+        try:
+            while True:
+                await asyncio.sleep(self.valves.EMIT_INTERVAL)
+                elapsed += self.valves.EMIT_INTERVAL
+                # Format elapsed time
+                if elapsed < 60:
+                    time_str = f"{elapsed}s"
+                else:
+                    minutes, seconds = divmod(elapsed, 60)
+                    time_str = f"{minutes}m {seconds}s"
+                status_message = f"Thinking... ({time_str} elapsed)"
+                await self._emit_status(status_message, done=False, event_emitter=event_emitter)
+        except asyncio.CancelledError:
+            log.debug("Timer task cancelled.")
+        except Exception:
+            log.exception("Error in timer task")
 
     async def _emit_error(
         self,
@@ -558,9 +630,58 @@ class Pipe:
         """
         final_response_chunk: types.GenerateContentResponse | None = None
         error_occurred = False
+        
+        # Initialize timer variables
+        thinking_timer_task = None
+        start_time = None
+        model_name = gen_content_args.get("model", "")
+        first_chunk_received = False
+        
+        # Check if this is a thinking model and initialize timer if needed
+        if self.is_thinking_model(model_name):
+            # Emit initial 'Thinking' status
+            if self.valves.EMIT_STATUS_UPDATES:
+                await self._emit_status("Thinking...", done=False, event_emitter=event_emitter)
+            
+            # Record the start time
+            start_time = time.time()
+            
+            # Start the thinking timer
+            if self.valves.EMIT_STATUS_UPDATES:
+                thinking_timer_task = asyncio.create_task(self.thinking_timer(event_emitter))
+        
         try:
             async for chunk in response_stream:
                 final_response_chunk = chunk
+                
+                # Stop the timer when we receive the first chunk
+                if not first_chunk_received and thinking_timer_task and start_time:
+                    first_chunk_received = True
+                    
+                    # Cancel the timer task
+                    thinking_timer_task.cancel()
+                    try:
+                        await thinking_timer_task
+                    except asyncio.CancelledError:
+                        log.debug("Timer task successfully cancelled on first chunk.")
+                    except Exception:
+                        log.exception("Error cancelling timer task on first chunk")
+                    
+                    # Calculate elapsed time and emit final status message
+                    if self.valves.EMIT_STATUS_UPDATES:
+                        total_elapsed = int(time.time() - start_time)
+                        if total_elapsed < 60:
+                            total_time_str = f"{total_elapsed}s"
+                        else:
+                            minutes, seconds = divmod(total_elapsed, 60)
+                            total_time_str = f"{minutes}m {seconds}s"
+                        
+                        final_status = f"Thinking completed in {total_time_str}."
+                        await self._emit_status(final_status, done=True, event_emitter=event_emitter)
+                    
+                    # Set timer task to None to avoid duplicate cancellation in finally block
+                    thinking_timer_task = None
+                
                 if not (candidate := self._get_first_candidate(chunk.candidates)):
                     log.warning("Stream chunk has no candidates, skipping.")
                     continue
@@ -602,6 +723,16 @@ class Pipe:
             log.exception("Error during stream processing")
             raise
         finally:
+            # Cancel the timer task if it exists and wasn't already cancelled
+            if thinking_timer_task:
+                thinking_timer_task.cancel()
+                try:
+                    await thinking_timer_task
+                except asyncio.CancelledError:
+                    log.debug("Timer task successfully cancelled in finally block.")
+                except Exception:
+                    log.exception("Error cancelling timer task in finally block")
+            
             log.info(f"Stream finished.")
             # Metadata about the model response is always in the final chunk of the stream.
             await self._do_post_processing(
