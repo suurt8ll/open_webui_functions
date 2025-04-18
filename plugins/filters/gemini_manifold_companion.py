@@ -35,6 +35,8 @@ if TYPE_CHECKING:
 
 # according to https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-gemini
 ALLOWED_GROUNDING_MODELS = [
+    "gemini-2.5-flash-preview-04-17",
+    "gemini-2.5-pro-preview-03-25",
     "gemini-2.5-pro-exp-03-25",
     "gemini-2.0-pro-exp-02-05",
     "gemini-2.0-pro-exp",
@@ -48,6 +50,8 @@ ALLOWED_GROUNDING_MODELS = [
 
 # according to https://ai.google.dev/gemini-api/docs/code-execution
 ALLOWED_CODE_EXECUTION_MODELS = [
+    "gemini-2.5-flash-preview-04-17",
+    "gemini-2.5-pro-preview-03-25",
     "gemini-2.5-pro-exp-03-25",
     "gemini-2.0-pro-exp-02-05",
     "gemini-2.0-pro-exp",

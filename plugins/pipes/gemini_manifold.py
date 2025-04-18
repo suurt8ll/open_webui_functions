@@ -29,7 +29,6 @@ requirements: google-genai==1.11.0
 #   TODO Video input support.
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 
-import asyncio
 import copy
 import json
 from fastapi.datastructures import State
