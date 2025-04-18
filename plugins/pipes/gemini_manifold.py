@@ -248,8 +248,7 @@ class Pipe:
                     "Image Generation model does not support the system prompt message! Removing the system prompt."
                 )
 
-        # BUG: Can be None, make sure to convert to {} in this case.
-        features = __metadata__.get("features", {})
+        features = __metadata__.get("features", {}) or {}
         gen_content_conf.tools = []
 
         if features.get("google_search_tool"):
@@ -679,6 +678,9 @@ class Pipe:
             start_time = time.time()
 
             # Start the thinking timer
+            # NOTE: It's important to note that the model could not be actually thinking
+            # when the status message starts. API could be just slow or the chat data
+            # payload could still be uploading.
             if self.valves.EMIT_STATUS_UPDATES:
                 thinking_timer_task = asyncio.create_task(
                     self.thinking_timer(event_emitter)
