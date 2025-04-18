@@ -125,10 +125,8 @@ class Pipe:
         # TODO: Get the id from the frontmatter instead of hardcoding it.
         valves = Functions.get_function_valves_by_id("gemini_manifold_google_genai")
         self.valves = self.Valves(**(valves if valves else {}))
-        # FIXME: Is logging out the API key a bad idea?
-        print(
-            f"[gemini_manifold] self.valves initialized:\n{self.valves.model_dump_json(indent=2)}"
-        )
+        # FIXME: There is no trigger for changing the log level if it changes inside Pipe.Valves
+        self._add_log_handler()
 
         # Initialize the genai client with default API given in Valves.
         self.clients = {"default": self._get_genai_client()}
@@ -136,14 +134,10 @@ class Pipe:
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
         self.last_blacklist = self.valves.MODEL_BLACKLIST
 
-        print(f"[gemini_manifold] Function has been initialized:\n{self.__dict__}")
+        log.info("Function has been initialized.")
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
-
-        # TODO: Move into `__init__`.
-        self._add_log_handler()
-
         # Return existing models if all conditions are met and no error models are present
         if (
             self.models
@@ -1125,6 +1119,7 @@ class Pipe:
         handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
         for key, handler in handlers.items():
             existing_filter = handler._filter
+            # FIXME: Check log level too.
             if (
                 hasattr(existing_filter, "__name__")
                 and existing_filter.__name__ == plugin_filter.__name__
