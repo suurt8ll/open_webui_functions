@@ -85,6 +85,18 @@ class Pipe:
             default="https://generativelanguage.googleapis.com",
             description="The base URL for calling the Gemini API",
         )
+        USE_VERTEX_AI: bool = Field(
+            default=False,
+            description="Whether to use Google Cloud Vertex AI instead of the standard Gemini API.",
+        )
+        VERTEX_PROJECT: str | None = Field(
+            default=None,
+            description="The Google Cloud project ID to use with Vertex AI.",
+        )
+        VERTEX_LOCATION: str = Field(
+            default="us-central1",
+            description="The Google Cloud region to use with Vertex AI.",
+        )
         MODEL_WHITELIST: str = Field(
             default="*",
             description="""Comma-separated list of allowed model names.
@@ -137,6 +149,18 @@ class Pipe:
         GEMINI_API_BASE_URL: str = Field(
             default="https://generativelanguage.googleapis.com",
             description="The base URL for calling the Gemini API",
+        )
+        USE_VERTEX_AI: bool = Field(
+            default=False,
+            description="Whether to use Google Cloud Vertex AI instead of the standard Gemini API.",
+        )
+        VERTEX_PROJECT: str | None = Field(
+            default=None,
+            description="The Google Cloud project ID to use with Vertex AI.",
+        )
+        VERTEX_LOCATION: str = Field(
+            default="us-central1",
+            description="The Google Cloud region to use with Vertex AI.",
         )
         THINKING_BUDGET: int | None = Field(
             default=None,
@@ -994,23 +1018,51 @@ class Pipe:
 
     # region Client initialization and model retrival from Google API
     def _get_genai_client(
-        self, api_key: str | None = None, base_url: str | None = None
+        self, api_key: str | None = None, base_url: str | None = None,
+        use_vertex_ai: bool | None = None, vertex_project: str | None = None,
+        vertex_location: str | None = None
     ) -> genai.Client | None:
         client = None
-        api_key = api_key if api_key else self.valves.GEMINI_API_KEY
-        base_url = base_url if base_url else self.valves.GEMINI_API_BASE_URL
-        if api_key:
-            http_options = types.HttpOptions(base_url=base_url)
+
+        # Determine whether to use Vertex AI or standard API
+        use_vertex = use_vertex_ai if use_vertex_ai is not None else self.valves.USE_VERTEX_AI
+
+        if use_vertex:
+            # Vertex AI initialization
+            vertex_project = vertex_project if vertex_project else self.valves.VERTEX_PROJECT
+            vertex_location = vertex_location if vertex_location else self.valves.VERTEX_LOCATION
+
+            if not vertex_project:
+                log.error("VERTEX_PROJECT is not set but USE_VERTEX_AI is enabled.")
+                return None
+
             try:
                 client = genai.Client(
-                    api_key=api_key,
-                    http_options=http_options,
+                    vertexai=True,
+                    project=vertex_project,
+                    location=vertex_location,
                 )
-                log.info("genai client successfully initialized!")
+                log.info("genai client successfully initialized with Vertex AI!")
             except Exception:
-                log.exception("genai client initialization failed.")
+                log.exception("genai client initialization with Vertex AI failed.")
         else:
-            log.error("GEMINI_API_KEY is not set.")
+            # Standard API initialization
+            api_key = api_key if api_key else self.valves.GEMINI_API_KEY
+            base_url = base_url if base_url else self.valves.GEMINI_API_BASE_URL
+
+            if api_key:
+                http_options = types.HttpOptions(base_url=base_url)
+                try:
+                    client = genai.Client(
+                        api_key=api_key,
+                        http_options=http_options,
+                    )
+                    log.info("genai client successfully initialized!")
+                except Exception:
+                    log.exception("genai client initialization failed.")
+            else:
+                log.error("GEMINI_API_KEY is not set.")
+
         return client
 
     def _get_user_client(self, __user__: "UserData") -> genai.Client | None:
@@ -1018,12 +1070,15 @@ class Pipe:
         user_valves: Pipe.UserValves | None = __user__.get("valves")
         if (
             user_valves
-            and user_valves.GEMINI_API_KEY
+            and (user_valves.GEMINI_API_KEY or user_valves.USE_VERTEX_AI and user_valves.VERTEX_PROJECT)
             and not self.clients.get(__user__["id"])
         ):
             self.clients[__user__.get("id")] = self._get_genai_client(
                 api_key=user_valves.GEMINI_API_KEY,
                 base_url=user_valves.GEMINI_API_BASE_URL,
+                use_vertex_ai=user_valves.USE_VERTEX_AI,
+                vertex_project=user_valves.VERTEX_PROJECT,
+                vertex_location=user_valves.VERTEX_LOCATION
             )
             log.info(
                 f'Creating a new genai client for user {__user__.get("email")} clients dict now looks like:\n{self.clients}.'
