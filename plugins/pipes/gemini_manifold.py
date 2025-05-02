@@ -282,7 +282,11 @@ class Pipe:
             "config": gen_content_conf,
         }
         log.debug("Passing these args to the Google API:")
-        print(self._truncate_long_strings(gen_content_args, max_length=512))
+        # Lazy log the args without any loguru formatting.
+        log.opt(raw=True, lazy=True).debug(
+            "{x}\n",
+            x=lambda: self._truncate_long_strings(gen_content_args, max_length=512),
+        )
 
         if body.get("stream", False):
             # Streaming response
