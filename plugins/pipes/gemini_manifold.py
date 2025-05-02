@@ -125,11 +125,11 @@ class Pipe:
             default=False,
             description="Whether to emit status updates during model thinking.",
         )
-        LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = (
-            Field(
-                default="INFO",
-                description="Select logging level. Use `docker logs -f open-webui` to view logs.",
-            )
+        LOG_LEVEL: Literal[
+            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
+        ] = Field(
+            default="INFO",
+            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
 
     class UserValves(BaseModel):
