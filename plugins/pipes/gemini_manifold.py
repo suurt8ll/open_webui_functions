@@ -163,7 +163,7 @@ class Pipe:
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
-        # TODO: One SUCCESS log in here at least.
+        # TODO: SUCCESS log in here.
         # Return existing models if all conditions are met and no error models are present
         if (
             self.models
@@ -183,7 +183,7 @@ class Pipe:
         # Lazy log the models without any loguru formatting.
         log.opt(raw=True, lazy=True).debug(
             "{x}\n",
-            x=lambda: self._truncate_long_strings(self.models, max_length=512),
+            x=lambda: self._serialize_data(self.models, truncate=True, max_length=512),
         )
 
         return self.models
@@ -300,7 +300,9 @@ class Pipe:
         # Lazy log the args without any loguru formatting.
         log.opt(raw=True, lazy=True).debug(
             "{x}\n",
-            x=lambda: self._truncate_long_strings(gen_content_args, max_length=512),
+            x=lambda: self._serialize_data(
+                gen_content_args, truncate=True, max_length=512
+            ),
         )
 
         if body.get("stream", False):
@@ -873,7 +875,9 @@ class Pipe:
             # Lazy log event data without any loguru formatting.
             log.opt(raw=True, lazy=True).debug(
                 "{x}\n",
-                x=lambda: self._truncate_long_strings(usage_event, max_length=512),
+                x=lambda: self._serialize_data(
+                    usage_event, truncate=True, max_length=512
+                ),
             )
             # TODO: catch potential errors?
             await event_emitter(usage_event)
@@ -1079,7 +1083,9 @@ class Pipe:
             # Lazy log client data without any loguru formatting.
             log.opt(raw=True, lazy=True).debug(
                 "{x}\n",
-                x=lambda: self._truncate_long_strings(self.clients, max_length=512),
+                x=lambda: self._serialize_data(
+                    self.clients, truncate=True, max_length=512
+                ),
             )
         if user_client := self.clients.get(__user__.get("id")):
             return user_client
@@ -1304,49 +1310,61 @@ class Pipe:
     # endregion
 
     # region Other helpers
-    def _truncate_long_strings(self, data: Any, max_length: int = 64) -> str:
+    def _serialize_data(self, data: Any, truncate: bool, max_length: int) -> str:
         """
-        Recursively truncates all string and bytes fields within a dictionary or list that exceed
-        the specified maximum length. Handles Pydantic BaseModel instances by converting them to dicts.
+        Recursively processes data (dicts, lists, Pydantic models) and returns
+        a formatted JSON string. Optionally truncates long strings/bytes fields.
         The original input data remains unmodified.
 
         Args:
-            data: A dictionary, list, or Pydantic BaseModel instance containing data that may include Pydantic models or dictionaries.
-            max_length: The maximum length of strings before truncation.
+            data: A dictionary, list, or Pydantic BaseModel instance.
+            truncate: If True, strings/bytes exceeding max_length will be truncated.
+            max_length: The maximum length for strings/bytes before truncation (if truncate=True).
 
         Returns:
-            A nicely formatted string representation of the modified data with long strings truncated.
+            A nicely formatted JSON string representation of the processed data.
         """
 
-        def process_data(data: Any, max_length: int) -> Any:
-            if isinstance(data, BaseModel):
-                data_dict = data.model_dump()
-                return process_data(data_dict, max_length)
-            elif isinstance(data, dict):
-                for key, value in list(data.items()):
-                    data[key] = process_data(value, max_length)
-                return data
-            elif isinstance(data, list):
-                for idx, item in enumerate(data):
-                    data[idx] = process_data(item, max_length)
-                return data
-            elif isinstance(data, str):
-                if len(data) > max_length:
-                    truncated_length = len(data) - max_length
-                    return f"{data[:max_length]}[{truncated_length} chars truncated]"
-                return data
-            elif isinstance(data, bytes):
-                hex_str = data.hex()
-                if len(hex_str) > max_length:
-                    truncated_length = len(hex_str) - max_length
-                    return f"{hex_str[:max_length]}[{truncated_length} chars truncated]"
+        def process_item(item: Any, truncate_flag: bool, length: int) -> Any:
+            if isinstance(item, BaseModel):
+                # Convert Pydantic model to dict and process recursively
+                item_dict = item.model_dump()
+                return process_item(item_dict, truncate_flag, length)
+            elif isinstance(item, dict):
+                # Process dictionary items recursively
+                return {
+                    key: process_item(value, truncate_flag, length)
+                    for key, value in item.items()
+                }
+            elif isinstance(item, list):
+                # Process list items recursively
+                return [
+                    process_item(element, truncate_flag, length) for element in item
+                ]
+            elif isinstance(item, str):
+                # Truncate string if requested and necessary
+                if truncate_flag and len(item) > length:
+                    truncated_len = len(item) - length
+                    return f"{item[:length]}[{truncated_len} chars truncated]"
+                return (
+                    item  # Return original string if not truncated or not long enough
+                )
+            elif isinstance(item, bytes):
+                # Convert bytes to hex and truncate if requested and necessary
+                hex_str = item.hex()
+                if truncate_flag and len(hex_str) > length:
+                    truncated_len = len(hex_str) - length
+                    return f"{hex_str[:length]}[{truncated_len} chars truncated]"
                 else:
-                    return hex_str
+                    return hex_str  # Return original hex string
             else:
-                return data
+                # Return other types as is
+                return item
 
+        # Deep copy to avoid modifying the original data structure
         copied_data = copy.deepcopy(data)
-        processed = process_data(copied_data, max_length)
+        processed = process_item(copied_data, truncate, max_length)
+        # Serialize the processed data to a formatted JSON string
         return json.dumps(processed, indent=2, default=str)
 
     def _add_log_handler(self):
