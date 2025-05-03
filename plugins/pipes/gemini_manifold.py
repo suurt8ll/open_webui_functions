@@ -180,11 +180,7 @@ class Pipe:
         # Filter the model list based on white- and blacklist.
         self.models = self._filter_models(await self._get_genai_models())
         log.info(f"Returning {len(self.models)} models to Open WebUI.")
-        # Lazy log the models without any loguru formatting.
-        log.opt(raw=True, lazy=True).debug(
-            "{x}\n",
-            x=lambda: self._serialize_data(self.models, truncate=True, max_length=512),
-        )
+        self._log_with_data("DEBUG", "Model list:", self.models, truncate=False)
 
         return self.models
 
@@ -296,13 +292,8 @@ class Pipe:
             "contents": contents,
             "config": gen_content_conf,
         }
-        log.debug("Passing these args to the Google API:")
-        # Lazy log the args without any loguru formatting.
-        log.opt(raw=True, lazy=True).debug(
-            "{x}\n",
-            x=lambda: self._serialize_data(
-                gen_content_args, truncate=True, max_length=512
-            ),
+        self._log_with_data(
+            "DEBUG", "Passing these args to the Google API:", gen_content_args
         )
 
         if body.get("stream", False):
@@ -871,14 +862,7 @@ class Pipe:
 
         # Emit token usage data.
         if usage_event := self._get_usage_data_event(model_response):
-            log.debug("Emitting usage data.")
-            # Lazy log event data without any loguru formatting.
-            log.opt(raw=True, lazy=True).debug(
-                "{x}\n",
-                x=lambda: self._serialize_data(
-                    usage_event, truncate=True, max_length=512
-                ),
-            )
+            self._log_with_data("DEBUG", "Emitting usage data:", usage_event)
             # TODO: catch potential errors?
             await event_emitter(usage_event)
         self._add_grounding_data_to_state(model_response, metadata, request)
@@ -1079,13 +1063,8 @@ class Pipe:
                 api_key=user_valves.GEMINI_API_KEY,
                 base_url=user_valves.GEMINI_API_BASE_URL,
             )
-            log.debug("Genai clients dict now looks like this:")
-            # Lazy log client data without any loguru formatting.
-            log.opt(raw=True, lazy=True).debug(
-                "{x}\n",
-                x=lambda: self._serialize_data(
-                    self.clients, truncate=True, max_length=512
-                ),
+            self._log_with_data(
+                "DEBUG", "Genai clients dict now looks like this:", self.clients
             )
         if user_client := self.clients.get(__user__.get("id")):
             return user_client
@@ -1310,6 +1289,43 @@ class Pipe:
     # endregion
 
     # region Other helpers
+    def _log_with_data(
+        self,
+        log_level: str,
+        msg: str,
+        data: Any,
+        truncate: bool = True,
+        truncate_length: int = 512,
+    ):
+        """
+        Logs a message and then lazily logs potentially complex data, formatted as JSON.
+
+        The data logging uses the same log level, is raw (no Loguru formatting added),
+        and only occurs if the log level is enabled. The data serialization can optionally
+        truncate long strings/bytes.
+
+        Both the initial message and the data log will show the caller of this
+        `log_with_data` function in their trace information.
+
+        Args:
+            log_level: The logging level (e.g., "DEBUG", "INFO").
+            msg: The primary log message.
+            data: The data structure (dict, list, Pydantic model) to serialize and log.
+            truncate: Whether to truncate long strings/bytes in the data (default True).
+            truncate_length: Max length before truncation (default 64).
+        """
+        # Log the primary message normally, using depth=1 to point to the caller of log_with_data
+        log.opt(depth=1).log(log_level, msg)
+
+        # Lazy log the serialized data raw, using depth=1 to point to the caller of log_with_data
+        log.opt(raw=True, lazy=True, depth=1).log(
+            log_level,
+            "{x}\n",  # Use a format string for the lambda argument, add newline for clarity
+            x=lambda: self._serialize_data(
+                data, truncate=truncate, max_length=truncate_length
+            ),
+        )
+
     def _serialize_data(self, data: Any, truncate: bool, max_length: int) -> str:
         """
         Recursively processes data (dicts, lists, Pydantic models) and returns
