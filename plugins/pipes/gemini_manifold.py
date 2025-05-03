@@ -60,12 +60,16 @@ from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
 from open_webui.models.functions import Functions
 from open_webui.storage.provider import Storage
-from open_webui.utils.logger import stdout_format, start_logger
-from loguru import logger as global_logger
+from open_webui.utils.logger import stdout_format
+from loguru import logger
 
 if TYPE_CHECKING:
-    from loguru import Logger
+    from loguru import Record
+    from loguru._handler import Handler
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
+
+# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
+log = logger.bind(auditable=False)
 
 
 class Pipe:
@@ -146,24 +150,25 @@ class Pipe:
         # TODO: Get the id from the frontmatter instead of hardcoding it.
         valves = Functions.get_function_valves_by_id("gemini_manifold_google_genai")
         self.valves = self.Valves(**(valves if valves else {}))
-        self._setup_plugin_logger()
+        self.log_level = self.valves.LOG_LEVEL
+        self._add_log_handler()
         # Initialize the genai client with default API given in Valves.
         self.clients = {"default": self._get_genai_client()}
         self.models: list["ModelData"] = []
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
         self.last_blacklist = self.valves.MODEL_BLACKLIST
 
-        self.log.success("Function has been initialized.")
+        log.success("Function has been initialized.")
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
         # Detect log level change inside self.valves
         if self.log_level != self.valves.LOG_LEVEL:
-            self.log.info(
+            log.info(
                 f"Detected log level change: {self.log_level=} and {self.valves.LOG_LEVEL=}. "
                 "Running the logging setup again."
             )
-            self._setup_plugin_logger()
+            self._add_log_handler()
         # Return existing models if all conditions are met and no error models are present
         if (
             self.models
@@ -172,15 +177,15 @@ class Pipe:
             and self.last_blacklist == self.valves.MODEL_BLACKLIST
             and not any(model["id"] == "error" for model in self.models)
         ):
-            self.log.info(
+            log.info(
                 f"Models are cached and valid. Returning the cached list ({len(self.models)} models)."
             )
             return self.models
 
-        self.log.info("Fetching and filtering models from Google API.")
+        log.info("Fetching and filtering models from Google API.")
         # Filter the model list based on white- and blacklist.
         self.models = self._filter_models(await self._get_genai_models())
-        self.log.info(
+        log.info(
             f"Finished processing models. Returning {len(self.models)} models to Open WebUI."
         )
         self._log_with_data("DEBUG", "Model list:", self.models, truncate=False)
@@ -204,11 +209,9 @@ class Pipe:
                 error_msg = "You have not defined your own API key in UserValves. You need to define in to continue."
                 raise ValueError(error_msg)
             else:
-                self.log.info("Using genai client with the default API key.")
+                log.info("Using genai client with the default API key.")
         else:
-            self.log.info(
-                f'Using genai client with user {__user__.get("email")} API key.'
-            )
+            log.info(f'Using genai client with user {__user__.get("email")} API key.')
 
         # Check if user is chatting with an error model for some reason.
         if "error" in __metadata__["model"]["id"]:
@@ -224,9 +227,9 @@ class Pipe:
             messages_db = chat_content.get("messages")[:-1]
         else:
             warn_msg = f"Chat with ID - {chat_id} - not found. Can't filter out the citation marks."
-            self.log.warning(warn_msg)
+            log.warning(warn_msg)
             messages_db = None
-        self.log.info(
+        log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
         )
         contents, system_prompt = self._genai_contents_from_messages(
@@ -236,7 +239,7 @@ class Pipe:
         # API does not stream thoughts sadly. See https://github.com/googleapis/python-genai/issues/226#issuecomment-2631657100
         thinking_conf = None
         if self.is_thinking_model(model_name):
-            self.log.info(f"Model ID '{model_name}' is a thinking model.")
+            log.info(f"Model ID '{model_name}' is a thinking model.")
             thinking_conf = types.ThinkingConfig(
                 thinking_budget=self.valves.THINKING_BUDGET, include_thoughts=None
             )
@@ -262,7 +265,7 @@ class Pipe:
             # TODO: append to user message instead.
             if gen_content_conf.system_instruction:
                 gen_content_conf.system_instruction = None
-                self.log.warning(
+                log.warning(
                     "Image Generation model does not support the system prompt message! Removing the system prompt."
                 )
 
@@ -270,12 +273,12 @@ class Pipe:
         gen_content_conf.tools = []
 
         if features.get("google_search_tool"):
-            self.log.info("Using grounding with Google Search as a Tool.")
+            log.info("Using grounding with Google Search as a Tool.")
             gen_content_conf.tools.append(
                 types.Tool(google_search=types.GoogleSearch())
             )
         elif features.get("google_search_retrieval"):
-            self.log.info("Using grounding with Google Search Retrieval.")
+            log.info("Using grounding with Google Search Retrieval.")
             gs = types.GoogleSearchRetrieval(
                 dynamic_retrieval_config=types.DynamicRetrievalConfig(
                     dynamic_threshold=features.get("google_search_retrieval_threshold")
@@ -286,7 +289,7 @@ class Pipe:
         # NB: It is not possible to use both Search and Code execution at the same time,
         # however, it can be changed later, so let's just handle it as a common error
         if features.get("google_code_execution"):
-            self.log.info("Using code execution on Google side.")
+            log.info("Using code execution on Google side.")
             gen_content_conf.tools.append(
                 types.Tool(code_execution=types.ToolCodeExecution())
             )
@@ -305,7 +308,7 @@ class Pipe:
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
                 await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
             )
-            self.log.info("Streaming enabled. Returning AsyncGenerator.")
+            log.info("Streaming enabled. Returning AsyncGenerator.")
             return self._stream_response_generator(
                 response_stream,
                 __request__,
@@ -323,12 +326,12 @@ class Pipe:
             # TODO: Support code execution here too.
             res = await client.aio.models.generate_content(**gen_content_args)
             if raw_text := res.text:
-                self.log.info("Non-streaming response finished successfully!")
+                log.info("Non-streaming response finished successfully!")
                 self._log_with_data("DEBUG", "Non-streaming response:", res)
                 await self._do_post_processing(
                     res, __event_emitter__, __metadata__, __request__
                 )
-                self.log.info(
+                log.info(
                     "Streaming disabled. Returning full response as str. "
                     "With that Pipe.pipe method has finished it's run!"
                 )
@@ -369,7 +372,7 @@ class Pipe:
             )
             return result
         except Exception:
-            self.log.exception("Error checking if model is a thinking model")
+            log.exception("Error checking if model is a thinking model")
             return False
 
     async def _emit_status(
@@ -386,13 +389,13 @@ class Pipe:
                     "data": {"description": message, "done": done},
                 }
                 await event_emitter(status_event)
-                self.log.debug(f"Emitted status: '{message}', {done=}")
+                log.debug(f"Emitted status: '{message}', {done=}")
             else:
-                self.log.debug(
+                log.debug(
                     f"EMIT_STATUS_UPDATES is disabled. Skipping status: '{message}'"
                 )
         except Exception:
-            self.log.exception("Error emitting status")
+            log.exception("Error emitting status")
 
     async def thinking_timer(
         self, event_emitter: Callable[["Event"], Awaitable[None]]
@@ -400,7 +403,7 @@ class Pipe:
         """Asynchronous task to emit periodic status updates."""
         elapsed = 0
         try:
-            self.log.info("Thinking timer started.")
+            log.info("Thinking timer started.")
             while True:
                 await asyncio.sleep(self.valves.EMIT_INTERVAL)
                 elapsed += self.valves.EMIT_INTERVAL
@@ -415,9 +418,9 @@ class Pipe:
                     status_message, event_emitter=event_emitter, done=False
                 )
         except asyncio.CancelledError:
-            self.log.debug("Timer task cancelled.")
+            log.debug("Timer task cancelled.")
         except Exception:
-            self.log.exception("Error in timer task")
+            log.exception("Error in timer task")
 
     async def _emit_error(
         self,
@@ -429,9 +432,9 @@ class Pipe:
         """Emits an event to the front-end that causes it to display a nice red error message."""
 
         if warning:
-            self.log.opt(depth=1, exception=False).warning(error_msg)
+            log.opt(depth=1, exception=False).warning(error_msg)
         else:
-            self.log.opt(depth=1, exception=exception).error(error_msg)
+            log.opt(depth=1, exception=exception).error(error_msg)
         await self._emit_completion(
             error=f"\n{error_msg}", event_emitter=event_emitter, done=True
         )
@@ -454,9 +457,9 @@ class Pipe:
     ) -> "ModelData":
         """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
         if warning:
-            self.log.opt(depth=1, exception=False).warning(error_msg)
+            log.opt(depth=1, exception=False).warning(error_msg)
         else:
-            self.log.opt(depth=1, exception=exception).error(error_msg)
+            log.opt(depth=1, exception=exception).error(error_msg)
         return {
             "id": "error",
             "name": "[gemini_manifold] " + error_msg,
@@ -544,9 +547,7 @@ class Pipe:
                 system_prompt = message.get("content")
                 continue
             else:
-                self.log.warning(
-                    f"Role {role} is not valid, skipping to the next message."
-                )
+                log.warning(f"Role {role} is not valid, skipping to the next message.")
                 continue
             contents.append(types.Content(role=role, parts=parts))
         return contents, system_prompt
@@ -578,7 +579,7 @@ class Pipe:
                 )
         except Exception:
             # TODO: Send warnin toast to user in front-end.
-            self.log.exception(f"Error processing image URL: {image_url[:64]}[...]")
+            log.exception(f"Error processing image URL: {image_url[:64]}[...]")
             return None
 
     def _genai_parts_from_text(self, text: str) -> list[types.Part]:
@@ -603,7 +604,7 @@ class Pipe:
                 try:
                     mime_type = match.group(2)
                     base64_data = match.group(3)
-                    self.log.debug(
+                    log.debug(
                         "Found base64 image link!",
                         mime_type=mime_type,
                         base64_data=match.group(3)[:64] + "[...]",
@@ -615,16 +616,16 @@ class Pipe:
                     parts.append(image_part)
                 except Exception:
                     # TODO: Emit toast
-                    self.log.exception("Error decoding base64 image:")
+                    log.exception("Error decoding base64 image:")
 
             elif match.group(4):  # File URL
-                self.log.debug("Found API image link!", id=match.group(4))
+                log.debug("Found API image link!", id=match.group(4))
                 file_id = match.group(4)
                 file_model = Files.get_file_by_id(file_id)
 
                 if file_model is None:
                     # TODO: Emit toast
-                    self.log.warning("File with this ID not found.", id=file_id)
+                    log.warning("File with this ID not found.", id=file_id)
                     #  Could add placeholder text here if desired
                     continue  # Skip to the next match
 
@@ -633,7 +634,7 @@ class Pipe:
                     content_type = file_model.meta.get("content_type")  # type: ignore
                     if content_type is None:
                         # TODO: Emit toast
-                        self.log.warning(
+                        log.warning(
                             "Content type not found for this file ID.",
                             id=file_id,
                         )
@@ -649,20 +650,20 @@ class Pipe:
 
                 except FileNotFoundError:
                     # TODO: Emit toast
-                    self.log.exception(
+                    log.exception(
                         "File not found on disk for this ID.",
                         id=file_id,
                         path=file_model.path,
                     )
                 except KeyError:
                     # TODO: Emit toast
-                    self.log.exception(
+                    log.exception(
                         "Metadata error for this file ID: 'content_type' missing.",
                         id=file_id,
                     )
                 except Exception:
                     # TODO: Emit toast
-                    self.log.exception("Error processing file with this ID", id=file_id)
+                    log.exception("Error processing file with this ID", id=file_id)
 
             last_pos = match.end()
 
@@ -732,11 +733,11 @@ class Pipe:
                     try:
                         await thinking_timer_task
                     except asyncio.CancelledError:
-                        self.log.info(
+                        log.info(
                             "Thinking timer task successfully cancelled on first chunk."
                         )
                     except Exception:
-                        self.log.exception(
+                        log.exception(
                             "Error cancelling thinking timer task on first chunk"
                         )
 
@@ -758,10 +759,10 @@ class Pipe:
                     thinking_timer_task = None
 
                 if not (candidate := self._get_first_candidate(chunk.candidates)):
-                    self.log.warning("Stream chunk has no candidates, skipping.")
+                    log.warning("Stream chunk has no candidates, skipping.")
                     continue
                 if not (parts := candidate.content and candidate.content.parts):
-                    self.log.warning(
+                    log.warning(
                         "candidate does not contain content or content.parts, skipping."
                     )
                     continue
@@ -805,16 +806,16 @@ class Pipe:
                 try:
                     await thinking_timer_task
                 except asyncio.CancelledError:
-                    self.log.info(
+                    log.info(
                         "Thinking timer task successfully cancelled in finally block."
                     )
                 except Exception:
-                    self.log.exception(
+                    log.exception(
                         "Error cancelling thinking timer task in finally block"
                     )
 
             if not error_occurred:
-                self.log.info(f"Stream finished successfully!")
+                log.info(f"Stream finished successfully!")
                 self._log_with_data("DEBUG", "Last chunk:", final_response_chunk)
             try:
                 # Catch and emit any errors that might happen here as a toast message.
@@ -830,8 +831,8 @@ class Pipe:
                 error_msg = f"Post-processing failed with error:\n\n{e}"
                 # Using toast here in order to keep the inital AI response untouched.
                 await self._emit_toast(error_msg, event_emitter, "error")
-                self.log.exception(error_msg)
-            self.log.debug("AsyncGenerator finished.")
+                log.exception(error_msg)
+            log.debug("AsyncGenerator finished.")
 
     async def _do_post_processing(
         self,
@@ -842,18 +843,18 @@ class Pipe:
         stream_error_happened: bool = False,
     ):
         """Handles emitting usage, grounding, and sources after the main response/stream is done."""
-        self.log.info("Post-processing the model response.")
+        log.info("Post-processing the model response.")
         if stream_error_happened:
-            self.log.warning(
+            log.warning(
                 "An error occured during the stream, cannot do post-processing."
             )
             # All the needed metadata is always in the last chunk, so if error happened then we cannot do anything.
             return
         if not model_response:
-            self.log.warning("model_response is empty, cannot do post-processing.")
+            log.warning("model_response is empty, cannot do post-processing.")
             return
         if not (candidate := self._get_first_candidate(model_response.candidates)):
-            self.log.warning(
+            log.warning(
                 "Response does not contain any canditates. Cannot do post-processing."
             )
             return
@@ -866,10 +867,10 @@ class Pipe:
             # MAX_TOKENS is often acceptable, but others might indicate issues.
             error_msg = f"Stream finished with sus reason:\n\n{finish_reason}."
             await self._emit_toast(error_msg, event_emitter, "error")
-            self.log.error(error_msg)
+            log.error(error_msg)
             return
         else:
-            self.log.debug(f"Response has correct finish reason: {finish_reason}.")
+            log.debug(f"Response has correct finish reason: {finish_reason}.")
 
         # Emit token usage data.
         if usage_event := self._get_usage_data_event(model_response):
@@ -892,7 +893,7 @@ class Pipe:
         storage_key = f"grounding_{chat_id}_{message_id}"
 
         if grounding_metadata_obj:
-            self.log.debug(
+            log.debug(
                 f"Found grounding metadata. Storing in in request's app state using key {storage_key}."
             )
             # Using shared `request.app.state` to pass grounding metadata to Filter.outlet.
@@ -902,7 +903,7 @@ class Pipe:
             app_state: State = request.app.state
             app_state._state[storage_key] = grounding_metadata_obj
         else:
-            self.log.debug(f"Response {message_id} does not have grounding metadata.")
+            log.debug(f"Response {message_id} does not have grounding metadata.")
 
     def _get_first_candidate(
         self, candidates: list[types.Candidate] | None
@@ -912,9 +913,7 @@ class Pipe:
             # Logging warnings is handled downstream.
             return None
         if len(candidates) > 1:
-            self.log.warning(
-                "Multiple candidates found, defaulting to first candidate."
-            )
+            log.warning("Multiple candidates found, defaulting to first candidate.")
         return candidates[0]
 
     def _process_image_part(
@@ -953,11 +952,11 @@ class Pipe:
             if lang_name := executable_code_part_lang_enum.name:
                 lang_name = executable_code_part_lang_enum.name.lower()
             else:
-                self.log.warning(
+                log.warning(
                     f"Could not extract language name from {executable_code_part_lang_enum}. Default to python."
                 )
         else:
-            self.log.warning("Language Enum is None, defaulting to python.")
+            log.warning("Language Enum is None, defaulting to python.")
 
         if executable_code_part_code := executable_code_part.code:
             return f"```{lang_name}\n{executable_code_part_code.rstrip()}\n```\n\n"
@@ -1003,17 +1002,17 @@ class Pipe:
         }
 
         # Upload the image to user configured storage provider.
-        self.log.info("Uploading the model generated image to Open WebUI backend.")
-        self.log.debug("Uploading to the configured storage provider.")
+        log.info("Uploading the model generated image to Open WebUI backend.")
+        log.debug("Uploading to the configured storage provider.")
         try:
             contents, image_path = Storage.upload_file(image, imagename)
         except Exception:
             error_msg = f"Error occurred during upload to the storage provider."
             # TODO: emit toast
-            self.log.exception(error_msg)
+            log.exception(error_msg)
             return None
         # Add the image file to files database.
-        self.log.debug("Adding the image file to Open WebUI files database.")
+        log.debug("Adding the image file to Open WebUI files database.")
         file_item = Files.insert_new_file(
             user_id,
             FileForm(
@@ -1029,7 +1028,7 @@ class Pipe:
             ),
         )
         if not file_item:
-            self.log.warning(
+            log.warning(
                 "Files.insert_new_file did not return anything. Image upload to Open WebUI database likely failed."
             )
             return None
@@ -1037,7 +1036,7 @@ class Pipe:
         image_url: str = __request__.app.url_path_for(
             "get_file_content_by_id", id=file_item.id
         )
-        self.log.success("Image upload finished!")
+        log.success("Image upload finished!")
         return image_url
 
     # endregion
@@ -1056,11 +1055,11 @@ class Pipe:
                     api_key=api_key,
                     http_options=http_options,
                 )
-                self.log.success("Genai client successfully initialized!")
+                log.success("Genai client successfully initialized!")
             except Exception:
-                self.log.exception("genai client initialization failed.")
+                log.exception("genai client initialization failed.")
         else:
-            self.log.error("GEMINI_API_KEY is not set.")
+            log.error("GEMINI_API_KEY is not set.")
         return client
 
     def _get_user_client(self, __user__: "UserData") -> genai.Client | None:
@@ -1071,9 +1070,7 @@ class Pipe:
             and user_valves.GEMINI_API_KEY
             and not self.clients.get(__user__["id"])
         ):
-            self.log.info(
-                f'Creating a new genai client for user {__user__.get("email")}'
-            )
+            log.info(f'Creating a new genai client for user {__user__.get("email")}')
             self.clients[__user__.get("id")] = self._get_genai_client(
                 api_key=user_valves.GEMINI_API_KEY,
                 base_url=user_valves.GEMINI_API_BASE_URL,
@@ -1096,12 +1093,12 @@ class Pipe:
         """
         client = self.clients.get("default")
         if not client:
-            self.log.warning("There is no usable genai client. Trying to create one.")
+            log.warning("There is no usable genai client. Trying to create one.")
             # Try to create a client one more time.
             if client := self._get_genai_client():
                 self.clients["default"] = client
             else:
-                self.log.error("Can't initialize the client, returning no models.")
+                log.error("Can't initialize the client, returning no models.")
                 return []
 
         # This executes if we have a working client.
@@ -1112,7 +1109,7 @@ class Pipe:
                 config={"query_base": True}
             )
         except Exception:
-            self.log.exception("Retriving models from Google API failed.")
+            log.exception("Retriving models from Google API failed.")
             return []
 
         # Iterate the pager to get the full list of models
@@ -1120,10 +1117,10 @@ class Pipe:
         try:
             all_google_models = [model async for model in google_models_pager]
         except Exception:
-            self.log.exception("Iterating Google models pager failed.")
+            log.exception("Iterating Google models pager failed.")
             return []
 
-        self.log.info(
+        log.info(
             f"Retrieved {len(all_google_models)} models from Gemini Developer API."
         )
         self._log_with_data(
@@ -1171,7 +1168,7 @@ class Pipe:
             and not any(fnmatch.fnmatch(model.name, f"models/{b}") for b in blacklist)
         ]
         # Add an info log to report the result of the filtering process
-        self.log.info(
+        log.info(
             f"Filtered {len(google_models)} raw models down to {len(filtered_models)} models based on white/blacklists."
         )
         return filtered_models
@@ -1214,7 +1211,7 @@ class Pipe:
                 types.HarmBlockThreshold.OFF
             )
 
-        self.log.debug(
+        log.debug(
             f"Safety settings: {str({k.value: v.value for k, v in category_threshold_map.items()})}"
         )
 
@@ -1236,7 +1233,7 @@ class Pipe:
             return stripped
         except Exception:
             error_msg = "Error stripping prefix, using the original model name."
-            self.log.exception(error_msg)
+            log.exception(error_msg)
             return model_name
 
     # endregion
@@ -1279,7 +1276,7 @@ class Pipe:
                         + text[pos + len(segment_text) + len(citation_markers) :]
                     )
         trim = len(original_text) - len(text)
-        self.log.debug(
+        log.debug(
             f"Citation removal finished. Returning text str that is {trim} character shorter than the original input."
         )
         return text
@@ -1305,7 +1302,7 @@ class Pipe:
         """
 
         if not response.usage_metadata:
-            self.log.warning(
+            log.warning(
                 "Usage_metadata is missing from the response. Cannot reliably determine usage."
             )
             return None
@@ -1351,15 +1348,15 @@ class Pipe:
         Args:
             log_level: The logging level (e.g., "DEBUG", "INFO").
             msg: The primary log message.
-            data: The data structure (dict, list, Pydantic model) to serialize and self.log.
+            data: The data structure (dict, list, Pydantic model) to serialize and log.
             truncate: Whether to truncate long strings/bytes in the data (default True).
             truncate_length: Max length before truncation (default 64).
         """
         # Log the primary message normally, using depth=1 to point to the caller of log_with_data
-        self.log.opt(depth=1).log(log_level, msg)
+        log.opt(depth=1).log(log_level, msg)
 
         # Lazy log the serialized data raw, using depth=1 to point to the caller of log_with_data
-        self.log.opt(raw=True, lazy=True, depth=1).log(
+        log.opt(raw=True, lazy=True, depth=1).log(
             log_level,
             "{x}\n",  # Use a format string for the lambda argument, add newline for clarity
             x=lambda: self._serialize_data(
@@ -1427,45 +1424,108 @@ class Pipe:
         # Serialize the data to a formatted JSON string
         return json.dumps(processed, indent=2, default=str)
 
-    def _setup_plugin_logger(self):
+    def _add_log_handler(self):
         """
-        Creates an independent logger instance for this plugin by temporarily
-        removing and restoring global handlers during a deep copy.
-        """
-        try:
-            # 1. Remove all handlers from the global logger.
-            #    This returns it to a "clean" state for copying.
-            global_logger.remove(None)
+        Adds or updates the loguru handler specifically for this plugin.
 
-            # 2. Create a deep copy of the now handler-less global logger.
-            self.log: "Logger" = copy.deepcopy(global_logger)
-        finally:
-            # 3. Restore the backend's global logger configuration *immediately*.
-            #    Call the same function the backend uses for its initial setup.
-            try:
-                start_logger()  # Or whatever function sets up the backend logger
-            except Exception as e:
-                # Log an error if restoring global handlers fails, but proceed
-                print(
-                    f"CRITICAL ERROR: Failed to restore global logger: {e}",
-                    file=sys.stderr,
-                )
-                # Try adding a basic handler back to global_logger.
-                global_logger.add(sys.stderr, level="INFO")
-        # 4. Configure the *copied* plugin logger instance. It starts empty, so no need to remove again.
+        This method ensures that a dedicated handler exists for logs originating
+        from this plugin's module (`__name__`). The primary purpose is to allow
+        the plugin's log level, as defined by `self.valves.LOG_LEVEL`, to be
+        independent of the global loguru level set by the main application
+        ('blackend').
+
+        This independence is crucial for scenarios where the global log level
+        might be set to 'INFO' or higher, but the plugin needs to output 'DEBUG'
+        level messages for internal troubleshooting or detailed operation logs.
+
+        If a handler for this plugin already exists but is configured with a
+        different log level than `self.valves.LOG_LEVEL`, the existing handler
+        is removed and a new one with the correct level is added.
+        """
+
+        def plugin_filter(record: "Record"):
+            """Filter function to only allow logs from this plugin (based on module name)."""
+            return record["name"] == __name__
+
+        # Get the desired level name and number
+        desired_level_name = self.valves.LOG_LEVEL
         try:
-            self.log_level = self.valves.LOG_LEVEL
-            self.log.add(
+            # Use the public API to get level details
+            desired_level_info = log.level(desired_level_name)
+            desired_level_no = desired_level_info.no
+        except ValueError:
+            log.error(
+                f"Invalid LOG_LEVEL '{desired_level_name}' configured for plugin {__name__}. Cannot add/update handler."
+            )
+            return  # Stop processing if the level is invalid
+
+        # Access the internal state of the log
+        handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
+        handler_id_to_remove = None
+        found_correct_handler = False
+
+        for handler_id, handler in handlers.items():
+            existing_filter = handler._filter  # Access internal attribute
+
+            # Check if the filter matches our plugin_filter
+            # Comparing function objects directly can be fragile if they are recreated.
+            # Comparing by name and module is more robust for functions defined at module level.
+            is_our_filter = (
+                existing_filter is not None  # Make sure a filter is set
+                and hasattr(existing_filter, "__name__")
+                and existing_filter.__name__ == plugin_filter.__name__
+                and hasattr(existing_filter, "__module__")
+                and existing_filter.__module__ == plugin_filter.__module__
+            )
+
+            if is_our_filter:
+                existing_level_no = handler.levelno
+                log.trace(
+                    f"Found existing handler {handler_id} for {__name__} with level number {existing_level_no}."
+                )
+
+                # Check if the level matches the desired level
+                if existing_level_no == desired_level_no:
+                    log.debug(
+                        f"Handler {handler_id} for {__name__} already exists with the correct level '{desired_level_name}'."
+                    )
+                    found_correct_handler = True
+                    break  # Found the correct handler, no action needed
+                else:
+                    # Found our handler, but the level is wrong. Mark for removal.
+                    log.info(
+                        f"Handler {handler_id} for {__name__} found, but log level differs "
+                        f"(existing: {existing_level_no}, desired: {desired_level_no}). "
+                        f"Removing it to update."
+                    )
+                    handler_id_to_remove = handler_id
+                    break  # Found the handler to replace, stop searching
+
+        # Remove the old handler if marked for removal
+        if handler_id_to_remove is not None:
+            try:
+                log.remove(handler_id_to_remove)
+                log.debug(f"Removed handler {handler_id_to_remove} for {__name__}.")
+            except ValueError:
+                # This might happen if the handler was somehow removed between the check and now
+                log.warning(
+                    f"Could not remove handler {handler_id_to_remove} for {__name__}. It might have already been removed."
+                )
+                # If removal failed but we intended to remove, we should still proceed to add
+                # unless found_correct_handler is somehow True (which it shouldn't be if handler_id_to_remove was set).
+
+        # Add a new handler if no correct one was found OR if we just removed an incorrect one
+        if not found_correct_handler:
+            self.log_level = desired_level_name
+            log.add(
                 sys.stdout,
-                level=self.log_level,
-                format=stdout_format,  # Use the backend's format
+                level=desired_level_name,
+                # FIXME: hide {"auditable": false} in the final log output.
+                format=stdout_format,
+                filter=plugin_filter,
             )
-            self.log.debug(
-                f"Initialized independent logger for {__name__} with level {self.log_level}."
-            )
-        except Exception as e:
-            print(
-                f"ERROR: Failed to add handler to plugin logger: {e}", file=sys.stderr
+            log.debug(
+                f"Added new handler to loguru for {__name__} with level {desired_level_name}."
             )
 
     def _get_mime_type(self, file_uri: str) -> str:
@@ -1494,7 +1554,7 @@ class Pipe:
 
         if youtube_urls:
             # TODO: toast
-            self.log.info(f"Extracted YouTube URLs: {youtube_urls}")
+            log.info(f"Extracted YouTube URLs: {youtube_urls}")
 
         return youtube_urls
 
