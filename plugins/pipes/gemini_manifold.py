@@ -1079,7 +1079,10 @@ class Pipe:
                 base_url=user_valves.GEMINI_API_BASE_URL,
             )
             self._log_with_data(
-                "DEBUG", "Genai clients dict now looks like this:", self.clients
+                "DEBUG",
+                "Genai clients dict now looks like this:",
+                self.clients,
+                truncate=False,
             )
         if user_client := self.clients.get(__user__.get("id")):
             return user_client
@@ -1415,10 +1418,13 @@ class Pipe:
                 # Return other types as is
                 return item
 
-        # Deep copy to avoid modifying the original data structure
-        copied_data = copy.deepcopy(data)
-        processed = process_item(copied_data, truncate, max_length)
-        # Serialize the processed data to a formatted JSON string
+        if truncate:
+            # Deep copy to avoid modifying the original data structure
+            copied_data = copy.deepcopy(data)
+            processed = process_item(copied_data, truncate, max_length)
+        else:
+            processed = data
+        # Serialize the data to a formatted JSON string
         return json.dumps(processed, indent=2, default=str)
 
     def _setup_plugin_logger(self):
