@@ -165,7 +165,6 @@ class Pipe:
                 "Running the logging setup again."
             )
             self._setup_plugin_logger()
-        # TODO: SUCCESS log in here.
         # Return existing models if all conditions are met and no error models are present
         if (
             self.models
@@ -175,15 +174,17 @@ class Pipe:
             and not any(model["id"] == "error" for model in self.models)
         ):
             self.log.info(
-                f"Models are already initialized. Returning the cached list ({len(self.models)} models)."
+                f"Models are cached and valid. Returning the cached list ({len(self.models)} models)."
             )
             return self.models
 
+        self.log.info("Fetching and filtering models from Google API.")
         # Filter the model list based on white- and blacklist.
         self.models = self._filter_models(await self._get_genai_models())
-        self.log.info(f"Returning {len(self.models)} models to Open WebUI.")
+        self.log.info(
+            f"Finished processing models. Returning {len(self.models)} models to Open WebUI."
+        )
         self._log_with_data("DEBUG", "Model list:", self.models, truncate=False)
-
         return self.models
 
     async def pipe(
@@ -323,11 +324,15 @@ class Pipe:
             # TODO: Support code execution here too.
             res = await client.aio.models.generate_content(**gen_content_args)
             if raw_text := res.text:
+                self.log.info("Non-streaming response finished successfully!")
+                self._log_with_data("DEBUG", "Non-streaming response:", res)
                 await self._do_post_processing(
                     res, __event_emitter__, __metadata__, __request__
                 )
-                self.log.info("Streaming disabled. Returning full response as str.")
-                self.log.success("Pipe.pipe method has finished it's run!")
+                self.log.info(
+                    "Streaming disabled. Returning full response as str. "
+                    "With that Pipe.pipe method has finished it's run!"
+                )
                 return raw_text
             else:
                 warn_msg = "Non-streaming response did not have any text inside it."
@@ -728,7 +733,7 @@ class Pipe:
                     try:
                         await thinking_timer_task
                     except asyncio.CancelledError:
-                        self.log.success(
+                        self.log.info(
                             "Thinking timer task successfully cancelled on first chunk."
                         )
                     except Exception:
@@ -801,7 +806,7 @@ class Pipe:
                 try:
                     await thinking_timer_task
                 except asyncio.CancelledError:
-                    self.log.success(
+                    self.log.info(
                         "Thinking timer task successfully cancelled in finally block."
                     )
                 except Exception:
@@ -810,7 +815,8 @@ class Pipe:
                     )
 
             if not error_occurred:
-                self.log.success(f"Stream finished.")
+                self.log.info(f"Stream finished successfully!")
+                self._log_with_data("DEBUG", "Last chunk:", final_response_chunk)
             try:
                 # Catch and emit any errors that might happen here as a toast message.
                 await self._do_post_processing(
@@ -1105,6 +1111,7 @@ class Pipe:
         self.log.info(
             f"Retrieved {len(google_models)} models from Gemini Developer API."
         )
+        self._log_with_data("TRACE", "All models returned by Google:", google_models)
         # Filter Google models list down to generative models only.
         return [
             model
@@ -1118,7 +1125,6 @@ class Pipe:
         Returns a list[dict] that can be directly returned by the `pipes` method.
         """
         if not google_models:
-            # TODO: Make error messages more specific.
             error_msg = "Error during getting the models from Google API, check logs."
             return [self._return_error_model(error_msg, exception=False)]
 
@@ -1134,7 +1140,8 @@ class Pipe:
             if self.valves.MODEL_BLACKLIST
             else []
         )
-        return [
+        # Perform filtering and store the result
+        filtered_models: list["ModelData"] = [
             {
                 "id": self._strip_prefix(model.name),
                 "name": model.display_name,
@@ -1146,6 +1153,11 @@ class Pipe:
             and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
             and not any(fnmatch.fnmatch(model.name, f"models/{b}") for b in blacklist)
         ]
+        # Add an info log to report the result of the filtering process
+        self.log.info(
+            f"Filtered {len(google_models)} raw models down to {len(filtered_models)} models based on white/blacklists."
+        )
+        return filtered_models
 
     def _get_safety_settings(self, model_name: str) -> list[types.SafetySetting]:
         """Get safety settings based on model name and permissive setting."""
