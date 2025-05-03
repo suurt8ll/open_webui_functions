@@ -146,7 +146,6 @@ class Pipe:
         # TODO: Get the id from the frontmatter instead of hardcoding it.
         valves = Functions.get_function_valves_by_id("gemini_manifold_google_genai")
         self.valves = self.Valves(**(valves if valves else {}))
-        self.log_level = self.valves.LOG_LEVEL
         self._setup_plugin_logger()
         # Initialize the genai client with default API given in Valves.
         self.clients = {"default": self._get_genai_client()}
@@ -1092,7 +1091,6 @@ class Pipe:
         Gets valid Google models from the API.
         Returns a list of `genai.types.Model` objects.
         """
-        google_models = None
         client = self.clients.get("default")
         if not client:
             self.log.warning("There is no usable genai client. Trying to create one.")
@@ -1102,20 +1100,36 @@ class Pipe:
             else:
                 self.log.error("Can't initialize the client, returning no models.")
                 return []
+
         # This executes if we have a working client.
+        google_models_pager = None
         try:
-            google_models = await client.aio.models.list(config={"query_base": True})
+            # Get the AsyncPager object
+            google_models_pager = await client.aio.models.list(
+                config={"query_base": True}
+            )
         except Exception:
             self.log.exception("Retriving models from Google API failed.")
             return []
+
+        # Iterate the pager to get the full list of models
+        # This is where the actual API calls for subsequent pages happen if needed
+        try:
+            all_google_models = [model async for model in google_models_pager]
+        except Exception:
+            self.log.exception("Iterating Google models pager failed.")
+            return []
+
         self.log.info(
-            f"Retrieved {len(google_models)} models from Gemini Developer API."
+            f"Retrieved {len(all_google_models)} models from Gemini Developer API."
         )
-        self._log_with_data("TRACE", "All models returned by Google:", google_models)
+        self._log_with_data(
+            "TRACE", "All models returned by Google:", all_google_models
+        )
         # Filter Google models list down to generative models only.
         return [
             model
-            for model in google_models
+            for model in all_google_models
             if model.supported_actions and "generateContent" in model.supported_actions
         ]
 
@@ -1434,6 +1448,7 @@ class Pipe:
                 global_logger.add(sys.stderr, level="INFO")
         # 4. Configure the *copied* plugin logger instance. It starts empty, so no need to remove again.
         try:
+            self.log_level = self.valves.LOG_LEVEL
             self.log.add(
                 sys.stdout,
                 level=self.log_level,
