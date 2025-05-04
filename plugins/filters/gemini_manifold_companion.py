@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.2.1
+version: 1.3.0
 """
 
 # This filter can detect that a feature like web search or code execution is enabled in the front-end,
