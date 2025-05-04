@@ -667,31 +667,11 @@ class Pipe:
         final_response_chunk: types.GenerateContentResponse | None = None
         error_occurred = False
 
-        # Initialize timer variables
-        thinking_timer_task = None
-        start_time = None
+        # Start thinking timer (model name check is inside this method).
         model_name = gen_content_args.get("model", "")
-
-        # Check if this is a thinking model and initialize timer if needed
-        # TODO: refac
-        if self.is_thinking_model(model_name):
-            # Emit initial 'Thinking' status
-            if self.valves.EMIT_STATUS_UPDATES:
-                await self._emit_status(
-                    "Thinking...", event_emitter=event_emitter, done=False
-                )
-
-            # Record the start time
-            start_time = time.time()
-
-            # Start the thinking timer
-            # NOTE: It's important to note that the model could not be actually thinking
-            # when the status message starts. API could be just slow or the chat data
-            # payload could still be uploading.
-            if self.valves.EMIT_STATUS_UPDATES:
-                thinking_timer_task = asyncio.create_task(
-                    self._thinking_timer(event_emitter)
-                )
+        start_time, thinking_timer_task = await self._start_thinking_timer(
+            model_name, event_emitter
+        )
 
         try:
             async for chunk in response_stream:
@@ -768,8 +748,31 @@ class Pipe:
                 log.exception(error_msg)
             log.debug("AsyncGenerator finished.")
 
+    async def _start_thinking_timer(
+        self, model_name: str, event_emitter: Callable[["Event"], Awaitable[None]]
+    ) -> tuple[float | None, asyncio.Task[None] | None]:
+        # Check if this is a thinking model and exit early if not.
+        if not self.is_thinking_model(model_name):
+            return None, None
+        # Indicates if emitted status messages should be visible in the front-end.
+        hidden = not self.valves.EMIT_STATUS_UPDATES
+        # Emit initial 'Thinking' status
+        await self._emit_status(
+            "Thinking...", event_emitter=event_emitter, done=False, hidden=hidden
+        )
+        # Record the start time
+        start_time = time.time()
+        # Start the thinking timer
+        # NOTE: It's important to note that the model could not be actually thinking
+        # when the status message starts. API could be just slow or the chat data
+        # payload could still be uploading.
+        thinking_timer_task = asyncio.create_task(
+            self._thinking_timer(event_emitter, hidden=hidden)
+        )
+        return start_time, thinking_timer_task
+
     async def _thinking_timer(
-        self, event_emitter: Callable[["Event"], Awaitable[None]]
+        self, event_emitter: Callable[["Event"], Awaitable[None]], hidden=False
     ) -> None:
         """Asynchronous task to emit periodic status updates."""
         elapsed = 0
@@ -786,7 +789,10 @@ class Pipe:
                     time_str = f"{minutes}m {seconds}s"
                 status_message = f"Thinking... ({time_str} elapsed)"
                 await self._emit_status(
-                    status_message, event_emitter=event_emitter, done=False
+                    status_message,
+                    event_emitter=event_emitter,
+                    done=False,
+                    hidden=hidden,
                 )
         except asyncio.CancelledError:
             log.debug("Timer task cancelled.")
