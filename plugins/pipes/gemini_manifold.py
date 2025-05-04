@@ -760,7 +760,8 @@ class Pipe:
         self, model_name: str, event_emitter: Callable[["Event"], Awaitable[None]]
     ) -> tuple[float | None, asyncio.Task[None] | None]:
         # Check if this is a thinking model and exit early if not.
-        if not self.is_thinking_model(model_name):
+        # Exit also if thinking budget is explicitly set to 0.
+        if not self.is_thinking_model(model_name) or self.valves.THINKING_BUDGET == 0:
             return None, None
         # Indicates if emitted status messages should be visible in the front-end.
         hidden = not self.valves.EMIT_STATUS_UPDATES
