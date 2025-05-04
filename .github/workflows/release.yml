@@ -39,17 +39,15 @@ jobs:
           CURRENT_TAG: ${{ github.ref_name }}
           PLUGIN_PATH: ${{ steps.find_plugin_file.outputs.plugin_path }}
 
-      # Step 5: Create the GitHub Release
-      - name: Create Release
+      # Step 5: Create the GitHub Draft Release
+      - name: Create Draft Release for Verification
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: Release ${{ steps.parse_tag.outputs.plugin_name }} ${{ steps.parse_tag.outputs.version }}
-          # Use the generated changelog body
           body: ${{ steps.changelog.outputs.changelog_body }}
-          # Attach the specific plugin file found
           files: ${{ steps.find_plugin_file.outputs.plugin_path }}
-          draft: false
+          draft: true # Create a draft release instead of publishing immediately
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
