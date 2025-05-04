@@ -1443,6 +1443,51 @@ class Pipe:
         is removed and a new one with the correct level is added.
         """
 
+        def plugin_stdout_format(record: "Record") -> str:
+            """
+            Custom format function for the plugin's logs.
+            Processes extra data before formatting, excluding 'auditable'.
+            """
+            # Get the original extra dictionary
+            original_extra = record["extra"]
+
+            # Create a new dictionary excluding 'auditable'
+            filtered_extra = {}
+            if isinstance(original_extra, dict):
+                for key, value in original_extra.items():
+                    if key != "auditable":
+                        filtered_extra[key] = value
+
+            # Serialize the filtered extra dictionary
+            # Handle potential serialization errors
+            try:
+                filtered_extra_json = json.dumps(filtered_extra)
+            except TypeError:
+                # Fallback if serialization fails
+                filtered_extra_json = "{}"  # Or a placeholder indicating error
+
+            # Add the serialized, filtered extra back into the record's extra
+            # under a *different* key than the original stdout_format used.
+            # This avoids conflict and provides the data for the template.
+            record["extra"]["plugin_extra_json"] = filtered_extra_json
+
+            # Return the format string template.
+            # This template is based on the original stdout_format but uses the new key
+            # and conditionally includes the extra part only if it's not empty after filtering.
+            base_template = (
+                "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+                "<level>{level: <8}</level> | "
+                "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+                "<level>{message}</level>"
+            )
+
+            # Add the extra part
+            base_template += " - {extra[plugin_extra_json]}"
+            # Add the exception part
+            base_template += "\n{exception}"
+
+            return base_template
+
         def plugin_filter(record: "Record"):
             """Filter function to only allow logs from this plugin (based on module name)."""
             return record["name"] == __name__
@@ -1520,8 +1565,7 @@ class Pipe:
             log.add(
                 sys.stdout,
                 level=desired_level_name,
-                # FIXME: hide {"auditable": false} in the final log output.
-                format=stdout_format,
+                format=plugin_stdout_format,
                 filter=plugin_filter,
             )
             log.debug(
