@@ -20,7 +20,7 @@ requirements: google-genai==1.13.0
 #   - YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
 #   - Streaming
 #   - Grounding with Google Search (this requires installing "Gemini Manifold Companion" >= 1.2.0 filter, see GitHub README)
-#   - Safety settings
+#   - Permissive safety settings (Gemini Manifold Companion >= 1.3.0 required)
 #   - Each user can decide to use their own API key.
 #   - Token usage data
 #   - Code execution tool. (Gemini Manifold Companion >= 1.1.0 required)
@@ -105,9 +105,6 @@ class Pipe:
         THINKING_BUDGET: int | None = Field(
             default=None,
             description="Indicates the thinking budget in tokens. Default value is None.",
-        )
-        USE_PERMISSIVE_SAFETY: bool = Field(
-            default=False, description="Whether to request relaxed safety filtering."
         )
         USE_FILES_API: bool = Field(
             title="Use Files API",
@@ -215,6 +212,7 @@ class Pipe:
         else:
             log.info(f'Using genai client with user {__user__.get("email")} API key.')
 
+        log.trace("__metadata__:", payload=__metadata__)
         # Check if user is chatting with an error model for some reason.
         if "error" in __metadata__["model"]["id"]:
             error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
@@ -245,6 +243,10 @@ class Pipe:
             thinking_conf = types.ThinkingConfig(
                 thinking_budget=self.valves.THINKING_BUDGET, include_thoughts=None
             )
+        safety_settings: list[types.SafetySetting] | None = __metadata__.get(
+            "safety_settings"
+        )
+
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
             system_instruction=system_prompt,
@@ -253,7 +255,7 @@ class Pipe:
             top_k=body.get("top_k"),
             max_output_tokens=body.get("max_tokens"),
             stop_sequences=body.get("stop"),
-            safety_settings=self._get_safety_settings(model_name),
+            safety_settings=safety_settings,
             thinking_config=thinking_conf,
         )
 
@@ -1165,54 +1167,6 @@ class Pipe:
             f"Filtered {len(google_models)} raw models down to {len(filtered_models)} models based on white/blacklists."
         )
         return filtered_models
-
-    def _get_safety_settings(self, model_name: str) -> list[types.SafetySetting]:
-        """Get safety settings based on model name and permissive setting."""
-
-        if not self.valves.USE_PERMISSIVE_SAFETY:
-            return []
-
-        # Settings supported by most models
-        category_threshold_map = {
-            types.HarmCategory.HARM_CATEGORY_HARASSMENT: types.HarmBlockThreshold.OFF,
-            types.HarmCategory.HARM_CATEGORY_HATE_SPEECH: types.HarmBlockThreshold.OFF,
-            types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: types.HarmBlockThreshold.OFF,
-            types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: types.HarmBlockThreshold.OFF,
-            types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY: types.HarmBlockThreshold.BLOCK_NONE,
-        }
-
-        # Older models use BLOCK_NONE
-        if model_name in [
-            "gemini-1.5-pro-001",
-            "gemini-1.5-flash-001",
-            "gemini-1.5-flash-8b-exp-0827",
-            "gemini-1.5-flash-8b-exp-0924",
-            "gemini-pro",
-            "gemini-1.0-pro",
-            "gemini-1.0-pro-001",
-        ]:
-            for category in category_threshold_map:
-                category_threshold_map[category] = types.HarmBlockThreshold.BLOCK_NONE
-
-        # Gemini 2.0 Flash supports CIVIC_INTEGRITY OFF
-        if model_name in [
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-001",
-            "gemini-2.0-flash-exp",
-        ]:
-            category_threshold_map[types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY] = (
-                types.HarmBlockThreshold.OFF
-            )
-
-        log.debug(
-            f"Safety settings: {str({k.value: v.value for k, v in category_threshold_map.items()})}"
-        )
-
-        safety_settings = [
-            types.SafetySetting(category=category, threshold=threshold)
-            for category, threshold in category_threshold_map.items()
-        ]
-        return safety_settings
 
     def _strip_prefix(self, model_name: str) -> str:
         """
