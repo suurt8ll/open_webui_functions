@@ -102,9 +102,13 @@ class Pipe:
             default=True,
             description="Whether to request models only on first load and when white- or blacklist changes.",
         )
-        THINKING_BUDGET: int | None = Field(
-            default=None,
-            description="Indicates the thinking budget in tokens. Default value is None.",
+        THINKING_BUDGET: int = Field(
+            ge=0,
+            le=24576,
+            default=8192,
+            description="""Gemini 2.5 Flash only. Indicates the thinking budget in tokens. 
+            0 means no thinking. Default value is 8192.
+            See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
         )
         USE_FILES_API: bool = Field(
             title="Use Files API",
@@ -168,12 +172,6 @@ class Pipe:
                 "Running the logging setup again."
             )
             self._add_log_handler()
-        # Do it here in case user changed the budget.
-        self.budget_str = (
-            ""
-            if self.valves.THINKING_BUDGET is None
-            else f" • {self.valves.THINKING_BUDGET} tokens budget"
-        )
         # Return existing models if all conditions are met and no error models are present
         if (
             self.models
@@ -241,17 +239,17 @@ class Pipe:
         contents, system_prompt = self._genai_contents_from_messages(
             body.get("messages"), messages_db
         )
-        model_name = self._strip_prefix(body.get("model", ""))
-        # API does not stream thoughts sadly. See https://github.com/googleapis/python-genai/issues/226#issuecomment-2631657100
-        thinking_conf = None
-        if self.is_thinking_model(model_name):
-            log.info(f"Model ID '{model_name}' is a thinking model.")
-            thinking_conf = types.ThinkingConfig(
-                thinking_budget=self.valves.THINKING_BUDGET, include_thoughts=None
-            )
         safety_settings: list[types.SafetySetting] | None = __metadata__.get(
             "safety_settings"
         )
+        model_name = self._strip_prefix(body.get("model", ""))
+        # API does not stream thoughts sadly. See https://github.com/googleapis/python-genai/issues/226#issuecomment-2631657100
+        thinking_conf = None
+        if model_name == "gemini-2.5-flash-preview-04-17":
+            log.info(f"Model ID '{model_name}' allows adjusting the thinking settings.")
+            thinking_conf = types.ThinkingConfig(
+                thinking_budget=self.valves.THINKING_BUDGET, include_thoughts=None
+            )
 
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
@@ -687,7 +685,7 @@ class Pipe:
 
                 # Stop the timer when we receive the first chunk
                 await self._cancel_thinking_timer(
-                    thinking_timer_task, start_time, event_emitter
+                    thinking_timer_task, start_time, event_emitter, model_name
                 )
                 # Set timer task to None to avoid duplicate cancellation in finally block and subsequent stream chunks.
                 thinking_timer_task = None
@@ -734,7 +732,9 @@ class Pipe:
             await self._emit_error(error_msg, event_emitter)
         finally:
             # Cancel the timer task if error occured before the stream could start.
-            await self._cancel_thinking_timer(thinking_timer_task, None, event_emitter)
+            await self._cancel_thinking_timer(
+                thinking_timer_task, None, event_emitter, model_name
+            )
 
             if not error_occurred:
                 log.info(f"Stream finished successfully!")
@@ -756,18 +756,29 @@ class Pipe:
                 log.exception(error_msg)
             log.debug("AsyncGenerator finished.")
 
+    def _get_budget_str(self, model_name: str) -> str:
+        return (
+            f" • {self.valves.THINKING_BUDGET} tokens budget"
+            if model_name == "gemini-2.5-flash-preview-04-17"
+            and self.valves.THINKING_BUDGET > 0
+            else ""
+        )
+
     async def _start_thinking_timer(
         self, model_name: str, event_emitter: Callable[["Event"], Awaitable[None]]
     ) -> tuple[float | None, asyncio.Task[None] | None]:
         # Check if this is a thinking model and exit early if not.
-        # Exit also if thinking budget is explicitly set to 0.
-        if not self.is_thinking_model(model_name) or self.valves.THINKING_BUDGET == 0:
+        # Exit also if thinking budget is explicitly set to 0 and Gemini 2.5 Flash is selected.
+        if not self.is_thinking_model(model_name) or (
+            self.valves.THINKING_BUDGET == 0
+            and model_name == "gemini-2.5-flash-preview-04-17"
+        ):
             return None, None
         # Indicates if emitted status messages should be visible in the front-end.
         hidden = not self.valves.EMIT_STATUS_UPDATES
         # Emit initial 'Thinking' status
         await self._emit_status(
-            f"Thinking • 0s elapsed{self.budget_str}",
+            f"Thinking • 0s elapsed{self._get_budget_str(model_name)}",
             event_emitter=event_emitter,
             done=False,
             hidden=hidden,
@@ -779,12 +790,15 @@ class Pipe:
         # when the status message starts. API could be just slow or the chat data
         # payload could still be uploading.
         thinking_timer_task = asyncio.create_task(
-            self._thinking_timer(event_emitter, hidden=hidden)
+            self._thinking_timer(event_emitter, model_name, hidden=hidden)
         )
         return start_time, thinking_timer_task
 
     async def _thinking_timer(
-        self, event_emitter: Callable[["Event"], Awaitable[None]], hidden=False
+        self,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        model_name: str,
+        hidden=False,
     ) -> None:
         """Asynchronous task to emit periodic status updates."""
         elapsed = 0
@@ -799,7 +813,9 @@ class Pipe:
                 else:
                     minutes, seconds = divmod(elapsed, 60)
                     time_str = f"{minutes}m {seconds}s"
-                status_message = f"Thinking • {time_str} elapsed{self.budget_str}"
+                status_message = (
+                    f"Thinking • {time_str} elapsed{self._get_budget_str(model_name)}"
+                )
                 await self._emit_status(
                     status_message,
                     event_emitter=event_emitter,
@@ -816,6 +832,7 @@ class Pipe:
         timer_task: asyncio.Task[None] | None,
         start_time: float | None,
         event_emitter: Callable[["Event"], Awaitable[None]],
+        model_name: str,
     ):
         # Check if task was already canceled.
         if not timer_task:
@@ -839,9 +856,7 @@ class Pipe:
                 minutes, seconds = divmod(total_elapsed, 60)
                 total_time_str = f"{minutes}m {seconds}s"
 
-            final_status = (
-                f"Thinking completed • took {total_time_str}{self.budget_str}"
-            )
+            final_status = f"Thinking completed • took {total_time_str}{self._get_budget_str(model_name)}"
             await self._emit_status(
                 final_status, event_emitter=event_emitter, done=True, hidden=hidden
             )
