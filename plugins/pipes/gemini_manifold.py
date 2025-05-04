@@ -20,7 +20,7 @@ requirements: google-genai==1.13.0
 #   - YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
 #   - Streaming
 #   - Grounding with Google Search (this requires installing "Gemini Manifold Companion" >= 1.2.0 filter, see GitHub README)
-#   - Safety settings
+#   - Permissive safety settings (Gemini Manifold Companion >= 1.3.0 required)
 #   - Each user can decide to use their own API key.
 #   - Token usage data
 #   - Code execution tool. (Gemini Manifold Companion >= 1.1.0 required)
