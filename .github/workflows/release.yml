@@ -1,8 +1,6 @@
 name: Plugin Release
 
 on:
-  # Trigger this workflow when a new tag matching the pattern is pushed
-  # Example tags: gemini_manifold/v1.16.0, system_prompt_injector/v1.0.0
   push:
     tags:
       - '*/v*'
@@ -11,43 +9,47 @@ jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
-      # Needed to create releases and upload assets
       contents: write
     steps:
-      # Step 1: Checkout the code
+      # Step 1: Checkout the code (fetch all history)
       - name: Checkout code
         uses: actions/checkout@v4
-        # Fetch all history so annotated tag messages are available
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # IMPORTANT: Needed for git log between tags
 
-      # Step 2: Parse tag name using external script
+      # Step 2: Parse tag name
       - name: Parse Tag
         id: parse_tag
         run: .github/scripts/parse_tag.sh
+        # GITHUB_REF_NAME is implicitly available to the script
 
-      # Step 3: Find Plugin File Path using external script
+      # Step 3: Find Plugin File Path
       - name: Find Plugin File
         id: find_plugin_file
         run: .github/scripts/find_plugin_file.sh
         env:
           PLUGIN_NAME: ${{ steps.parse_tag.outputs.plugin_name }}
 
-      # Step 4: Create the GitHub Release
+      # Step 4: Generate Changelog using external script
+      - name: Generate Changelog
+        id: changelog
+        run: .github/scripts/generate_changelog.sh
+        env:
+          PLUGIN_NAME: ${{ steps.parse_tag.outputs.plugin_name }}
+          CURRENT_TAG: ${{ github.ref_name }}
+          PLUGIN_PATH: ${{ steps.find_plugin_file.outputs.plugin_path }}
+
+      # Step 5: Create the GitHub Release
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          # Use the full tag name that triggered the workflow
           tag_name: ${{ github.ref_name }}
-          # Create a descriptive release name using parsed outputs
           name: Release ${{ steps.parse_tag.outputs.plugin_name }} ${{ steps.parse_tag.outputs.version }}
-          # Use the annotated tag message as the release body (notes)
-          body: |
-            ${{ github.event.head_commit.message || 'No description provided.' }}
-          # Attach the plugin file directly if its path was found
+          # Use the generated changelog body
+          body: ${{ steps.changelog.outputs.changelog_body }}
+          # Attach the specific plugin file found
           files: ${{ steps.find_plugin_file.outputs.plugin_path }}
           draft: false
           prerelease: false
         env:
-          # GITHUB_TOKEN is automatically provided by GitHub Actions
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
