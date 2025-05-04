@@ -30,13 +30,14 @@ requirements: google-genai==1.11.0
 #   TODO Video input support (other than YouTube URLs).
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 
+from google import genai
+from google.genai import types
+
 import asyncio
 import copy
 import json
 import time
 from fastapi.datastructures import State
-from google import genai
-from google.genai import types
 import io
 import mimetypes
 import os
@@ -46,6 +47,7 @@ import re
 import fnmatch
 import sys
 from fastapi import Request
+import pydantic_core
 from pydantic import BaseModel, Field
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import (
@@ -60,7 +62,6 @@ from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
 from open_webui.models.functions import Functions
 from open_webui.storage.provider import Storage
-from open_webui.utils.logger import stdout_format
 from loguru import logger
 
 if TYPE_CHECKING:
@@ -159,6 +160,7 @@ class Pipe:
         self.last_blacklist = self.valves.MODEL_BLACKLIST
 
         log.success("Function has been initialized.")
+        log.trace("Full self object:", payload=self.__dict__)
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
@@ -188,7 +190,7 @@ class Pipe:
         log.info(
             f"Finished processing models. Returning {len(self.models)} models to Open WebUI."
         )
-        self._log_with_data("DEBUG", "Model list:", self.models, truncate=False)
+        log.debug("Model list:", payload=self.models, _log_truncation_enabled=False)
         return self.models
 
     async def pipe(
@@ -299,9 +301,7 @@ class Pipe:
             "contents": contents,
             "config": gen_content_conf,
         }
-        self._log_with_data(
-            "DEBUG", "Passing these args to the Google API:", gen_content_args
-        )
+        log.debug("Passing these args to the Google API:", payload=gen_content_args)
 
         if body.get("stream", False):
             # Streaming response
@@ -327,7 +327,7 @@ class Pipe:
             res = await client.aio.models.generate_content(**gen_content_args)
             if raw_text := res.text:
                 log.info("Non-streaming response finished successfully!")
-                self._log_with_data("DEBUG", "Non-streaming response:", res)
+                log.debug("Non-streaming response:", payload=res)
                 await self._do_post_processing(
                     res, __event_emitter__, __metadata__, __request__
                 )
@@ -816,7 +816,7 @@ class Pipe:
 
             if not error_occurred:
                 log.info(f"Stream finished successfully!")
-                self._log_with_data("DEBUG", "Last chunk:", final_response_chunk)
+                log.debug("Last chunk:", payload=final_response_chunk)
             try:
                 # Catch and emit any errors that might happen here as a toast message.
                 await self._do_post_processing(
@@ -874,7 +874,7 @@ class Pipe:
 
         # Emit token usage data.
         if usage_event := self._get_usage_data_event(model_response):
-            self._log_with_data("DEBUG", "Emitting usage data:", usage_event)
+            log.debug("Emitting usage data:", payload=usage_event)
             # TODO: catch potential errors?
             await event_emitter(usage_event)
         self._add_grounding_data_to_state(model_response, metadata, request)
@@ -1075,12 +1075,7 @@ class Pipe:
                 api_key=user_valves.GEMINI_API_KEY,
                 base_url=user_valves.GEMINI_API_BASE_URL,
             )
-            self._log_with_data(
-                "DEBUG",
-                "Genai clients dict now looks like this:",
-                self.clients,
-                truncate=False,
-            )
+            log.debug("Genai clients dict now looks like this:", payload=self.clients)
         if user_client := self.clients.get(__user__.get("id")):
             return user_client
         else:
@@ -1123,9 +1118,7 @@ class Pipe:
         log.info(
             f"Retrieved {len(all_google_models)} models from Gemini Developer API."
         )
-        self._log_with_data(
-            "TRACE", "All models returned by Google:", all_google_models
-        )
+        log.trace("All models returned by Google:", payload=all_google_models)
         # Filter Google models list down to generative models only.
         return [
             model
@@ -1327,166 +1320,146 @@ class Pipe:
     # endregion
 
     # region Other helpers
-    def _log_with_data(
-        self,
-        log_level: str,
-        msg: str,
-        data: Any,
-        truncate: bool = True,
-        truncate_length: int = 512,
-    ):
+    def _is_flat_dict(self, data: Any) -> bool:
         """
-        Logs a message and then lazily logs potentially complex data, formatted as JSON.
+        Checks if a dictionary contains only non-dict/non-list values (is one level deep).
+        """
+        if not isinstance(data, dict):
+            return False
+        return not any(isinstance(value, (dict, list)) for value in data.values())
 
-        The data logging uses the same log level, is raw (no Loguru formatting added),
-        and only occurs if the log level is enabled. The data serialization can optionally
-        truncate long strings/bytes.
-
-        Both the initial message and the data log will show the caller of this
-        `log_with_data` function in their trace information.
+    def _truncate_long_strings(
+        self, data: Any, max_len: int, truncation_marker: str, truncation_enabled: bool
+    ) -> Any:
+        """
+        Recursively traverses a data structure (dicts, lists) and truncates
+        long string values. Creates copies to avoid modifying original data.
 
         Args:
-            log_level: The logging level (e.g., "DEBUG", "INFO").
-            msg: The primary log message.
-            data: The data structure (dict, list, Pydantic model) to serialize and log.
-            truncate: Whether to truncate long strings/bytes in the data (default True).
-            truncate_length: Max length before truncation (default 64).
-        """
-        # Log the primary message normally, using depth=1 to point to the caller of log_with_data
-        log.opt(depth=1).log(log_level, msg)
-
-        # Lazy log the serialized data raw, using depth=1 to point to the caller of log_with_data
-        log.opt(raw=True, lazy=True, depth=1).log(
-            log_level,
-            "{x}\n",  # Use a format string for the lambda argument, add newline for clarity
-            x=lambda: self._serialize_data(
-                data, truncate=truncate, max_length=truncate_length
-            ),
-        )
-
-    def _serialize_data(self, data: Any, truncate: bool, max_length: int) -> str:
-        """
-        Recursively processes data (dicts, lists, Pydantic models) and returns
-        a formatted JSON string. Optionally truncates long strings/bytes fields.
-        The original input data remains unmodified.
-
-        Args:
-            data: A dictionary, list, or Pydantic BaseModel instance.
-            truncate: If True, strings/bytes exceeding max_length will be truncated.
-            max_length: The maximum length for strings/bytes before truncation (if truncate=True).
+            data: The data structure (dict, list, str, int, float, bool, None) to process.
+            max_len: The maximum allowed length for string values.
+            truncation_marker: The string to append to truncated values.
+            truncation_enabled: Whether truncation is enabled.
 
         Returns:
-            A nicely formatted JSON string representation of the processed data.
+            A potentially new data structure with long strings truncated.
+        """
+        if not truncation_enabled or max_len <= len(truncation_marker):
+            # If truncation is disabled or max_len is too small, return original
+            # Make a copy only if it's a mutable type we might otherwise modify
+            if isinstance(data, (dict, list)):
+                return copy.deepcopy(data)  # Ensure deep copy for nested structures
+            return data  # Primitives are immutable
+
+        if isinstance(data, str):
+            if len(data) > max_len:
+                return data[: max_len - len(truncation_marker)] + truncation_marker
+            return data  # Return original string if not truncated
+        elif isinstance(data, dict):
+            # Process dictionary items, creating a new dict
+            return {
+                k: self._truncate_long_strings(
+                    v, max_len, truncation_marker, truncation_enabled
+                )
+                for k, v in data.items()
+            }
+        elif isinstance(data, list):
+            # Process list items, creating a new list
+            return [
+                self._truncate_long_strings(
+                    item, max_len, truncation_marker, truncation_enabled
+                )
+                for item in data
+            ]
+        else:
+            # Return non-string, non-container types as is (they are immutable)
+            return data
+
+    def plugin_stdout_format(self, record: "Record") -> str:
+        """
+        Custom format function for the plugin's logs.
+        Serializes and truncates data passed under the 'payload' key in extra.
         """
 
-        def process_item(item: Any, truncate_flag: bool, length: int) -> Any:
-            if isinstance(item, BaseModel):
-                # Convert Pydantic model to dict and process recursively
-                item_dict = item.model_dump()
-                return process_item(item_dict, truncate_flag, length)
-            elif isinstance(item, dict):
-                # Process dictionary items recursively
-                return {
-                    key: process_item(value, truncate_flag, length)
-                    for key, value in item.items()
-                }
-            elif isinstance(item, list):
-                # Process list items recursively
-                return [
-                    process_item(element, truncate_flag, length) for element in item
-                ]
-            elif isinstance(item, str):
-                # Truncate string if requested and necessary
-                if truncate_flag and len(item) > length:
-                    truncated_len = len(item) - length
-                    return f"{item[:length]}[{truncated_len} chars truncated]"
-                return (
-                    item  # Return original string if not truncated or not long enough
-                )
-            elif isinstance(item, bytes):
-                # Convert bytes to hex and truncate if requested and necessary
-                hex_str = item.hex()
-                if truncate_flag and len(hex_str) > length:
-                    truncated_len = len(hex_str) - length
-                    return f"{hex_str[:length]}[{truncated_len} chars truncated]"
-                else:
-                    return hex_str  # Return original hex string
-            else:
-                # Return other types as is
-                return item
+        # Configuration Keys
+        LOG_OPTIONS_PREFIX = "_log_"
+        TRUNCATION_ENABLED_KEY = f"{LOG_OPTIONS_PREFIX}truncation_enabled"
+        MAX_LENGTH_KEY = f"{LOG_OPTIONS_PREFIX}max_length"
+        TRUNCATION_MARKER_KEY = f"{LOG_OPTIONS_PREFIX}truncation_marker"
+        DATA_KEY = "payload"
 
-        if truncate:
-            # Deep copy to avoid modifying the original data structure
-            copied_data = copy.deepcopy(data)
-            processed = process_item(copied_data, truncate, max_length)
-        else:
-            processed = data
-        # Serialize the data to a formatted JSON string
-        return json.dumps(processed, indent=2, default=str)
+        original_extra = record["extra"]
+        # Extract the data intended for serialization using the chosen key
+        data_to_process = original_extra.get(DATA_KEY)
+
+        serialized_data_json = ""
+        if data_to_process is not None:
+            try:
+                serializable_data = pydantic_core.to_jsonable_python(
+                    data_to_process, serialize_unknown=True
+                )
+
+                # Determine truncation settings
+                truncation_enabled = original_extra.get(TRUNCATION_ENABLED_KEY, True)
+                max_length = original_extra.get(MAX_LENGTH_KEY, 256)
+                truncation_marker = original_extra.get(TRUNCATION_MARKER_KEY, "[...]")
+
+                # If max_length was explicitly provided, force truncation enabled
+                if MAX_LENGTH_KEY in original_extra:
+                    truncation_enabled = True
+
+                # Truncate long strings
+                truncated_data = self._truncate_long_strings(
+                    serializable_data,
+                    max_length,
+                    truncation_marker,
+                    truncation_enabled,
+                )
+
+                # Serialize the (potentially truncated) data
+                if self._is_flat_dict(truncated_data) and not isinstance(
+                    truncated_data, list
+                ):
+                    json_string = json.dumps(
+                        truncated_data, separators=(",", ":"), default=str
+                    )
+                    # Add a simple prefix if it's compact
+                    serialized_data_json = " - " + json_string
+                else:
+                    json_string = json.dumps(truncated_data, indent=2, default=str)
+                    # Prepend with newline for readability
+                    serialized_data_json = "\n" + json_string
+
+            except (TypeError, ValueError) as e:  # Catch specific serialization errors
+                serialized_data_json = f" - {{Serialization Error: {e}}}"
+            except (
+                Exception
+            ) as e:  # Catch any other unexpected errors during processing
+                serialized_data_json = f" - {{Processing Error: {e}}}"
+
+        # Add the final JSON string (or error message) back into the record
+        record["extra"]["_plugin_serialized_data"] = serialized_data_json
+
+        # Base template
+        base_template = (
+            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+            "<level>{message}</level>"
+        )
+
+        # Append the serialized data
+        base_template += "{extra[_plugin_serialized_data]}"
+        # Append the exception part
+        base_template += "\n{exception}"
+        # Return the format string template
+        return base_template.rstrip()
 
     def _add_log_handler(self):
         """
         Adds or updates the loguru handler specifically for this plugin.
-
-        This method ensures that a dedicated handler exists for logs originating
-        from this plugin's module (`__name__`). The primary purpose is to allow
-        the plugin's log level, as defined by `self.valves.LOG_LEVEL`, to be
-        independent of the global loguru level set by the main application
-        ('blackend').
-
-        This independence is crucial for scenarios where the global log level
-        might be set to 'INFO' or higher, but the plugin needs to output 'DEBUG'
-        level messages for internal troubleshooting or detailed operation logs.
-
-        If a handler for this plugin already exists but is configured with a
-        different log level than `self.valves.LOG_LEVEL`, the existing handler
-        is removed and a new one with the correct level is added.
+        Includes logic for serializing and truncating extra data.
         """
-
-        def plugin_stdout_format(record: "Record") -> str:
-            """
-            Custom format function for the plugin's logs.
-            Processes extra data before formatting, excluding 'auditable'.
-            """
-            # Get the original extra dictionary
-            original_extra = record["extra"]
-
-            # Create a new dictionary excluding 'auditable'
-            filtered_extra = {}
-            if isinstance(original_extra, dict):
-                for key, value in original_extra.items():
-                    if key != "auditable":
-                        filtered_extra[key] = value
-
-            # Serialize the filtered extra dictionary
-            # Handle potential serialization errors
-            try:
-                filtered_extra_json = json.dumps(filtered_extra)
-            except TypeError:
-                # Fallback if serialization fails
-                filtered_extra_json = "{}"  # Or a placeholder indicating error
-
-            # Add the serialized, filtered extra back into the record's extra
-            # under a *different* key than the original stdout_format used.
-            # This avoids conflict and provides the data for the template.
-            record["extra"]["plugin_extra_json"] = filtered_extra_json
-
-            # Return the format string template.
-            # This template is based on the original stdout_format but uses the new key
-            # and conditionally includes the extra part only if it's not empty after filtering.
-            base_template = (
-                "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-                "<level>{level: <8}</level> | "
-                "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-                "<level>{message}</level>"
-            )
-
-            # Add the extra part
-            base_template += " - {extra[plugin_extra_json]}"
-            # Add the exception part
-            base_template += "\n{exception}"
-
-            return base_template
 
         def plugin_filter(record: "Record"):
             """Filter function to only allow logs from this plugin (based on module name)."""
@@ -1565,7 +1538,7 @@ class Pipe:
             log.add(
                 sys.stdout,
                 level=desired_level_name,
-                format=plugin_stdout_format,
+                format=self.plugin_stdout_format,
                 filter=plugin_filter,
             )
             log.debug(
