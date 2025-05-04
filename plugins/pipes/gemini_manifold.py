@@ -397,31 +397,6 @@ class Pipe:
         except Exception:
             log.exception("Error emitting status")
 
-    async def thinking_timer(
-        self, event_emitter: Callable[["Event"], Awaitable[None]]
-    ) -> None:
-        """Asynchronous task to emit periodic status updates."""
-        elapsed = 0
-        try:
-            log.info("Thinking timer started.")
-            while True:
-                await asyncio.sleep(self.valves.EMIT_INTERVAL)
-                elapsed += self.valves.EMIT_INTERVAL
-                # Format elapsed time
-                if elapsed < 60:
-                    time_str = f"{elapsed}s"
-                else:
-                    minutes, seconds = divmod(elapsed, 60)
-                    time_str = f"{minutes}m {seconds}s"
-                status_message = f"Thinking... ({time_str} elapsed)"
-                await self._emit_status(
-                    status_message, event_emitter=event_emitter, done=False
-                )
-        except asyncio.CancelledError:
-            log.debug("Timer task cancelled.")
-        except Exception:
-            log.exception("Error in timer task")
-
     async def _emit_error(
         self,
         error_msg: str,
@@ -696,8 +671,6 @@ class Pipe:
         thinking_timer_task = None
         start_time = None
         model_name = gen_content_args.get("model", "")
-        # FIXME: This is not needed?
-        first_chunk_received = False
 
         # Check if this is a thinking model and initialize timer if needed
         # TODO: refac
@@ -717,7 +690,7 @@ class Pipe:
             # payload could still be uploading.
             if self.valves.EMIT_STATUS_UPDATES:
                 thinking_timer_task = asyncio.create_task(
-                    self.thinking_timer(event_emitter)
+                    self._thinking_timer(event_emitter)
                 )
 
         try:
@@ -725,15 +698,11 @@ class Pipe:
                 final_response_chunk = chunk
 
                 # Stop the timer when we receive the first chunk
-                if not first_chunk_received and start_time:
-                    first_chunk_received = True
-
-                    # Cancel the timer task
-                    await self._cancel_thinking_timer(
-                        thinking_timer_task, start_time, event_emitter
-                    )
-                    # Set timer task to None to avoid duplicate cancellation in finally block
-                    thinking_timer_task = None
+                await self._cancel_thinking_timer(
+                    thinking_timer_task, start_time, event_emitter
+                )
+                # Set timer task to None to avoid duplicate cancellation in finally block and subsequent stream chunks.
+                thinking_timer_task = None
 
                 if not (candidate := self._get_first_candidate(chunk.candidates)):
                     log.warning("Stream chunk has no candidates, skipping.")
@@ -798,6 +767,31 @@ class Pipe:
                 await self._emit_toast(error_msg, event_emitter, "error")
                 log.exception(error_msg)
             log.debug("AsyncGenerator finished.")
+
+    async def _thinking_timer(
+        self, event_emitter: Callable[["Event"], Awaitable[None]]
+    ) -> None:
+        """Asynchronous task to emit periodic status updates."""
+        elapsed = 0
+        try:
+            log.info("Thinking timer started.")
+            while True:
+                await asyncio.sleep(self.valves.EMIT_INTERVAL)
+                elapsed += self.valves.EMIT_INTERVAL
+                # Format elapsed time
+                if elapsed < 60:
+                    time_str = f"{elapsed}s"
+                else:
+                    minutes, seconds = divmod(elapsed, 60)
+                    time_str = f"{minutes}m {seconds}s"
+                status_message = f"Thinking... ({time_str} elapsed)"
+                await self._emit_status(
+                    status_message, event_emitter=event_emitter, done=False
+                )
+        except asyncio.CancelledError:
+            log.debug("Timer task cancelled.")
+        except Exception:
+            log.exception("Error in timer task")
 
     async def _cancel_thinking_timer(
         self,
