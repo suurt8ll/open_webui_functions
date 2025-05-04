@@ -168,6 +168,12 @@ class Pipe:
                 "Running the logging setup again."
             )
             self._add_log_handler()
+        # Do it here in case user changed the budget.
+        self.budget_str = (
+            ""
+            if self.valves.THINKING_BUDGET is None
+            else f" • {self.valves.THINKING_BUDGET} tokens budget"
+        )
         # Return existing models if all conditions are met and no error models are present
         if (
             self.models
@@ -562,6 +568,8 @@ class Pipe:
         Turns raw text into list of genai.types.Parts objects.
         Extracts and converts markdown images to parts, preserving text order.
         """
+        # TODO: Extract generated code and it's result into genai parts too.
+
         parts: list[types.Part] = []
         last_pos = 0
 
@@ -758,7 +766,10 @@ class Pipe:
         hidden = not self.valves.EMIT_STATUS_UPDATES
         # Emit initial 'Thinking' status
         await self._emit_status(
-            "Thinking...", event_emitter=event_emitter, done=False, hidden=hidden
+            f"Thinking • 0s elapsed{self.budget_str}",
+            event_emitter=event_emitter,
+            done=False,
+            hidden=hidden,
         )
         # Record the start time
         start_time = time.time()
@@ -787,7 +798,7 @@ class Pipe:
                 else:
                     minutes, seconds = divmod(elapsed, 60)
                     time_str = f"{minutes}m {seconds}s"
-                status_message = f"Thinking... ({time_str} elapsed)"
+                status_message = f"Thinking • {time_str} elapsed{self.budget_str}"
                 await self._emit_status(
                     status_message,
                     event_emitter=event_emitter,
@@ -816,9 +827,8 @@ class Pipe:
             log.info(f"Thinking timer task successfully cancelled.")
         except Exception:
             log.exception(f"Error cancelling thinking timer task.")
-        # No status message if user valves setting is not enabled.
-        if not self.valves.EMIT_STATUS_UPDATES:
-            return
+        # Indicates if emitted status messages should be visible in the front-end.
+        hidden = not self.valves.EMIT_STATUS_UPDATES
         # Calculate elapsed time and emit final status message
         if start_time:
             total_elapsed = int(time.time() - start_time)
@@ -828,9 +838,11 @@ class Pipe:
                 minutes, seconds = divmod(total_elapsed, 60)
                 total_time_str = f"{minutes}m {seconds}s"
 
-            final_status = f"Thinking completed in {total_time_str}."
+            final_status = (
+                f"Thinking completed • took {total_time_str}{self.budget_str}"
+            )
             await self._emit_status(
-                final_status, event_emitter=event_emitter, done=True
+                final_status, event_emitter=event_emitter, done=True, hidden=hidden
             )
         else:
             # Hide the status message if stream failed.
