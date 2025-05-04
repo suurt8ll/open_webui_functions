@@ -382,20 +382,18 @@ class Pipe:
         message: str,
         event_emitter: Callable[["Event"], Awaitable[None]],
         done: bool = False,
+        hidden: bool = False,
     ) -> None:
         """Emit status updates asynchronously."""
         try:
-            if self.valves.EMIT_STATUS_UPDATES:
-                status_event: "StatusEvent" = {
-                    "type": "status",
-                    "data": {"description": message, "done": done},
-                }
-                await event_emitter(status_event)
-                log.debug(f"Emitted status: '{message}', {done=}")
-            else:
-                log.debug(
-                    f"EMIT_STATUS_UPDATES is disabled. Skipping status: '{message}'"
-                )
+            if not self.valves.EMIT_STATUS_UPDATES:
+                return
+            status_event: "StatusEvent" = {
+                "type": "status",
+                "data": {"description": message, "done": done, "hidden": hidden},
+            }
+            await event_emitter(status_event)
+            log.debug(f"Emitted status:", payload=status_event)
         except Exception:
             log.exception("Error emitting status")
 
@@ -727,36 +725,13 @@ class Pipe:
                 final_response_chunk = chunk
 
                 # Stop the timer when we receive the first chunk
-                if not first_chunk_received and thinking_timer_task and start_time:
+                if not first_chunk_received and start_time:
                     first_chunk_received = True
 
                     # Cancel the timer task
-                    thinking_timer_task.cancel()
-                    try:
-                        await thinking_timer_task
-                    except asyncio.CancelledError:
-                        log.info(
-                            "Thinking timer task successfully cancelled on first chunk."
-                        )
-                    except Exception:
-                        log.exception(
-                            "Error cancelling thinking timer task on first chunk"
-                        )
-
-                    # Calculate elapsed time and emit final status message
-                    if self.valves.EMIT_STATUS_UPDATES:
-                        total_elapsed = int(time.time() - start_time)
-                        if total_elapsed < 60:
-                            total_time_str = f"{total_elapsed}s"
-                        else:
-                            minutes, seconds = divmod(total_elapsed, 60)
-                            total_time_str = f"{minutes}m {seconds}s"
-
-                        final_status = f"Thinking completed in {total_time_str}."
-                        await self._emit_status(
-                            final_status, event_emitter=event_emitter, done=True
-                        )
-
+                    await self._cancel_thinking_timer(
+                        thinking_timer_task, start_time, event_emitter
+                    )
                     # Set timer task to None to avoid duplicate cancellation in finally block
                     thinking_timer_task = None
 
@@ -801,20 +776,8 @@ class Pipe:
             error_msg = f"Stream ended with error: {e}"
             await self._emit_error(error_msg, event_emitter)
         finally:
-            # Cancel the timer task if it exists and wasn't already cancelled
-            # TODO: Can this possibly happen?
-            if thinking_timer_task:
-                thinking_timer_task.cancel()
-                try:
-                    await thinking_timer_task
-                except asyncio.CancelledError:
-                    log.info(
-                        "Thinking timer task successfully cancelled in finally block."
-                    )
-                except Exception:
-                    log.exception(
-                        "Error cancelling thinking timer task in finally block"
-                    )
+            # Cancel the timer task if error occured before the stream could start.
+            await self._cancel_thinking_timer(thinking_timer_task, None, event_emitter)
 
             if not error_occurred:
                 log.info(f"Stream finished successfully!")
@@ -835,6 +798,46 @@ class Pipe:
                 await self._emit_toast(error_msg, event_emitter, "error")
                 log.exception(error_msg)
             log.debug("AsyncGenerator finished.")
+
+    async def _cancel_thinking_timer(
+        self,
+        timer_task: asyncio.Task[None] | None,
+        start_time: float | None,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+    ):
+        # Check if task was already canceled.
+        if not timer_task:
+            return
+        # Cancel the timer.
+        timer_task.cancel()
+        try:
+            await timer_task
+        except asyncio.CancelledError:
+            log.info(f"Thinking timer task successfully cancelled.")
+        except Exception:
+            log.exception(f"Error cancelling thinking timer task.")
+        # No status message if user valves setting is not enabled.
+        if not self.valves.EMIT_STATUS_UPDATES:
+            return
+        # Calculate elapsed time and emit final status message
+        if start_time:
+            total_elapsed = int(time.time() - start_time)
+            if total_elapsed < 60:
+                total_time_str = f"{total_elapsed}s"
+            else:
+                minutes, seconds = divmod(total_elapsed, 60)
+                total_time_str = f"{minutes}m {seconds}s"
+
+            final_status = f"Thinking completed in {total_time_str}."
+            await self._emit_status(
+                final_status, event_emitter=event_emitter, done=True
+            )
+        else:
+            # Hide the status message if stream failed.
+            final_status = f"An error occured during the thinking phase."
+            await self._emit_status(
+                final_status, event_emitter=event_emitter, done=True, hidden=True
+            )
 
     async def _do_post_processing(
         self,
