@@ -30,13 +30,14 @@ requirements: google-genai==1.11.0
 #   TODO Video input support (other than YouTube URLs).
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 
+from google import genai
+from google.genai import types
+
 import asyncio
 import copy
 import json
 import time
 from fastapi.datastructures import State
-from google import genai
-from google.genai import types
 import io
 import mimetypes
 import os
@@ -46,6 +47,7 @@ import re
 import fnmatch
 import sys
 from fastapi import Request
+import pydantic_core
 from pydantic import BaseModel, Field
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import (
@@ -60,7 +62,6 @@ from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
 from open_webui.models.functions import Functions
 from open_webui.storage.provider import Storage
-from open_webui.utils.logger import stdout_format
 from loguru import logger
 
 if TYPE_CHECKING:
@@ -125,11 +126,11 @@ class Pipe:
             default=False,
             description="Whether to emit status updates during model thinking.",
         )
-        LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = (
-            Field(
-                default="INFO",
-                description="Select logging level. Use `docker logs -f open-webui` to view logs.",
-            )
+        LOG_LEVEL: Literal[
+            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
+        ] = Field(
+            default="INFO",
+            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
 
     class UserValves(BaseModel):
@@ -150,19 +151,26 @@ class Pipe:
         # TODO: Get the id from the frontmatter instead of hardcoding it.
         valves = Functions.get_function_valves_by_id("gemini_manifold_google_genai")
         self.valves = self.Valves(**(valves if valves else {}))
-        # FIXME: There is no trigger for changing the log level if it changes inside Pipe.Valves
+        self.log_level = self.valves.LOG_LEVEL
         self._add_log_handler()
-
         # Initialize the genai client with default API given in Valves.
         self.clients = {"default": self._get_genai_client()}
         self.models: list["ModelData"] = []
         self.last_whitelist: str = self.valves.MODEL_WHITELIST
         self.last_blacklist = self.valves.MODEL_BLACKLIST
 
-        log.info("Function has been initialized.")
+        log.success("Function has been initialized.")
+        log.trace("Full self object:", payload=self.__dict__)
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
+        # Detect log level change inside self.valves
+        if self.log_level != self.valves.LOG_LEVEL:
+            log.info(
+                f"Detected log level change: {self.log_level=} and {self.valves.LOG_LEVEL=}. "
+                "Running the logging setup again."
+            )
+            self._add_log_handler()
         # Return existing models if all conditions are met and no error models are present
         if (
             self.models
@@ -171,13 +179,18 @@ class Pipe:
             and self.last_blacklist == self.valves.MODEL_BLACKLIST
             and not any(model["id"] == "error" for model in self.models)
         ):
-            log.info("Models are already initialized. Returning the cached list.")
+            log.info(
+                f"Models are cached and valid. Returning the cached list ({len(self.models)} models)."
+            )
             return self.models
 
+        log.info("Fetching and filtering models from Google API.")
         # Filter the model list based on white- and blacklist.
         self.models = self._filter_models(await self._get_genai_models())
-        log.debug("Registered models:", data=self.models)
-
+        log.info(
+            f"Finished processing models. Returning {len(self.models)} models to Open WebUI."
+        )
+        log.debug("Model list:", payload=self.models, _log_truncation_enabled=False)
         return self.models
 
     async def pipe(
@@ -189,17 +202,22 @@ class Pipe:
         __metadata__: dict[str, Any],
     ) -> AsyncGenerator | str | None:
 
+        # Obtain Genai client
         if not (client := self._get_user_client(__user__)):
             error_msg = "There are no usable genai clients, check the logs."
-            log.error(error_msg)
             raise ValueError(error_msg)
-        if self.clients.get("default") == client and self.valves.REQUIRE_USER_API_KEY:
-            error_msg = "You have not defined your own API key in UserValves. You need to define in to continue."
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        if self.clients.get("default") == client:
+            if self.valves.REQUIRE_USER_API_KEY:
+                error_msg = "You have not defined your own API key in UserValves. You need to define in to continue."
+                raise ValueError(error_msg)
+            else:
+                log.info("Using genai client with the default API key.")
+        else:
+            log.info(f'Using genai client with user {__user__.get("email")} API key.')
+
+        # Check if user is chatting with an error model for some reason.
         if "error" in __metadata__["model"]["id"]:
             error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
-            log.error(error_msg)
             raise ValueError(error_msg)
 
         # Get the message history directly from the backend.
@@ -213,7 +231,9 @@ class Pipe:
             warn_msg = f"Chat with ID - {chat_id} - not found. Can't filter out the citation marks."
             log.warning(warn_msg)
             messages_db = None
-
+        log.info(
+            "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
+        )
         contents, system_prompt = self._genai_contents_from_messages(
             body.get("messages"), messages_db
         )
@@ -221,7 +241,7 @@ class Pipe:
         # API does not stream thoughts sadly. See https://github.com/googleapis/python-genai/issues/226#issuecomment-2631657100
         thinking_conf = None
         if self.is_thinking_model(model_name):
-            log.info("This is a thinking model. Adding thinking_config options.")
+            log.info(f"Model ID '{model_name}' is a thinking model.")
             thinking_conf = types.ThinkingConfig(
                 thinking_budget=self.valves.THINKING_BUDGET, include_thoughts=None
             )
@@ -244,7 +264,7 @@ class Pipe:
         ):
             if "gemini-2.0-flash-exp-image-generation" in model_name:
                 gen_content_conf.response_modalities.append("Image")
-            # FIXME: append to user message instead.
+            # TODO: append to user message instead.
             if gen_content_conf.system_instruction:
                 gen_content_conf.system_instruction = None
                 log.warning(
@@ -281,8 +301,7 @@ class Pipe:
             "contents": contents,
             "config": gen_content_conf,
         }
-        log.debug("Passing these args to the Google API:")
-        print(self._truncate_long_strings(gen_content_args, max_length=512))
+        log.debug("Passing these args to the Google API:", payload=gen_content_args)
 
         if body.get("stream", False):
             # Streaming response
@@ -302,20 +321,23 @@ class Pipe:
             # Non-streaming response.
             if "gemini-2.0-flash-exp-image-generation" in model_name:
                 warn_msg = "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
-                log.warning(warn_msg)
                 raise NotImplementedError(warn_msg)
-            # FIXME: Support native image gen here too.
-            # FIXME: Support code execution here too.
+            # TODO: Support native image gen here too.
+            # TODO: Support code execution here too.
             res = await client.aio.models.generate_content(**gen_content_args)
             if raw_text := res.text:
+                log.info("Non-streaming response finished successfully!")
+                log.debug("Non-streaming response:", payload=res)
                 await self._do_post_processing(
                     res, __event_emitter__, __metadata__, __request__
                 )
-                log.info("pipe method has finished it's run.")
+                log.info(
+                    "Streaming disabled. Returning full response as str. "
+                    "With that Pipe.pipe method has finished it's run!"
+                )
                 return raw_text
             else:
                 warn_msg = "Non-streaming response did not have any text inside it."
-                log.warning(warn_msg)
                 raise ValueError(warn_msg)
 
     # region Helper methods inside the Pipe class
@@ -348,7 +370,6 @@ class Pipe:
             result = bool(
                 re.search(self.valves.THINKING_MODEL_PATTERN, model_id, re.IGNORECASE)
             )
-            log.debug(f"Model ID '{model_id}' is a thinking model: {result}")
             return result
         except Exception:
             log.exception("Error checking if model is a thinking model")
@@ -382,6 +403,7 @@ class Pipe:
         """Asynchronous task to emit periodic status updates."""
         elapsed = 0
         try:
+            log.info("Thinking timer started.")
             while True:
                 await asyncio.sleep(self.valves.EMIT_INTERVAL)
                 elapsed += self.valves.EMIT_INTERVAL
@@ -423,6 +445,7 @@ class Pipe:
         event_emitter: Callable[["Event"], Awaitable[None]],
         toastType: Literal["info", "success", "warning", "error"] = "info",
     ) -> None:
+        # TODO: Use this method in more places, even for info toasts.
         event: NotificationEvent = {
             "type": "notification",
             "data": {"type": toastType, "content": msg},
@@ -556,7 +579,7 @@ class Pipe:
                 )
         except Exception:
             # TODO: Send warnin toast to user in front-end.
-            log.exception("Error processing image URL.", image_url=image_url)
+            log.exception(f"Error processing image URL: {image_url[:64]}[...]")
             return None
 
     def _genai_parts_from_text(self, text: str) -> list[types.Part]:
@@ -584,7 +607,7 @@ class Pipe:
                     log.debug(
                         "Found base64 image link!",
                         mime_type=mime_type,
-                        base64_data=match.group(3)[:50] + "...",
+                        base64_data=match.group(3)[:64] + "[...]",
                     )
                     image_part = types.Part.from_bytes(
                         data=base64.b64decode(base64_data),
@@ -592,6 +615,7 @@ class Pipe:
                     )
                     parts.append(image_part)
                 except Exception:
+                    # TODO: Emit toast
                     log.exception("Error decoding base64 image:")
 
             elif match.group(4):  # File URL
@@ -600,6 +624,7 @@ class Pipe:
                 file_model = Files.get_file_by_id(file_id)
 
                 if file_model is None:
+                    # TODO: Emit toast
                     log.warning("File with this ID not found.", id=file_id)
                     #  Could add placeholder text here if desired
                     continue  # Skip to the next match
@@ -608,6 +633,7 @@ class Pipe:
                     # "continue" above ensures that file_model is not None
                     content_type = file_model.meta.get("content_type")  # type: ignore
                     if content_type is None:
+                        # TODO: Emit toast
                         log.warning(
                             "Content type not found for this file ID.",
                             id=file_id,
@@ -623,17 +649,20 @@ class Pipe:
                     parts.append(image_part)
 
                 except FileNotFoundError:
+                    # TODO: Emit toast
                     log.exception(
                         "File not found on disk for this ID.",
                         id=file_id,
                         path=file_model.path,
                     )
                 except KeyError:
+                    # TODO: Emit toast
                     log.exception(
                         "Metadata error for this file ID: 'content_type' missing.",
                         id=file_id,
                     )
                 except Exception:
+                    # TODO: Emit toast
                     log.exception("Error processing file with this ID", id=file_id)
 
             last_pos = match.end()
@@ -667,9 +696,11 @@ class Pipe:
         thinking_timer_task = None
         start_time = None
         model_name = gen_content_args.get("model", "")
+        # FIXME: This is not needed?
         first_chunk_received = False
 
         # Check if this is a thinking model and initialize timer if needed
+        # TODO: refac
         if self.is_thinking_model(model_name):
             # Emit initial 'Thinking' status
             if self.valves.EMIT_STATUS_UPDATES:
@@ -702,9 +733,13 @@ class Pipe:
                     try:
                         await thinking_timer_task
                     except asyncio.CancelledError:
-                        log.debug("Timer task successfully cancelled on first chunk.")
+                        log.info(
+                            "Thinking timer task successfully cancelled on first chunk."
+                        )
                     except Exception:
-                        log.exception("Error cancelling timer task on first chunk")
+                        log.exception(
+                            "Error cancelling thinking timer task on first chunk"
+                        )
 
                     # Calculate elapsed time and emit final status message
                     if self.valves.EMIT_STATUS_UPDATES:
@@ -761,20 +796,27 @@ class Pipe:
                         )
         except Exception as e:
             error_occurred = True
-            error_msg = f"Error during stream processing: {e}"
+            error_msg = f"Stream ended with error: {e}"
             await self._emit_error(error_msg, event_emitter)
         finally:
             # Cancel the timer task if it exists and wasn't already cancelled
+            # TODO: Can this possibly happen?
             if thinking_timer_task:
                 thinking_timer_task.cancel()
                 try:
                     await thinking_timer_task
                 except asyncio.CancelledError:
-                    log.debug("Timer task successfully cancelled in finally block.")
+                    log.info(
+                        "Thinking timer task successfully cancelled in finally block."
+                    )
                 except Exception:
-                    log.exception("Error cancelling timer task in finally block")
+                    log.exception(
+                        "Error cancelling thinking timer task in finally block"
+                    )
 
-            log.info(f"Stream finished.")
+            if not error_occurred:
+                log.info(f"Stream finished successfully!")
+                log.debug("Last chunk:", payload=final_response_chunk)
             try:
                 # Catch and emit any errors that might happen here as a toast message.
                 await self._do_post_processing(
@@ -787,6 +829,7 @@ class Pipe:
                 )
             except Exception as e:
                 error_msg = f"Post-processing failed with error:\n\n{e}"
+                # Using toast here in order to keep the inital AI response untouched.
                 await self._emit_toast(error_msg, event_emitter, "error")
                 log.exception(error_msg)
             log.debug("AsyncGenerator finished.")
@@ -827,11 +870,12 @@ class Pipe:
             log.error(error_msg)
             return
         else:
-            log.info(f"Response has correct finish reason: {finish_reason}.")
+            log.debug(f"Response has correct finish reason: {finish_reason}.")
 
         # Emit token usage data.
         if usage_event := self._get_usage_data_event(model_response):
-            log.info("Emitting usage data.")
+            log.debug("Emitting usage data:", payload=usage_event)
+            # TODO: catch potential errors?
             await event_emitter(usage_event)
         self._add_grounding_data_to_state(model_response, metadata, request)
 
@@ -849,7 +893,7 @@ class Pipe:
         storage_key = f"grounding_{chat_id}_{message_id}"
 
         if grounding_metadata_obj:
-            log.info(
+            log.debug(
                 f"Found grounding metadata. Storing in in request's app state using key {storage_key}."
             )
             # Using shared `request.app.state` to pass grounding metadata to Filter.outlet.
@@ -859,14 +903,14 @@ class Pipe:
             app_state: State = request.app.state
             app_state._state[storage_key] = grounding_metadata_obj
         else:
-            log.info(f"Response {message_id} does not have grounding metadata.")
+            log.debug(f"Response {message_id} does not have grounding metadata.")
 
     def _get_first_candidate(
         self, candidates: list[types.Candidate] | None
     ) -> types.Candidate | None:
         """Selects the first candidate, logging a warning if multiple exist."""
         if not candidates:
-            log.warning("Received chunk with no candidates, skipping processing.")
+            # Logging warnings is handled downstream.
             return None
         if len(candidates) > 1:
             log.warning("Multiple candidates found, defaulting to first candidate.")
@@ -958,15 +1002,17 @@ class Pipe:
         }
 
         # Upload the image to user configured storage provider.
-        log.info("Uploading the image to the configured storage provider.")
+        log.info("Uploading the model generated image to Open WebUI backend.")
+        log.debug("Uploading to the configured storage provider.")
         try:
             contents, image_path = Storage.upload_file(image, imagename)
         except Exception:
             error_msg = f"Error occurred during upload to the storage provider."
+            # TODO: emit toast
             log.exception(error_msg)
             return None
         # Add the image file to files database.
-        log.info("Adding the image file to Open WebUI files database.")
+        log.debug("Adding the image file to Open WebUI files database.")
         file_item = Files.insert_new_file(
             user_id,
             FileForm(
@@ -982,12 +1028,15 @@ class Pipe:
             ),
         )
         if not file_item:
-            log.warning("Files.insert_new_file did not return anything.")
+            log.warning(
+                "Files.insert_new_file did not return anything. Image upload to Open WebUI database likely failed."
+            )
             return None
         # Get the image url.
         image_url: str = __request__.app.url_path_for(
             "get_file_content_by_id", id=file_item.id
         )
+        log.success("Image upload finished!")
         return image_url
 
     # endregion
@@ -1006,7 +1055,7 @@ class Pipe:
                     api_key=api_key,
                     http_options=http_options,
                 )
-                log.info("genai client successfully initialized!")
+                log.success("Genai client successfully initialized!")
             except Exception:
                 log.exception("genai client initialization failed.")
         else:
@@ -1021,18 +1070,15 @@ class Pipe:
             and user_valves.GEMINI_API_KEY
             and not self.clients.get(__user__["id"])
         ):
+            log.info(f'Creating a new genai client for user {__user__.get("email")}')
             self.clients[__user__.get("id")] = self._get_genai_client(
                 api_key=user_valves.GEMINI_API_KEY,
                 base_url=user_valves.GEMINI_API_BASE_URL,
             )
-            log.info(
-                f'Creating a new genai client for user {__user__.get("email")} clients dict now looks like:\n{self.clients}.'
-            )
+            log.debug("Genai clients dict now looks like this:", payload=self.clients)
         if user_client := self.clients.get(__user__.get("id")):
-            log.info(f'Using genai client with user {__user__.get("email")} API key.')
             return user_client
         else:
-            log.info("Using genai client with the default API key.")
             return self.clients.get("default")
 
     async def _get_genai_models(self) -> list[types.Model]:
@@ -1040,7 +1086,6 @@ class Pipe:
         Gets valid Google models from the API.
         Returns a list of `genai.types.Model` objects.
         """
-        google_models = None
         client = self.clients.get("default")
         if not client:
             log.warning("There is no usable genai client. Trying to create one.")
@@ -1050,17 +1095,34 @@ class Pipe:
             else:
                 log.error("Can't initialize the client, returning no models.")
                 return []
+
         # This executes if we have a working client.
+        google_models_pager = None
         try:
-            google_models = await client.aio.models.list(config={"query_base": True})
+            # Get the AsyncPager object
+            google_models_pager = await client.aio.models.list(
+                config={"query_base": True}
+            )
         except Exception:
             log.exception("Retriving models from Google API failed.")
             return []
-        log.info(f"Retrieved {len(google_models)} models from Gemini Developer API.")
+
+        # Iterate the pager to get the full list of models
+        # This is where the actual API calls for subsequent pages happen if needed
+        try:
+            all_google_models = [model async for model in google_models_pager]
+        except Exception:
+            log.exception("Iterating Google models pager failed.")
+            return []
+
+        log.info(
+            f"Retrieved {len(all_google_models)} models from Gemini Developer API."
+        )
+        log.trace("All models returned by Google:", payload=all_google_models)
         # Filter Google models list down to generative models only.
         return [
             model
-            for model in google_models
+            for model in all_google_models
             if model.supported_actions and "generateContent" in model.supported_actions
         ]
 
@@ -1085,7 +1147,8 @@ class Pipe:
             if self.valves.MODEL_BLACKLIST
             else []
         )
-        return [
+        # Perform filtering and store the result
+        filtered_models: list["ModelData"] = [
             {
                 "id": self._strip_prefix(model.name),
                 "name": model.display_name,
@@ -1097,6 +1160,11 @@ class Pipe:
             and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
             and not any(fnmatch.fnmatch(model.name, f"models/{b}") for b in blacklist)
         ]
+        # Add an info log to report the result of the filtering process
+        log.info(
+            f"Filtered {len(google_models)} raw models down to {len(filtered_models)} models based on white/blacklists."
+        )
+        return filtered_models
 
     def _get_safety_settings(self, model_name: str) -> list[types.SafetySetting]:
         """Get safety settings based on model name and permissive setting."""
@@ -1166,6 +1234,7 @@ class Pipe:
     # region Citations
 
     def _remove_citation_markers(self, text: str, sources: list["Source"]) -> str:
+        original_text = text
         processed: set[str] = set()
         for source in sources:
             supports = [
@@ -1199,6 +1268,10 @@ class Pipe:
                         text[: pos + len(segment_text)]
                         + text[pos + len(segment_text) + len(citation_markers) :]
                     )
+        trim = len(original_text) - len(text)
+        log.debug(
+            f"Citation removal finished. Returning text str that is {trim} character shorter than the original input."
+        )
         return text
 
     # endregion
@@ -1247,81 +1320,230 @@ class Pipe:
     # endregion
 
     # region Other helpers
-    def _truncate_long_strings(self, data: Any, max_length: int = 64) -> str:
+    def _is_flat_dict(self, data: Any) -> bool:
         """
-        Recursively truncates all string and bytes fields within a dictionary or list that exceed
-        the specified maximum length. Handles Pydantic BaseModel instances by converting them to dicts.
-        The original input data remains unmodified.
+        Checks if a dictionary contains only non-dict/non-list values (is one level deep).
+        """
+        if not isinstance(data, dict):
+            return False
+        return not any(isinstance(value, (dict, list)) for value in data.values())
+
+    def _truncate_long_strings(
+        self, data: Any, max_len: int, truncation_marker: str, truncation_enabled: bool
+    ) -> Any:
+        """
+        Recursively traverses a data structure (dicts, lists) and truncates
+        long string values. Creates copies to avoid modifying original data.
 
         Args:
-            data: A dictionary, list, or Pydantic BaseModel instance containing data that may include Pydantic models or dictionaries.
-            max_length: The maximum length of strings before truncation.
+            data: The data structure (dict, list, str, int, float, bool, None) to process.
+            max_len: The maximum allowed length for string values.
+            truncation_marker: The string to append to truncated values.
+            truncation_enabled: Whether truncation is enabled.
 
         Returns:
-            A nicely formatted string representation of the modified data with long strings truncated.
+            A potentially new data structure with long strings truncated.
+        """
+        if not truncation_enabled or max_len <= len(truncation_marker):
+            # If truncation is disabled or max_len is too small, return original
+            # Make a copy only if it's a mutable type we might otherwise modify
+            if isinstance(data, (dict, list)):
+                return copy.deepcopy(data)  # Ensure deep copy for nested structures
+            return data  # Primitives are immutable
+
+        if isinstance(data, str):
+            if len(data) > max_len:
+                return data[: max_len - len(truncation_marker)] + truncation_marker
+            return data  # Return original string if not truncated
+        elif isinstance(data, dict):
+            # Process dictionary items, creating a new dict
+            return {
+                k: self._truncate_long_strings(
+                    v, max_len, truncation_marker, truncation_enabled
+                )
+                for k, v in data.items()
+            }
+        elif isinstance(data, list):
+            # Process list items, creating a new list
+            return [
+                self._truncate_long_strings(
+                    item, max_len, truncation_marker, truncation_enabled
+                )
+                for item in data
+            ]
+        else:
+            # Return non-string, non-container types as is (they are immutable)
+            return data
+
+    def plugin_stdout_format(self, record: "Record") -> str:
+        """
+        Custom format function for the plugin's logs.
+        Serializes and truncates data passed under the 'payload' key in extra.
         """
 
-        def process_data(data: Any, max_length: int) -> Any:
-            if isinstance(data, BaseModel):
-                data_dict = data.model_dump()
-                return process_data(data_dict, max_length)
-            elif isinstance(data, dict):
-                for key, value in list(data.items()):
-                    data[key] = process_data(value, max_length)
-                return data
-            elif isinstance(data, list):
-                for idx, item in enumerate(data):
-                    data[idx] = process_data(item, max_length)
-                return data
-            elif isinstance(data, str):
-                if len(data) > max_length:
-                    truncated_length = len(data) - max_length
-                    return f"{data[:max_length]}[{truncated_length} chars truncated]"
-                return data
-            elif isinstance(data, bytes):
-                hex_str = data.hex()
-                if len(hex_str) > max_length:
-                    truncated_length = len(hex_str) - max_length
-                    return f"{hex_str[:max_length]}[{truncated_length} chars truncated]"
-                else:
-                    return hex_str
-            else:
-                return data
+        # Configuration Keys
+        LOG_OPTIONS_PREFIX = "_log_"
+        TRUNCATION_ENABLED_KEY = f"{LOG_OPTIONS_PREFIX}truncation_enabled"
+        MAX_LENGTH_KEY = f"{LOG_OPTIONS_PREFIX}max_length"
+        TRUNCATION_MARKER_KEY = f"{LOG_OPTIONS_PREFIX}truncation_marker"
+        DATA_KEY = "payload"
 
-        copied_data = copy.deepcopy(data)
-        processed = process_data(copied_data, max_length)
-        return json.dumps(processed, indent=2, default=str)
+        original_extra = record["extra"]
+        # Extract the data intended for serialization using the chosen key
+        data_to_process = original_extra.get(DATA_KEY)
+
+        serialized_data_json = ""
+        if data_to_process is not None:
+            try:
+                serializable_data = pydantic_core.to_jsonable_python(
+                    data_to_process, serialize_unknown=True
+                )
+
+                # Determine truncation settings
+                truncation_enabled = original_extra.get(TRUNCATION_ENABLED_KEY, True)
+                max_length = original_extra.get(MAX_LENGTH_KEY, 256)
+                truncation_marker = original_extra.get(TRUNCATION_MARKER_KEY, "[...]")
+
+                # If max_length was explicitly provided, force truncation enabled
+                if MAX_LENGTH_KEY in original_extra:
+                    truncation_enabled = True
+
+                # Truncate long strings
+                truncated_data = self._truncate_long_strings(
+                    serializable_data,
+                    max_length,
+                    truncation_marker,
+                    truncation_enabled,
+                )
+
+                # Serialize the (potentially truncated) data
+                if self._is_flat_dict(truncated_data) and not isinstance(
+                    truncated_data, list
+                ):
+                    json_string = json.dumps(
+                        truncated_data, separators=(",", ":"), default=str
+                    )
+                    # Add a simple prefix if it's compact
+                    serialized_data_json = " - " + json_string
+                else:
+                    json_string = json.dumps(truncated_data, indent=2, default=str)
+                    # Prepend with newline for readability
+                    serialized_data_json = "\n" + json_string
+
+            except (TypeError, ValueError) as e:  # Catch specific serialization errors
+                serialized_data_json = f" - {{Serialization Error: {e}}}"
+            except (
+                Exception
+            ) as e:  # Catch any other unexpected errors during processing
+                serialized_data_json = f" - {{Processing Error: {e}}}"
+
+        # Add the final JSON string (or error message) back into the record
+        record["extra"]["_plugin_serialized_data"] = serialized_data_json
+
+        # Base template
+        base_template = (
+            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+            "<level>{message}</level>"
+        )
+
+        # Append the serialized data
+        base_template += "{extra[_plugin_serialized_data]}"
+        # Append the exception part
+        base_template += "\n{exception}"
+        # Return the format string template
+        return base_template.rstrip()
 
     def _add_log_handler(self):
-        """Adds handler to the root loguru instance for this plugin if one does not exist already."""
+        """
+        Adds or updates the loguru handler specifically for this plugin.
+        Includes logic for serializing and truncating extra data.
+        """
 
         def plugin_filter(record: "Record"):
             """Filter function to only allow logs from this plugin (based on module name)."""
-            return record["name"] == __name__  # Filter by module name
+            return record["name"] == __name__
+
+        # Get the desired level name and number
+        desired_level_name = self.valves.LOG_LEVEL
+        try:
+            # Use the public API to get level details
+            desired_level_info = log.level(desired_level_name)
+            desired_level_no = desired_level_info.no
+        except ValueError:
+            log.error(
+                f"Invalid LOG_LEVEL '{desired_level_name}' configured for plugin {__name__}. Cannot add/update handler."
+            )
+            return  # Stop processing if the level is invalid
 
         # Access the internal state of the log
         handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
-        for key, handler in handlers.items():
-            existing_filter = handler._filter
-            # FIXME: Check log level too.
-            if (
-                hasattr(existing_filter, "__name__")
+        handler_id_to_remove = None
+        found_correct_handler = False
+
+        for handler_id, handler in handlers.items():
+            existing_filter = handler._filter  # Access internal attribute
+
+            # Check if the filter matches our plugin_filter
+            # Comparing function objects directly can be fragile if they are recreated.
+            # Comparing by name and module is more robust for functions defined at module level.
+            is_our_filter = (
+                existing_filter is not None  # Make sure a filter is set
+                and hasattr(existing_filter, "__name__")
                 and existing_filter.__name__ == plugin_filter.__name__
                 and hasattr(existing_filter, "__module__")
                 and existing_filter.__module__ == plugin_filter.__module__
-            ):
-                log.debug("Handler for this plugin is already present!")
-                return
+            )
 
-        log.add(
-            sys.stdout,
-            level=self.valves.LOG_LEVEL,
-            format=stdout_format,
-            filter=plugin_filter,
-        )
-        log.info(
-            f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
-        )
+            if is_our_filter:
+                existing_level_no = handler.levelno
+                log.trace(
+                    f"Found existing handler {handler_id} for {__name__} with level number {existing_level_no}."
+                )
+
+                # Check if the level matches the desired level
+                if existing_level_no == desired_level_no:
+                    log.debug(
+                        f"Handler {handler_id} for {__name__} already exists with the correct level '{desired_level_name}'."
+                    )
+                    found_correct_handler = True
+                    break  # Found the correct handler, no action needed
+                else:
+                    # Found our handler, but the level is wrong. Mark for removal.
+                    log.info(
+                        f"Handler {handler_id} for {__name__} found, but log level differs "
+                        f"(existing: {existing_level_no}, desired: {desired_level_no}). "
+                        f"Removing it to update."
+                    )
+                    handler_id_to_remove = handler_id
+                    break  # Found the handler to replace, stop searching
+
+        # Remove the old handler if marked for removal
+        if handler_id_to_remove is not None:
+            try:
+                log.remove(handler_id_to_remove)
+                log.debug(f"Removed handler {handler_id_to_remove} for {__name__}.")
+            except ValueError:
+                # This might happen if the handler was somehow removed between the check and now
+                log.warning(
+                    f"Could not remove handler {handler_id_to_remove} for {__name__}. It might have already been removed."
+                )
+                # If removal failed but we intended to remove, we should still proceed to add
+                # unless found_correct_handler is somehow True (which it shouldn't be if handler_id_to_remove was set).
+
+        # Add a new handler if no correct one was found OR if we just removed an incorrect one
+        if not found_correct_handler:
+            self.log_level = desired_level_name
+            log.add(
+                sys.stdout,
+                level=desired_level_name,
+                format=self.plugin_stdout_format,
+                filter=plugin_filter,
+            )
+            log.debug(
+                f"Added new handler to loguru for {__name__} with level {desired_level_name}."
+            )
 
     def _get_mime_type(self, file_uri: str) -> str:
         """
@@ -1348,6 +1570,7 @@ class Pipe:
             youtube_urls.append(match.group(0))
 
         if youtube_urls:
+            # TODO: toast
             log.info(f"Extracted YouTube URLs: {youtube_urls}")
 
         return youtube_urls

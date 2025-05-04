@@ -82,11 +82,11 @@ class Filter:
             description="""See https://ai.google.dev/gemini-api/docs/grounding?lang=python#dynamic-threshold for more information.
             Only supported for 1.0 and 1.5 models""",
         )
-        LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = (
-            Field(
-                default="INFO",
-                description="Select logging level. Use `docker logs -f open-webui` to view logs.",
-            )
+        LOG_LEVEL: Literal[
+            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
+        ] = Field(
+            default="INFO",
+            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
 
     # TODO: Support user settting through UserValves.
