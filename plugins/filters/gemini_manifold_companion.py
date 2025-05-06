@@ -105,12 +105,20 @@ class Filter:
         # TODO: Get the id from the frontmatter instead of hardcoding it.
         valves = Functions.get_function_valves_by_id("gemini_manifold_companion")
         self.valves = self.Valves(**(valves if valves else {}))
-        # FIXME: There is no trigger for changing the log level if it changes inside Pipe.Valves
+        self.log_level = self.valves.LOG_LEVEL
         self._add_log_handler()
         log.info("Filter function has been initialized!")
 
     def inlet(self, body: dict) -> dict:
         """Modifies the incoming request payload before it's sent to the LLM. Operates on the `form_data` dictionary."""
+
+        # Detect log level change inside self.valves
+        if self.log_level != self.valves.LOG_LEVEL:
+            log.info(
+                f"Detected log level change: {self.log_level=} and {self.valves.LOG_LEVEL=}. "
+                "Running the logging setup again."
+            )
+            self._add_log_handler()
 
         # Exit early if we are filtering an unsupported model.
         model_name: str = body.get("model", "")
