@@ -242,7 +242,7 @@ class Pipe:
         safety_settings: list[types.SafetySetting] | None = __metadata__.get(
             "safety_settings"
         )
-        model_name = self._strip_prefix(body.get("model", ""))
+        model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
         # API does not stream thoughts sadly. See https://github.com/googleapis/python-genai/issues/226#issuecomment-2631657100
         thinking_conf = None
         if model_name == "gemini-2.5-flash-preview-04-17":
@@ -457,7 +457,7 @@ class Pipe:
         # Perform filtering and store the result
         filtered_models: list["ModelData"] = [
             {
-                "id": self._strip_prefix(model.name),
+                "id": re.sub(r"^.*?[./]", "", model.name),
                 "name": model.display_name,
                 "description": model.description,
             }
@@ -472,21 +472,6 @@ class Pipe:
             f"Filtered {len(google_models)} raw models down to {len(filtered_models)} models based on white/blacklists."
         )
         return filtered_models
-
-    def _strip_prefix(self, model_name: str) -> str:
-        """
-        Strip any prefix from the model name up to and including the first '.' or '/'.
-        This makes the method generic and adaptable to varying prefixes.
-        """
-        # TODO: [refac] pointless helper, remove.
-        try:
-            # Use non-greedy regex to remove everything up to and including the first '.' or '/'
-            stripped = re.sub(r"^.*?[./]", "", model_name)
-            return stripped
-        except Exception:
-            error_msg = "Error stripping prefix, using the original model name."
-            log.exception(error_msg)
-            return model_name
 
     # endregion
 
