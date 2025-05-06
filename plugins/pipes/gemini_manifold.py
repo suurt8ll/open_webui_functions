@@ -346,9 +346,9 @@ class Pipe:
                 warn_msg = "Non-streaming response did not have any text inside it."
                 raise ValueError(warn_msg)
 
-    # region ========== Helper methods inside the Pipe class ==========
+    # region 1. Helper methods inside the Pipe class
 
-    # region Client initialization and model retrival from Google API
+    # region 1.1 Client initialization and model retrival from Google API
     def _get_genai_client(
         self, api_key: str | None = None, base_url: str | None = None
     ) -> genai.Client | None:
@@ -473,9 +473,9 @@ class Pipe:
         )
         return filtered_models
 
-    # endregion
+    # endregion 1.1 Client initialization and model retrival from Google API
 
-    # region Open WebUI's body.messages -> list[genai.types.Content] conversion
+    # region 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
     def _genai_contents_from_messages(
         self, messages_body: list["Message"], messages_db: list["MessageModel"] | None
     ) -> tuple[list[types.Content], str | None]:
@@ -704,9 +704,9 @@ class Pipe:
 
         return youtube_urls
 
-    # endregion
+    # endregion 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
 
-    # region Event emission and error logging
+    # region 1.3 Event emission and error logging
     async def _emit_completion(
         self,
         event_emitter: Callable[["Event"], Awaitable[None]],
@@ -803,9 +803,9 @@ class Pipe:
             "description": error_msg,
         }
 
-    # endregion
+    # endregion 1.3 Event emission and error logging
 
-    # region Model response streaming
+    # region 1.4 Model response streaming
     async def _stream_response_generator(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
@@ -1027,9 +1027,9 @@ class Pipe:
         else:
             return None
 
-    # endregion
+    # endregion 1.4 Model response streaming
 
-    # region Thinking status message
+    # region 1.5 Thinking status message
     def _get_budget_str(self, model_name: str) -> str:
         return (
             f" • {self.valves.THINKING_BUDGET} tokens budget"
@@ -1141,9 +1141,9 @@ class Pipe:
                 final_status, event_emitter=event_emitter, done=True, hidden=True
             )
 
-    # endregion
+    # endregion 1.5 Thinking status message
 
-    # region Post-processing
+    # region 1.6 Post-processing
     async def _do_post_processing(
         self,
         model_response: types.GenerateContentResponse | None,
@@ -1296,9 +1296,9 @@ class Pipe:
         }
         return completion_event
 
-    # endregion
+    # endregion 1.6 Post-processing
 
-    # region Utility helpers
+    # region 1.7 Utility helpers
     def _is_flat_dict(self, data: Any) -> bool:
         """
         Checks if a dictionary contains only non-dict/non-list values (is one level deep).
@@ -1544,6 +1544,6 @@ class Pipe:
             log.warning("Multiple candidates found, defaulting to first candidate.")
         return candidates[0]
 
-    # endregion
+    # endregion 1.7 Utility helpers
 
-    # endregion
+    # endregion 1. Helper methods inside the Pipe class
