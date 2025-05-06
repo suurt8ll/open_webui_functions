@@ -30,6 +30,7 @@ requirements: google-genai==1.13.0
 #   TODO Video input support (other than YouTube URLs).
 #   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 
+import inspect
 from google import genai
 from google.genai import types
 
@@ -46,6 +47,7 @@ import base64
 import re
 import fnmatch
 import sys
+from loguru import logger
 from fastapi import Request
 import pydantic_core
 from pydantic import BaseModel, Field
@@ -62,7 +64,6 @@ from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
 from open_webui.models.functions import Functions
 from open_webui.storage.provider import Storage
-from loguru import logger
 
 if TYPE_CHECKING:
     from loguru import Record
@@ -868,10 +869,22 @@ class Pipe:
         log.info("Uploading the model generated image to Open WebUI backend.")
         log.debug("Uploading to the configured storage provider.")
         try:
-            contents, image_path = Storage.upload_file(image, imagename)
+            # Dynamically check if 'tags' parameter exists
+            sig = inspect.signature(Storage.upload_file)
+            has_tags = "tags" in sig.parameters
+        except Exception as e:
+            log.error(f"Error checking Storage.upload_file signature: {e}")
+            has_tags = False  # Default to old behavior
+
+        try:
+            if has_tags:
+                # New version with tags support >=v0.6.6
+                contents, image_path = Storage.upload_file(image, imagename, tags={})
+            else:
+                # Old version without tags <v0.6.5
+                contents, image_path = Storage.upload_file(image, imagename)  # type: ignore
         except Exception:
-            error_msg = f"Error occurred during upload to the storage provider."
-            # TODO: emit toast
+            error_msg = "Error occurred during upload to the storage provider."
             log.exception(error_msg)
             return None
         # Add the image file to files database.
