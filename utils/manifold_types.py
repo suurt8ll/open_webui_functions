@@ -3,22 +3,58 @@ from uuid import UUID
 from datetime import datetime
 from open_webui.models.files import FileModelResponse
 
-# TODO Contruct a type for `__metadata__`.
+# ---------- File Structures ----------
+# Define the nested structures found within the 'files' list items
+# and also within metadata.files
 
-# ---------- __event_emitter__ ----------
+
+class FileData(TypedDict):
+    """Represents the data extracted from a file."""
+
+    content: str  # Example shows text content
+
+
+class FileMeta(TypedDict):
+    """Represents metadata about a file."""
+
+    name: str
+    content_type: str
+    size: int
+    data: dict[
+        str, Any
+    ]  # Example shows empty dict, but could potentially hold other meta
+    collection_name: str
+
+
+class FileDetails(TypedDict):
+    """Represents detailed information about a file."""
+
+    id: str  # UUID
+    user_id: str  # UUID
+    hash: str
+    filename: str
+    data: FileData
+    meta: FileMeta
+    created_at: int  # Unix timestamp
+    updated_at: int  # Unix timestamp
 
 
 class FileInfo(TypedDict):
-    type: str  # could be "file", "image"
-    file: FileModelResponse
-    id: str
-    url: str
-    name: str
-    collection_name: str | None
-    status: str
-    size: int
-    error: str
-    itemId: str
+    """Represents an item in the top-level 'files' list or metadata.files."""
+
+    type: Literal["file"]  # The type of the item, always "file" for file uploads
+    file: FileDetails  # Detailed file information
+    id: str  # UUID (seems to duplicate file.id)
+    url: str  # API endpoint for the file
+    name: str  # (seems to duplicate file.filename and file.meta.name)
+    collection_name: str  # (seems to duplicate file.meta.collection_name)
+    status: str  # e.g., "uploaded", "processing", "error"
+    size: int  # (seems to duplicate file.meta.size)
+    error: str  # Error message if status is "error"
+    itemId: str  # UUID (seems to be a unique ID for this specific file *usage* in the message)
+
+
+# ---------- __event_emitter__ ----------
 
 
 class SourceSource(TypedDict):
@@ -90,56 +126,169 @@ class StatusEvent(TypedDict):
 
 Event = ChatCompletionEvent | StatusEvent | NotificationEvent
 
-# ---------- body ----------
+# ---------- Message Content ----------
+# These seem fine and cover multimodal cases, even if the example only shows text.
 
 
 class TextContent(TypedDict):
+    """Represents text content within a message."""
+
     type: Literal["text"]
     text: str
 
 
 class ImageURL(TypedDict):
-    url: str  # data:image/png;base64,iVBORw0KGgoAAAA....
+    """Represents an image URL within a message."""
+
+    url: str  # e.g., data:image/png;base64,iVBw0KGgoAAAA.... or a standard URL
 
 
 class ImageContent(TypedDict):
+    """Represents image content within a message."""
+
     type: Literal["image_url"]
     image_url: ImageURL
 
 
-Content = TextContent | ImageContent
+Content = TextContent | ImageContent  # Union of possible content types
+
+# ---------- Messages ----------
+# These also seem fine and cover different roles and multimodal content.
 
 
 class UserMessage(TypedDict):
+    """Represents a message from the user."""
+
     role: Literal["user"]
-    content: str | list[Content]
+    content: (
+        str | list[Content]
+    )  # Content can be a simple string or a list of Content blocks
 
 
 class AssistantMessage(TypedDict):
+    """Represents a message from the assistant."""
+
     role: Literal["assistant"]
-    content: str
+    content: str  # Assistant messages typically have string content
 
 
 class SystemMessage(TypedDict):
+    """Represents a system message."""
+
     role: Literal["system"]
     content: str
 
 
-Message = UserMessage | AssistantMessage | SystemMessage
+Message = (
+    UserMessage | AssistantMessage | SystemMessage
+)  # Union of possible message types
+
+# ---------- Features ----------
+# Define the specific structure of the 'features' object
+
+
+class Features(TypedDict):
+    """Represents the enabled/disabled features for the request."""
+
+    image_generation: bool
+    code_interpreter: bool
+    web_search: bool
+
+
+# ---------- Metadata Structures ----------
+# Define the detailed structure of the 'metadata' object
+
+
+class ModelDetails(TypedDict):
+    """Details about the model within Ollama metadata."""
+
+    parent_model: str
+    format: str
+    family: str
+    families: list[str]
+    parameter_size: str
+    quantization_level: str
+
+
+class OllamaDetails(TypedDict):
+    """Ollama specific details for the model."""
+
+    name: str
+    model: str
+    modified_at: str  # ISO 8601 datetime string
+    size: int
+    digest: str
+    details: ModelDetails
+    urls: list[
+        int
+    ]  # Example shows [0], type might be more complex? List[Any] is safer if unsure.
+
+
+class MetadataModel(TypedDict):
+    """Represents the model information within metadata."""
+
+    id: str
+    name: str
+    object: Literal["model"]
+    created: int  # Unix timestamp
+    owned_by: str
+    ollama: OllamaDetails
+    tags: list[str]
+    actions: list[Any]  # Structure of actions is not clear from example
+
+
+class MetadataVariables(TypedDict):
+    """Represents variables used in the prompt/request."""
+
+    # Keys are variable names (e.g., "{{USER_NAME}}"), values are strings
+    __dict__: dict[str, str]
+
+
+class Metadata(TypedDict):
+    """Represents the metadata object in the request body."""
+
+    user_id: str  # UUID
+    chat_id: str  # UUID
+    message_id: str  # UUID
+    session_id: str
+    tool_ids: list[str] | None  # Can be a list of strings or null
+    tool_servers: list[
+        dict[str, Any]
+    ]  # Example is empty list, assuming list of objects
+    files: list[FileInfo]  # List of files, using the same FileInfo structure
+    features: Features  # Using the specific Features TypedDict
+    variables: MetadataVariables  # Using the specific MetadataVariables TypedDict
+    model: MetadataModel  # Using the specific MetadataModel TypedDict
+    direct: bool
+
+
+# ---------- Options ----------
 
 
 class Options(TypedDict):
+    """Represents optional parameters for the model request."""
+
     temperature: NotRequired[float]
     top_p: NotRequired[float]
     min_p: NotRequired[float]
     top_k: NotRequired[float]
+    # Add other potential options if known, e.g., num_predict, stop, etc.
+    # Using NotRequired as the example shows an empty object {}
+
+
+# ---------- Main Body ----------
 
 
 class Body(TypedDict):
+    """Represents the main request body structure."""
+
     stream: bool
     model: str
     messages: list[Message]
-    options: NotRequired[Options]
+    files: NotRequired[list[FileInfo]]  # Optional list of files
+    features: NotRequired[Features]  # Optional features object
+    metadata: NotRequired[Metadata]  # Optional metadata object
+    options: NotRequired[Options]  # Optional options object
 
 
 # ---------- Chats.ChatModel ----------
