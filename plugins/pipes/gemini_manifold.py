@@ -348,6 +348,148 @@ class Pipe:
 
     # region Helper methods inside the Pipe class
 
+    # region Client initialization and model retrival from Google API
+    def _get_genai_client(
+        self, api_key: str | None = None, base_url: str | None = None
+    ) -> genai.Client | None:
+        client = None
+        api_key = api_key if api_key else self.valves.GEMINI_API_KEY
+        base_url = base_url if base_url else self.valves.GEMINI_API_BASE_URL
+        if api_key:
+            http_options = types.HttpOptions(base_url=base_url)
+            try:
+                client = genai.Client(
+                    api_key=api_key,
+                    http_options=http_options,
+                )
+                log.success("Genai client successfully initialized!")
+            except Exception:
+                log.exception("genai client initialization failed.")
+        else:
+            log.error("GEMINI_API_KEY is not set.")
+        return client
+
+    def _get_user_client(self, __user__: "UserData") -> genai.Client | None:
+        # Register a user specific client if they have added their own API key.
+        user_valves: Pipe.UserValves | None = __user__.get("valves")
+        if (
+            user_valves
+            and user_valves.GEMINI_API_KEY
+            and not self.clients.get(__user__["id"])
+        ):
+            log.info(f'Creating a new genai client for user {__user__.get("email")}')
+            self.clients[__user__.get("id")] = self._get_genai_client(
+                api_key=user_valves.GEMINI_API_KEY,
+                base_url=user_valves.GEMINI_API_BASE_URL,
+            )
+            log.debug("Genai clients dict now looks like this:", payload=self.clients)
+        if user_client := self.clients.get(__user__.get("id")):
+            return user_client
+        else:
+            return self.clients.get("default")
+
+    async def _get_genai_models(self) -> list[types.Model]:
+        """
+        Gets valid Google models from the API.
+        Returns a list of `genai.types.Model` objects.
+        """
+        client = self.clients.get("default")
+        if not client:
+            log.warning("There is no usable genai client. Trying to create one.")
+            # Try to create a client one more time.
+            if client := self._get_genai_client():
+                self.clients["default"] = client
+            else:
+                log.error("Can't initialize the client, returning no models.")
+                return []
+
+        # This executes if we have a working client.
+        google_models_pager = None
+        try:
+            # Get the AsyncPager object
+            google_models_pager = await client.aio.models.list(
+                config={"query_base": True}
+            )
+        except Exception:
+            log.exception("Retriving models from Google API failed.")
+            return []
+
+        # Iterate the pager to get the full list of models
+        # This is where the actual API calls for subsequent pages happen if needed
+        try:
+            all_google_models = [model async for model in google_models_pager]
+        except Exception:
+            log.exception("Iterating Google models pager failed.")
+            return []
+
+        log.info(
+            f"Retrieved {len(all_google_models)} models from Gemini Developer API."
+        )
+        log.trace("All models returned by Google:", payload=all_google_models)
+        # Filter Google models list down to generative models only.
+        return [
+            model
+            for model in all_google_models
+            if model.supported_actions and "generateContent" in model.supported_actions
+        ]
+
+    def _filter_models(self, google_models: list[types.Model]) -> list["ModelData"]:
+        """
+        Filters the genai model list down based on configured white- and blacklist.
+        Returns a list[dict] that can be directly returned by the `pipes` method.
+        """
+        if not google_models:
+            error_msg = "Error during getting the models from Google API, check logs."
+            return [self._return_error_model(error_msg, exception=False)]
+
+        self.last_whitelist = self.valves.MODEL_WHITELIST
+        self.last_blacklist = self.valves.MODEL_BLACKLIST
+        whitelist = (
+            self.valves.MODEL_WHITELIST.replace(" ", "").split(",")
+            if self.valves.MODEL_WHITELIST
+            else []
+        )
+        blacklist = (
+            self.valves.MODEL_BLACKLIST.replace(" ", "").split(",")
+            if self.valves.MODEL_BLACKLIST
+            else []
+        )
+        # Perform filtering and store the result
+        filtered_models: list["ModelData"] = [
+            {
+                "id": self._strip_prefix(model.name),
+                "name": model.display_name,
+                "description": model.description,
+            }
+            for model in google_models
+            if model.name
+            and model.display_name
+            and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
+            and not any(fnmatch.fnmatch(model.name, f"models/{b}") for b in blacklist)
+        ]
+        # Add an info log to report the result of the filtering process
+        log.info(
+            f"Filtered {len(google_models)} raw models down to {len(filtered_models)} models based on white/blacklists."
+        )
+        return filtered_models
+
+    def _strip_prefix(self, model_name: str) -> str:
+        """
+        Strip any prefix from the model name up to and including the first '.' or '/'.
+        This makes the method generic and adaptable to varying prefixes.
+        """
+        # TODO: [refac] pointless helper, remove.
+        try:
+            # Use non-greedy regex to remove everything up to and including the first '.' or '/'
+            stripped = re.sub(r"^.*?[./]", "", model_name)
+            return stripped
+        except Exception:
+            error_msg = "Error stripping prefix, using the original model name."
+            log.exception(error_msg)
+            return model_name
+
+    # endregion
+
     # region Event emission and error logging
     async def _emit_completion(
         self,
@@ -1071,148 +1213,6 @@ class Pipe:
         )
         log.success("Image upload finished!")
         return image_url
-
-    # endregion
-
-    # region Client initialization and model retrival from Google API
-    def _get_genai_client(
-        self, api_key: str | None = None, base_url: str | None = None
-    ) -> genai.Client | None:
-        client = None
-        api_key = api_key if api_key else self.valves.GEMINI_API_KEY
-        base_url = base_url if base_url else self.valves.GEMINI_API_BASE_URL
-        if api_key:
-            http_options = types.HttpOptions(base_url=base_url)
-            try:
-                client = genai.Client(
-                    api_key=api_key,
-                    http_options=http_options,
-                )
-                log.success("Genai client successfully initialized!")
-            except Exception:
-                log.exception("genai client initialization failed.")
-        else:
-            log.error("GEMINI_API_KEY is not set.")
-        return client
-
-    def _get_user_client(self, __user__: "UserData") -> genai.Client | None:
-        # Register a user specific client if they have added their own API key.
-        user_valves: Pipe.UserValves | None = __user__.get("valves")
-        if (
-            user_valves
-            and user_valves.GEMINI_API_KEY
-            and not self.clients.get(__user__["id"])
-        ):
-            log.info(f'Creating a new genai client for user {__user__.get("email")}')
-            self.clients[__user__.get("id")] = self._get_genai_client(
-                api_key=user_valves.GEMINI_API_KEY,
-                base_url=user_valves.GEMINI_API_BASE_URL,
-            )
-            log.debug("Genai clients dict now looks like this:", payload=self.clients)
-        if user_client := self.clients.get(__user__.get("id")):
-            return user_client
-        else:
-            return self.clients.get("default")
-
-    async def _get_genai_models(self) -> list[types.Model]:
-        """
-        Gets valid Google models from the API.
-        Returns a list of `genai.types.Model` objects.
-        """
-        client = self.clients.get("default")
-        if not client:
-            log.warning("There is no usable genai client. Trying to create one.")
-            # Try to create a client one more time.
-            if client := self._get_genai_client():
-                self.clients["default"] = client
-            else:
-                log.error("Can't initialize the client, returning no models.")
-                return []
-
-        # This executes if we have a working client.
-        google_models_pager = None
-        try:
-            # Get the AsyncPager object
-            google_models_pager = await client.aio.models.list(
-                config={"query_base": True}
-            )
-        except Exception:
-            log.exception("Retriving models from Google API failed.")
-            return []
-
-        # Iterate the pager to get the full list of models
-        # This is where the actual API calls for subsequent pages happen if needed
-        try:
-            all_google_models = [model async for model in google_models_pager]
-        except Exception:
-            log.exception("Iterating Google models pager failed.")
-            return []
-
-        log.info(
-            f"Retrieved {len(all_google_models)} models from Gemini Developer API."
-        )
-        log.trace("All models returned by Google:", payload=all_google_models)
-        # Filter Google models list down to generative models only.
-        return [
-            model
-            for model in all_google_models
-            if model.supported_actions and "generateContent" in model.supported_actions
-        ]
-
-    def _filter_models(self, google_models: list[types.Model]) -> list["ModelData"]:
-        """
-        Filters the genai model list down based on configured white- and blacklist.
-        Returns a list[dict] that can be directly returned by the `pipes` method.
-        """
-        if not google_models:
-            error_msg = "Error during getting the models from Google API, check logs."
-            return [self._return_error_model(error_msg, exception=False)]
-
-        self.last_whitelist = self.valves.MODEL_WHITELIST
-        self.last_blacklist = self.valves.MODEL_BLACKLIST
-        whitelist = (
-            self.valves.MODEL_WHITELIST.replace(" ", "").split(",")
-            if self.valves.MODEL_WHITELIST
-            else []
-        )
-        blacklist = (
-            self.valves.MODEL_BLACKLIST.replace(" ", "").split(",")
-            if self.valves.MODEL_BLACKLIST
-            else []
-        )
-        # Perform filtering and store the result
-        filtered_models: list["ModelData"] = [
-            {
-                "id": self._strip_prefix(model.name),
-                "name": model.display_name,
-                "description": model.description,
-            }
-            for model in google_models
-            if model.name
-            and model.display_name
-            and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
-            and not any(fnmatch.fnmatch(model.name, f"models/{b}") for b in blacklist)
-        ]
-        # Add an info log to report the result of the filtering process
-        log.info(
-            f"Filtered {len(google_models)} raw models down to {len(filtered_models)} models based on white/blacklists."
-        )
-        return filtered_models
-
-    def _strip_prefix(self, model_name: str) -> str:
-        """
-        Strip any prefix from the model name up to and including the first '.' or '/'.
-        This makes the method generic and adaptable to varying prefixes.
-        """
-        # TODO: [refac] pointless helper, remove.
-        try:
-            # Use non-greedy regex to remove everything up to and including the first '.' or '/'
-            stripped = re.sub(r"^.*?[./]", "", model_name)
-            return stripped
-        except Exception:
-            error_msg = "Error stripping prefix, using the original model name."
-            log.exception(error_msg)
-            return model_name
 
     # endregion
 
