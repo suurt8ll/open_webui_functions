@@ -883,117 +883,6 @@ class Pipe:
                 log.exception(error_msg)
             log.debug("AsyncGenerator finished.")
 
-    def _get_budget_str(self, model_name: str) -> str:
-        return (
-            f" • {self.valves.THINKING_BUDGET} tokens budget"
-            if model_name == "gemini-2.5-flash-preview-04-17"
-            and self.valves.THINKING_BUDGET > 0
-            else ""
-        )
-
-    async def _start_thinking_timer(
-        self, model_name: str, event_emitter: Callable[["Event"], Awaitable[None]]
-    ) -> tuple[float | None, asyncio.Task[None] | None]:
-        # Check if this is a thinking model and exit early if not.
-        # Exit also if thinking budget is explicitly set to 0 and Gemini 2.5 Flash is selected.
-        if not self.is_thinking_model(model_name) or (
-            self.valves.THINKING_BUDGET == 0
-            and model_name == "gemini-2.5-flash-preview-04-17"
-        ):
-            return None, None
-        # Indicates if emitted status messages should be visible in the front-end.
-        hidden = not self.valves.EMIT_STATUS_UPDATES
-        # Emit initial 'Thinking' status
-        await self._emit_status(
-            f"Thinking • 0s elapsed{self._get_budget_str(model_name)}",
-            event_emitter=event_emitter,
-            done=False,
-            hidden=hidden,
-        )
-        # Record the start time
-        start_time = time.time()
-        # Start the thinking timer
-        # NOTE: It's important to note that the model could not be actually thinking
-        # when the status message starts. API could be just slow or the chat data
-        # payload could still be uploading.
-        thinking_timer_task = asyncio.create_task(
-            self._thinking_timer(event_emitter, model_name, hidden=hidden)
-        )
-        return start_time, thinking_timer_task
-
-    async def _thinking_timer(
-        self,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        model_name: str,
-        hidden=False,
-    ) -> None:
-        """Asynchronous task to emit periodic status updates."""
-        elapsed = 0
-        try:
-            log.info("Thinking timer started.")
-            while True:
-                await asyncio.sleep(self.valves.EMIT_INTERVAL)
-                elapsed += self.valves.EMIT_INTERVAL
-                # Format elapsed time
-                if elapsed < 60:
-                    time_str = f"{elapsed}s"
-                else:
-                    minutes, seconds = divmod(elapsed, 60)
-                    time_str = f"{minutes}m {seconds}s"
-                status_message = (
-                    f"Thinking • {time_str} elapsed{self._get_budget_str(model_name)}"
-                )
-                await self._emit_status(
-                    status_message,
-                    event_emitter=event_emitter,
-                    done=False,
-                    hidden=hidden,
-                )
-        except asyncio.CancelledError:
-            log.debug("Timer task cancelled.")
-        except Exception:
-            log.exception("Error in timer task")
-
-    async def _cancel_thinking_timer(
-        self,
-        timer_task: asyncio.Task[None] | None,
-        start_time: float | None,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        model_name: str,
-    ):
-        # Check if task was already canceled.
-        if not timer_task:
-            return
-        # Cancel the timer.
-        timer_task.cancel()
-        try:
-            await timer_task
-        except asyncio.CancelledError:
-            log.info(f"Thinking timer task successfully cancelled.")
-        except Exception:
-            log.exception(f"Error cancelling thinking timer task.")
-        # Indicates if emitted status messages should be visible in the front-end.
-        hidden = not self.valves.EMIT_STATUS_UPDATES
-        # Calculate elapsed time and emit final status message
-        if start_time:
-            total_elapsed = int(time.time() - start_time)
-            if total_elapsed < 60:
-                total_time_str = f"{total_elapsed}s"
-            else:
-                minutes, seconds = divmod(total_elapsed, 60)
-                total_time_str = f"{minutes}m {seconds}s"
-
-            final_status = f"Thinking completed • took {total_time_str}{self._get_budget_str(model_name)}"
-            await self._emit_status(
-                final_status, event_emitter=event_emitter, done=True, hidden=hidden
-            )
-        else:
-            # Hide the status message if stream failed.
-            final_status = f"An error occured during the thinking phase."
-            await self._emit_status(
-                final_status, event_emitter=event_emitter, done=True, hidden=True
-            )
-
     async def _do_post_processing(
         self,
         model_response: types.GenerateContentResponse | None,
@@ -1198,6 +1087,120 @@ class Pipe:
         )
         log.success("Image upload finished!")
         return image_url
+
+    # endregion
+
+    # region Thinking status message
+    def _get_budget_str(self, model_name: str) -> str:
+        return (
+            f" • {self.valves.THINKING_BUDGET} tokens budget"
+            if model_name == "gemini-2.5-flash-preview-04-17"
+            and self.valves.THINKING_BUDGET > 0
+            else ""
+        )
+
+    async def _start_thinking_timer(
+        self, model_name: str, event_emitter: Callable[["Event"], Awaitable[None]]
+    ) -> tuple[float | None, asyncio.Task[None] | None]:
+        # Check if this is a thinking model and exit early if not.
+        # Exit also if thinking budget is explicitly set to 0 and Gemini 2.5 Flash is selected.
+        if not self.is_thinking_model(model_name) or (
+            self.valves.THINKING_BUDGET == 0
+            and model_name == "gemini-2.5-flash-preview-04-17"
+        ):
+            return None, None
+        # Indicates if emitted status messages should be visible in the front-end.
+        hidden = not self.valves.EMIT_STATUS_UPDATES
+        # Emit initial 'Thinking' status
+        await self._emit_status(
+            f"Thinking • 0s elapsed{self._get_budget_str(model_name)}",
+            event_emitter=event_emitter,
+            done=False,
+            hidden=hidden,
+        )
+        # Record the start time
+        start_time = time.time()
+        # Start the thinking timer
+        # NOTE: It's important to note that the model could not be actually thinking
+        # when the status message starts. API could be just slow or the chat data
+        # payload could still be uploading.
+        thinking_timer_task = asyncio.create_task(
+            self._thinking_timer(event_emitter, model_name, hidden=hidden)
+        )
+        return start_time, thinking_timer_task
+
+    async def _thinking_timer(
+        self,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        model_name: str,
+        hidden=False,
+    ) -> None:
+        """Asynchronous task to emit periodic status updates."""
+        elapsed = 0
+        try:
+            log.info("Thinking timer started.")
+            while True:
+                await asyncio.sleep(self.valves.EMIT_INTERVAL)
+                elapsed += self.valves.EMIT_INTERVAL
+                # Format elapsed time
+                if elapsed < 60:
+                    time_str = f"{elapsed}s"
+                else:
+                    minutes, seconds = divmod(elapsed, 60)
+                    time_str = f"{minutes}m {seconds}s"
+                status_message = (
+                    f"Thinking • {time_str} elapsed{self._get_budget_str(model_name)}"
+                )
+                await self._emit_status(
+                    status_message,
+                    event_emitter=event_emitter,
+                    done=False,
+                    hidden=hidden,
+                )
+        except asyncio.CancelledError:
+            log.debug("Timer task cancelled.")
+        except Exception:
+            log.exception("Error in timer task")
+
+    async def _cancel_thinking_timer(
+        self,
+        timer_task: asyncio.Task[None] | None,
+        start_time: float | None,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        model_name: str,
+    ):
+        # Check if task was already canceled.
+        if not timer_task:
+            return
+        # Cancel the timer.
+        timer_task.cancel()
+        try:
+            await timer_task
+        except asyncio.CancelledError:
+            log.info(f"Thinking timer task successfully cancelled.")
+        except Exception:
+            log.exception(f"Error cancelling thinking timer task.")
+        # Indicates if emitted status messages should be visible in the front-end.
+        hidden = not self.valves.EMIT_STATUS_UPDATES
+        # Calculate elapsed time and emit final status message
+        if start_time:
+            total_elapsed = int(time.time() - start_time)
+            if total_elapsed < 60:
+                total_time_str = f"{total_elapsed}s"
+            else:
+                minutes, seconds = divmod(total_elapsed, 60)
+                total_time_str = f"{minutes}m {seconds}s"
+
+            final_status = f"Thinking completed • took {total_time_str}{self._get_budget_str(model_name)}"
+            await self._emit_status(
+                final_status, event_emitter=event_emitter, done=True, hidden=hidden
+            )
+        else:
+            # Hide the status message if stream failed.
+            final_status = f"An error occured during the thinking phase."
+            await self._emit_status(
+                final_status, event_emitter=event_emitter, done=True, hidden=True
+            )
 
     # endregion
 
