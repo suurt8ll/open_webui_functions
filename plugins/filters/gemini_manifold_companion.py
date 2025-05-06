@@ -110,7 +110,7 @@ class Filter:
         log.success("Function has been initialized.")
         log.trace("Full self object:", payload=self.__dict__)
 
-    def inlet(self, body: dict) -> dict:
+    def inlet(self, body: "Body") -> "Body":
         """Modifies the incoming request payload before it's sent to the LLM. Operates on the `form_data` dictionary."""
 
         # Detect log level change inside self.valves
@@ -123,29 +123,17 @@ class Filter:
 
         log.debug("inlet method has been triggered.")
 
-        # Exit early if we are filtering an unsupported model.
-        model_name: str = body.get("model", "")
-
-        # Extract and use base model name in case of custom Workspace models
-        metadata = body.get("metadata", {})
-        base_model_name = (
-            metadata.get("model", {}).get("info", {}).get("base_model_id", None)
-        )
-        if base_model_name:
-            model_name = base_model_name
-
-        canonical_model_name = model_name.replace("gemini_manifold_google_genai.", "")
-
+        canonical_model_name, is_manifold = self._get_model_name(body)
         # Check if it's a relevant model (supports either feature)
         is_grounding_model = canonical_model_name in ALLOWED_GROUNDING_MODELS
         is_code_exec_model = canonical_model_name in ALLOWED_CODE_EXECUTION_MODELS
+        log.debug(f"{is_grounding_model=}, {is_code_exec_model=}")
 
-        if "gemini_manifold_google_genai." not in model_name or (
-            not is_grounding_model and not is_code_exec_model
-        ):  # Check if it supports *any* of the features we filter on
+        # Exit early if we are filtering an unsupported model.
+        # Check if it supports *any* of the features we filter on
+        if not is_manifold or (not is_grounding_model and not is_code_exec_model):
             log.debug(
                 "Returning the original body object because conditions for proceeding are not fulfilled."
-                f"{model_name=}, {is_grounding_model=}, {is_code_exec_model=}"
             )
             return body
 
@@ -153,7 +141,7 @@ class Filter:
         log.debug(f"body.features:", payload=features)
 
         # Ensure metadata structure exists and add new feature
-        metadata = body.setdefault("metadata", {})
+        metadata = body.setdefault("metadata", {})  # type: ignore
         metadata_features = metadata.setdefault("features", {})
 
         if is_grounding_model:
@@ -169,7 +157,7 @@ class Filter:
                 # Disable web_search
                 features["web_search"] = False
                 # Use "Google Search Retrieval" for 1.0 and 1.5 models and "Google Search as a Tool for >=2.0 models".
-                if "1.0" in model_name or "1.5" in model_name:
+                if "1.0" in canonical_model_name or "1.5" in canonical_model_name:
                     metadata_features["google_search_retrieval"] = True
                     metadata_features["google_search_retrieval_threshold"] = (
                         self.valves.GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD
@@ -180,7 +168,7 @@ class Filter:
                 # https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-with-google-search#:~:text=For%20ideal%20results%2C%20use%20a%20temperature%20of%200.0.
                 if self.valves.SET_TEMP_TO_ZERO:
                     log.info("Setting temperature to 0.")
-                    body["temperature"] = 0
+                    body["temperature"] = 0  # type: ignore
         if is_code_exec_model:
             code_execution_enabled = (
                 features.get("code_interpreter", False)
@@ -199,6 +187,8 @@ class Filter:
             metadata["safety_settings"] = self._get_permissive_safety_settings(
                 canonical_model_name
             )
+
+        # TODO: Remove body.files here to bypass RAG (if we are using google model). (Valve option to make it user controllable)
 
         # TODO: Filter out the citation markers here.
 
@@ -583,6 +573,59 @@ class Filter:
         if len(candidates) > 1:
             log.warning("Multiple candidates found, defaulting to first candidate.")
         return candidates[0]
+
+    def _get_model_name(self, body: "Body") -> tuple[str, bool]:
+        """
+        Extracts the effective and canonical model name from the request body.
+
+        Handles standard model names and custom workspace models by prioritizing
+        the base_model_id found in metadata.
+
+        Args:
+            body: The request body dictionary.
+
+        Returns:
+            A tuple containing:
+            - The canonical model name (prefix removed).
+            - A boolean indicating if the effective model name contained the
+              'gemini_manifold_google_genai.' prefix.
+        """
+        # 1. Get the initially requested model name from the top level
+        effective_model_name: str = body.get("model", "")
+        initial_model_name = effective_model_name
+        base_model_name = None
+
+        # 2. Check for a base model ID in the metadata for custom models
+        # If metadata exists, attempt to extract the base_model_id
+        if metadata := body.get("metadata"):
+            # Safely navigate the nested structure: metadata -> model -> info -> base_model_id
+            base_model_name = (
+                metadata.get("model", {}).get("info", {}).get("base_model_id", None)
+            )
+            # If a base model ID is found, it overrides the initially requested name
+            if base_model_name:
+                effective_model_name = base_model_name
+
+        # 3. Determine if the effective model name contains the manifold prefix.
+        # This flag indicates if the model (after considering base_model_id)
+        # appears to be one defined or routed via the manifold pipe function.
+        is_manifold_model = "gemini_manifold_google_genai." in effective_model_name
+
+        # 4. Create the canonical model name by removing the manifold prefix
+        # from the effective model name.
+        canonical_model_name = effective_model_name.replace(
+            "gemini_manifold_google_genai.", ""
+        )
+
+        # 5. Log the relevant names for debugging purposes
+        log.debug(
+            f"Model Name Extraction: initial='{initial_model_name}', "
+            f"base='{base_model_name}', effective='{effective_model_name}', "
+            f"canonical='{canonical_model_name}', is_manifold={is_manifold_model}"
+        )
+
+        # 6. Return the canonical name and the manifold flag
+        return canonical_model_name, is_manifold_model
 
     def _is_flat_dict(self, data: Any) -> bool:
         """
