@@ -388,6 +388,20 @@ class Pipe:
         else:
             return self.clients.get("default")
 
+    def _return_error_model(
+        self, error_msg: str, warning: bool = False, exception: bool = True
+    ) -> "ModelData":
+        """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        return {
+            "id": "error",
+            "name": "[gemini_manifold] " + error_msg,
+            "description": error_msg,
+        }
+
     async def _get_genai_models(self) -> list[types.Model]:
         """
         Gets valid Google models from the API.
@@ -706,106 +720,7 @@ class Pipe:
 
     # endregion 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
 
-    # region 1.3 Event emission and error logging
-    async def _emit_completion(
-        self,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        content: str | None = None,
-        done: bool = False,
-        error: str | None = None,
-        sources: list["Source"] | None = None,
-    ):
-        """Constructs and emits completion event."""
-        emission: "ChatCompletionEvent" = {
-            "type": "chat:completion",
-            "data": {"done": done},
-        }
-        if content:
-            emission["data"]["content"] = content
-        if error:
-            emission["data"]["error"] = {"detail": error}
-        if sources:
-            emission["data"]["sources"] = sources
-        await event_emitter(emission)
-
-    def is_thinking_model(self, model_id: str) -> bool:
-        """Check if the model is a thinking model based on the valve pattern."""
-        try:
-            result = bool(
-                re.search(self.valves.THINKING_MODEL_PATTERN, model_id, re.IGNORECASE)
-            )
-            return result
-        except Exception:
-            log.exception("Error checking if model is a thinking model")
-            return False
-
-    async def _emit_status(
-        self,
-        message: str,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        done: bool = False,
-        hidden: bool = False,
-    ) -> None:
-        """Emit status updates asynchronously."""
-        try:
-            if not self.valves.EMIT_STATUS_UPDATES:
-                return
-            status_event: "StatusEvent" = {
-                "type": "status",
-                "data": {"description": message, "done": done, "hidden": hidden},
-            }
-            await event_emitter(status_event)
-            log.debug(f"Emitted status:", payload=status_event)
-        except Exception:
-            log.exception("Error emitting status")
-
-    async def _emit_error(
-        self,
-        error_msg: str,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        warning: bool = False,
-        exception: bool = True,
-    ) -> None:
-        """Emits an event to the front-end that causes it to display a nice red error message."""
-
-        if warning:
-            log.opt(depth=1, exception=False).warning(error_msg)
-        else:
-            log.opt(depth=1, exception=exception).error(error_msg)
-        await self._emit_completion(
-            error=f"\n{error_msg}", event_emitter=event_emitter, done=True
-        )
-
-    async def _emit_toast(
-        self,
-        msg: str,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        toastType: Literal["info", "success", "warning", "error"] = "info",
-    ) -> None:
-        # TODO: Use this method in more places, even for info toasts.
-        event: NotificationEvent = {
-            "type": "notification",
-            "data": {"type": toastType, "content": msg},
-        }
-        await event_emitter(event)
-
-    def _return_error_model(
-        self, error_msg: str, warning: bool = False, exception: bool = True
-    ) -> "ModelData":
-        """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
-        if warning:
-            log.opt(depth=1, exception=False).warning(error_msg)
-        else:
-            log.opt(depth=1, exception=exception).error(error_msg)
-        return {
-            "id": "error",
-            "name": "[gemini_manifold] " + error_msg,
-            "description": error_msg,
-        }
-
-    # endregion 1.3 Event emission and error logging
-
-    # region 1.4 Model response streaming
+    # region 1.3 Model response streaming
     async def _stream_response_generator(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
@@ -1027,9 +942,9 @@ class Pipe:
         else:
             return None
 
-    # endregion 1.4 Model response streaming
+    # endregion 1.3 Model response streaming
 
-    # region 1.5 Thinking status message
+    # region 1.4 Thinking status message
     def _get_budget_str(self, model_name: str) -> str:
         return (
             f" • {self.valves.THINKING_BUDGET} tokens budget"
@@ -1037,6 +952,17 @@ class Pipe:
             and self.valves.THINKING_BUDGET > 0
             else ""
         )
+
+    def is_thinking_model(self, model_id: str) -> bool:
+        """Check if the model is a thinking model based on the valve pattern."""
+        try:
+            result = bool(
+                re.search(self.valves.THINKING_MODEL_PATTERN, model_id, re.IGNORECASE)
+            )
+            return result
+        except Exception:
+            log.exception("Error checking if model is a thinking model")
+            return False
 
     async def _start_thinking_timer(
         self, model_name: str, event_emitter: Callable[["Event"], Awaitable[None]]
@@ -1141,9 +1067,9 @@ class Pipe:
                 final_status, event_emitter=event_emitter, done=True, hidden=True
             )
 
-    # endregion 1.5 Thinking status message
+    # endregion 1.4 Thinking status message
 
-    # region 1.6 Post-processing
+    # region 1.5 Post-processing
     async def _do_post_processing(
         self,
         model_response: types.GenerateContentResponse | None,
@@ -1296,7 +1222,81 @@ class Pipe:
         }
         return completion_event
 
-    # endregion 1.6 Post-processing
+    # endregion 1.5 Post-processing
+
+    # region 1.6 Event emissions
+    async def _emit_completion(
+        self,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        content: str | None = None,
+        done: bool = False,
+        error: str | None = None,
+        sources: list["Source"] | None = None,
+    ):
+        """Constructs and emits completion event."""
+        emission: "ChatCompletionEvent" = {
+            "type": "chat:completion",
+            "data": {"done": done},
+        }
+        if content:
+            emission["data"]["content"] = content
+        if error:
+            emission["data"]["error"] = {"detail": error}
+        if sources:
+            emission["data"]["sources"] = sources
+        await event_emitter(emission)
+
+    async def _emit_status(
+        self,
+        message: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        done: bool = False,
+        hidden: bool = False,
+    ) -> None:
+        """Emit status updates asynchronously."""
+        try:
+            if not self.valves.EMIT_STATUS_UPDATES:
+                return
+            status_event: "StatusEvent" = {
+                "type": "status",
+                "data": {"description": message, "done": done, "hidden": hidden},
+            }
+            await event_emitter(status_event)
+            log.debug(f"Emitted status:", payload=status_event)
+        except Exception:
+            log.exception("Error emitting status")
+
+    async def _emit_error(
+        self,
+        error_msg: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        warning: bool = False,
+        exception: bool = True,
+    ) -> None:
+        """Emits an event to the front-end that causes it to display a nice red error message."""
+
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        await self._emit_completion(
+            error=f"\n{error_msg}", event_emitter=event_emitter, done=True
+        )
+
+    async def _emit_toast(
+        self,
+        msg: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        toastType: Literal["info", "success", "warning", "error"] = "info",
+    ) -> None:
+        # TODO: Use this method in more places, even for info toasts.
+        event: NotificationEvent = {
+            "type": "notification",
+            "data": {"type": toastType, "content": msg},
+        }
+        await event_emitter(event)
+
+    # endregion 1.6 Event emissions
 
     # region 1.7 Utility helpers
     def _is_flat_dict(self, data: Any) -> bool:
