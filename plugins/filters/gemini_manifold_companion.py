@@ -248,7 +248,9 @@ class Filter:
 
         return body
 
-    # region Helper methods inside the Pipe class
+    # region 1. Helper methods inside the Filter class
+
+    # region 1.1 Add citations
 
     async def _get_text_w_citation_markers(
         self,
@@ -487,47 +489,13 @@ class Filter:
         log.debug(f"Emitting StatusEvent: {status_event}")
         await event_emitter(status_event)
 
-    def _get_first_candidate(
-        self, candidates: list[types.Candidate] | None
-    ) -> types.Candidate | None:
-        """Selects the first candidate, logging a warning if multiple exist."""
-        if not candidates:
-            log.warning("Received chunk with no candidates, skipping processing.")
-            return None
-        if len(candidates) > 1:
-            log.warning("Multiple candidates found, defaulting to first candidate.")
-        return candidates[0]
+    # endregion 1.1 Add citations
 
-    def _add_log_handler(self):
-        """Adds handler to the root loguru instance for this plugin if one does not exist already."""
+    # region 1.2 Remove citation markers
+    # TODO: Remove citation markers from model input.
+    # endregion 1.2 Remove citation markers
 
-        def plugin_filter(record: "Record"):
-            """Filter function to only allow logs from this plugin (based on module name)."""
-            return record["name"] == __name__  # Filter by module name
-
-        # Access the internal state of the log
-        handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
-        for key, handler in handlers.items():
-            existing_filter = handler._filter
-            # FIXME: Check log level too.
-            if (
-                hasattr(existing_filter, "__name__")
-                and existing_filter.__name__ == plugin_filter.__name__
-                and hasattr(existing_filter, "__module__")
-                and existing_filter.__module__ == plugin_filter.__module__
-            ):
-                log.debug("Handler for this plugin is already present!")
-                return
-
-        log.add(
-            sys.stdout,
-            level=self.valves.LOG_LEVEL,
-            format=stdout_format,
-            filter=plugin_filter,
-        )
-        log.info(
-            f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
-        )
+    # region 1.3 Get permissive safety settings
 
     def _get_permissive_safety_settings(
         self, model_name: str
@@ -576,4 +544,52 @@ class Filter:
         ]
         return safety_settings
 
-    # endregion
+    # endregion 1.3 Get permissive safety settings
+
+    # region 1.4 Utility helpers
+
+    def _get_first_candidate(
+        self, candidates: list[types.Candidate] | None
+    ) -> types.Candidate | None:
+        """Selects the first candidate, logging a warning if multiple exist."""
+        if not candidates:
+            log.warning("Received chunk with no candidates, skipping processing.")
+            return None
+        if len(candidates) > 1:
+            log.warning("Multiple candidates found, defaulting to first candidate.")
+        return candidates[0]
+
+    def _add_log_handler(self):
+        """Adds handler to the root loguru instance for this plugin if one does not exist already."""
+
+        def plugin_filter(record: "Record"):
+            """Filter function to only allow logs from this plugin (based on module name)."""
+            return record["name"] == __name__  # Filter by module name
+
+        # Access the internal state of the log
+        handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
+        for key, handler in handlers.items():
+            existing_filter = handler._filter
+            # FIXME: Check log level too.
+            if (
+                hasattr(existing_filter, "__name__")
+                and existing_filter.__name__ == plugin_filter.__name__
+                and hasattr(existing_filter, "__module__")
+                and existing_filter.__module__ == plugin_filter.__module__
+            ):
+                log.debug("Handler for this plugin is already present!")
+                return
+
+        log.add(
+            sys.stdout,
+            level=self.valves.LOG_LEVEL,
+            format=stdout_format,
+            filter=plugin_filter,
+        )
+        log.info(
+            f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
+        )
+
+    # endregion 1.4 Utility helpers
+
+    # endregion 1. Helper methods inside the Filter class
