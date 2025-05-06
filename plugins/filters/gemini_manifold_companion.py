@@ -91,6 +91,11 @@ class Filter:
             description="""Whether to request relaxed safety filtering.
             Default value is False.""",
         )
+        NATIVE_PDF_SUPPORT: bool = Field(
+            default=True,
+            description="""Decide if you want ot bypass Open WebUI's RAG and send your PDF directly to Google API.
+            Default value is True.""",
+        )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
@@ -124,18 +129,17 @@ class Filter:
         log.debug("inlet method has been triggered.")
 
         canonical_model_name, is_manifold = self._get_model_name(body)
-        # Check if it's a relevant model (supports either feature)
-        is_grounding_model = canonical_model_name in ALLOWED_GROUNDING_MODELS
-        is_code_exec_model = canonical_model_name in ALLOWED_CODE_EXECUTION_MODELS
-        log.debug(f"{is_grounding_model=}, {is_code_exec_model=}")
-
         # Exit early if we are filtering an unsupported model.
-        # Check if it supports *any* of the features we filter on
-        if not is_manifold or (not is_grounding_model and not is_code_exec_model):
+        if not is_manifold:
             log.debug(
                 "Returning the original body object because conditions for proceeding are not fulfilled."
             )
             return body
+
+        # Check if it's a relevant model (supports either feature)
+        is_grounding_model = canonical_model_name in ALLOWED_GROUNDING_MODELS
+        is_code_exec_model = canonical_model_name in ALLOWED_CODE_EXECUTION_MODELS
+        log.debug(f"{is_grounding_model=}, {is_code_exec_model=}")
 
         features = body.get("features", {})
         log.debug(f"body.features:", payload=features)
@@ -187,6 +191,35 @@ class Filter:
             metadata["safety_settings"] = self._get_permissive_safety_settings(
                 canonical_model_name
             )
+        if self.valves.NATIVE_PDF_SUPPORT:
+            log.info(
+                "NATIVE_PDF_SUPPORT is enabled, bypassing Open WebUI RAG and allowing gemini_manifold pipe to handle the rest."
+            )
+            # Remove all PDF files from body.files (body.metadata still has info about all the uploaded files.)
+            current_files = body.get("files", [])
+            original_file_count = len(current_files)
+            # Create a new list containing only non-PDF files
+            # A file is a PDF if its content_type is 'application/pdf'
+            non_pdf_files = [
+                file
+                for file in current_files
+                if file.get("file", {}).get("meta", {}).get("content_type")
+                != "application/pdf"
+            ]
+            # Check if any files were removed (i.e., if any PDFs were present)
+            pdfs_were_detected_and_removed = len(non_pdf_files) < original_file_count
+            # Update the 'files' key in the body with the new list.
+            # If the resulting list is empty, remove the 'files' key as it's NotRequired.
+            if non_pdf_files:
+                body["files"] = non_pdf_files
+            elif "files" in body:  # Only delete the key if it existed before
+                del body["files"]
+            if pdfs_were_detected_and_removed:
+                log.info(
+                    f"{original_file_count - len(non_pdf_files)} PDF files were removed from body.files"
+                )
+            # Set the upload_pdfs flag based on whether PDFs were detected and removed
+            metadata_features["upload_pdfs"] = pdfs_were_detected_and_removed
 
         # TODO: Remove body.files here to bypass RAG (if we are using google model). (Valve option to make it user controllable)
 
