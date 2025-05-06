@@ -904,88 +904,6 @@ class Pipe:
                 log.exception(error_msg)
             log.debug("AsyncGenerator finished.")
 
-    async def _do_post_processing(
-        self,
-        model_response: types.GenerateContentResponse | None,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        metadata: dict[str, Any],
-        request: Request,
-        stream_error_happened: bool = False,
-    ):
-        """Handles emitting usage, grounding, and sources after the main response/stream is done."""
-        log.info("Post-processing the model response.")
-        if stream_error_happened:
-            log.warning(
-                "An error occured during the stream, cannot do post-processing."
-            )
-            # All the needed metadata is always in the last chunk, so if error happened then we cannot do anything.
-            return
-        if not model_response:
-            log.warning("model_response is empty, cannot do post-processing.")
-            return
-        if not (candidate := self._get_first_candidate(model_response.candidates)):
-            log.warning(
-                "Response does not contain any canditates. Cannot do post-processing."
-            )
-            return
-
-        finish_reason = candidate.finish_reason
-        if finish_reason not in (
-            types.FinishReason.STOP,
-            types.FinishReason.MAX_TOKENS,
-        ):
-            # MAX_TOKENS is often acceptable, but others might indicate issues.
-            error_msg = f"Stream finished with sus reason:\n\n{finish_reason}."
-            await self._emit_toast(error_msg, event_emitter, "error")
-            log.error(error_msg)
-            return
-        else:
-            log.debug(f"Response has correct finish reason: {finish_reason}.")
-
-        # Emit token usage data.
-        if usage_event := self._get_usage_data_event(model_response):
-            log.debug("Emitting usage data:", payload=usage_event)
-            # TODO: catch potential errors?
-            await event_emitter(usage_event)
-        self._add_grounding_data_to_state(model_response, metadata, request)
-
-    def _add_grounding_data_to_state(
-        self,
-        response: types.GenerateContentResponse,
-        chat_metadata: dict[str, Any],
-        request: Request,
-    ):
-        candidate = self._get_first_candidate(response.candidates)
-        grounding_metadata_obj = candidate.grounding_metadata if candidate else None
-
-        chat_id: str = chat_metadata.get("chat_id", "")
-        message_id: str = chat_metadata.get("message_id", "")
-        storage_key = f"grounding_{chat_id}_{message_id}"
-
-        if grounding_metadata_obj:
-            log.debug(
-                f"Found grounding metadata. Storing in in request's app state using key {storage_key}."
-            )
-            # Using shared `request.app.state` to pass grounding metadata to Filter.outlet.
-            # This is necessary because the Pipe finishes during the initial `/api/completion` request,
-            # while Filter.outlet is invoked by a separate, later `/api/chat/completed` request.
-            # `request.state` does not persist across these distinct request lifecycles.
-            app_state: State = request.app.state
-            app_state._state[storage_key] = grounding_metadata_obj
-        else:
-            log.debug(f"Response {message_id} does not have grounding metadata.")
-
-    def _get_first_candidate(
-        self, candidates: list[types.Candidate] | None
-    ) -> types.Candidate | None:
-        """Selects the first candidate, logging a warning if multiple exist."""
-        if not candidates:
-            # Logging warnings is handled downstream.
-            return None
-        if len(candidates) > 1:
-            log.warning("Multiple candidates found, defaulting to first candidate.")
-        return candidates[0]
-
     def _process_image_part(
         self, inline_data, gen_content_args: dict, user: "UserData", request: Request
     ) -> str | None:
@@ -1006,46 +924,6 @@ class Pipe:
         else:
             encoded = base64.b64encode(image_data).decode()
             return f"![Generated Image](data:{mime_type};base64,{encoded})"
-
-    def _process_executable_code_part(
-        self, executable_code_part: types.ExecutableCode | None
-    ) -> str | None:
-        """
-        Processes an executable code part and returns the formatted string representation.
-        """
-
-        if not executable_code_part:
-            return None
-
-        lang_name = "python"  # Default language
-        if executable_code_part_lang_enum := executable_code_part.language:
-            if lang_name := executable_code_part_lang_enum.name:
-                lang_name = executable_code_part_lang_enum.name.lower()
-            else:
-                log.warning(
-                    f"Could not extract language name from {executable_code_part_lang_enum}. Default to python."
-                )
-        else:
-            log.warning("Language Enum is None, defaulting to python.")
-
-        if executable_code_part_code := executable_code_part.code:
-            return f"```{lang_name}\n{executable_code_part_code.rstrip()}\n```\n\n"
-        return ""
-
-    def _process_code_execution_result_part(
-        self, code_execution_result_part: types.CodeExecutionResult | None
-    ) -> str | None:
-        """
-        Processes a code execution result part and returns the formatted string representation.
-        """
-
-        if not code_execution_result_part:
-            return None
-
-        if code_execution_result_part_output := code_execution_result_part.output:
-            return f"**Output:**\n\n```\n{code_execution_result_part_output.rstrip()}\n```\n\n"
-        else:
-            return None
 
     def _upload_image(
         self,
@@ -1108,6 +986,46 @@ class Pipe:
         )
         log.success("Image upload finished!")
         return image_url
+
+    def _process_executable_code_part(
+        self, executable_code_part: types.ExecutableCode | None
+    ) -> str | None:
+        """
+        Processes an executable code part and returns the formatted string representation.
+        """
+
+        if not executable_code_part:
+            return None
+
+        lang_name = "python"  # Default language
+        if executable_code_part_lang_enum := executable_code_part.language:
+            if lang_name := executable_code_part_lang_enum.name:
+                lang_name = executable_code_part_lang_enum.name.lower()
+            else:
+                log.warning(
+                    f"Could not extract language name from {executable_code_part_lang_enum}. Default to python."
+                )
+        else:
+            log.warning("Language Enum is None, defaulting to python.")
+
+        if executable_code_part_code := executable_code_part.code:
+            return f"```{lang_name}\n{executable_code_part_code.rstrip()}\n```\n\n"
+        return ""
+
+    def _process_code_execution_result_part(
+        self, code_execution_result_part: types.CodeExecutionResult | None
+    ) -> str | None:
+        """
+        Processes a code execution result part and returns the formatted string representation.
+        """
+
+        if not code_execution_result_part:
+            return None
+
+        if code_execution_result_part_output := code_execution_result_part.output:
+            return f"**Output:**\n\n```\n{code_execution_result_part_output.rstrip()}\n```\n\n"
+        else:
+            return None
 
     # endregion
 
@@ -1225,7 +1143,77 @@ class Pipe:
 
     # endregion
 
-    # region Citations
+    # region Post-processing
+    async def _do_post_processing(
+        self,
+        model_response: types.GenerateContentResponse | None,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        metadata: dict[str, Any],
+        request: Request,
+        stream_error_happened: bool = False,
+    ):
+        """Handles emitting usage, grounding, and sources after the main response/stream is done."""
+        log.info("Post-processing the model response.")
+        if stream_error_happened:
+            log.warning(
+                "An error occured during the stream, cannot do post-processing."
+            )
+            # All the needed metadata is always in the last chunk, so if error happened then we cannot do anything.
+            return
+        if not model_response:
+            log.warning("model_response is empty, cannot do post-processing.")
+            return
+        if not (candidate := self._get_first_candidate(model_response.candidates)):
+            log.warning(
+                "Response does not contain any canditates. Cannot do post-processing."
+            )
+            return
+
+        finish_reason = candidate.finish_reason
+        if finish_reason not in (
+            types.FinishReason.STOP,
+            types.FinishReason.MAX_TOKENS,
+        ):
+            # MAX_TOKENS is often acceptable, but others might indicate issues.
+            error_msg = f"Stream finished with sus reason:\n\n{finish_reason}."
+            await self._emit_toast(error_msg, event_emitter, "error")
+            log.error(error_msg)
+            return
+        else:
+            log.debug(f"Response has correct finish reason: {finish_reason}.")
+
+        # Emit token usage data.
+        if usage_event := self._get_usage_data_event(model_response):
+            log.debug("Emitting usage data:", payload=usage_event)
+            # TODO: catch potential errors?
+            await event_emitter(usage_event)
+        self._add_grounding_data_to_state(model_response, metadata, request)
+
+    def _add_grounding_data_to_state(
+        self,
+        response: types.GenerateContentResponse,
+        chat_metadata: dict[str, Any],
+        request: Request,
+    ):
+        candidate = self._get_first_candidate(response.candidates)
+        grounding_metadata_obj = candidate.grounding_metadata if candidate else None
+
+        chat_id: str = chat_metadata.get("chat_id", "")
+        message_id: str = chat_metadata.get("message_id", "")
+        storage_key = f"grounding_{chat_id}_{message_id}"
+
+        if grounding_metadata_obj:
+            log.debug(
+                f"Found grounding metadata. Storing in in request's app state using key {storage_key}."
+            )
+            # Using shared `request.app.state` to pass grounding metadata to Filter.outlet.
+            # This is necessary because the Pipe finishes during the initial `/api/completion` request,
+            # while Filter.outlet is invoked by a separate, later `/api/chat/completed` request.
+            # `request.state` does not persist across these distinct request lifecycles.
+            app_state: State = request.app.state
+            app_state._state[storage_key] = grounding_metadata_obj
+        else:
+            log.debug(f"Response {message_id} does not have grounding metadata.")
 
     def _remove_citation_markers(self, text: str, sources: list["Source"]) -> str:
         original_text = text
@@ -1268,9 +1256,6 @@ class Pipe:
         )
         return text
 
-    # endregion
-
-    # region Usage data
     def _get_usage_data_event(
         self,
         response: types.GenerateContentResponse,
