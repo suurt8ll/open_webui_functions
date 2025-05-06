@@ -242,7 +242,7 @@ class Pipe:
         safety_settings: list[types.SafetySetting] | None = __metadata__.get(
             "safety_settings"
         )
-        model_name = self._strip_prefix(body.get("model", ""))
+        model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
         # API does not stream thoughts sadly. See https://github.com/googleapis/python-genai/issues/226#issuecomment-2631657100
         thinking_conf = None
         if model_name == "gemini-2.5-flash-preview-04-17":
@@ -346,90 +346,47 @@ class Pipe:
                 warn_msg = "Non-streaming response did not have any text inside it."
                 raise ValueError(warn_msg)
 
-    # region Helper methods inside the Pipe class
+    # region 1. Helper methods inside the Pipe class
 
-    # region Event emission and error logging
-    async def _emit_completion(
-        self,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        content: str | None = None,
-        done: bool = False,
-        error: str | None = None,
-        sources: list["Source"] | None = None,
-    ):
-        """Constructs and emits completion event."""
-        emission: "ChatCompletionEvent" = {
-            "type": "chat:completion",
-            "data": {"done": done},
-        }
-        if content:
-            emission["data"]["content"] = content
-        if error:
-            emission["data"]["error"] = {"detail": error}
-        if sources:
-            emission["data"]["sources"] = sources
-        await event_emitter(emission)
-
-    def is_thinking_model(self, model_id: str) -> bool:
-        """Check if the model is a thinking model based on the valve pattern."""
-        try:
-            result = bool(
-                re.search(self.valves.THINKING_MODEL_PATTERN, model_id, re.IGNORECASE)
-            )
-            return result
-        except Exception:
-            log.exception("Error checking if model is a thinking model")
-            return False
-
-    async def _emit_status(
-        self,
-        message: str,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        done: bool = False,
-        hidden: bool = False,
-    ) -> None:
-        """Emit status updates asynchronously."""
-        try:
-            if not self.valves.EMIT_STATUS_UPDATES:
-                return
-            status_event: "StatusEvent" = {
-                "type": "status",
-                "data": {"description": message, "done": done, "hidden": hidden},
-            }
-            await event_emitter(status_event)
-            log.debug(f"Emitted status:", payload=status_event)
-        except Exception:
-            log.exception("Error emitting status")
-
-    async def _emit_error(
-        self,
-        error_msg: str,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        warning: bool = False,
-        exception: bool = True,
-    ) -> None:
-        """Emits an event to the front-end that causes it to display a nice red error message."""
-
-        if warning:
-            log.opt(depth=1, exception=False).warning(error_msg)
+    # region 1.1 Client initialization and model retrival from Google API
+    def _get_genai_client(
+        self, api_key: str | None = None, base_url: str | None = None
+    ) -> genai.Client | None:
+        client = None
+        api_key = api_key if api_key else self.valves.GEMINI_API_KEY
+        base_url = base_url if base_url else self.valves.GEMINI_API_BASE_URL
+        if api_key:
+            http_options = types.HttpOptions(base_url=base_url)
+            try:
+                client = genai.Client(
+                    api_key=api_key,
+                    http_options=http_options,
+                )
+                log.success("Genai client successfully initialized!")
+            except Exception:
+                log.exception("genai client initialization failed.")
         else:
-            log.opt(depth=1, exception=exception).error(error_msg)
-        await self._emit_completion(
-            error=f"\n{error_msg}", event_emitter=event_emitter, done=True
-        )
+            log.error("GEMINI_API_KEY is not set.")
+        return client
 
-    async def _emit_toast(
-        self,
-        msg: str,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        toastType: Literal["info", "success", "warning", "error"] = "info",
-    ) -> None:
-        # TODO: Use this method in more places, even for info toasts.
-        event: NotificationEvent = {
-            "type": "notification",
-            "data": {"type": toastType, "content": msg},
-        }
-        await event_emitter(event)
+    def _get_user_client(self, __user__: "UserData") -> genai.Client | None:
+        # Register a user specific client if they have added their own API key.
+        user_valves: Pipe.UserValves | None = __user__.get("valves")
+        if (
+            user_valves
+            and user_valves.GEMINI_API_KEY
+            and not self.clients.get(__user__["id"])
+        ):
+            log.info(f'Creating a new genai client for user {__user__.get("email")}')
+            self.clients[__user__.get("id")] = self._get_genai_client(
+                api_key=user_valves.GEMINI_API_KEY,
+                base_url=user_valves.GEMINI_API_BASE_URL,
+            )
+            log.debug("Genai clients dict now looks like this:", payload=self.clients)
+        if user_client := self.clients.get(__user__.get("id")):
+            return user_client
+        else:
+            return self.clients.get("default")
 
     def _return_error_model(
         self, error_msg: str, warning: bool = False, exception: bool = True
@@ -445,9 +402,94 @@ class Pipe:
             "description": error_msg,
         }
 
-    # endregion
+    async def _get_genai_models(self) -> list[types.Model]:
+        """
+        Gets valid Google models from the API.
+        Returns a list of `genai.types.Model` objects.
+        """
+        client = self.clients.get("default")
+        if not client:
+            log.warning("There is no usable genai client. Trying to create one.")
+            # Try to create a client one more time.
+            if client := self._get_genai_client():
+                self.clients["default"] = client
+            else:
+                log.error("Can't initialize the client, returning no models.")
+                return []
 
-    # region ChatModel.chat.messages -> list[genai.types.Content] conversion
+        # This executes if we have a working client.
+        google_models_pager = None
+        try:
+            # Get the AsyncPager object
+            google_models_pager = await client.aio.models.list(
+                config={"query_base": True}
+            )
+        except Exception:
+            log.exception("Retriving models from Google API failed.")
+            return []
+
+        # Iterate the pager to get the full list of models
+        # This is where the actual API calls for subsequent pages happen if needed
+        try:
+            all_google_models = [model async for model in google_models_pager]
+        except Exception:
+            log.exception("Iterating Google models pager failed.")
+            return []
+
+        log.info(
+            f"Retrieved {len(all_google_models)} models from Gemini Developer API."
+        )
+        log.trace("All models returned by Google:", payload=all_google_models)
+        # Filter Google models list down to generative models only.
+        return [
+            model
+            for model in all_google_models
+            if model.supported_actions and "generateContent" in model.supported_actions
+        ]
+
+    def _filter_models(self, google_models: list[types.Model]) -> list["ModelData"]:
+        """
+        Filters the genai model list down based on configured white- and blacklist.
+        Returns a list[dict] that can be directly returned by the `pipes` method.
+        """
+        if not google_models:
+            error_msg = "Error during getting the models from Google API, check logs."
+            return [self._return_error_model(error_msg, exception=False)]
+
+        self.last_whitelist = self.valves.MODEL_WHITELIST
+        self.last_blacklist = self.valves.MODEL_BLACKLIST
+        whitelist = (
+            self.valves.MODEL_WHITELIST.replace(" ", "").split(",")
+            if self.valves.MODEL_WHITELIST
+            else []
+        )
+        blacklist = (
+            self.valves.MODEL_BLACKLIST.replace(" ", "").split(",")
+            if self.valves.MODEL_BLACKLIST
+            else []
+        )
+        # Perform filtering and store the result
+        filtered_models: list["ModelData"] = [
+            {
+                "id": re.sub(r"^.*?[./]", "", model.name),
+                "name": model.display_name,
+                "description": model.description,
+            }
+            for model in google_models
+            if model.name
+            and model.display_name
+            and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
+            and not any(fnmatch.fnmatch(model.name, f"models/{b}") for b in blacklist)
+        ]
+        # Add an info log to report the result of the filtering process
+        log.info(
+            f"Filtered {len(google_models)} raw models down to {len(filtered_models)} models based on white/blacklists."
+        )
+        return filtered_models
+
+    # endregion 1.1 Client initialization and model retrival from Google API
+
+    # region 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
     def _genai_contents_from_messages(
         self, messages_body: list["Message"], messages_db: list["MessageModel"] | None
     ) -> tuple[list[types.Content], str | None]:
@@ -655,9 +697,30 @@ class Pipe:
 
         return parts
 
-    # endregion
+    def _extract_youtube_urls(self, text: str) -> list[str]:
+        """
+        Extracts YouTube URLs from a given text.
+        Supports standard youtube.com/watch?v= URLs and shortened youtu.be URLs
+        """
+        youtube_urls = []
+        # Match standard YouTube URLs
+        for match in re.finditer(
+            r"https?://(?:www\.)?youtube\.com/watch\?v=[^&\s]+", text
+        ):
+            youtube_urls.append(match.group(0))
+        # Match shortened YouTube URLs
+        for match in re.finditer(r"https?://(?:www\.)?youtu\.be/[^&\s]+", text):
+            youtube_urls.append(match.group(0))
 
-    # region Model response streaming
+        if youtube_urls:
+            # TODO: toast
+            log.info(f"Extracted YouTube URLs: {youtube_urls}")
+
+        return youtube_urls
+
+    # endregion 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
+
+    # region 1.3 Model response streaming
     async def _stream_response_generator(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
@@ -756,6 +819,132 @@ class Pipe:
                 log.exception(error_msg)
             log.debug("AsyncGenerator finished.")
 
+    def _process_image_part(
+        self, inline_data, gen_content_args: dict, user: "UserData", request: Request
+    ) -> str | None:
+        """Handles image data conversion to markdown."""
+        mime_type = inline_data.mime_type
+        image_data = inline_data.data
+
+        if self.valves.USE_FILES_API:
+            image_url = self._upload_image(
+                image_data,
+                mime_type,
+                gen_content_args.get("model", ""),
+                "Not implemented yet. TAKE IT FROM gen_content_args contents",
+                user["id"],
+                request,
+            )
+            return f"![Generated Image]({image_url})" if image_url else None
+        else:
+            encoded = base64.b64encode(image_data).decode()
+            return f"![Generated Image](data:{mime_type};base64,{encoded})"
+
+    def _upload_image(
+        self,
+        image_data: bytes,
+        mime_type: str,
+        model: str,
+        prompt: str,
+        user_id: str,
+        __request__: Request,
+    ) -> str | None:
+        """
+        Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
+        Returns the url to uploaded image.
+        """
+        image_format = mimetypes.guess_extension(mime_type)
+        id = str(uuid.uuid4())
+        # TODO: Better filename? Prompt as the filename?
+        name = os.path.basename(f"generated-image{image_format}")
+        imagename = f"{id}_{name}"
+        image = io.BytesIO(image_data)
+        image_metadata = {
+            "model": model,
+            "prompt": prompt,
+        }
+
+        # Upload the image to user configured storage provider.
+        log.info("Uploading the model generated image to Open WebUI backend.")
+        log.debug("Uploading to the configured storage provider.")
+        try:
+            contents, image_path = Storage.upload_file(image, imagename)
+        except Exception:
+            error_msg = f"Error occurred during upload to the storage provider."
+            # TODO: emit toast
+            log.exception(error_msg)
+            return None
+        # Add the image file to files database.
+        log.debug("Adding the image file to Open WebUI files database.")
+        file_item = Files.insert_new_file(
+            user_id,
+            FileForm(
+                id=id,
+                filename=name,
+                path=image_path,
+                meta={
+                    "name": name,
+                    "content_type": mime_type,
+                    "size": len(contents),
+                    "data": image_metadata,
+                },
+            ),
+        )
+        if not file_item:
+            log.warning(
+                "Files.insert_new_file did not return anything. Image upload to Open WebUI database likely failed."
+            )
+            return None
+        # Get the image url.
+        image_url: str = __request__.app.url_path_for(
+            "get_file_content_by_id", id=file_item.id
+        )
+        log.success("Image upload finished!")
+        return image_url
+
+    def _process_executable_code_part(
+        self, executable_code_part: types.ExecutableCode | None
+    ) -> str | None:
+        """
+        Processes an executable code part and returns the formatted string representation.
+        """
+
+        if not executable_code_part:
+            return None
+
+        lang_name = "python"  # Default language
+        if executable_code_part_lang_enum := executable_code_part.language:
+            if lang_name := executable_code_part_lang_enum.name:
+                lang_name = executable_code_part_lang_enum.name.lower()
+            else:
+                log.warning(
+                    f"Could not extract language name from {executable_code_part_lang_enum}. Default to python."
+                )
+        else:
+            log.warning("Language Enum is None, defaulting to python.")
+
+        if executable_code_part_code := executable_code_part.code:
+            return f"```{lang_name}\n{executable_code_part_code.rstrip()}\n```\n\n"
+        return ""
+
+    def _process_code_execution_result_part(
+        self, code_execution_result_part: types.CodeExecutionResult | None
+    ) -> str | None:
+        """
+        Processes a code execution result part and returns the formatted string representation.
+        """
+
+        if not code_execution_result_part:
+            return None
+
+        if code_execution_result_part_output := code_execution_result_part.output:
+            return f"**Output:**\n\n```\n{code_execution_result_part_output.rstrip()}\n```\n\n"
+        else:
+            return None
+
+    # endregion 1.3 Model response streaming
+
+    # region 1.4 Thinking status message
     def _get_budget_str(self, model_name: str) -> str:
         return (
             f" • {self.valves.THINKING_BUDGET} tokens budget"
@@ -763,6 +952,17 @@ class Pipe:
             and self.valves.THINKING_BUDGET > 0
             else ""
         )
+
+    def is_thinking_model(self, model_id: str) -> bool:
+        """Check if the model is a thinking model based on the valve pattern."""
+        try:
+            result = bool(
+                re.search(self.valves.THINKING_MODEL_PATTERN, model_id, re.IGNORECASE)
+            )
+            return result
+        except Exception:
+            log.exception("Error checking if model is a thinking model")
+            return False
 
     async def _start_thinking_timer(
         self, model_name: str, event_emitter: Callable[["Event"], Awaitable[None]]
@@ -867,6 +1067,9 @@ class Pipe:
                 final_status, event_emitter=event_emitter, done=True, hidden=True
             )
 
+    # endregion 1.4 Thinking status message
+
+    # region 1.5 Post-processing
     async def _do_post_processing(
         self,
         model_response: types.GenerateContentResponse | None,
@@ -938,286 +1141,6 @@ class Pipe:
         else:
             log.debug(f"Response {message_id} does not have grounding metadata.")
 
-    def _get_first_candidate(
-        self, candidates: list[types.Candidate] | None
-    ) -> types.Candidate | None:
-        """Selects the first candidate, logging a warning if multiple exist."""
-        if not candidates:
-            # Logging warnings is handled downstream.
-            return None
-        if len(candidates) > 1:
-            log.warning("Multiple candidates found, defaulting to first candidate.")
-        return candidates[0]
-
-    def _process_image_part(
-        self, inline_data, gen_content_args: dict, user: "UserData", request: Request
-    ) -> str | None:
-        """Handles image data conversion to markdown."""
-        mime_type = inline_data.mime_type
-        image_data = inline_data.data
-
-        if self.valves.USE_FILES_API:
-            image_url = self._upload_image(
-                image_data,
-                mime_type,
-                gen_content_args.get("model", ""),
-                "Not implemented yet. TAKE IT FROM gen_content_args contents",
-                user["id"],
-                request,
-            )
-            return f"![Generated Image]({image_url})" if image_url else None
-        else:
-            encoded = base64.b64encode(image_data).decode()
-            return f"![Generated Image](data:{mime_type};base64,{encoded})"
-
-    def _process_executable_code_part(
-        self, executable_code_part: types.ExecutableCode | None
-    ) -> str | None:
-        """
-        Processes an executable code part and returns the formatted string representation.
-        """
-
-        if not executable_code_part:
-            return None
-
-        lang_name = "python"  # Default language
-        if executable_code_part_lang_enum := executable_code_part.language:
-            if lang_name := executable_code_part_lang_enum.name:
-                lang_name = executable_code_part_lang_enum.name.lower()
-            else:
-                log.warning(
-                    f"Could not extract language name from {executable_code_part_lang_enum}. Default to python."
-                )
-        else:
-            log.warning("Language Enum is None, defaulting to python.")
-
-        if executable_code_part_code := executable_code_part.code:
-            return f"```{lang_name}\n{executable_code_part_code.rstrip()}\n```\n\n"
-        return ""
-
-    def _process_code_execution_result_part(
-        self, code_execution_result_part: types.CodeExecutionResult | None
-    ) -> str | None:
-        """
-        Processes a code execution result part and returns the formatted string representation.
-        """
-
-        if not code_execution_result_part:
-            return None
-
-        if code_execution_result_part_output := code_execution_result_part.output:
-            return f"**Output:**\n\n```\n{code_execution_result_part_output.rstrip()}\n```\n\n"
-        else:
-            return None
-
-    def _upload_image(
-        self,
-        image_data: bytes,
-        mime_type: str,
-        model: str,
-        prompt: str,
-        user_id: str,
-        __request__: Request,
-    ) -> str | None:
-        """
-        Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
-        Returns the url to uploaded image.
-        """
-        image_format = mimetypes.guess_extension(mime_type)
-        id = str(uuid.uuid4())
-        # TODO: Better filename? Prompt as the filename?
-        name = os.path.basename(f"generated-image{image_format}")
-        imagename = f"{id}_{name}"
-        image = io.BytesIO(image_data)
-        image_metadata = {
-            "model": model,
-            "prompt": prompt,
-        }
-
-        # Upload the image to user configured storage provider.
-        log.info("Uploading the model generated image to Open WebUI backend.")
-        log.debug("Uploading to the configured storage provider.")
-        try:
-            contents, image_path = Storage.upload_file(image, imagename)
-        except Exception:
-            error_msg = f"Error occurred during upload to the storage provider."
-            # TODO: emit toast
-            log.exception(error_msg)
-            return None
-        # Add the image file to files database.
-        log.debug("Adding the image file to Open WebUI files database.")
-        file_item = Files.insert_new_file(
-            user_id,
-            FileForm(
-                id=id,
-                filename=name,
-                path=image_path,
-                meta={
-                    "name": name,
-                    "content_type": mime_type,
-                    "size": len(contents),
-                    "data": image_metadata,
-                },
-            ),
-        )
-        if not file_item:
-            log.warning(
-                "Files.insert_new_file did not return anything. Image upload to Open WebUI database likely failed."
-            )
-            return None
-        # Get the image url.
-        image_url: str = __request__.app.url_path_for(
-            "get_file_content_by_id", id=file_item.id
-        )
-        log.success("Image upload finished!")
-        return image_url
-
-    # endregion
-
-    # region Client initialization and model retrival from Google API
-    def _get_genai_client(
-        self, api_key: str | None = None, base_url: str | None = None
-    ) -> genai.Client | None:
-        client = None
-        api_key = api_key if api_key else self.valves.GEMINI_API_KEY
-        base_url = base_url if base_url else self.valves.GEMINI_API_BASE_URL
-        if api_key:
-            http_options = types.HttpOptions(base_url=base_url)
-            try:
-                client = genai.Client(
-                    api_key=api_key,
-                    http_options=http_options,
-                )
-                log.success("Genai client successfully initialized!")
-            except Exception:
-                log.exception("genai client initialization failed.")
-        else:
-            log.error("GEMINI_API_KEY is not set.")
-        return client
-
-    def _get_user_client(self, __user__: "UserData") -> genai.Client | None:
-        # Register a user specific client if they have added their own API key.
-        user_valves: Pipe.UserValves | None = __user__.get("valves")
-        if (
-            user_valves
-            and user_valves.GEMINI_API_KEY
-            and not self.clients.get(__user__["id"])
-        ):
-            log.info(f'Creating a new genai client for user {__user__.get("email")}')
-            self.clients[__user__.get("id")] = self._get_genai_client(
-                api_key=user_valves.GEMINI_API_KEY,
-                base_url=user_valves.GEMINI_API_BASE_URL,
-            )
-            log.debug("Genai clients dict now looks like this:", payload=self.clients)
-        if user_client := self.clients.get(__user__.get("id")):
-            return user_client
-        else:
-            return self.clients.get("default")
-
-    async def _get_genai_models(self) -> list[types.Model]:
-        """
-        Gets valid Google models from the API.
-        Returns a list of `genai.types.Model` objects.
-        """
-        client = self.clients.get("default")
-        if not client:
-            log.warning("There is no usable genai client. Trying to create one.")
-            # Try to create a client one more time.
-            if client := self._get_genai_client():
-                self.clients["default"] = client
-            else:
-                log.error("Can't initialize the client, returning no models.")
-                return []
-
-        # This executes if we have a working client.
-        google_models_pager = None
-        try:
-            # Get the AsyncPager object
-            google_models_pager = await client.aio.models.list(
-                config={"query_base": True}
-            )
-        except Exception:
-            log.exception("Retriving models from Google API failed.")
-            return []
-
-        # Iterate the pager to get the full list of models
-        # This is where the actual API calls for subsequent pages happen if needed
-        try:
-            all_google_models = [model async for model in google_models_pager]
-        except Exception:
-            log.exception("Iterating Google models pager failed.")
-            return []
-
-        log.info(
-            f"Retrieved {len(all_google_models)} models from Gemini Developer API."
-        )
-        log.trace("All models returned by Google:", payload=all_google_models)
-        # Filter Google models list down to generative models only.
-        return [
-            model
-            for model in all_google_models
-            if model.supported_actions and "generateContent" in model.supported_actions
-        ]
-
-    def _filter_models(self, google_models: list[types.Model]) -> list["ModelData"]:
-        """
-        Filters the genai model list down based on configured white- and blacklist.
-        Returns a list[dict] that can be directly returned by the `pipes` method.
-        """
-        if not google_models:
-            error_msg = "Error during getting the models from Google API, check logs."
-            return [self._return_error_model(error_msg, exception=False)]
-
-        self.last_whitelist = self.valves.MODEL_WHITELIST
-        self.last_blacklist = self.valves.MODEL_BLACKLIST
-        whitelist = (
-            self.valves.MODEL_WHITELIST.replace(" ", "").split(",")
-            if self.valves.MODEL_WHITELIST
-            else []
-        )
-        blacklist = (
-            self.valves.MODEL_BLACKLIST.replace(" ", "").split(",")
-            if self.valves.MODEL_BLACKLIST
-            else []
-        )
-        # Perform filtering and store the result
-        filtered_models: list["ModelData"] = [
-            {
-                "id": self._strip_prefix(model.name),
-                "name": model.display_name,
-                "description": model.description,
-            }
-            for model in google_models
-            if model.name
-            and model.display_name
-            and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
-            and not any(fnmatch.fnmatch(model.name, f"models/{b}") for b in blacklist)
-        ]
-        # Add an info log to report the result of the filtering process
-        log.info(
-            f"Filtered {len(google_models)} raw models down to {len(filtered_models)} models based on white/blacklists."
-        )
-        return filtered_models
-
-    def _strip_prefix(self, model_name: str) -> str:
-        """
-        Strip any prefix from the model name up to and including the first '.' or '/'.
-        This makes the method generic and adaptable to varying prefixes.
-        """
-        # TODO: [refac] pointless helper, remove.
-        try:
-            # Use non-greedy regex to remove everything up to and including the first '.' or '/'
-            stripped = re.sub(r"^.*?[./]", "", model_name)
-            return stripped
-        except Exception:
-            error_msg = "Error stripping prefix, using the original model name."
-            log.exception(error_msg)
-            return model_name
-
-    # endregion
-
-    # region Citations
-
     def _remove_citation_markers(self, text: str, sources: list["Source"]) -> str:
         original_text = text
         processed: set[str] = set()
@@ -1259,9 +1182,6 @@ class Pipe:
         )
         return text
 
-    # endregion
-
-    # region Usage data
     def _get_usage_data_event(
         self,
         response: types.GenerateContentResponse,
@@ -1302,9 +1222,83 @@ class Pipe:
         }
         return completion_event
 
-    # endregion
+    # endregion 1.5 Post-processing
 
-    # region Other helpers
+    # region 1.6 Event emissions
+    async def _emit_completion(
+        self,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        content: str | None = None,
+        done: bool = False,
+        error: str | None = None,
+        sources: list["Source"] | None = None,
+    ):
+        """Constructs and emits completion event."""
+        emission: "ChatCompletionEvent" = {
+            "type": "chat:completion",
+            "data": {"done": done},
+        }
+        if content:
+            emission["data"]["content"] = content
+        if error:
+            emission["data"]["error"] = {"detail": error}
+        if sources:
+            emission["data"]["sources"] = sources
+        await event_emitter(emission)
+
+    async def _emit_status(
+        self,
+        message: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        done: bool = False,
+        hidden: bool = False,
+    ) -> None:
+        """Emit status updates asynchronously."""
+        try:
+            if not self.valves.EMIT_STATUS_UPDATES:
+                return
+            status_event: "StatusEvent" = {
+                "type": "status",
+                "data": {"description": message, "done": done, "hidden": hidden},
+            }
+            await event_emitter(status_event)
+            log.debug(f"Emitted status:", payload=status_event)
+        except Exception:
+            log.exception("Error emitting status")
+
+    async def _emit_error(
+        self,
+        error_msg: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        warning: bool = False,
+        exception: bool = True,
+    ) -> None:
+        """Emits an event to the front-end that causes it to display a nice red error message."""
+
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        await self._emit_completion(
+            error=f"\n{error_msg}", event_emitter=event_emitter, done=True
+        )
+
+    async def _emit_toast(
+        self,
+        msg: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        toastType: Literal["info", "success", "warning", "error"] = "info",
+    ) -> None:
+        # TODO: Use this method in more places, even for info toasts.
+        event: NotificationEvent = {
+            "type": "notification",
+            "data": {"type": toastType, "content": msg},
+        }
+        await event_emitter(event)
+
+    # endregion 1.6 Event emissions
+
+    # region 1.7 Utility helpers
     def _is_flat_dict(self, data: Any) -> bool:
         """
         Checks if a dictionary contains only non-dict/non-list values (is one level deep).
@@ -1539,27 +1533,17 @@ class Pipe:
             return "application/octet-stream"  # Default MIME type if unknown
         return mime_type
 
-    def _extract_youtube_urls(self, text: str) -> list[str]:
-        """
-        Extracts YouTube URLs from a given text.
-        Supports standard youtube.com/watch?v= URLs and shortened youtu.be URLs
-        """
-        youtube_urls = []
-        # Match standard YouTube URLs
-        for match in re.finditer(
-            r"https?://(?:www\.)?youtube\.com/watch\?v=[^&\s]+", text
-        ):
-            youtube_urls.append(match.group(0))
-        # Match shortened YouTube URLs
-        for match in re.finditer(r"https?://(?:www\.)?youtu\.be/[^&\s]+", text):
-            youtube_urls.append(match.group(0))
+    def _get_first_candidate(
+        self, candidates: list[types.Candidate] | None
+    ) -> types.Candidate | None:
+        """Selects the first candidate, logging a warning if multiple exist."""
+        if not candidates:
+            # Logging warnings is handled downstream.
+            return None
+        if len(candidates) > 1:
+            log.warning("Multiple candidates found, defaulting to first candidate.")
+        return candidates[0]
 
-        if youtube_urls:
-            # TODO: toast
-            log.info(f"Extracted YouTube URLs: {youtube_urls}")
+    # endregion 1.7 Utility helpers
 
-        return youtube_urls
-
-    # endregion
-
-    # endregion
+    # endregion 1. Helper methods inside the Pipe class
