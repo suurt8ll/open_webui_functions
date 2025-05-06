@@ -107,7 +107,8 @@ class Filter:
         self.valves = self.Valves(**(valves if valves else {}))
         self.log_level = self.valves.LOG_LEVEL
         self._add_log_handler()
-        log.info("Filter function has been initialized!")
+        log.success("Function has been initialized.")
+        log.trace("Full self object:", payload=self.__dict__)
 
     def inlet(self, body: dict) -> dict:
         """Modifies the incoming request payload before it's sent to the LLM. Operates on the `form_data` dictionary."""
@@ -119,6 +120,8 @@ class Filter:
                 "Running the logging setup again."
             )
             self._add_log_handler()
+
+        log.debug("inlet method has been triggered.")
 
         # Exit early if we are filtering an unsupported model.
         model_name: str = body.get("model", "")
@@ -140,10 +143,14 @@ class Filter:
         if "gemini_manifold_google_genai." not in model_name or (
             not is_grounding_model and not is_code_exec_model
         ):  # Check if it supports *any* of the features we filter on
+            log.debug(
+                "Returning the original body object because conditions for proceeding are not fulfilled."
+                f"{model_name=}, {is_grounding_model=}, {is_code_exec_model=}"
+            )
             return body
 
         features = body.get("features", {})
-        log.debug(f"Features: {features}")
+        log.debug(f"body.features:", payload=features)
 
         # Ensure metadata structure exists and add new feature
         metadata = body.setdefault("metadata", {})
@@ -188,6 +195,7 @@ class Filter:
                 features["code_interpreter"] = False
                 metadata_features["google_code_execution"] = True
         if self.valves.USE_PERMISSIVE_SAFETY:
+            log.info("Adding permissive safety settings to body.metadata")
             metadata["safety_settings"] = self._get_permissive_safety_settings(
                 canonical_model_name
             )
@@ -210,12 +218,14 @@ class Filter:
     ) -> "Body":
         """Modifies the complete response payload after it's received from the LLM. Operates on the final `body` dictionary."""
 
+        log.debug("outlet method has been triggered.")
+
         chat_id: str = __metadata__.get("chat_id", "")
         message_id: str = __metadata__.get("message_id", "")
         storage_key = f"grounding_{chat_id}_{message_id}"
 
         app_state: State = __request__.app.state
-        log.info(f"Seeing if there is attribute {storage_key} in request state.")
+        log.debug(f"Seeing if there is attribute {storage_key} in request state.")
         stored_metadata: types.GroundingMetadata | None = getattr(
             app_state, storage_key, None
         )
@@ -239,7 +249,7 @@ class Filter:
                 text_to_use,
                 __event_emitter__,
             )
-            log.debug(f"Text with citations:\n{cited_text}")
+            log.trace(f"Text with citations:\n{cited_text}")
 
             if cited_text:
                 content = body["messages"][-1]["content"]
@@ -279,6 +289,7 @@ class Filter:
         if not supports or not grounding_chunks:
             log.info(
                 "Grounding metadata missing supports or chunks, can't insert citation markers."
+                "Response was probably just not grounded."
             )
             return
 
@@ -467,6 +478,7 @@ class Filter:
         }
         await event_emitter(event)
         log.info("Emitted sources event.")
+        log.debug("ChatCompletionEvent:", payload=event)
 
     async def _emit_status_event_w_queries(
         self,
@@ -498,8 +510,9 @@ class Filter:
             "type": "status",
             "data": status_event_data,
         }
-        log.debug(f"Emitting StatusEvent: {status_event}")
         await event_emitter(status_event)
+        log.info("Emitted search queries.")
+        log.debug("StatusEvent:", payload=status_event)
 
     # endregion 1.1 Add citations
 
