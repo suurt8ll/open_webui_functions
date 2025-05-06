@@ -683,6 +683,27 @@ class Pipe:
 
         return parts
 
+    def _extract_youtube_urls(self, text: str) -> list[str]:
+        """
+        Extracts YouTube URLs from a given text.
+        Supports standard youtube.com/watch?v= URLs and shortened youtu.be URLs
+        """
+        youtube_urls = []
+        # Match standard YouTube URLs
+        for match in re.finditer(
+            r"https?://(?:www\.)?youtube\.com/watch\?v=[^&\s]+", text
+        ):
+            youtube_urls.append(match.group(0))
+        # Match shortened YouTube URLs
+        for match in re.finditer(r"https?://(?:www\.)?youtu\.be/[^&\s]+", text):
+            youtube_urls.append(match.group(0))
+
+        if youtube_urls:
+            # TODO: toast
+            log.info(f"Extracted YouTube URLs: {youtube_urls}")
+
+        return youtube_urls
+
     # endregion
 
     # region Event emission and error logging
@@ -1292,7 +1313,7 @@ class Pipe:
 
     # endregion
 
-    # region Other helpers
+    # region Utility helpers
     def _is_flat_dict(self, data: Any) -> bool:
         """
         Checks if a dictionary contains only non-dict/non-list values (is one level deep).
@@ -1527,26 +1548,16 @@ class Pipe:
             return "application/octet-stream"  # Default MIME type if unknown
         return mime_type
 
-    def _extract_youtube_urls(self, text: str) -> list[str]:
-        """
-        Extracts YouTube URLs from a given text.
-        Supports standard youtube.com/watch?v= URLs and shortened youtu.be URLs
-        """
-        youtube_urls = []
-        # Match standard YouTube URLs
-        for match in re.finditer(
-            r"https?://(?:www\.)?youtube\.com/watch\?v=[^&\s]+", text
-        ):
-            youtube_urls.append(match.group(0))
-        # Match shortened YouTube URLs
-        for match in re.finditer(r"https?://(?:www\.)?youtu\.be/[^&\s]+", text):
-            youtube_urls.append(match.group(0))
-
-        if youtube_urls:
-            # TODO: toast
-            log.info(f"Extracted YouTube URLs: {youtube_urls}")
-
-        return youtube_urls
+    def _get_first_candidate(
+        self, candidates: list[types.Candidate] | None
+    ) -> types.Candidate | None:
+        """Selects the first candidate, logging a warning if multiple exist."""
+        if not candidates:
+            # Logging warnings is handled downstream.
+            return None
+        if len(candidates) > 1:
+            log.warning("Multiple candidates found, defaulting to first candidate.")
+        return candidates[0]
 
     # endregion
 
