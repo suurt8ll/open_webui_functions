@@ -115,7 +115,7 @@ class Filter:
         log.success("Function has been initialized.")
         log.trace("Full self object:", payload=self.__dict__)
 
-    def inlet(self, body: "Body") -> "Body":
+    def inlet(self, body: "Body", __metadata__: dict[str, Any]) -> "Body":
         """Modifies the incoming request payload before it's sent to the LLM. Operates on the `form_data` dictionary."""
 
         # Detect log level change inside self.valves
@@ -192,6 +192,13 @@ class Filter:
                 canonical_model_name
             )
         if self.valves.NATIVE_PDF_SUPPORT:
+            if __metadata__["chat_id"] == "local":
+                # TODO toast notification
+                log.warning(
+                    "Temporary chats don't have support for native PDF upload currently"
+                    "This chat will likely use Open WebUI's RAG."
+                )
+                return body
             log.info(
                 "NATIVE_PDF_SUPPORT is enabled, bypassing Open WebUI RAG and allowing gemini_manifold pipe to handle the rest."
             )
