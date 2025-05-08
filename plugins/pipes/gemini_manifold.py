@@ -15,6 +15,7 @@ requirements: google-genai==1.13.0
 
 # Supported features:
 #   - Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
+#   - Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 required)
 #   - Display citations in the front-end.
 #   - Image input
 #   - YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
@@ -28,7 +29,6 @@ requirements: google-genai==1.13.0
 # Features that are supported by API but not yet implemented in the manifold:
 #   TODO Audio input support.
 #   TODO Video input support (other than YouTube URLs).
-#   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 
 import inspect
 from google import genai
@@ -231,19 +231,26 @@ class Pipe:
         # This allows us to see data about sources and files data.
         chat_id = __metadata__.get("chat_id", "")
         if chat := Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=__user__["id"]):
-            chat_content: ChatChatModel = chat.chat  # type: ignore
+            chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
             # Last message is the upcoming assistant response, at this point in the logic it's empty.
             messages_db = chat_content.get("messages")[:-1]
         else:
             warn_msg = f"Chat with ID - {chat_id} - not found. Can't filter out the citation marks."
             log.warning(warn_msg)
             messages_db = None
+
+        features = __metadata__.get("features", {}) or {}
         log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
         )
-        contents, system_prompt = self._genai_contents_from_messages(
-            body.get("messages"), messages_db
+        contents, system_prompt = await self._genai_contents_from_messages(
+            body.get("messages"),
+            messages_db,
+            features.get("upload_documents", False),
+            __event_emitter__,
         )
+
+        # Assemble GenerateContentConfig
         safety_settings: list[types.SafetySetting] | None = __metadata__.get(
             "safety_settings"
         )
@@ -264,7 +271,6 @@ class Pipe:
                 ),
                 include_thoughts=None,
             )
-
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
             system_instruction=system_prompt,
@@ -276,7 +282,6 @@ class Pipe:
             safety_settings=safety_settings,
             thinking_config=thinking_conf,
         )
-
         gen_content_conf.response_modalities = ["Text"]
         if (
             "gemini-2.0-flash-exp-image-generation" in model_name
@@ -290,10 +295,7 @@ class Pipe:
                 log.warning(
                     "Image Generation model does not support the system prompt message! Removing the system prompt."
                 )
-
-        features = __metadata__.get("features", {}) or {}
         gen_content_conf.tools = []
-
         if features.get("google_search_tool"):
             log.info("Using grounding with Google Search as a Tool.")
             gen_content_conf.tools.append(
@@ -307,7 +309,6 @@ class Pipe:
                 )
             )
             gen_content_conf.tools.append(types.Tool(google_search_retrieval=gs))
-
         # NB: It is not possible to use both Search and Code execution at the same time,
         # however, it can be changed later, so let's just handle it as a common error
         if features.get("google_code_execution"):
@@ -315,7 +316,6 @@ class Pipe:
             gen_content_conf.tools.append(
                 types.Tool(code_execution=types.ToolCodeExecution())
             )
-
         gen_content_args = {
             "model": model_name,
             "contents": contents,
@@ -504,23 +504,50 @@ class Pipe:
     # endregion 1.1 Client initialization and model retrival from Google API
 
     # region 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
-    def _genai_contents_from_messages(
-        self, messages_body: list["Message"], messages_db: list["MessageModel"] | None
+    async def _genai_contents_from_messages(
+        self,
+        messages_body: list["Message"],
+        messages_db: list["ChatMessageTD"] | None,
+        upload_documents: bool,
+        event_emitter: Callable[["Event"], Awaitable[None]],
     ) -> tuple[list[types.Content], str | None]:
         """Transforms `body.messages` list into list of `genai.types.Content` objects"""
 
-        def process_user_message(message: "UserMessage") -> list[types.Part]:
+        async def process_user_message(
+            message: "UserMessage", files: list["FileAttachmentTD"]
+        ) -> list[types.Part]:
             user_parts = []
             user_content = message.get("content")
+            if files:
+                log.info(f"Adding {len(files)} files to the user message.")
+            for file in files:
+                log.debug("Processing file:", payload=file)
+                file_id = file.get("file").get("id")
+                document_bytes, mime_type = self._get_file_data(file_id)
+                if not document_bytes or not mime_type:
+                    # Warnings are logged by the method above.
+                    continue
+
+                if mime_type.startswith("text/") or mime_type == "application/pdf":
+                    log.debug(
+                        f"{mime_type} is supported by Google API! Creating `types.Part` model for it."
+                    )
+                    user_parts.append(
+                        types.Part.from_bytes(data=document_bytes, mime_type=mime_type)
+                    )
+                else:
+                    warn_msg = f"{mime_type} is not supported by Google API! Skipping file {file_id}."
+                    log.warning(warn_msg)
+                    await self._emit_toast(warn_msg, event_emitter, "warning")
             if isinstance(user_content, str):
                 # Check for YouTube URLs in text content
+                # FIXME: Better ordering of Parts here.
                 youtube_urls = self._extract_youtube_urls(user_content)
                 if youtube_urls:
                     for url in youtube_urls:
                         user_parts.append(
                             types.Part(file_data=types.FileData(file_uri=url))
                         )
-
                 # Add text content as usual
                 user_parts.extend(self._genai_parts_from_text(user_content))
             elif isinstance(user_content, list):
@@ -564,7 +591,12 @@ class Pipe:
             role = message.get("role")
             if role == "user":
                 message = cast("UserMessage", message)
-                parts = process_user_message(message)
+                files = []
+                if messages_db:
+                    message_db = messages_db[i]
+                    if upload_documents:
+                        files = message_db.get("files", [])
+                parts = await process_user_message(message, files)
             elif role == "assistant":
                 message = cast("AssistantMessage", message)
                 # Google API's assistant role is "model"
@@ -574,7 +606,7 @@ class Pipe:
                     i -= 1
                 sources = None
                 if messages_db:
-                    message_db = cast("AssistantMessageModel", messages_db[i])
+                    message_db = messages_db[i]
                     sources = message_db.get("sources")
                 parts = process_assistant_message(message, sources)
             elif role == "system":
@@ -654,53 +686,16 @@ class Pipe:
                 except Exception:
                     # TODO: Emit toast
                     log.exception("Error decoding base64 image:")
-
             elif match.group(4):  # File URL
                 log.debug("Found API image link!", id=match.group(4))
                 file_id = match.group(4)
-                file_model = Files.get_file_by_id(file_id)
-
-                if file_model is None:
-                    # TODO: Emit toast
-                    log.warning("File with this ID not found.", id=file_id)
-                    #  Could add placeholder text here if desired
-                    continue  # Skip to the next match
-
-                try:
-                    # "continue" above ensures that file_model is not None
-                    content_type = file_model.meta.get("content_type")  # type: ignore
-                    if content_type is None:
-                        # TODO: Emit toast
-                        log.warning(
-                            "Content type not found for this file ID.",
-                            id=file_id,
-                        )
-                        continue
-
-                    with open(file_model.path, "rb") as file:  # type: ignore
-                        image_data = file.read()
-
-                    image_part = types.Part.from_bytes(
-                        data=image_data, mime_type=content_type
-                    )
-                    parts.append(image_part)
-
-                except FileNotFoundError:
-                    # TODO: Emit toast
-                    log.exception(
-                        "File not found on disk for this ID.",
-                        id=file_id,
-                        path=file_model.path,
-                    )
-                except KeyError:
-                    # TODO: Emit toast
-                    log.exception(
-                        "Metadata error for this file ID: 'content_type' missing.",
-                        id=file_id,
-                    )
-                except Exception:
-                    # TODO: Emit toast
-                    log.exception("Error processing file with this ID", id=file_id)
+                image_bytes, mime_type = self._get_file_data(file_id)
+                if not image_bytes or not mime_type:
+                    continue
+                image_part = types.Part.from_bytes(
+                    data=image_bytes, mime_type=mime_type
+                )
+                parts.append(image_part)
 
             last_pos = match.end()
 
@@ -1582,6 +1577,43 @@ class Pipe:
         if len(candidates) > 1:
             log.warning("Multiple candidates found, defaulting to first candidate.")
         return candidates[0]
+
+    def _get_file_data(self, file_id: str) -> tuple[bytes | None, str | None]:
+        file_model = Files.get_file_by_id(file_id)
+        if file_model is None:
+            # TODO: Emit toast
+            log.warning(f"File {file_id} not found in the backend's database.")
+            return None, None
+        if not (file_path := file_model.path):
+            # TODO: Emit toast
+            log.warning(
+                f"File {file_id} was found in the database but it lacks `path` field. Cannot Continue."
+            )
+            return None, None
+        if file_model.meta is None:
+            # TODO: Emit toast
+            log.warning(
+                f"File {file_path} was found in the database but it lacks `meta` field. Cannot continue."
+            )
+            return None, None
+        if not (content_type := file_model.meta.get("content_type")):
+            # TODO: Emit toast
+            log.warning(
+                f"File {file_path} was found in the database but it lacks `meta.content_type` field. Cannot continue."
+            )
+            return None, None
+        try:
+            with open(file_path, "rb") as file:
+                image_data = file.read()
+            return image_data, content_type
+        except FileNotFoundError:
+            # TODO: Emit toast
+            log.exception(f"File {file_path} not found on disk.")
+            return None, content_type
+        except Exception:
+            # TODO: Emit toast
+            log.exception(f"Error processing file {file_path}")
+            return None, content_type
 
     # endregion 1.7 Utility helpers
 
