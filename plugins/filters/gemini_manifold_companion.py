@@ -91,9 +91,9 @@ class Filter:
             description="""Whether to request relaxed safety filtering.
             Default value is False.""",
         )
-        NATIVE_PDF_SUPPORT: bool = Field(
+        BYPASS_BACKEND_RAG: bool = Field(
             default=True,
-            description="""Decide if you want ot bypass Open WebUI's RAG and send your PDF directly to Google API.
+            description="""Decide if you want ot bypass Open WebUI's RAG and send your documents directly to Google API.
             Default value is True.""",
         )
         LOG_LEVEL: Literal[
@@ -191,44 +191,24 @@ class Filter:
             metadata["safety_settings"] = self._get_permissive_safety_settings(
                 canonical_model_name
             )
-        if self.valves.NATIVE_PDF_SUPPORT:
+        if self.valves.BYPASS_BACKEND_RAG:
             if __metadata__["chat_id"] == "local":
                 # TODO toast notification
                 log.warning(
                     "Temporary chats don't have support for native PDF upload currently"
                     "This chat will likely use Open WebUI's RAG."
                 )
+                metadata_features["upload_documents"] = False
                 return body
             log.info(
-                "NATIVE_PDF_SUPPORT is enabled, bypassing Open WebUI RAG and allowing gemini_manifold pipe to handle the rest."
+                "BYPASS_BACKEND_RAG is enabled, bypassing Open WebUI RAG and allowing gemini_manifold pipe to handle the rest."
             )
-            # Remove all PDF files from body.files (body.metadata still has info about all the uploaded files.)
-            current_files = body.get("files", [])
-            original_file_count = len(current_files)
-            # Create a new list containing only non-PDF files
-            # A file is a PDF if its content_type is 'application/pdf'
-            non_pdf_files = [
-                file
-                for file in current_files
-                if file.get("file", {}).get("meta", {}).get("content_type")
-                != "application/pdf"
-            ]
-            # Check if any files were removed (i.e., if any PDFs were present)
-            pdfs_were_detected_and_removed = len(non_pdf_files) < original_file_count
-            # Update the 'files' key in the body with the new list.
-            # If the resulting list is empty, remove the 'files' key as it's NotRequired.
-            if non_pdf_files:
-                body["files"] = non_pdf_files
-            elif "files" in body:  # Only delete the key if it existed before
-                del body["files"]
-            if pdfs_were_detected_and_removed:
-                log.info(
-                    f"{original_file_count - len(non_pdf_files)} PDF files were removed from body.files"
-                )
-            # Set the upload_pdfs flag based on whether PDFs were detected and removed
-            metadata_features["upload_pdfs"] = pdfs_were_detected_and_removed
-
-        # TODO: Remove body.files here to bypass RAG (if we are using google model). (Valve option to make it user controllable)
+            if files := body.get("files"):
+                log.info(f"Removing {len(files)} from backend's RAG pipeline.")
+                body["files"] = []
+            metadata_features["upload_documents"] = True
+        else:
+            metadata_features["upload_documents"] = False
 
         # TODO: Filter out the citation markers here.
 
