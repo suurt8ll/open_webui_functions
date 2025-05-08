@@ -15,6 +15,7 @@ requirements: google-genai==1.13.0
 
 # Supported features:
 #   - Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
+#   - Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 required)
 #   - Display citations in the front-end.
 #   - Image input
 #   - YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
@@ -28,7 +29,6 @@ requirements: google-genai==1.13.0
 # Features that are supported by API but not yet implemented in the manifold:
 #   TODO Audio input support.
 #   TODO Video input support (other than YouTube URLs).
-#   TODO PDF (other documents?) input support, __files__ param that is passed to the pipe() func can be used for this.
 
 import inspect
 from google import genai
@@ -234,12 +234,19 @@ class Pipe:
             warn_msg = f"Chat with ID - {chat_id} - not found. Can't filter out the citation marks."
             log.warning(warn_msg)
             messages_db = None
+
+        features = __metadata__.get("features", {}) or {}
         log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
         )
-        contents, system_prompt = self._genai_contents_from_messages(
-            body.get("messages"), messages_db
+        contents, system_prompt = await self._genai_contents_from_messages(
+            body.get("messages"),
+            messages_db,
+            features.get("upload_documents", False),
+            __event_emitter__,
         )
+
+        # Assemble GenerateContentConfig
         safety_settings: list[types.SafetySetting] | None = __metadata__.get(
             "safety_settings"
         )
@@ -251,7 +258,6 @@ class Pipe:
             thinking_conf = types.ThinkingConfig(
                 thinking_budget=self.valves.THINKING_BUDGET, include_thoughts=None
             )
-
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
             system_instruction=system_prompt,
@@ -263,7 +269,6 @@ class Pipe:
             safety_settings=safety_settings,
             thinking_config=thinking_conf,
         )
-
         gen_content_conf.response_modalities = ["Text"]
         if (
             "gemini-2.0-flash-exp-image-generation" in model_name
@@ -277,10 +282,7 @@ class Pipe:
                 log.warning(
                     "Image Generation model does not support the system prompt message! Removing the system prompt."
                 )
-
-        features = __metadata__.get("features", {}) or {}
         gen_content_conf.tools = []
-
         if features.get("google_search_tool"):
             log.info("Using grounding with Google Search as a Tool.")
             gen_content_conf.tools.append(
@@ -294,7 +296,6 @@ class Pipe:
                 )
             )
             gen_content_conf.tools.append(types.Tool(google_search_retrieval=gs))
-
         # NB: It is not possible to use both Search and Code execution at the same time,
         # however, it can be changed later, so let's just handle it as a common error
         if features.get("google_code_execution"):
@@ -302,7 +303,6 @@ class Pipe:
             gen_content_conf.tools.append(
                 types.Tool(code_execution=types.ToolCodeExecution())
             )
-
         gen_content_args = {
             "model": model_name,
             "contents": contents,
@@ -491,23 +491,50 @@ class Pipe:
     # endregion 1.1 Client initialization and model retrival from Google API
 
     # region 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
-    def _genai_contents_from_messages(
-        self, messages_body: list["Message"], messages_db: list["ChatMessageTD"] | None
+    async def _genai_contents_from_messages(
+        self,
+        messages_body: list["Message"],
+        messages_db: list["ChatMessageTD"] | None,
+        upload_documents: bool,
+        event_emitter: Callable[["Event"], Awaitable[None]],
     ) -> tuple[list[types.Content], str | None]:
         """Transforms `body.messages` list into list of `genai.types.Content` objects"""
 
-        def process_user_message(message: "UserMessage") -> list[types.Part]:
+        async def process_user_message(
+            message: "UserMessage", files: list["FileAttachmentTD"]
+        ) -> list[types.Part]:
             user_parts = []
             user_content = message.get("content")
+            if files:
+                log.info(f"Adding {len(files)} files to the user message.")
+            for file in files:
+                log.debug("Processing file:", payload=file)
+                file_id = file.get("file").get("id")
+                document_bytes, mime_type = self._get_file_data(file_id)
+                if not document_bytes or not mime_type:
+                    # Warnings are logged by the method above.
+                    continue
+
+                if mime_type.startswith("text/") or mime_type == "application/pdf":
+                    log.debug(
+                        f"{mime_type} is supported by Google API! Creating `types.Part` model for it."
+                    )
+                    user_parts.append(
+                        types.Part.from_bytes(data=document_bytes, mime_type=mime_type)
+                    )
+                else:
+                    warn_msg = f"{mime_type} is not supported by Google API! Skipping file {file_id}."
+                    log.warning(warn_msg)
+                    await self._emit_toast(warn_msg, event_emitter, "warning")
             if isinstance(user_content, str):
                 # Check for YouTube URLs in text content
+                # FIXME: Better ordering of Parts here.
                 youtube_urls = self._extract_youtube_urls(user_content)
                 if youtube_urls:
                     for url in youtube_urls:
                         user_parts.append(
                             types.Part(file_data=types.FileData(file_uri=url))
                         )
-
                 # Add text content as usual
                 user_parts.extend(self._genai_parts_from_text(user_content))
             elif isinstance(user_content, list):
@@ -551,7 +578,12 @@ class Pipe:
             role = message.get("role")
             if role == "user":
                 message = cast("UserMessage", message)
-                parts = process_user_message(message)
+                files = []
+                if messages_db:
+                    message_db = messages_db[i]
+                    if upload_documents:
+                        files = message_db.get("files", [])
+                parts = await process_user_message(message, files)
             elif role == "assistant":
                 message = cast("AssistantMessage", message)
                 # Google API's assistant role is "model"
