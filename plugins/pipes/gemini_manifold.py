@@ -227,7 +227,7 @@ class Pipe:
         # This allows us to see data about sources and files data.
         chat_id = __metadata__.get("chat_id", "")
         if chat := Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=__user__["id"]):
-            chat_content: ChatChatModel = chat.chat  # type: ignore
+            chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
             # Last message is the upcoming assistant response, at this point in the logic it's empty.
             messages_db = chat_content.get("messages")[:-1]
         else:
@@ -492,7 +492,7 @@ class Pipe:
 
     # region 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
     def _genai_contents_from_messages(
-        self, messages_body: list["Message"], messages_db: list["MessageModel"] | None
+        self, messages_body: list["Message"], messages_db: list["ChatMessageTD"] | None
     ) -> tuple[list[types.Content], str | None]:
         """Transforms `body.messages` list into list of `genai.types.Content` objects"""
 
@@ -561,7 +561,7 @@ class Pipe:
                     i -= 1
                 sources = None
                 if messages_db:
-                    message_db = cast("AssistantMessageModel", messages_db[i])
+                    message_db = messages_db[i]
                     sources = message_db.get("sources")
                 parts = process_assistant_message(message, sources)
             elif role == "system":
