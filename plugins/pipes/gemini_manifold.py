@@ -641,53 +641,16 @@ class Pipe:
                 except Exception:
                     # TODO: Emit toast
                     log.exception("Error decoding base64 image:")
-
             elif match.group(4):  # File URL
                 log.debug("Found API image link!", id=match.group(4))
                 file_id = match.group(4)
-                file_model = Files.get_file_by_id(file_id)
-
-                if file_model is None:
-                    # TODO: Emit toast
-                    log.warning("File with this ID not found.", id=file_id)
-                    #  Could add placeholder text here if desired
-                    continue  # Skip to the next match
-
-                try:
-                    # "continue" above ensures that file_model is not None
-                    content_type = file_model.meta.get("content_type")  # type: ignore
-                    if content_type is None:
-                        # TODO: Emit toast
-                        log.warning(
-                            "Content type not found for this file ID.",
-                            id=file_id,
-                        )
-                        continue
-
-                    with open(file_model.path, "rb") as file:  # type: ignore
-                        image_data = file.read()
-
-                    image_part = types.Part.from_bytes(
-                        data=image_data, mime_type=content_type
-                    )
-                    parts.append(image_part)
-
-                except FileNotFoundError:
-                    # TODO: Emit toast
-                    log.exception(
-                        "File not found on disk for this ID.",
-                        id=file_id,
-                        path=file_model.path,
-                    )
-                except KeyError:
-                    # TODO: Emit toast
-                    log.exception(
-                        "Metadata error for this file ID: 'content_type' missing.",
-                        id=file_id,
-                    )
-                except Exception:
-                    # TODO: Emit toast
-                    log.exception("Error processing file with this ID", id=file_id)
+                image_bytes, mime_type = self._get_file_data(file_id)
+                if not image_bytes or not mime_type:
+                    continue
+                image_part = types.Part.from_bytes(
+                    data=image_bytes, mime_type=mime_type
+                )
+                parts.append(image_part)
 
             last_pos = match.end()
 
@@ -1556,6 +1519,43 @@ class Pipe:
         if len(candidates) > 1:
             log.warning("Multiple candidates found, defaulting to first candidate.")
         return candidates[0]
+
+    def _get_file_data(self, file_id: str) -> tuple[bytes | None, str | None]:
+        file_model = Files.get_file_by_id(file_id)
+        if file_model is None:
+            # TODO: Emit toast
+            log.warning(f"File {file_id} not found in the backend's database.")
+            return None, None
+        if not (file_path := file_model.path):
+            # TODO: Emit toast
+            log.warning(
+                f"File {file_id} was found in the database but it lacks `path` field. Cannot Continue."
+            )
+            return None, None
+        if file_model.meta is None:
+            # TODO: Emit toast
+            log.warning(
+                f"File {file_path} was found in the database but it lacks `meta` field. Cannot continue."
+            )
+            return None, None
+        if not (content_type := file_model.meta.get("content_type")):
+            # TODO: Emit toast
+            log.warning(
+                f"File {file_path} was found in the database but it lacks `meta.content_type` field. Cannot continue."
+            )
+            return None, None
+        try:
+            with open(file_path, "rb") as file:
+                image_data = file.read()
+            return image_data, content_type
+        except FileNotFoundError:
+            # TODO: Emit toast
+            log.exception(f"File {file_path} not found on disk.")
+            return None, content_type
+        except Exception:
+            # TODO: Emit toast
+            log.exception(f"Error processing file {file_path}")
+            return None, content_type
 
     # endregion 1.7 Utility helpers
 
