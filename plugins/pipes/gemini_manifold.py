@@ -239,11 +239,13 @@ class Pipe:
             log.warning(warn_msg)
             messages_db = None
 
+        system_prompt = self._pop_system_prompt(body.get("messages"))
+
         features = __metadata__.get("features", {}) or {}
         log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
         )
-        contents, system_prompt = await self._genai_contents_from_messages(
+        contents = await self._genai_contents_from_messages(
             body.get("messages"),
             messages_db,
             features.get("upload_documents", False),
@@ -504,25 +506,39 @@ class Pipe:
     # endregion 1.1 Client initialization and model retrival from Google API
 
     # region 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
+
+    def _pop_system_prompt(self, messages: list["Message"]) -> str | None:
+        """
+        Pops the system prompt from the messages list.
+        System prompt is always the first message in the list.
+        """
+        if not messages:
+            return None
+        first_message = messages[0]
+        if first_message.get("role") == "system":
+            first_message = cast("SystemMessage", first_message)
+            system_prompt = first_message.get("content")
+            log.info("System prompt found in the messages list.")
+            log.debug("System prompt:", payload=system_prompt)
+            messages.pop(0)
+            return system_prompt
+        return None
+
     async def _genai_contents_from_messages(
         self,
         messages_body: list["Message"],
         messages_db: list["ChatMessageTD"] | None,
         upload_documents: bool,
         event_emitter: Callable[["Event"], Awaitable[None]],
-    ) -> tuple[list[types.Content], str | None]:
+    ) -> list[types.Content]:
         """Transforms `body.messages` list into list of `genai.types.Content` objects"""
 
-        system_prompt = None
         contents = []
         parts = []
         for i, message in enumerate(messages_body):
             role = message.get("role")
             if role == "user":
                 message = cast("UserMessage", message)
-                # Offset to correct location if system prompt was inside the body's messages.
-                if system_prompt:
-                    i -= 1
                 files = []
                 if messages_db:
                     message_db = messages_db[i]
@@ -533,23 +549,18 @@ class Pipe:
                 message = cast("AssistantMessage", message)
                 # Google API's assistant role is "model"
                 role = "model"
-                # Offset to correct location if system prompt was inside the body's messages.
-                if system_prompt:
-                    i -= 1
                 sources = None
                 if messages_db:
                     message_db = messages_db[i]
                     sources = message_db.get("sources")
                 parts = self._process_assistant_message(message, sources)
-            elif role == "system":
-                message = cast("SystemMessage", message)
-                system_prompt = message.get("content")
-                continue
             else:
-                log.warning(f"Role {role} is not valid, skipping to the next message.")
+                warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
+                log.warning(warn_msg)
+                await self._emit_toast(warn_msg, event_emitter, "warning")
                 continue
             contents.append(types.Content(role=role, parts=parts))
-        return contents, system_prompt
+        return contents
 
     async def _process_user_message(
         self,
