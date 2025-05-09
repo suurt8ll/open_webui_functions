@@ -2,6 +2,9 @@ google-genai==1.13.0
 fastapi==0.115.7
 loguru==0.7.2
 
+pytest
+pytest-asyncio
+pydantic
 aiohttp
 aiofiles
 python-dotenv
