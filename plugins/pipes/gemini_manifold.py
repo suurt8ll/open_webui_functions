@@ -1579,6 +1579,10 @@ class Pipe:
         return candidates[0]
 
     def _get_file_data(self, file_id: str) -> tuple[bytes | None, str | None]:
+        if not file_id:
+            # TODO: Emit toast
+            log.warning(f"file_id is empty. Cannot continue.")
+            return None, None
         file_model = Files.get_file_by_id(file_id)
         if file_model is None:
             # TODO: Emit toast
