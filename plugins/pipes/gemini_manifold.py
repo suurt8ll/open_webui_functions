@@ -241,6 +241,17 @@ class Pipe:
 
         system_prompt = self._pop_system_prompt(body.get("messages"))
 
+        if messages_db and len(messages_db) != len(body.get("messages")):
+            warn_msg = (
+                f"Messages in the body ({len(body.get('messages'))}) and "
+                f"messages in the database ({len(messages_db)}) do not match. "
+                "This is likely due to a bug in Open WebUI. "
+                "Cannot filter out citation marks or upload files."
+            )
+            log.warning(warn_msg)
+            await self._emit_toast(warn_msg, __event_emitter__, "warning")
+            messages_db = None
+
         features = __metadata__.get("features", {}) or {}
         log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
