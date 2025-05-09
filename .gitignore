@@ -5,3 +5,4 @@
 dev/.dev_state/
 docs/.obsidian/
 docs/knowledge_for_llms/
+.pytest_cache/
