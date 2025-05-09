@@ -266,6 +266,94 @@ async def test_genai_contents_from_messages_youtube_link_mixed_with_text(
         mock_event_emitter.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_genai_contents_from_messages_user_text_with_pdf(pipe_instance_fixture):
+    pipe_instance = pipe_instance_fixture
+
+    # Arrange: Inputs
+    user_text_content = "Please analyze this PDF."
+    pdf_file_id = "test-pdf-id-001"
+    pdf_file_name = "mydoc.pdf"
+    fake_pdf_bytes = b"%PDF-1.4 fake content..."
+    pdf_mime_type = "application/pdf"
+
+    messages_body = [{"role": "user", "content": user_text_content}]
+
+    # Construct messages_db with file attachment info
+    messages_db = [
+        {
+            "id": "user-msg-db-id-1",
+            "parentId": None,
+            "childrenIds": [],
+            "role": "user",
+            "content": user_text_content,  # Should match messages_body content
+            "timestamp": 1620000000,
+            "files": [
+                {
+                    "id": "attachment-id-pdf-1",  # ID of the attachment link
+                    "type": "file",
+                    "file": {  # FileInfoTD
+                        "id": pdf_file_id,
+                        "name": pdf_file_name,
+                        "size": len(fake_pdf_bytes),
+                        "timestamp": 1620000000,
+                    },
+                    "references": [],
+                    "tool_code_id": None,
+                }
+            ],
+        }
+    ]
+    upload_documents = True
+    mock_event_emitter = AsyncMock()
+
+    # Mock objects for parts
+    mock_pdf_part_obj = MagicMock(spec=gemini_types.Part, name="PdfPart")
+    mock_text_part_obj = MagicMock(spec=gemini_types.Part, name="TextPart")
+
+    # Patch _get_file_data, Part.from_bytes, and Part.from_text
+    with patch.object(
+        Pipe, "_get_file_data", return_value=(fake_pdf_bytes, pdf_mime_type)
+    ) as mock_get_file_data, patch(
+        "plugins.pipes.gemini_manifold.types.Part.from_bytes",
+        return_value=mock_pdf_part_obj,
+    ) as mock_part_from_bytes, patch(
+        "plugins.pipes.gemini_manifold.types.Part.from_text",
+        return_value=mock_text_part_obj,
+    ) as mock_part_from_text:
+
+        # Act
+        contents, system_prompt = await pipe_instance._genai_contents_from_messages(
+            messages_body,
+            messages_db,
+            upload_documents,
+            mock_event_emitter,
+        )
+
+        # Assert
+        assert system_prompt is None
+        mock_get_file_data.assert_called_once_with(pdf_file_id)
+        mock_part_from_bytes.assert_called_once_with(
+            data=fake_pdf_bytes, mime_type=pdf_mime_type
+        )
+        mock_part_from_text.assert_called_once_with(text=user_text_content)
+
+        assert len(contents) == 1
+        user_content_obj = contents[0]
+        assert user_content_obj.role == "user"
+        assert len(user_content_obj.parts) == 2
+
+        # Check order: PDF part should be first, then text part
+        assert (
+            user_content_obj.parts[0] is mock_pdf_part_obj
+        ), "First part should be the PDF mock."
+        assert (
+            user_content_obj.parts[1] is mock_text_part_obj
+        ), "Second part should be the text mock."
+
+        mock_event_emitter.assert_not_called()
+
+
 def teardown_module(module):
     """Cleans up sys.modules after tests in this file are done."""
     del sys.modules["open_webui.models.chats"]
