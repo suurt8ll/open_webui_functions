@@ -522,7 +522,7 @@ class Pipe:
                 log.info(f"Adding {len(files)} files to the user message.")
             for file in files:
                 log.debug("Processing file:", payload=file)
-                file_id = file.get("file").get("id")
+                file_id = file.get("file", {}).get("id")
                 document_bytes, mime_type = self._get_file_data(file_id)
                 if not document_bytes or not mime_type:
                     # Warnings are logged by the method above.
@@ -591,6 +591,9 @@ class Pipe:
             role = message.get("role")
             if role == "user":
                 message = cast("UserMessage", message)
+                # Offset to correct location if system prompt was inside the body's messages.
+                if system_prompt:
+                    i -= 1
                 files = []
                 if messages_db:
                     message_db = messages_db[i]
@@ -601,7 +604,7 @@ class Pipe:
                 message = cast("AssistantMessage", message)
                 # Google API's assistant role is "model"
                 role = "model"
-                # Offset to correct location if system prompt was inside the body's messages list.
+                # Offset to correct location if system prompt was inside the body's messages.
                 if system_prompt:
                     i -= 1
                 sources = None
@@ -1579,6 +1582,10 @@ class Pipe:
         return candidates[0]
 
     def _get_file_data(self, file_id: str) -> tuple[bytes | None, str | None]:
+        if not file_id:
+            # TODO: Emit toast
+            log.warning(f"file_id is empty. Cannot continue.")
+            return None, None
         file_model = Files.get_file_by_id(file_id)
         if file_model is None:
             # TODO: Emit toast
