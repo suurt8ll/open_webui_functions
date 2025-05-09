@@ -584,38 +584,45 @@ class Pipe:
 
         user_content = message.get("content")
         if isinstance(user_content, str):
-            # Check for YouTube URLs in text content
-            # FIXME: Better ordering of Parts here.
-            youtube_urls = self._extract_youtube_urls(user_content)
-            if youtube_urls:
-                for url in youtube_urls:
-                    user_parts.append(
-                        types.Part(file_data=types.FileData(file_uri=url))
-                    )
-            # Add text content as usual
-            user_parts.extend(self._genai_parts_from_text(user_content))
+            user_content_list: list["Content"] = [
+                {"type": "text", "text": user_content}
+            ]
         elif isinstance(user_content, list):
-            for c in user_content:
-                c_type = c.get("type")
-                if c_type == "text":
-                    c = cast("TextContent", c)
-                    # Don't process empty strings.
-                    if c_text := c.get("text"):
-                        # Check for YouTube URLs in text content
-                        youtube_urls = self._extract_youtube_urls(c_text)
-                        if youtube_urls:
-                            for url in youtube_urls:
-                                user_parts.append(
-                                    types.Part(file_data=types.FileData(file_uri=url))
-                                )
+            user_content_list = user_content
+        else:
+            warn_msg = f"User message content is not a string or list, skipping to the next message."
+            log.warning(warn_msg)
+            await self._emit_toast(warn_msg, event_emitter, "warning")
+            return user_parts
 
-                        user_parts.extend(self._genai_parts_from_text(c_text))
-                elif c_type == "image_url":
-                    c = cast("ImageContent", c)
-                    if img_part := self._genai_part_from_image_url(
-                        c.get("image_url").get("url")
-                    ):
-                        user_parts.append(img_part)
+        for c in user_content_list:
+            c_type = c.get("type")
+            if c_type == "text":
+                c = cast("TextContent", c)
+                # Don't process empty strings.
+                if c_text := c.get("text"):
+                    # Check for YouTube URLs in text content
+                    # FIXME: Better ordering of Parts here.
+                    youtube_urls = self._extract_youtube_urls(c_text)
+                    if youtube_urls:
+                        for url in youtube_urls:
+                            user_parts.append(
+                                types.Part(file_data=types.FileData(file_uri=url))
+                            )
+
+                    user_parts.extend(self._genai_parts_from_text(c_text))
+            elif c_type == "image_url":
+                c = cast("ImageContent", c)
+                if img_part := self._genai_part_from_image_url(
+                    c.get("image_url").get("url")
+                ):
+                    user_parts.append(img_part)
+            else:
+                warn_msg = f"User message content type {c_type} is not supported, skipping to the next message."
+                log.warning(warn_msg)
+                await self._emit_toast(warn_msg, event_emitter, "warning")
+                continue
+
         return user_parts
 
     def _process_assistant_message(
