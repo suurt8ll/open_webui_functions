@@ -1,6 +1,7 @@
 .env
 .venv/
 .vscode/
+**/__pycache__/
 dev/.dev_state/
 docs/.obsidian/
 docs/knowledge_for_llms/
