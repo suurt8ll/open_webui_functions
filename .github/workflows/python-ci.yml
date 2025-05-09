@@ -10,6 +10,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Add the permissions block here for the 'build' job
+    permissions:
+      checks: write
+      pull-requests: write
 
     strategy:
       matrix:
@@ -27,26 +31,14 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        # Install dependencies from requirements.txt
         pip install -r requirements.txt
 
     - name: Run pytest and generate report
-      # Run pytest and output results to a JUnit XML file.
-      # The '--junitxml' flag requires the pytest-junitxml plugin,
-      # which is usually included when you install pytest.
-      # We use '|| true' so this step doesn't fail the job immediately
-      # if tests fail. The job failure will be determined by the
-      # test result publisher action below.
       run: pytest --junitxml=test-results.xml tests/test_gemini_manifold.py || true
 
     - name: Publish test results
-      # This action publishes the JUnit XML report to the GitHub Actions UI.
-      # It will parse the XML and display the results per test.
-      # It will also mark the job as failed if there are test failures.
       uses: EnricoMi/publish-unit-test-result-action@v2
-      # Always run this step, even if the previous pytest step failed
       if: always()
       with:
-        files: test-results.xml # Path to the generated report file
-        # Customize the name of the check in the UI
+        files: test-results.xml
         check_name: Pytest Results (Python ${{ matrix.python-version }})
