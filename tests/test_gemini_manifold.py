@@ -124,7 +124,7 @@ async def test_genai_contents_from_messages_simple_user_text(pipe_instance_fixtu
     ) as mock_part_from_text:
         mock_part_from_text.return_value = MagicMock(spec=gemini_types.Part)
 
-        contents, system_prompt = await pipe_instance._genai_contents_from_messages(
+        contents = await pipe_instance._genai_contents_from_messages(
             messages_body,
             messages_db,
             upload_documents,
@@ -132,7 +132,6 @@ async def test_genai_contents_from_messages_simple_user_text(pipe_instance_fixtu
         )
 
         mock_part_from_text.assert_called_once_with(text="Hello!")
-        assert system_prompt is None
         assert len(contents) == 1
         content_item = contents[0]
         assert content_item.role == "user"
@@ -194,7 +193,7 @@ async def test_genai_contents_from_messages_youtube_link_mixed_with_text(
         mock_part_from_text.side_effect = from_text_side_effect
 
         # Act: Call the method under test
-        contents, system_prompt = await pipe_instance._genai_contents_from_messages(
+        contents = await pipe_instance._genai_contents_from_messages(
             messages_body,
             messages_db,
             upload_documents,
@@ -202,7 +201,6 @@ async def test_genai_contents_from_messages_youtube_link_mixed_with_text(
         )
 
         # Assert: Verify the outcome
-        assert system_prompt is None, "System prompt should be None for this input"
         assert len(contents) == 1, "Should produce one content item"
 
         content_item = contents[0]
@@ -323,7 +321,7 @@ async def test_genai_contents_from_messages_user_text_with_pdf(pipe_instance_fix
     ) as mock_part_from_text:
 
         # Act
-        contents, system_prompt = await pipe_instance._genai_contents_from_messages(
+        contents = await pipe_instance._genai_contents_from_messages(
             messages_body,
             messages_db,
             upload_documents,
@@ -331,7 +329,6 @@ async def test_genai_contents_from_messages_user_text_with_pdf(pipe_instance_fix
         )
 
         # Assert
-        assert system_prompt is None
         mock_get_file_data.assert_called_once_with(pdf_file_id)
         mock_part_from_bytes.assert_called_once_with(
             data=fake_pdf_bytes, mime_type=pdf_mime_type

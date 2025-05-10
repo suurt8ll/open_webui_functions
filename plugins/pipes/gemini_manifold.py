@@ -239,11 +239,24 @@ class Pipe:
             log.warning(warn_msg)
             messages_db = None
 
+        system_prompt = self._pop_system_prompt(body.get("messages"))
+
+        if messages_db and len(messages_db) != len(body.get("messages")):
+            warn_msg = (
+                f"Messages in the body ({len(body.get('messages'))}) and "
+                f"messages in the database ({len(messages_db)}) do not match. "
+                "This is likely due to a bug in Open WebUI. "
+                "Cannot filter out citation marks or upload files."
+            )
+            log.warning(warn_msg)
+            await self._emit_toast(warn_msg, __event_emitter__, "warning")
+            messages_db = None
+
         features = __metadata__.get("features", {}) or {}
         log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
         )
-        contents, system_prompt = await self._genai_contents_from_messages(
+        contents = await self._genai_contents_from_messages(
             body.get("messages"),
             messages_db,
             features.get("upload_documents", False),
@@ -504,123 +517,143 @@ class Pipe:
     # endregion 1.1 Client initialization and model retrival from Google API
 
     # region 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
+
+    def _pop_system_prompt(self, messages: list["Message"]) -> str | None:
+        """
+        Pops the system prompt from the messages list.
+        System prompt is always the first message in the list.
+        """
+        if not messages:
+            return None
+        first_message = messages[0]
+        if first_message.get("role") == "system":
+            first_message = cast("SystemMessage", first_message)
+            system_prompt = first_message.get("content")
+            log.info("System prompt found in the messages list.")
+            log.debug("System prompt:", payload=system_prompt)
+            messages.pop(0)
+            return system_prompt
+        return None
+
     async def _genai_contents_from_messages(
         self,
         messages_body: list["Message"],
         messages_db: list["ChatMessageTD"] | None,
         upload_documents: bool,
         event_emitter: Callable[["Event"], Awaitable[None]],
-    ) -> tuple[list[types.Content], str | None]:
+    ) -> list[types.Content]:
         """Transforms `body.messages` list into list of `genai.types.Content` objects"""
 
-        async def process_user_message(
-            message: "UserMessage", files: list["FileAttachmentTD"]
-        ) -> list[types.Part]:
-            user_parts = []
-            user_content = message.get("content")
-            if files:
-                log.info(f"Adding {len(files)} files to the user message.")
-            for file in files:
-                log.debug("Processing file:", payload=file)
-                file_id = file.get("file", {}).get("id")
-                document_bytes, mime_type = self._get_file_data(file_id)
-                if not document_bytes or not mime_type:
-                    # Warnings are logged by the method above.
-                    continue
-
-                if mime_type.startswith("text/") or mime_type == "application/pdf":
-                    log.debug(
-                        f"{mime_type} is supported by Google API! Creating `types.Part` model for it."
-                    )
-                    user_parts.append(
-                        types.Part.from_bytes(data=document_bytes, mime_type=mime_type)
-                    )
-                else:
-                    warn_msg = f"{mime_type} is not supported by Google API! Skipping file {file_id}."
-                    log.warning(warn_msg)
-                    await self._emit_toast(warn_msg, event_emitter, "warning")
-            if isinstance(user_content, str):
-                # Check for YouTube URLs in text content
-                # FIXME: Better ordering of Parts here.
-                youtube_urls = self._extract_youtube_urls(user_content)
-                if youtube_urls:
-                    for url in youtube_urls:
-                        user_parts.append(
-                            types.Part(file_data=types.FileData(file_uri=url))
-                        )
-                # Add text content as usual
-                user_parts.extend(self._genai_parts_from_text(user_content))
-            elif isinstance(user_content, list):
-                for c in user_content:
-                    c_type = c.get("type")
-                    if c_type == "text":
-                        c = cast("TextContent", c)
-                        # Don't process empty strings.
-                        if c_text := c.get("text"):
-                            # Check for YouTube URLs in text content
-                            youtube_urls = self._extract_youtube_urls(c_text)
-                            if youtube_urls:
-                                for url in youtube_urls:
-                                    user_parts.append(
-                                        types.Part(
-                                            file_data=types.FileData(file_uri=url)
-                                        )
-                                    )
-
-                            user_parts.extend(self._genai_parts_from_text(c_text))
-                    elif c_type == "image_url":
-                        c = cast("ImageContent", c)
-                        if img_part := self._genai_part_from_image_url(
-                            c.get("image_url").get("url")
-                        ):
-                            user_parts.append(img_part)
-            return user_parts
-
-        def process_assistant_message(
-            message: "AssistantMessage", sources: list["Source"] | None
-        ) -> list[types.Part]:
-            assistant_text = message.get("content")
-            if sources:
-                assistant_text = self._remove_citation_markers(assistant_text, sources)
-            return self._genai_parts_from_text(assistant_text)
-
-        system_prompt = None
         contents = []
         parts = []
         for i, message in enumerate(messages_body):
             role = message.get("role")
             if role == "user":
                 message = cast("UserMessage", message)
-                # Offset to correct location if system prompt was inside the body's messages.
-                if system_prompt:
-                    i -= 1
                 files = []
                 if messages_db:
                     message_db = messages_db[i]
                     if upload_documents:
                         files = message_db.get("files", [])
-                parts = await process_user_message(message, files)
+                parts = await self._process_user_message(message, files, event_emitter)
             elif role == "assistant":
                 message = cast("AssistantMessage", message)
                 # Google API's assistant role is "model"
                 role = "model"
-                # Offset to correct location if system prompt was inside the body's messages.
-                if system_prompt:
-                    i -= 1
                 sources = None
                 if messages_db:
                     message_db = messages_db[i]
                     sources = message_db.get("sources")
-                parts = process_assistant_message(message, sources)
-            elif role == "system":
-                message = cast("SystemMessage", message)
-                system_prompt = message.get("content")
-                continue
+                parts = self._process_assistant_message(message, sources)
             else:
-                log.warning(f"Role {role} is not valid, skipping to the next message.")
+                warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
+                log.warning(warn_msg)
+                await self._emit_toast(warn_msg, event_emitter, "warning")
                 continue
             contents.append(types.Content(role=role, parts=parts))
-        return contents, system_prompt
+        return contents
+
+    async def _process_user_message(
+        self,
+        message: "UserMessage",
+        files: list["FileAttachmentTD"],
+        event_emitter: Callable[["Event"], Awaitable[None]],
+    ) -> list[types.Part]:
+
+        user_parts = []
+
+        if files:
+            log.info(f"Adding {len(files)} files to the user message.")
+        for file in files:
+            log.debug("Processing file:", payload=file)
+            file_id = file.get("file", {}).get("id")
+            document_bytes, mime_type = self._get_file_data(file_id)
+            if not document_bytes or not mime_type:
+                # Warnings are logged by the method above.
+                continue
+
+            if mime_type.startswith("text/") or mime_type == "application/pdf":
+                log.debug(
+                    f"{mime_type} is supported by Google API! Creating `types.Part` model for it."
+                )
+                user_parts.append(
+                    types.Part.from_bytes(data=document_bytes, mime_type=mime_type)
+                )
+            else:
+                warn_msg = f"{mime_type} is not supported by Google API! Skipping file {file_id}."
+                log.warning(warn_msg)
+                await self._emit_toast(warn_msg, event_emitter, "warning")
+
+        user_content = message.get("content")
+        if isinstance(user_content, str):
+            user_content_list: list["Content"] = [
+                {"type": "text", "text": user_content}
+            ]
+        elif isinstance(user_content, list):
+            user_content_list = user_content
+        else:
+            warn_msg = f"User message content is not a string or list, skipping to the next message."
+            log.warning(warn_msg)
+            await self._emit_toast(warn_msg, event_emitter, "warning")
+            return user_parts
+
+        for c in user_content_list:
+            c_type = c.get("type")
+            if c_type == "text":
+                c = cast("TextContent", c)
+                # Don't process empty strings.
+                if c_text := c.get("text"):
+                    # Check for YouTube URLs in text content
+                    # FIXME: Better ordering of Parts here.
+                    youtube_urls = self._extract_youtube_urls(c_text)
+                    if youtube_urls:
+                        for url in youtube_urls:
+                            user_parts.append(
+                                types.Part(file_data=types.FileData(file_uri=url))
+                            )
+
+                    user_parts.extend(self._genai_parts_from_text(c_text))
+            elif c_type == "image_url":
+                c = cast("ImageContent", c)
+                if img_part := self._genai_part_from_image_url(
+                    c.get("image_url").get("url")
+                ):
+                    user_parts.append(img_part)
+            else:
+                warn_msg = f"User message content type {c_type} is not supported, skipping to the next message."
+                log.warning(warn_msg)
+                await self._emit_toast(warn_msg, event_emitter, "warning")
+                continue
+
+        return user_parts
+
+    def _process_assistant_message(
+        self, message: "AssistantMessage", sources: list["Source"] | None
+    ) -> list[types.Part]:
+        assistant_text = message.get("content")
+        if sources:
+            assistant_text = self._remove_citation_markers(assistant_text, sources)
+        return self._genai_parts_from_text(assistant_text)
 
     def _genai_part_from_image_url(self, image_url: str) -> types.Part | None:
         """
