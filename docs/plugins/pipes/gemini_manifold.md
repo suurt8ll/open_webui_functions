@@ -13,11 +13,13 @@ Here's a breakdown of implemented and planned features for the Gemini Manifold p
 **Implemented Features:**
 
 -   [x] Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
+-   [x] Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 required)
 -   [x] Display citations in the front-end.
 -   [x] Image input
+-   [x] YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
 -   [x] Streaming
 -   [x] Grounding with Google Search (requires installing the "Gemini Manifold Companion" >= 1.2.0 filter - see [it's doc](../filters/gemini_manifold_companion.md))
--   [x] Safety settings
+-   [x] Permissive safety settings (Gemini Manifold Companion >= 1.3.0 required)
 -   [x] Each user can decide to use their own API key.
 -   [x] White- and blacklist based model retrieval and registration.
 -   [x] Display usage statistics (token counts)
@@ -26,8 +28,7 @@ Here's a breakdown of implemented and planned features for the Gemini Manifold p
 **Planned Features:**
 
 -   [ ] Audio input support.
--   [ ] Video input support.
--   [ ] PDF (other documents?) input support, `__files__` param passed to the `pipe()` function can be used for this.
+-   [ ] Video input support (other than YouTube URLs).
 
 ## Installation
 
