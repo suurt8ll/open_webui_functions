@@ -38,6 +38,7 @@ import asyncio
 import copy
 import json
 import time
+from functools import cache
 from fastapi.datastructures import State
 import io
 import mimetypes
@@ -152,7 +153,6 @@ class Pipe:
         # TODO: Add more options that can be changed by the user.
 
     def __init__(self):
-
         # This hack makes the valves values available to the `__init__` method.
         # TODO: Get the id from the frontmatter instead of hardcoding it.
         valves = Functions.get_function_valves_by_id("gemini_manifold_google_genai")
@@ -161,9 +161,6 @@ class Pipe:
         self._add_log_handler()
         # Initialize the genai client with default API given in Valves.
         self.clients = {"default": self._get_genai_client()}
-        self.models: list["ModelData"] = []
-        self.last_whitelist: str = self.valves.MODEL_WHITELIST
-        self.last_blacklist = self.valves.MODEL_BLACKLIST
 
         log.success("Function has been initialized.")
         log.trace("Full self object:", payload=self.__dict__)
@@ -177,27 +174,35 @@ class Pipe:
                 "Running the logging setup again."
             )
             self._add_log_handler()
-        # Return existing models if all conditions are met and no error models are present
-        if (
-            self.models
-            and self.valves.CACHE_MODELS
-            and self.last_whitelist == self.valves.MODEL_WHITELIST
-            and self.last_blacklist == self.valves.MODEL_BLACKLIST
-            and not any(model["id"] == "error" for model in self.models)
-        ):
-            log.info(
-                f"Models are cached and valid. Returning the cached list ({len(self.models)} models)."
-            )
-            return self.models
+
+        # Clear cache if caching is disabled
+        if not self.valves.CACHE_MODELS:
+            log.debug("CACHE_MODELS is False, clearing model cache.")
+            self._get_genai_models.cache_clear()
 
         log.info("Fetching and filtering models from Google API.")
+        # Get models (potentially cached based on API key and base URL)
+        try:
+            google_models = await self._get_genai_models(
+                api_key=self.valves.GEMINI_API_KEY,
+                base_url=self.valves.GEMINI_API_BASE_URL,
+            )
+        except RuntimeError:
+            error_msg = "Error getting the models from Google API, check the logs."
+            return [self._return_error_model(error_msg, exception=False)]
+
         # Filter the model list based on white- and blacklist.
-        self.models = self._filter_models(await self._get_genai_models())
-        log.info(
-            f"Finished processing models. Returning {len(self.models)} models to Open WebUI."
+        # Directly return the filtered list without storing in self.models
+        filtered_models = self._filter_models(
+            google_models,
+            self.valves.MODEL_WHITELIST,
+            self.valves.MODEL_BLACKLIST,
         )
-        log.debug("Model list:", payload=self.models, _log_truncation_enabled=False)
-        return self.models
+        log.info(
+            f"Finished processing models. Returning {len(filtered_models)} models to Open WebUI."
+        )
+        log.debug("Model list:", payload=filtered_models, _log_truncation_enabled=False)
+        return filtered_models
 
     async def pipe(
         self,
@@ -207,7 +212,6 @@ class Pipe:
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __metadata__: dict[str, Any],
     ) -> AsyncGenerator | str | None:
-
         # Obtain Genai client
         if not (client := self._get_user_client(__user__)):
             error_msg = "There are no usable genai clients, check the logs."
@@ -219,12 +223,12 @@ class Pipe:
             else:
                 log.info("Using genai client with the default API key.")
         else:
-            log.info(f'Using genai client with user {__user__.get("email")} API key.')
+            log.info(f"Using genai client with user {__user__.get('email')} API key.")
 
         log.trace("__metadata__:", payload=__metadata__)
         # Check if user is chatting with an error model for some reason.
         if "error" in __metadata__["model"]["id"]:
-            error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
+            error_msg = f"There has been an error during model retrival phase: {str(__metadata__['model'])}"
             raise ValueError(error_msg)
 
         # Get the message history directly from the backend.
@@ -404,7 +408,7 @@ class Pipe:
             and user_valves.GEMINI_API_KEY
             and not self.clients.get(__user__["id"])
         ):
-            log.info(f'Creating a new genai client for user {__user__.get("email")}')
+            log.info(f"Creating a new genai client for user {__user__.get('email')}")
             self.clients[__user__.get("id")] = self._get_genai_client(
                 api_key=user_valves.GEMINI_API_KEY,
                 base_url=user_valves.GEMINI_API_BASE_URL,
@@ -429,20 +433,23 @@ class Pipe:
             "description": error_msg,
         }
 
-    async def _get_genai_models(self) -> list[types.Model]:
+    @cache
+    async def _get_genai_models(
+        self, api_key: str | None, base_url: str
+    ) -> list[types.Model]:
         """
         Gets valid Google models from the API.
         Returns a list of `genai.types.Model` objects.
+        The result is cached based on the provided api_key and base_url.
         """
-        client = self.clients.get("default")
+        # Get a client using the provided API key and base URL
+        client = self._get_genai_client(api_key=api_key, base_url=base_url)
+
         if not client:
-            log.warning("There is no usable genai client. Trying to create one.")
-            # Try to create a client one more time.
-            if client := self._get_genai_client():
-                self.clients["default"] = client
-            else:
-                log.error("Can't initialize the client, returning no models.")
-                return []
+            log.error(
+                "Can't initialize the client with provided API key and base URL, returning no models."
+            )
+            raise RuntimeError
 
         # This executes if we have a working client.
         google_models_pager = None
@@ -452,8 +459,8 @@ class Pipe:
                 config={"query_base": True}
             )
         except Exception:
-            log.exception("Retriving models from Google API failed.")
-            return []
+            log.exception("Retrieving models from Google API failed.")
+            raise RuntimeError
 
         # Iterate the pager to get the full list of models
         # This is where the actual API calls for subsequent pages happen if needed
@@ -461,40 +468,38 @@ class Pipe:
             all_google_models = [model async for model in google_models_pager]
         except Exception:
             log.exception("Iterating Google models pager failed.")
-            return []
+            raise RuntimeError
 
         log.info(
             f"Retrieved {len(all_google_models)} models from Gemini Developer API."
         )
         log.trace("All models returned by Google:", payload=all_google_models)
         # Filter Google models list down to generative models only.
-        return [
+        generative_models = [
             model
             for model in all_google_models
             if model.supported_actions and "generateContent" in model.supported_actions
         ]
 
-    def _filter_models(self, google_models: list[types.Model]) -> list["ModelData"]:
+        # Raise if there are not generative models
+        if not generative_models:
+            raise RuntimeError
+
+        return generative_models
+
+    def _filter_models(
+        self,
+        google_models: list[types.Model],
+        whitelist_str: str,
+        blacklist_str: str | None,
+    ) -> list["ModelData"]:
         """
         Filters the genai model list down based on configured white- and blacklist.
         Returns a list[dict] that can be directly returned by the `pipes` method.
         """
-        if not google_models:
-            error_msg = "Error during getting the models from Google API, check logs."
-            return [self._return_error_model(error_msg, exception=False)]
 
-        self.last_whitelist = self.valves.MODEL_WHITELIST
-        self.last_blacklist = self.valves.MODEL_BLACKLIST
-        whitelist = (
-            self.valves.MODEL_WHITELIST.replace(" ", "").split(",")
-            if self.valves.MODEL_WHITELIST
-            else []
-        )
-        blacklist = (
-            self.valves.MODEL_BLACKLIST.replace(" ", "").split(",")
-            if self.valves.MODEL_BLACKLIST
-            else []
-        )
+        whitelist = whitelist_str.replace(" ", "").split(",") if whitelist_str else []
+        blacklist = blacklist_str.replace(" ", "").split(",") if blacklist_str else []
         # Perform filtering and store the result
         filtered_models: list["ModelData"] = [
             {
@@ -579,7 +584,6 @@ class Pipe:
         files: list["FileAttachmentTD"],
         event_emitter: Callable[["Event"], Awaitable[None]],
     ) -> list[types.Part]:
-
         user_parts = []
 
         if files:
