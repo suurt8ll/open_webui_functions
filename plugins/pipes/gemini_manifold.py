@@ -108,7 +108,7 @@ class Pipe:
             ge=0,
             le=24576,
             default=8192,
-            description="""Gemini 2.5 Flash only. Indicates the thinking budget in tokens. 
+            description="""Gemini 2.5 Flash only. Indicates the thinking budget in tokens.
             0 means no thinking. Default value is 8192.
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
         )
@@ -146,7 +146,7 @@ class Pipe:
             ge=0,
             le=24576,
             default=8192,
-            description="""Gemini 2.5 Flash only. Indicates the thinking budget in tokens. 
+            description="""Gemini 2.5 Flash only. Indicates the thinking budget in tokens.
             0 means no thinking. Default value is 8192.
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
         )
@@ -181,23 +181,18 @@ class Pipe:
             self._get_genai_models.cache_clear()
 
         log.info("Fetching and filtering models from Google API.")
-        # Get models (potentially cached based on API key and base URL)
+        # Get and filter models (potentially cached based on API key, base URL, white- and blacklist)
         try:
-            google_models = await self._get_genai_models(
+            filtered_models = await self._get_genai_models(
                 api_key=self.valves.GEMINI_API_KEY,
                 base_url=self.valves.GEMINI_API_BASE_URL,
+                whitelist_str=self.valves.MODEL_WHITELIST,
+                blacklist_str=self.valves.MODEL_BLACKLIST,
             )
         except RuntimeError:
             error_msg = "Error getting the models from Google API, check the logs."
             return [self._return_error_model(error_msg, exception=False)]
 
-        # Filter the model list based on white- and blacklist.
-        # Directly return the filtered list without storing in self.models
-        filtered_models = self._filter_models(
-            google_models,
-            self.valves.MODEL_WHITELIST,
-            self.valves.MODEL_BLACKLIST,
-        )
         log.info(
             f"Finished processing models. Returning {len(filtered_models)} models to Open WebUI."
         )
@@ -435,12 +430,16 @@ class Pipe:
 
     @cache
     async def _get_genai_models(
-        self, api_key: str | None, base_url: str
-    ) -> list[types.Model]:
+        self,
+        api_key: str | None,
+        base_url: str,
+        whitelist_str: str,
+        blacklist_str: str | None,
+    ) -> list["ModelData"]:
         """
-        Gets valid Google models from the API.
-        Returns a list of `genai.types.Model` objects.
-        The result is cached based on the provided api_key and base_url.
+        Gets valid Google models from the API and filters them based on configured white- and blacklist.
+        Returns a list[dict] that can be directly returned by the `pipes` method.
+        The result is cached based on the provided api_key, base_url, whitelist_str, and blacklist_str.
         """
         # Get a client using the provided API key and base URL
         client = self._get_genai_client(api_key=api_key, base_url=base_url)
@@ -485,37 +484,23 @@ class Pipe:
         if not generative_models:
             raise RuntimeError
 
-        return generative_models
-
-    def _filter_models(
-        self,
-        google_models: list[types.Model],
-        whitelist_str: str,
-        blacklist_str: str | None,
-    ) -> list["ModelData"]:
-        """
-        Filters the genai model list down based on configured white- and blacklist.
-        Returns a list[dict] that can be directly returned by the `pipes` method.
-        """
-
+        # Filter based on whitelist and blacklist
         whitelist = whitelist_str.replace(" ", "").split(",") if whitelist_str else []
         blacklist = blacklist_str.replace(" ", "").split(",") if blacklist_str else []
-        # Perform filtering and store the result
         filtered_models: list["ModelData"] = [
             {
                 "id": re.sub(r"^.*?[./]", "", model.name),
                 "name": model.display_name,
                 "description": model.description,
             }
-            for model in google_models
+            for model in generative_models
             if model.name
             and model.display_name
             and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
             and not any(fnmatch.fnmatch(model.name, f"models/{b}") for b in blacklist)
         ]
-        # Add an info log to report the result of the filtering process
         log.info(
-            f"Filtered {len(google_models)} raw models down to {len(filtered_models)} models based on white/blacklists."
+            f"Filtered {len(generative_models)} raw models down to {len(filtered_models)} models based on white/blacklists."
         )
         return filtered_models
 
