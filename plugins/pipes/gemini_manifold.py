@@ -157,8 +157,7 @@ class Pipe:
         # TODO: Get the id from the frontmatter instead of hardcoding it.
         valves = Functions.get_function_valves_by_id("gemini_manifold_google_genai")
         self.valves = self.Valves(**(valves if valves else {}))
-        self.log_level = self.valves.LOG_LEVEL
-        self._add_log_handler()
+        self._add_log_handler(self.valves.LOG_LEVEL)
         # Initialize the genai client with default API given in Valves.
         self.clients = {"default": self._get_genai_client()}
 
@@ -168,12 +167,7 @@ class Pipe:
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
         # Detect log level change inside self.valves
-        if self.log_level != self.valves.LOG_LEVEL:
-            log.info(
-                f"Detected log level change: {self.log_level=} and {self.valves.LOG_LEVEL=}. "
-                "Running the logging setup again."
-            )
-            self._add_log_handler()
+        self._add_log_handler(self.valves.LOG_LEVEL)
 
         # Clear cache if caching is disabled
         if not self.valves.CACHE_MODELS:
@@ -1493,10 +1487,12 @@ class Pipe:
         # Return the format string template
         return base_template.rstrip()
 
-    def _add_log_handler(self):
+    @cache
+    def _add_log_handler(self, log_level: str):
         """
         Adds or updates the loguru handler specifically for this plugin.
         Includes logic for serializing and truncating extra data.
+        The handler is added only if the log_level has changed since the last call.
         """
 
         def plugin_filter(record: "Record"):
@@ -1504,7 +1500,7 @@ class Pipe:
             return record["name"] == __name__
 
         # Get the desired level name and number
-        desired_level_name = self.valves.LOG_LEVEL
+        desired_level_name = log_level
         try:
             # Use the public API to get level details
             desired_level_info = log.level(desired_level_name)
@@ -1572,7 +1568,6 @@ class Pipe:
 
         # Add a new handler if no correct one was found OR if we just removed an incorrect one
         if not found_correct_handler:
-            self.log_level = desired_level_name
             log.add(
                 sys.stdout,
                 level=desired_level_name,
