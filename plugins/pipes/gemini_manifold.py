@@ -158,9 +158,6 @@ class Pipe:
         valves = Functions.get_function_valves_by_id("gemini_manifold_google_genai")
         self.valves = self.Valves(**(valves if valves else {}))
         self._add_log_handler(self.valves.LOG_LEVEL)
-        # Initialize the genai client with default API given in Valves.
-        self.clients = {"default": self._get_genai_client()}
-
         log.success("Function has been initialized.")
         log.trace("Full self object:", payload=self.__dict__)
 
@@ -187,9 +184,7 @@ class Pipe:
             error_msg = "Error getting the models from Google API, check the logs."
             return [self._return_error_model(error_msg, exception=False)]
 
-        log.info(
-            f"Finished processing models. Returning {len(filtered_models)} models to Open WebUI."
-        )
+        log.info(f"Returning {len(filtered_models)} models to Open WebUI.")
         log.debug("Model list:", payload=filtered_models, _log_truncation_enabled=False)
         return filtered_models
 
@@ -202,17 +197,7 @@ class Pipe:
         __metadata__: dict[str, Any],
     ) -> AsyncGenerator | str | None:
         # Obtain Genai client
-        if not (client := self._get_user_client(__user__)):
-            error_msg = "There are no usable genai clients, check the logs."
-            raise ValueError(error_msg)
-        if self.clients.get("default") == client:
-            if self.valves.REQUIRE_USER_API_KEY:
-                error_msg = "You have not defined your own API key in UserValves. You need to define in to continue."
-                raise ValueError(error_msg)
-            else:
-                log.info("Using genai client with the default API key.")
-        else:
-            log.info(f"Using genai client with user {__user__.get('email')} API key.")
+        client = self._get_user_client(__user__)
 
         log.trace("__metadata__:", payload=__metadata__)
         # Check if user is chatting with an error model for some reason.
@@ -369,44 +354,56 @@ class Pipe:
     # region 1. Helper methods inside the Pipe class
 
     # region 1.1 Client initialization and model retrival from Google API
-    def _get_genai_client(
-        self, api_key: str | None = None, base_url: str | None = None
+    @cache
+    def _get_or_create_genai_client(
+        self, api_key: str, base_url: str
     ) -> genai.Client | None:
-        client = None
-        api_key = api_key if api_key else self.valves.GEMINI_API_KEY
-        base_url = base_url if base_url else self.valves.GEMINI_API_BASE_URL
-        if api_key:
-            http_options = types.HttpOptions(base_url=base_url)
-            try:
-                client = genai.Client(
-                    api_key=api_key,
-                    http_options=http_options,
-                )
-                log.success("Genai client successfully initialized!")
-            except Exception:
-                log.exception("genai client initialization failed.")
-        else:
-            log.error("GEMINI_API_KEY is not set.")
-        return client
+        """
+        Creates a genai.Client instance or retrieves it from cache.
+        Cached based on api_key and base_url.
+        """
+        if not api_key:
+            log.error("GEMINI API key is missing")
+            return None
 
-    def _get_user_client(self, __user__: "UserData") -> genai.Client | None:
-        # Register a user specific client if they have added their own API key.
+        http_options = types.HttpOptions(base_url=base_url)
+        try:
+            client = genai.Client(api_key=api_key, http_options=http_options)
+            log.success("Genai client successfully initialized")
+            return client
+        except Exception:
+            log.exception("Genai client initialization failed")
+            return None
+
+    def _get_user_client(self, __user__: "UserData") -> genai.Client:
         user_valves: Pipe.UserValves | None = __user__.get("valves")
-        if (
-            user_valves
-            and user_valves.GEMINI_API_KEY
-            and not self.clients.get(__user__["id"])
-        ):
-            log.info(f"Creating a new genai client for user {__user__.get('email')}")
-            self.clients[__user__.get("id")] = self._get_genai_client(
-                api_key=user_valves.GEMINI_API_KEY,
-                base_url=user_valves.GEMINI_API_BASE_URL,
+        user_provides_own_key = bool(user_valves and user_valves.GEMINI_API_KEY)
+
+        if self.valves.REQUIRE_USER_API_KEY and not user_provides_own_key:
+            error_msg = (
+                f"User-specific GEMINI API key is required (REQUIRE_USER_API_KEY is true), "
+                f"but user {__user__.get('email')} has not defined their own API key in UserValves."
             )
-            log.debug("Genai clients dict now looks like this:", payload=self.clients)
-        if user_client := self.clients.get(__user__.get("id")):
-            return user_client
+            log.error(error_msg)
+            raise ValueError(error_msg)
+
+        api_key, base_url = self.valves.GEMINI_API_KEY, self.valves.GEMINI_API_BASE_URL
+        if user_provides_own_key:
+            log.debug(f"Using user-specific API key for user {__user__.get('email')}.")
+            api_key = user_valves.GEMINI_API_KEY
+            base_url = user_valves.GEMINI_API_BASE_URL
         else:
-            return self.clients.get("default")
+            log.debug(
+                f"User {__user__.get('email')} has not provided an API key, using default."
+            )
+
+        client = self._get_or_create_genai_client(api_key, base_url)
+
+        if not client:
+            error_msg = "Failed to initialize genai.Client. Check logs for details."
+            raise ValueError(error_msg)
+
+        return client
 
     def _return_error_model(
         self, error_msg: str, warning: bool = False, exception: bool = True
@@ -436,7 +433,7 @@ class Pipe:
         The result is cached based on the provided api_key, base_url, whitelist_str, and blacklist_str.
         """
         # Get a client using the provided API key and base URL
-        client = self._get_genai_client(api_key=api_key, base_url=base_url)
+        client = self._get_or_create_genai_client(api_key, base_url)
 
         if not client:
             log.error(
