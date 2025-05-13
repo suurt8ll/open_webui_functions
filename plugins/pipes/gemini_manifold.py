@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 1.18.0
-requirements: google-genai==1.13.0
+requirements: google-genai==1.14.0
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API.
@@ -67,7 +67,7 @@ from open_webui.storage.provider import Storage
 
 if TYPE_CHECKING:
     from loguru import Record
-    from loguru._handler import Handler
+    from loguru._handler import Handler  # type: ignore
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
