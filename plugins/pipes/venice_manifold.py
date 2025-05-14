@@ -230,6 +230,8 @@ class Pipe:
 
     # region 1. Helper methods inside the Pipe class
 
+    # region 1.1 Model retrieval
+
     async def _get_models(self) -> list["ModelData"]:
         try:
             async with aiohttp.ClientSession() as session:
@@ -252,6 +254,22 @@ class Pipe:
         except Exception as e:
             error_msg = f"An unexpected error occurred: {str(e)}"
             return [self._return_error_model(error_msg)]
+
+    def _return_error_model(
+        self, error_msg: str, warning: bool = False, exception: bool = True
+    ) -> "ModelData":
+        """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        return {
+            "id": "error",
+            "name": "[venice_manifold] " + error_msg,
+            "description": error_msg,
+        }
+
+    # endregion 1.1 Model retrieval
 
     async def _generate_image(self, model: str, prompt: str) -> dict | None:
         try:
@@ -363,21 +381,7 @@ class Pipe:
             log.opt(depth=1, exception=exception).error(error_msg)
         await self.__event_emitter__(error)
 
-    def _return_error_model(
-        self, error_msg: str, warning: bool = False, exception: bool = True
-    ) -> "ModelData":
-        """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
-        if warning:
-            log.opt(depth=1, exception=False).warning(error_msg)
-        else:
-            log.opt(depth=1, exception=exception).error(error_msg)
-        return {
-            "id": "error",
-            "name": "[venice_manifold] " + error_msg,
-            "description": error_msg,
-        }
-
-    # region 1.1 Logging
+    # region 1.2 Logging
     def _is_flat_dict(self, data: Any) -> bool:
         """
         Checks if a dictionary contains only non-dict/non-list values (is one level deep).
@@ -603,6 +607,6 @@ class Pipe:
                 f"Added new handler to loguru for {__name__} with level {desired_level_name}."
             )
 
-    # endregion 1.1 Logging
+    # endregion 1.2 Logging
 
     # endregion 1. Helper methods inside the Pipe class
