@@ -39,7 +39,6 @@ from fastapi import Request
 import pydantic_core
 from open_webui.models.files import Files, FileForm
 from open_webui.models.functions import Functions
-from open_webui.utils.logger import stdout_format
 from open_webui.storage.provider import Storage
 from loguru import logger
 
@@ -271,6 +270,8 @@ class Pipe:
 
     # endregion 1.1 Model retrieval
 
+    # region 1.2 Image generation
+
     async def _generate_image(self, model: str, prompt: str) -> dict | None:
         try:
             async with aiohttp.ClientSession() as session:
@@ -364,6 +365,10 @@ class Pipe:
         )
         return image_url
 
+    # endregion 1.2 Image generation
+
+    # region 1.3 Event emissions
+
     async def _emit_error(
         self, error_msg: str, warning: bool = False, exception: bool = True
     ) -> None:
@@ -381,7 +386,9 @@ class Pipe:
             log.opt(depth=1, exception=exception).error(error_msg)
         await self.__event_emitter__(error)
 
-    # region 1.2 Logging
+    # endregion 1.3 Event emissions
+
+    # region 1.4 Logging
     def _is_flat_dict(self, data: Any) -> bool:
         """
         Checks if a dictionary contains only non-dict/non-list values (is one level deep).
@@ -607,6 +614,6 @@ class Pipe:
                 f"Added new handler to loguru for {__name__} with level {desired_level_name}."
             )
 
-    # endregion 1.2 Logging
+    # endregion 1.4 Logging
 
     # endregion 1. Helper methods inside the Pipe class
