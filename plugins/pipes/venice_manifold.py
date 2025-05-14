@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.10.0
+version: 0.10.1
 """
 
 # NB! This is work in progress and not yet fully featured.
