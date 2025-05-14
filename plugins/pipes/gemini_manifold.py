@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 1.18.1
-requirements: google-genai==1.14.0
+requirements: google-genai==1.15.0
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API.
