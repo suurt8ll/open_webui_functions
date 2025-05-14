@@ -18,6 +18,7 @@ version: 0.10.0
 # TODO: Upscaling
 
 import copy
+import inspect
 import io
 import json
 import mimetypes
@@ -333,11 +334,26 @@ class Pipe:
         }
 
         # Upload the image to user configured storage provider.
-        log.info("Uploading the image to the configured storage provider.")
+        log.info("Uploading the model generated image to Open WebUI backend.")
+        log.debug("Uploading to the configured storage provider.")
         try:
-            contents, image_path = Storage.upload_file(image, imagename)
+            # Dynamically check if 'tags' parameter exists
+            sig = inspect.signature(Storage.upload_file)
+            has_tags = "tags" in sig.parameters
+        except Exception as e:
+            log.error(f"Error checking Storage.upload_file signature: {e}")
+            has_tags = False  # Default to old behavior
+
+        try:
+            # TODO: Remove this in the future.
+            if has_tags:
+                # New version with tags support >=v0.6.6
+                contents, image_path = Storage.upload_file(image, imagename, tags={})
+            else:
+                # Old version without tags <v0.6.5
+                contents, image_path = Storage.upload_file(image, imagename)  # type: ignore
         except Exception:
-            error_msg = f"Error occurred during upload to the storage provider."
+            error_msg = "Error occurred during upload to the storage provider."
             log.exception(error_msg)
             return None
         # Add the image file to files database.
