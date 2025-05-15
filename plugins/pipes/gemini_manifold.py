@@ -1057,7 +1057,7 @@ class Pipe:
         hidden = not self.valves.EMIT_STATUS_UPDATES
         # Emit initial 'Thinking' status
         await self._emit_status(
-            f"Thinking • 0s elapsed{self._get_budget_str(model_name, thinking_budget)}",
+            f"Thinking • 0s{self._get_budget_str(model_name, thinking_budget)}",
             event_emitter=event_emitter,
             done=False,
             hidden=hidden,
@@ -1095,7 +1095,7 @@ class Pipe:
                 else:
                     minutes, seconds = divmod(elapsed, 60)
                     time_str = f"{minutes}m {seconds}s"
-                status_message = f"Thinking • {time_str} elapsed{self._get_budget_str(model_name, thinking_budget)}"
+                status_message = f"Thinking • {time_str}{self._get_budget_str(model_name, thinking_budget)}"
                 await self._emit_status(
                     status_message,
                     event_emitter=event_emitter,
