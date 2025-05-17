@@ -6,8 +6,8 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.18.0
-requirements: google-genai==1.13.0
+version: 1.18.2
+requirements: google-genai==1.15.0
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API.
@@ -51,7 +51,7 @@ import sys
 from loguru import logger
 from fastapi import Request
 import pydantic_core
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import (
     Any,
@@ -68,7 +68,7 @@ from open_webui.storage.provider import Storage
 
 if TYPE_CHECKING:
     from loguru import Record
-    from loguru._handler import Handler
+    from loguru._handler import Handler  # type: ignore
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
@@ -142,14 +142,22 @@ class Pipe:
             default="https://generativelanguage.googleapis.com",
             description="The base URL for calling the Gemini API",
         )
-        THINKING_BUDGET: int = Field(
+        THINKING_BUDGET: int | None = Field(
             ge=0,
             le=24576,
-            default=8192,
-            description="""Gemini 2.5 Flash only. Indicates the thinking budget in tokens.
-            0 means no thinking. Default value is 8192.
+            default=None,
+            description="""Gemini 2.5 Flash only. Indicates the thinking budget in tokens. 
+            0 means no thinking. Default value is None (uses the default from Valves).
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
         )
+
+        @field_validator("THINKING_BUDGET", mode="before")
+        @classmethod
+        def empty_str_to_none(cls, v):
+            if v == "":
+                return 8192
+            return v
+
         # TODO: Add more options that can be changed by the user.
 
     def __init__(self):
@@ -254,12 +262,13 @@ class Pipe:
         thinking_conf = None
         if model_name == "gemini-2.5-flash-preview-04-17":
             log.info(f"Model ID '{model_name}' allows adjusting the thinking settings.")
+            thinking_budget = (
+                user_valves.THINKING_BUDGET
+                if user_valves and user_valves.THINKING_BUDGET is not None
+                else self.valves.THINKING_BUDGET
+            )
             thinking_conf = types.ThinkingConfig(
-                thinking_budget=(
-                    user_valves.THINKING_BUDGET
-                    if user_valves
-                    else self.valves.THINKING_BUDGET
-                ),
+                thinking_budget=thinking_budget,
                 include_thoughts=None,
             )
         # TODO: Take defaults from the general front-end config.
@@ -764,7 +773,9 @@ class Pipe:
         # Get thinking budget, UserValves takes priority.
         user_valves: Pipe.UserValves | None = __user__.get("valves")
         thinking_budget = (
-            user_valves.THINKING_BUDGET if user_valves else self.valves.THINKING_BUDGET
+            user_valves.THINKING_BUDGET
+            if user_valves and user_valves.THINKING_BUDGET is not None
+            else self.valves.THINKING_BUDGET
         )
 
         # Start thinking timer (model name check is inside this method).
@@ -1026,7 +1037,7 @@ class Pipe:
         hidden = not self.valves.EMIT_STATUS_UPDATES
         # Emit initial 'Thinking' status
         await self._emit_status(
-            f"Thinking • 0s elapsed{self._get_budget_str(model_name, thinking_budget)}",
+            f"Thinking • 0s{self._get_budget_str(model_name, thinking_budget)}",
             event_emitter=event_emitter,
             done=False,
             hidden=hidden,
@@ -1064,7 +1075,7 @@ class Pipe:
                 else:
                     minutes, seconds = divmod(elapsed, 60)
                     time_str = f"{minutes}m {seconds}s"
-                status_message = f"Thinking • {time_str} elapsed{self._get_budget_str(model_name, thinking_budget)}"
+                status_message = f"Thinking • {time_str}{self._get_budget_str(model_name, thinking_budget)}"
                 await self._emit_status(
                     status_message,
                     event_emitter=event_emitter,

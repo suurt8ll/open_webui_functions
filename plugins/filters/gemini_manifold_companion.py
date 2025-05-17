@@ -34,7 +34,7 @@ from open_webui.models.functions import Functions
 
 if TYPE_CHECKING:
     from loguru import Record
-    from loguru._handler import Handler
+    from loguru._handler import Handler  # type: ignore
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 # According to https://ai.google.dev/gemini-api/docs/models

@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.10.0
+version: 0.10.1
 """
 
 # NB! This is work in progress and not yet fully featured.
@@ -17,7 +17,10 @@ version: 0.10.0
 # TODO: Negative prompts
 # TODO: Upscaling
 
+import copy
+import inspect
 import io
+import json
 import mimetypes
 import os
 import sys
@@ -34,15 +37,15 @@ from typing import (
 )
 from pydantic import BaseModel, Field
 from fastapi import Request
+import pydantic_core
 from open_webui.models.files import Files, FileForm
 from open_webui.models.functions import Functions
-from open_webui.utils.logger import stdout_format
 from open_webui.storage.provider import Storage
 from loguru import logger
 
 if TYPE_CHECKING:
     from loguru import Record
-    from loguru._handler import Handler
+    from loguru._handler import Handler  # type: ignore
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 
@@ -81,18 +84,23 @@ class Pipe:
         # TODO: Get the id from the frontmatter instead of hardcoding it.
         valves = Functions.get_function_valves_by_id("venice_image_generation")
         self.valves = self.Valves(**(valves if valves else {}))
-        # FIXME: Is logging out the API key a bad idea?
-        print(
-            f"[venice_manifold] self.valves initialized:\n{self.valves.model_dump_json(indent=2)}"
-        )
+        self.log_level = self.valves.LOG_LEVEL
+        self._add_log_handler()
 
         self.models: list["ModelData"] = []
 
-        print("[venice_manifold] Function has been initialized!")
+        log.success("Function has been initialized.")
+        log.trace("Full self object:", payload=self.__dict__)
 
     async def pipes(self) -> list["ModelData"]:
-        # TODO: Move into `__init__`
-        self._add_log_handler()
+
+        # Detect log level change inside self.valves
+        if self.log_level != self.valves.LOG_LEVEL:
+            log.info(
+                f"Detected log level change: {self.log_level=} and {self.valves.LOG_LEVEL=}. "
+                "Running the logging setup again."
+            )
+            self._add_log_handler()
 
         # Return existing models if all conditions are met and no error models are present
         if (
@@ -220,9 +228,9 @@ class Pipe:
         else:
             return f"![Generated Image](data:image/png;base64,{base64_image})"
 
-    """
-    ---------- Helper functions inside the Pipe class. ----------
-    """
+    # region 1. Helper methods inside the Pipe class
+
+    # region 1.1 Model retrieval
 
     async def _get_models(self) -> list["ModelData"]:
         try:
@@ -246,6 +254,24 @@ class Pipe:
         except Exception as e:
             error_msg = f"An unexpected error occurred: {str(e)}"
             return [self._return_error_model(error_msg)]
+
+    def _return_error_model(
+        self, error_msg: str, warning: bool = False, exception: bool = True
+    ) -> "ModelData":
+        """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        return {
+            "id": "error",
+            "name": "[venice_manifold] " + error_msg,
+            "description": error_msg,
+        }
+
+    # endregion 1.1 Model retrieval
+
+    # region 1.2 Image generation
 
     async def _generate_image(self, model: str, prompt: str) -> dict | None:
         try:
@@ -308,11 +334,26 @@ class Pipe:
         }
 
         # Upload the image to user configured storage provider.
-        log.info("Uploading the image to the configured storage provider.")
+        log.info("Uploading the model generated image to Open WebUI backend.")
+        log.debug("Uploading to the configured storage provider.")
         try:
-            contents, image_path = Storage.upload_file(image, imagename)
+            # Dynamically check if 'tags' parameter exists
+            sig = inspect.signature(Storage.upload_file)
+            has_tags = "tags" in sig.parameters
+        except Exception as e:
+            log.error(f"Error checking Storage.upload_file signature: {e}")
+            has_tags = False  # Default to old behavior
+
+        try:
+            # TODO: Remove this in the future.
+            if has_tags:
+                # New version with tags support >=v0.6.6
+                contents, image_path = Storage.upload_file(image, imagename, tags={})
+            else:
+                # Old version without tags <v0.6.5
+                contents, image_path = Storage.upload_file(image, imagename)  # type: ignore
         except Exception:
-            error_msg = f"Error occurred during upload to the storage provider."
+            error_msg = "Error occurred during upload to the storage provider."
             log.exception(error_msg)
             return None
         # Add the image file to files database.
@@ -340,35 +381,9 @@ class Pipe:
         )
         return image_url
 
-    def _add_log_handler(self):
-        """Adds handler to the root loguru instance for this plugin if one does not exist already."""
+    # endregion 1.2 Image generation
 
-        def plugin_filter(record: "Record"):
-            """Filter function to only allow logs from this plugin (based on module name)."""
-            return record["name"] == __name__  # Filter by module name
-
-        # Access the internal state of the logger
-        handlers: dict[int, "Handler"] = logger._core.handlers  # type: ignore
-        for key, handler in handlers.items():
-            existing_filter = handler._filter
-            if (
-                hasattr(existing_filter, "__name__")
-                and existing_filter.__name__ == plugin_filter.__name__
-                and hasattr(existing_filter, "__module__")
-                and existing_filter.__module__ == plugin_filter.__module__
-            ):
-                log.debug("Handler for this plugin is already present!")
-                return
-
-        logger.add(
-            sys.stdout,
-            level=self.valves.LOG_LEVEL,
-            format=stdout_format,
-            filter=plugin_filter,
-        )
-        log.info(
-            f"Added new handler to loguru with level {self.valves.LOG_LEVEL} and filter {__name__}."
-        )
+    # region 1.3 Event emissions
 
     async def _emit_error(
         self, error_msg: str, warning: bool = False, exception: bool = True
@@ -387,16 +402,234 @@ class Pipe:
             log.opt(depth=1, exception=exception).error(error_msg)
         await self.__event_emitter__(error)
 
-    def _return_error_model(
-        self, error_msg: str, warning: bool = False, exception: bool = True
-    ) -> "ModelData":
-        """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
-        if warning:
-            log.opt(depth=1, exception=False).warning(error_msg)
+    # endregion 1.3 Event emissions
+
+    # region 1.4 Logging
+    def _is_flat_dict(self, data: Any) -> bool:
+        """
+        Checks if a dictionary contains only non-dict/non-list values (is one level deep).
+        """
+        if not isinstance(data, dict):
+            return False
+        return not any(isinstance(value, (dict, list)) for value in data.values())
+
+    def _truncate_long_strings(
+        self, data: Any, max_len: int, truncation_marker: str, truncation_enabled: bool
+    ) -> Any:
+        """
+        Recursively traverses a data structure (dicts, lists) and truncates
+        long string values. Creates copies to avoid modifying original data.
+
+        Args:
+            data: The data structure (dict, list, str, int, float, bool, None) to process.
+            max_len: The maximum allowed length for string values.
+            truncation_marker: The string to append to truncated values.
+            truncation_enabled: Whether truncation is enabled.
+
+        Returns:
+            A potentially new data structure with long strings truncated.
+        """
+        if not truncation_enabled or max_len <= len(truncation_marker):
+            # If truncation is disabled or max_len is too small, return original
+            # Make a copy only if it's a mutable type we might otherwise modify
+            if isinstance(data, (dict, list)):
+                return copy.deepcopy(data)  # Ensure deep copy for nested structures
+            return data  # Primitives are immutable
+
+        if isinstance(data, str):
+            if len(data) > max_len:
+                return data[: max_len - len(truncation_marker)] + truncation_marker
+            return data  # Return original string if not truncated
+        elif isinstance(data, dict):
+            # Process dictionary items, creating a new dict
+            return {
+                k: self._truncate_long_strings(
+                    v, max_len, truncation_marker, truncation_enabled
+                )
+                for k, v in data.items()
+            }
+        elif isinstance(data, list):
+            # Process list items, creating a new list
+            return [
+                self._truncate_long_strings(
+                    item, max_len, truncation_marker, truncation_enabled
+                )
+                for item in data
+            ]
         else:
-            log.opt(depth=1, exception=exception).error(error_msg)
-        return {
-            "id": "error",
-            "name": "[venice_manifold] " + error_msg,
-            "description": error_msg,
-        }
+            # Return non-string, non-container types as is (they are immutable)
+            return data
+
+    def plugin_stdout_format(self, record: "Record") -> str:
+        """
+        Custom format function for the plugin's logs.
+        Serializes and truncates data passed under the 'payload' key in extra.
+        """
+
+        # Configuration Keys
+        LOG_OPTIONS_PREFIX = "_log_"
+        TRUNCATION_ENABLED_KEY = f"{LOG_OPTIONS_PREFIX}truncation_enabled"
+        MAX_LENGTH_KEY = f"{LOG_OPTIONS_PREFIX}max_length"
+        TRUNCATION_MARKER_KEY = f"{LOG_OPTIONS_PREFIX}truncation_marker"
+        DATA_KEY = "payload"
+
+        original_extra = record["extra"]
+        # Extract the data intended for serialization using the chosen key
+        data_to_process = original_extra.get(DATA_KEY)
+
+        serialized_data_json = ""
+        if data_to_process is not None:
+            try:
+                serializable_data = pydantic_core.to_jsonable_python(
+                    data_to_process, serialize_unknown=True
+                )
+
+                # Determine truncation settings
+                truncation_enabled = original_extra.get(TRUNCATION_ENABLED_KEY, True)
+                max_length = original_extra.get(MAX_LENGTH_KEY, 256)
+                truncation_marker = original_extra.get(TRUNCATION_MARKER_KEY, "[...]")
+
+                # If max_length was explicitly provided, force truncation enabled
+                if MAX_LENGTH_KEY in original_extra:
+                    truncation_enabled = True
+
+                # Truncate long strings
+                truncated_data = self._truncate_long_strings(
+                    serializable_data,
+                    max_length,
+                    truncation_marker,
+                    truncation_enabled,
+                )
+
+                # Serialize the (potentially truncated) data
+                if self._is_flat_dict(truncated_data) and not isinstance(
+                    truncated_data, list
+                ):
+                    json_string = json.dumps(
+                        truncated_data, separators=(",", ":"), default=str
+                    )
+                    # Add a simple prefix if it's compact
+                    serialized_data_json = " - " + json_string
+                else:
+                    json_string = json.dumps(truncated_data, indent=2, default=str)
+                    # Prepend with newline for readability
+                    serialized_data_json = "\n" + json_string
+
+            except (TypeError, ValueError) as e:  # Catch specific serialization errors
+                serialized_data_json = f" - {{Serialization Error: {e}}}"
+            except (
+                Exception
+            ) as e:  # Catch any other unexpected errors during processing
+                serialized_data_json = f" - {{Processing Error: {e}}}"
+
+        # Add the final JSON string (or error message) back into the record
+        record["extra"]["_plugin_serialized_data"] = serialized_data_json
+
+        # Base template
+        base_template = (
+            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+            "<level>{message}</level>"
+        )
+
+        # Append the serialized data
+        base_template += "{extra[_plugin_serialized_data]}"
+        # Append the exception part
+        base_template += "\n{exception}"
+        # Return the format string template
+        return base_template.rstrip()
+
+    def _add_log_handler(self):
+        """
+        Adds or updates the loguru handler specifically for this plugin.
+        Includes logic for serializing and truncating extra data.
+        """
+
+        def plugin_filter(record: "Record"):
+            """Filter function to only allow logs from this plugin (based on module name)."""
+            return record["name"] == __name__
+
+        # Get the desired level name and number
+        desired_level_name = self.valves.LOG_LEVEL
+        try:
+            # Use the public API to get level details
+            desired_level_info = log.level(desired_level_name)
+            desired_level_no = desired_level_info.no
+        except ValueError:
+            log.error(
+                f"Invalid LOG_LEVEL '{desired_level_name}' configured for plugin {__name__}. Cannot add/update handler."
+            )
+            return  # Stop processing if the level is invalid
+
+        # Access the internal state of the log
+        handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
+        handler_id_to_remove = None
+        found_correct_handler = False
+
+        for handler_id, handler in handlers.items():
+            existing_filter = handler._filter  # Access internal attribute
+
+            # Check if the filter matches our plugin_filter
+            # Comparing function objects directly can be fragile if they are recreated.
+            # Comparing by name and module is more robust for functions defined at module level.
+            is_our_filter = (
+                existing_filter is not None  # Make sure a filter is set
+                and hasattr(existing_filter, "__name__")
+                and existing_filter.__name__ == plugin_filter.__name__
+                and hasattr(existing_filter, "__module__")
+                and existing_filter.__module__ == plugin_filter.__module__
+            )
+
+            if is_our_filter:
+                existing_level_no = handler.levelno
+                log.trace(
+                    f"Found existing handler {handler_id} for {__name__} with level number {existing_level_no}."
+                )
+
+                # Check if the level matches the desired level
+                if existing_level_no == desired_level_no:
+                    log.debug(
+                        f"Handler {handler_id} for {__name__} already exists with the correct level '{desired_level_name}'."
+                    )
+                    found_correct_handler = True
+                    break  # Found the correct handler, no action needed
+                else:
+                    # Found our handler, but the level is wrong. Mark for removal.
+                    log.info(
+                        f"Handler {handler_id} for {__name__} found, but log level differs "
+                        f"(existing: {existing_level_no}, desired: {desired_level_no}). "
+                        f"Removing it to update."
+                    )
+                    handler_id_to_remove = handler_id
+                    break  # Found the handler to replace, stop searching
+
+        # Remove the old handler if marked for removal
+        if handler_id_to_remove is not None:
+            try:
+                log.remove(handler_id_to_remove)
+                log.debug(f"Removed handler {handler_id_to_remove} for {__name__}.")
+            except ValueError:
+                # This might happen if the handler was somehow removed between the check and now
+                log.warning(
+                    f"Could not remove handler {handler_id_to_remove} for {__name__}. It might have already been removed."
+                )
+                # If removal failed but we intended to remove, we should still proceed to add
+                # unless found_correct_handler is somehow True (which it shouldn't be if handler_id_to_remove was set).
+
+        # Add a new handler if no correct one was found OR if we just removed an incorrect one
+        if not found_correct_handler:
+            self.log_level = desired_level_name
+            log.add(
+                sys.stdout,
+                level=desired_level_name,
+                format=self.plugin_stdout_format,
+                filter=plugin_filter,
+            )
+            log.debug(
+                f"Added new handler to loguru for {__name__} with level {desired_level_name}."
+            )
+
+    # endregion 1.4 Logging
+
+    # endregion 1. Helper methods inside the Pipe class
