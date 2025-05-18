@@ -164,13 +164,13 @@ class Pipe:
             description="The Google Cloud project ID to use with Vertex AI.",
         )
         VERTEX_LOCATION: str = Field(
-            default="us-central1",
+            default="global",
             description="The Google Cloud region to use with Vertex AI.",
         )
         THINKING_BUDGET: int | None = Field(
             default=None,  # ge / le constraints error for None default, thus are moved to a separate validator
             description="""Gemini 2.5 Flash only. Indicates the thinking budget in tokens.
-            0 means no thinking. Default value is 8192.
+            0 means no thinking. Default value is None (uses the default from Valves).
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
         )
 
@@ -466,16 +466,14 @@ class Pipe:
             self.valves.VERTEX_LOCATION,
         )
         if user_provides_own_key:
-            log.debug(f"Using user-specific API key for user {__user__.get('email')}.")
+            log.debug(f"Using user API key(s) for user {__user__.get('email')}.")
             api_key = user_valves.GEMINI_API_KEY
             base_url = user_valves.GEMINI_API_BASE_URL
             use_vertex_ai = user_valves.USE_VERTEX_AI
             vertex_project = user_valves.VERTEX_PROJECT
             vertex_location = user_valves.VERTEX_LOCATION
         else:
-            log.debug(
-                f"User {__user__.get('email')} has not provided an API key, using default."
-            )
+            log.debug(f"No API key(s) for user {__user__.get('email')}. Using default.")
 
         client = self._get_or_create_genai_client(
             api_key,
@@ -486,7 +484,7 @@ class Pipe:
         )
 
         if not client:
-            error_msg = "Failed to initialize genai.Client. Check logs for details."
+            error_msg = "Failed to initialize genai client. Check logs for details."
             raise ValueError(error_msg)
 
         return client
