@@ -212,7 +212,11 @@ class Pipe:
                 {
                     "id": "google/gemini-2.5-flash-preview-04-17",
                     "name": "Gemini 2.5 Flash Preview 04-17",
-                }
+                },
+                {
+                    "id": "google/gemini-2.5-pro-preview-05-06",
+                    "name": "Gemini 2.5 Pro Preview 05-06",
+                },
             ]
 
         # Clear cache if caching is disabled
@@ -407,8 +411,8 @@ class Pipe:
     @cache
     def _get_or_create_genai_client(
         self,
-        api_key: str,
-        base_url: str,
+        api_key: str | None = None,
+        base_url: str | None = None,
         use_vertex_ai: bool | None = None,
         vertex_project: str | None = None,
         vertex_location: str | None = None,
