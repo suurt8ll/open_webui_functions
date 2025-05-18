@@ -210,7 +210,7 @@ class Pipe:
         self._add_log_handler(self.valves.LOG_LEVEL)
 
         # FIXME: Hardcoded Gemini flagship models here
-        # while https://github.com/googleapis/python-genai/issues/679 is resolved.
+        # while https://github.com/googleapis/python-genai/issues/679 is unresolved.
         if self.valves.USE_VERTEX_AI:
             return [
                 {
@@ -231,12 +231,9 @@ class Pipe:
         log.info("Fetching and filtering models from Google API.")
         # Get and filter models (potentially cached based on API key, base URL, white- and blacklist)
         try:
-            filtered_models = await self._get_genai_models(
-                api_key=self.valves.GEMINI_API_KEY,
-                base_url=self.valves.GEMINI_API_BASE_URL,
-                whitelist_str=self.valves.MODEL_WHITELIST,
-                blacklist_str=self.valves.MODEL_BLACKLIST,
-            )
+            client_args = self._prepare_client_args(self.valves)
+            client_args += [self.valves.MODEL_WHITELIST, self.valves.MODEL_BLACKLIST]
+            filtered_models = await self._get_genai_models(*client_args)
         except GenaiApiError:
             error_msg = "Error getting the models from Google API, check the logs."
             return [self._return_error_model(error_msg, exception=False)]
@@ -468,30 +465,17 @@ class Pipe:
             log.error(error_msg)
             raise ValueError(error_msg)
 
-        api_key, base_url = self.valves.GEMINI_API_KEY, self.valves.GEMINI_API_BASE_URL
-        use_vertex_ai, vertex_project, vertex_location = (
-            self.valves.USE_VERTEX_AI,
-            self.valves.VERTEX_PROJECT,
-            self.valves.VERTEX_LOCATION,
-        )
+        # Determine the source of the valve values
+        source_valves = self.valves
         if user_provides_own_key:
             log.debug(f"Using user API key(s) for user {__user__.get('email')}.")
-            api_key = user_valves.GEMINI_API_KEY
-            base_url = user_valves.GEMINI_API_BASE_URL
-            use_vertex_ai = user_valves.USE_VERTEX_AI
-            vertex_project = user_valves.VERTEX_PROJECT
-            vertex_location = user_valves.VERTEX_LOCATION
+            source_valves = user_valves
         else:
             log.debug(f"No API key(s) for user {__user__.get('email')}. Using default.")
 
         try:
-            client = self._get_or_create_genai_client(
-                api_key,
-                base_url,
-                use_vertex_ai,
-                vertex_project,
-                vertex_location,
-            )
+            client_args = self._prepare_client_args(source_valves)
+            client = self._get_or_create_genai_client(*client_args)
         except GenaiApiError as e:
             error_msg = f"Failed to initialize genai client for user {__user__.get('email')}: {e}"
             log.error(error_msg)
@@ -516,7 +500,10 @@ class Pipe:
     async def _get_genai_models(
         self,
         api_key: str | None,
-        base_url: str,
+        base_url: str | None,
+        use_vertex_ai: bool | None,
+        vertex_project: str | None,
+        vertex_location: str | None,
         whitelist_str: str,
         blacklist_str: str | None,
     ) -> list["ModelData"]:
@@ -526,7 +513,9 @@ class Pipe:
         The result is cached based on the provided api_key, base_url, whitelist_str, and blacklist_str.
         """
         # Get a client using the provided API key and base URL
-        client = self._get_or_create_genai_client(api_key, base_url)
+        client = self._get_or_create_genai_client(
+            api_key, base_url, use_vertex_ai, vertex_project, vertex_location
+        )
 
         try:
             # Get the AsyncPager object
@@ -572,6 +561,20 @@ class Pipe:
             f"Filtered {len(generative_models)} raw models down to {len(filtered_models)} models based on white/blacklists."
         )
         return filtered_models
+
+    @classmethod
+    def _prepare_client_args(
+        cls, source_valves: "Pipe.Valves | Pipe.UserValves"
+    ) -> list[str | bool | None]:
+        """Prepares arguments for _get_or_create_genai_client from source_valves."""
+        ATTRS = [
+            "GEMINI_API_KEY",
+            "GEMINI_API_BASE_URL",
+            "USE_VERTEX_AI",
+            "VERTEX_PROJECT",
+            "VERTEX_LOCATION",
+        ]
+        return [getattr(source_valves, attr) for attr in ATTRS]
 
     # endregion 1.1 Client initialization and model retrival from Google API
 
