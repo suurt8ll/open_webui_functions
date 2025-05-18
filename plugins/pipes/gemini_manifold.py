@@ -89,6 +89,18 @@ class Pipe:
             default="https://generativelanguage.googleapis.com",
             description="The base URL for calling the Gemini API",
         )
+        USE_VERTEX_AI: bool = Field(
+            default=False,
+            description="Whether to use Google Cloud Vertex AI instead of the standard Gemini API.",
+        )
+        VERTEX_PROJECT: str | None = Field(
+            default=None,
+            description="The Google Cloud project ID to use with Vertex AI.",
+        )
+        VERTEX_LOCATION: str = Field(
+            default="global",
+            description="The Google Cloud region to use with Vertex AI.",
+        )
         MODEL_WHITELIST: str = Field(
             default="*",
             description="""Comma-separated list of allowed model names.
@@ -143,12 +155,22 @@ class Pipe:
             default="https://generativelanguage.googleapis.com",
             description="The base URL for calling the Gemini API",
         )
-        THINKING_BUDGET: int | None = Field(
-            ge=0,
-            le=24576,
+        USE_VERTEX_AI: bool = Field(
+            default=False,
+            description="Whether to use Google Cloud Vertex AI instead of the standard Gemini API.",
+        )
+        VERTEX_PROJECT: str | None = Field(
             default=None,
-            description="""Gemini 2.5 Flash only. Indicates the thinking budget in tokens. 
-            0 means no thinking. Default value is None (uses the default from Valves).
+            description="The Google Cloud project ID to use with Vertex AI.",
+        )
+        VERTEX_LOCATION: str = Field(
+            default="us-central1",
+            description="The Google Cloud region to use with Vertex AI.",
+        )
+        THINKING_BUDGET: int | None = Field(
+            default=None,  # ge / le constraints error for None default, thus are moved to a separate validator
+            description="""Gemini 2.5 Flash only. Indicates the thinking budget in tokens.
+            0 means no thinking. Default value is 8192.
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
         )
 
@@ -157,6 +179,16 @@ class Pipe:
         def empty_str_to_none(cls, v):
             if v == "":
                 return 8192
+            return v
+
+        @field_validator("THINKING_BUDGET", mode="after")
+        @classmethod
+        def validate_thinking_budget_range(cls, v):
+            if v is not None:
+                if not (0 <= v <= 24576):
+                    raise ValueError(
+                        "THINKING_BUDGET must be between 0 and 24576, inclusive."
+                    )
             return v
 
         # TODO: Add more options that can be changed by the user.
@@ -174,6 +206,14 @@ class Pipe:
         """Register all available Google models."""
         # Detect log level change inside self.valves
         self._add_log_handler(self.valves.LOG_LEVEL)
+
+        if self.valves.USE_VERTEX_AI:
+            return [
+                {
+                    "id": "google/gemini-2.5-flash-preview-04-17",
+                    "name": "Gemini 2.5 Flash Preview 04-17",
+                }
+            ]
 
         # Clear cache if caching is disabled
         if not self.valves.CACHE_MODELS:
@@ -366,19 +406,39 @@ class Pipe:
     # region 1.1 Client initialization and model retrival from Google API
     @cache
     def _get_or_create_genai_client(
-        self, api_key: str, base_url: str
+        self,
+        api_key: str,
+        base_url: str,
+        use_vertex_ai: bool | None = None,
+        vertex_project: str | None = None,
+        vertex_location: str | None = None,
     ) -> genai.Client | None:
         """
         Creates a genai.Client instance or retrieves it from cache.
         Cached based on api_key and base_url.
         """
-        if not api_key:
+        if not use_vertex_ai and not api_key:
             log.error("GEMINI API key is missing")
             return None
 
-        http_options = types.HttpOptions(base_url=base_url)
+        if use_vertex_ai and not vertex_project:
+            log.error("USE_VERTEX_AI is true but VERTEX_PROJECT is not set.")
+            return None
+
+        if use_vertex_ai:
+            kwargs = {
+                "vertexai": True,
+                "project": vertex_project,
+                "location": vertex_location,
+            }
+        else:
+            kwargs = {
+                "api_key": api_key,
+                "http_options": types.HttpOptions(base_url=base_url),
+            }
+
         try:
-            client = genai.Client(api_key=api_key, http_options=http_options)
+            client = genai.Client(**kwargs)
             log.success("Genai client successfully initialized")
             return client
         except Exception:
@@ -387,27 +447,43 @@ class Pipe:
 
     def _get_user_client(self, __user__: "UserData") -> genai.Client:
         user_valves: Pipe.UserValves | None = __user__.get("valves")
-        user_provides_own_key = bool(user_valves and user_valves.GEMINI_API_KEY)
+        user_provides_own_key = bool(
+            user_valves and (user_valves.GEMINI_API_KEY or user_valves.USE_VERTEX_AI)
+        )
 
         if self.valves.REQUIRE_USER_API_KEY and not user_provides_own_key:
             error_msg = (
-                f"User-specific GEMINI API key is required (REQUIRE_USER_API_KEY is true), "
-                f"but user {__user__.get('email')} has not defined their own API key in UserValves."
+                f"User-specific GEMINI or VERTEX API key are required (REQUIRE_USER_API_KEY is true), "
+                f"but user {__user__.get('email')} has not defined their own in UserValves."
             )
             log.error(error_msg)
             raise ValueError(error_msg)
 
         api_key, base_url = self.valves.GEMINI_API_KEY, self.valves.GEMINI_API_BASE_URL
+        use_vertex_ai, vertex_project, vertex_location = (
+            self.valves.USE_VERTEX_AI,
+            self.valves.VERTEX_PROJECT,
+            self.valves.VERTEX_LOCATION,
+        )
         if user_provides_own_key:
             log.debug(f"Using user-specific API key for user {__user__.get('email')}.")
             api_key = user_valves.GEMINI_API_KEY
             base_url = user_valves.GEMINI_API_BASE_URL
+            use_vertex_ai = user_valves.USE_VERTEX_AI
+            vertex_project = user_valves.VERTEX_PROJECT
+            vertex_location = user_valves.VERTEX_LOCATION
         else:
             log.debug(
                 f"User {__user__.get('email')} has not provided an API key, using default."
             )
 
-        client = self._get_or_create_genai_client(api_key, base_url)
+        client = self._get_or_create_genai_client(
+            api_key,
+            base_url,
+            use_vertex_ai,
+            vertex_project,
+            vertex_location,
+        )
 
         if not client:
             error_msg = "Failed to initialize genai.Client. Check logs for details."
