@@ -62,6 +62,15 @@ from typing import (
     cast,
 )
 
+
+class GenaiApiError(Exception):
+    """Custom exception for errors during Genai API interactions."""
+
+    def __init__(self, message):
+        log.exception(message)
+        super().__init__(message)
+
+
 from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
 from open_webui.models.functions import Functions
@@ -228,7 +237,7 @@ class Pipe:
                 whitelist_str=self.valves.MODEL_WHITELIST,
                 blacklist_str=self.valves.MODEL_BLACKLIST,
             )
-        except RuntimeError:
+        except GenaiApiError:
             error_msg = "Error getting the models from Google API, check the logs."
             return [self._return_error_model(error_msg, exception=False)]
 
@@ -413,17 +422,18 @@ class Pipe:
         use_vertex_ai: bool | None = None,
         vertex_project: str | None = None,
         vertex_location: str | None = None,
-    ) -> genai.Client | None:
+    ) -> genai.Client:
         """
         Creates a genai.Client instance or retrieves it from cache.
+        Raises GenaiApiError on failure.
         """
         if use_vertex_ai and not vertex_project:
-            log.error("USE_VERTEX_AI is True but VERTEX_PROJECT is missing.")
-            return None
+            msg = "USE_VERTEX_AI is True but VERTEX_PROJECT is missing."
+            raise GenaiApiError(msg)
 
         if not use_vertex_ai and not api_key:
-            log.error("USE_VERTEX_AI is False but GEMINI_API_KEY is missing")
-            return None
+            msg = "USE_VERTEX_AI is False but GEMINI_API_KEY is missing."
+            raise GenaiApiError(msg)
 
         if use_vertex_ai:
             kwargs = {
@@ -441,9 +451,8 @@ class Pipe:
             client = genai.Client(**kwargs)
             log.success("Genai client successfully initialized")
             return client
-        except Exception:
-            log.exception("Genai client initialization failed")
-            return None
+        except Exception as e:
+            raise GenaiApiError(f"Genai client initialization failed: {e}") from e
 
     def _get_user_client(self, __user__: "UserData") -> genai.Client:
         user_valves: Pipe.UserValves | None = __user__.get("valves")
@@ -475,18 +484,18 @@ class Pipe:
         else:
             log.debug(f"No API key(s) for user {__user__.get('email')}. Using default.")
 
-        client = self._get_or_create_genai_client(
-            api_key,
-            base_url,
-            use_vertex_ai,
-            vertex_project,
-            vertex_location,
-        )
-
-        if not client:
-            error_msg = "Failed to initialize genai client. Check logs for details."
-            raise ValueError(error_msg)
-
+        try:
+            client = self._get_or_create_genai_client(
+                api_key,
+                base_url,
+                use_vertex_ai,
+                vertex_project,
+                vertex_location,
+            )
+        except GenaiApiError as e:
+            error_msg = f"Failed to initialize genai client for user {__user__.get('email')}: {e}"
+            log.error(error_msg)
+            raise ValueError(error_msg) from e
         return client
 
     def _return_error_model(
@@ -519,35 +528,20 @@ class Pipe:
         # Get a client using the provided API key and base URL
         client = self._get_or_create_genai_client(api_key, base_url)
 
-        if not client:
-            log.error(
-                "Can't initialize the client with provided API key and base URL, returning no models."
-            )
-            raise RuntimeError
-
-        # This executes if we have a working client.
-        google_models_pager = None
         try:
             # Get the AsyncPager object
             google_models_pager = await client.aio.models.list(
                 config={"query_base": True}
             )
-        except Exception:
-            log.exception("Retrieving models from Google API failed.")
-            raise RuntimeError
-
-        # Iterate the pager to get the full list of models
-        # This is where the actual API calls for subsequent pages happen if needed
-        try:
+            # Iterate the pager to get the full list of models
+            # This is where the actual API calls for subsequent pages happen if needed
             all_google_models = [model async for model in google_models_pager]
-        except Exception:
-            log.exception("Iterating Google models pager failed.")
-            raise RuntimeError
+        except Exception as e:
+            raise GenaiApiError(f"Retrieving models from Google API failed: {e}") from e
+        else:
+            log.info(f"Retrieved {len(all_google_models)} models from Google API.")
+            log.trace("All models returned by Google:", payload=all_google_models)
 
-        log.info(
-            f"Retrieved {len(all_google_models)} models from Gemini Developer API."
-        )
-        log.trace("All models returned by Google:", payload=all_google_models)
         # Filter Google models list down to generative models only.
         generative_models = [
             model
@@ -557,7 +551,7 @@ class Pipe:
 
         # Raise if there are not generative models
         if not generative_models:
-            raise RuntimeError
+            raise GenaiApiError("No generative models found.")
 
         # Filter based on whitelist and blacklist
         whitelist = whitelist_str.replace(" ", "").split(",") if whitelist_str else []
