@@ -200,6 +200,8 @@ class Pipe:
         """Register all available Google models."""
         self._add_log_handler(self.valves.LOG_LEVEL)
 
+        # FIXME: Hardcoded Gemini flagship models here
+        # while https://github.com/googleapis/python-genai/issues/679 is resolved.
         if self.valves.USE_VERTEX_AI:
             return [
                 {
