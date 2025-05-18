@@ -160,22 +160,31 @@ class Pipe:
         )
 
     class UserValves(BaseModel):
-        GEMINI_API_KEY: str | None = Field(default=None)
-        GEMINI_API_BASE_URL: str = Field(
-            default="https://generativelanguage.googleapis.com",
-            description="The base URL for calling the Gemini API",
+        # TODO: Add more options that can be changed by the user.
+        GEMINI_API_KEY: str | None = Field(
+            default=None,
+            description="""Gemini Developer API key.
+            Default value is None (uses the default from Valves, same goes for other options below).""",
         )
-        USE_VERTEX_AI: bool = Field(
-            default=False,
-            description="Whether to use Google Cloud Vertex AI instead of the standard Gemini API.",
+        GEMINI_API_BASE_URL: str | None = Field(
+            default=None,
+            description="""The base URL for calling the Gemini API
+            Default value is None.""",
+        )
+        USE_VERTEX_AI: bool | None = Field(
+            default=None,
+            description="""Whether to use Google Cloud Vertex AI instead of the standard Gemini API.
+            Default value is None.""",
         )
         VERTEX_PROJECT: str | None = Field(
             default=None,
-            description="The Google Cloud project ID to use with Vertex AI.",
+            description="""The Google Cloud project ID to use with Vertex AI.
+            Default value is None.""",
         )
-        VERTEX_LOCATION: str = Field(
-            default="global",
-            description="The Google Cloud region to use with Vertex AI.",
+        VERTEX_LOCATION: str | None = Field(
+            default=None,
+            description="""The Google Cloud region to use with Vertex AI.
+            Default value is None.""",
         )
         THINKING_BUDGET: int | None = Field(
             default=None,  # ge / le constraints error for None default, thus are moved to a separate validator
@@ -200,8 +209,6 @@ class Pipe:
                         "THINKING_BUDGET must be between 0 and 24576, inclusive."
                     )
             return v
-
-        # TODO: Add more options that can be changed by the user.
 
     def __init__(self):
         self.valves = self.Valves()
@@ -254,9 +261,6 @@ class Pipe:
     ) -> AsyncGenerator | str | None:
         self._add_log_handler(self.valves.LOG_LEVEL)
 
-        # Obtain Genai client
-        client = self._get_user_client(__user__)
-
         log.trace("__metadata__:", payload=__metadata__)
         # Check if user is chatting with an error model for some reason.
         if "error" in __metadata__["model"]["id"]:
@@ -305,20 +309,17 @@ class Pipe:
         )
         model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
 
-        # Get UserValves if it exists.
-        user_valves: Pipe.UserValves | None = __user__.get("valves")
+        # Apply settings from the user
+        valves: Pipe.Valves = self._get_merged_valves(
+            self.valves, __user__.get("valves")
+        )
 
         # API does not stream thoughts sadly. See https://github.com/googleapis/python-genai/issues/226#issuecomment-2631657100
         thinking_conf = None
         if model_name == "gemini-2.5-flash-preview-04-17":
             log.info(f"Model ID '{model_name}' allows adjusting the thinking settings.")
-            thinking_budget = (
-                user_valves.THINKING_BUDGET
-                if user_valves and user_valves.THINKING_BUDGET is not None
-                else self.valves.THINKING_BUDGET
-            )
             thinking_conf = types.ThinkingConfig(
-                thinking_budget=thinking_budget,
+                thinking_budget=valves.THINKING_BUDGET,
                 include_thoughts=None,
             )
         # TODO: Take defaults from the general front-end config.
@@ -373,6 +374,9 @@ class Pipe:
         }
         log.debug("Passing these args to the Google API:", payload=gen_content_args)
 
+        # Obtain Genai client
+        client = self._get_user_client(valves, __user__["email"])
+
         if body.get("stream", False):
             # Streaming response
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
@@ -382,10 +386,11 @@ class Pipe:
             return self._stream_response_generator(
                 response_stream,
                 __request__,
-                __user__,
+                valves,
                 gen_content_args,
                 __event_emitter__,
                 __metadata__,
+                __user__["id"],
             )
         else:
             # Non-streaming response.
@@ -453,33 +458,28 @@ class Pipe:
         except Exception as e:
             raise GenaiApiError(f"Genai client initialization failed: {e}") from e
 
-    def _get_user_client(self, __user__: "UserData") -> genai.Client:
-        user_valves: Pipe.UserValves | None = __user__.get("valves")
-        user_provides_own_key = bool(
-            user_valves and (user_valves.GEMINI_API_KEY or user_valves.USE_VERTEX_AI)
-        )
+    def _get_user_client(self, valves: "Pipe.Valves", user_email: str) -> genai.Client:
+        user_provides_own_key = bool(valves.GEMINI_API_KEY or valves.USE_VERTEX_AI)
 
         if self.valves.REQUIRE_USER_API_KEY and not user_provides_own_key:
             error_msg = (
                 f"User-specific GEMINI or VERTEX API key are required (REQUIRE_USER_API_KEY is true), "
-                f"but user {__user__.get('email')} has not defined their own in UserValves."
+                f"but user {user_email} has not defined their own in UserValves."
             )
             log.error(error_msg)
             raise ValueError(error_msg)
 
         # Determine the source of the valve values
-        source_valves = self.valves
         if user_provides_own_key:
-            log.debug(f"Using user API key(s) for user {__user__.get('email')}.")
-            source_valves = user_valves
+            log.debug(f"Using user API key(s) for user {user_email}.")
         else:
-            log.debug(f"No API key(s) for user {__user__.get('email')}. Using default.")
+            log.debug(f"No API key(s) for user {user_email}. Using default.")
 
         try:
-            client_args = self._prepare_client_args(source_valves)
+            client_args = self._prepare_client_args(valves)
             client = self._get_or_create_genai_client(*client_args)
         except GenaiApiError as e:
-            error_msg = f"Failed to initialize genai client for user {__user__.get('email')}: {e}"
+            error_msg = f"Failed to initialize genai client for user {user_email}: {e}"
             log.error(error_msg)
             raise ValueError(error_msg) from e
         return client
@@ -833,10 +833,11 @@ class Pipe:
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
         __request__: Request,
-        __user__: "UserData",
+        valves: "Pipe.Valves",
         gen_content_args: dict,
         event_emitter: Callable[["Event"], Awaitable[None]],
         metadata: dict[str, Any],
+        user_id: str,
     ) -> AsyncGenerator[str, None]:
         """
         Yields text chunks from the stream and spawns metadata processing task on completion.
@@ -844,16 +845,9 @@ class Pipe:
         final_response_chunk: types.GenerateContentResponse | None = None
         error_occurred = False
 
-        # Get thinking budget, UserValves takes priority.
-        user_valves: Pipe.UserValves | None = __user__.get("valves")
-        thinking_budget = (
-            user_valves.THINKING_BUDGET
-            if user_valves and user_valves.THINKING_BUDGET is not None
-            else self.valves.THINKING_BUDGET
-        )
-
         # Start thinking timer (model name check is inside this method).
         model_name = gen_content_args.get("model", "")
+        thinking_budget = valves.THINKING_BUDGET
         start_time, thinking_timer_task = await self._start_thinking_timer(
             model_name, event_emitter, thinking_budget
         )
@@ -892,7 +886,7 @@ class Pipe:
                             self._process_image_part(
                                 part.inline_data,
                                 gen_content_args,
-                                __user__,
+                                user_id,
                                 __request__,
                             )
                             or ""
@@ -940,7 +934,7 @@ class Pipe:
             log.debug("AsyncGenerator finished.")
 
     def _process_image_part(
-        self, inline_data, gen_content_args: dict, user: "UserData", request: Request
+        self, inline_data, gen_content_args: dict, user_id: str, request: Request
     ) -> str | None:
         """Handles image data conversion to markdown."""
         mime_type = inline_data.mime_type
@@ -952,7 +946,7 @@ class Pipe:
                 mime_type,
                 gen_content_args.get("model", ""),
                 "Not implemented yet. TAKE IT FROM gen_content_args contents",
-                user["id"],
+                user_id,
                 request,
             )
             return f"![Generated Image]({image_url})" if image_url else None
@@ -1434,6 +1428,63 @@ class Pipe:
     # endregion 1.6 Event emissions
 
     # region 1.7 Utility helpers
+
+    @staticmethod
+    def _get_merged_valves(
+        default_valves: "Pipe.Valves",
+        user_valves: "Pipe.UserValves | None",
+    ) -> "Pipe.Valves":
+        """
+        Merges UserValves into a base Valves configuration.
+
+        The general rule is that if a field in UserValves is not None, it overrides
+        the corresponding field in the default_valves. Otherwise, the default_valves
+        field value is used.
+
+        Exceptions:
+        - If default_valves.REQUIRE_USER_API_KEY is True, then GEMINI_API_KEY and
+          VERTEX_PROJECT in the merged result will be taken directly from
+          user_valves (even if they are None), ignoring the values in default_valves.
+
+        Args:
+            default_valves: The base Valves object with default configurations.
+            user_valves: An optional UserValves object with user-specific overrides.
+                         If None, a copy of default_valves is returned.
+
+        Returns:
+            A new Valves object representing the merged configuration.
+        """
+        if user_valves is None:
+            # If no user-specific valves are provided, return a copy of the default valves.
+            return default_valves.model_copy(deep=True)
+
+        # Start with the values from the base `Valves`
+        merged_data = default_valves.model_dump()
+
+        # Override with non-None values from `UserValves`
+        # Iterate over fields defined in the UserValves model
+        for field_name in Pipe.UserValves.model_fields:
+            # getattr is safe as field_name comes from model_fields of user_valves' type
+            user_value = getattr(user_valves, field_name)
+            if user_value is not None:
+                # Only update if the field is also part of the main Valves model
+                # (keys of merged_data are fields of default_valves)
+                if field_name in merged_data:
+                    merged_data[field_name] = user_value
+
+        # Apply special logic based on default_valves.REQUIRE_USER_API_KEY
+        if default_valves.REQUIRE_USER_API_KEY:
+            # If REQUIRE_USER_API_KEY is True, GEMINI_API_KEY and VERTEX_PROJECT
+            # must be taken from UserValves, or be None if UserValves has them as None.
+            # The base values from default_valves for these fields are effectively ignored in this case.
+            # This assignment happens after the general loop, ensuring it takes final precedence.
+            merged_data["GEMINI_API_KEY"] = user_valves.GEMINI_API_KEY
+            merged_data["VERTEX_PROJECT"] = user_valves.VERTEX_PROJECT
+
+        # Create a new Valves instance with the merged data.
+        # Pydantic will validate the data against the Valves model definition during instantiation.
+        return Pipe.Valves(**merged_data)
+
     def _is_flat_dict(self, data: Any) -> bool:
         """
         Checks if a dictionary contains only non-dict/non-list values (is one level deep).
