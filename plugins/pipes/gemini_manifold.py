@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 1.18.2
-requirements: google-genai==1.15.0, async-lru
+requirements: google-genai==1.15.0
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API.
@@ -39,7 +39,7 @@ import copy
 import json
 import time
 from functools import cache
-from async_lru import alru_cache
+from aiocache import cached
 from fastapi.datastructures import State
 import io
 import mimetypes
@@ -496,7 +496,7 @@ class Pipe:
             "description": error_msg,
         }
 
-    @alru_cache(maxsize=None)
+    @cached
     async def _get_genai_models(
         self,
         api_key: str | None,
