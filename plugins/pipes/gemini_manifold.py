@@ -194,17 +194,10 @@ class Pipe:
         # TODO: Add more options that can be changed by the user.
 
     def __init__(self):
-        # This hack makes the valves values available to the `__init__` method.
-        # TODO: Get the id from the frontmatter instead of hardcoding it.
-        valves = Functions.get_function_valves_by_id("gemini_manifold_google_genai")
-        self.valves = self.Valves(**(valves if valves else {}))
-        self._add_log_handler(self.valves.LOG_LEVEL)
-        log.success("Function has been initialized.")
-        log.trace("Full self object:", payload=self.__dict__)
+        self.valves = self.Valves()
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
-        # Detect log level change inside self.valves
         self._add_log_handler(self.valves.LOG_LEVEL)
 
         if self.valves.USE_VERTEX_AI:
@@ -249,6 +242,8 @@ class Pipe:
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __metadata__: dict[str, Any],
     ) -> AsyncGenerator | str | None:
+        self._add_log_handler(self.valves.LOG_LEVEL)
+
         # Obtain Genai client
         client = self._get_user_client(__user__)
 
@@ -419,14 +414,13 @@ class Pipe:
     ) -> genai.Client | None:
         """
         Creates a genai.Client instance or retrieves it from cache.
-        Cached based on api_key and base_url.
         """
-        if not use_vertex_ai and not api_key:
-            log.error("GEMINI API key is missing")
+        if use_vertex_ai and not vertex_project:
+            log.error("USE_VERTEX_AI is True but VERTEX_PROJECT is missing.")
             return None
 
-        if use_vertex_ai and not vertex_project:
-            log.error("USE_VERTEX_AI is true but VERTEX_PROJECT is not set.")
+        if not use_vertex_ai and not api_key:
+            log.error("USE_VERTEX_AI is False but GEMINI_API_KEY is missing")
             return None
 
         if use_vertex_ai:
