@@ -40,6 +40,7 @@ import json
 import time
 from functools import cache
 from aiocache import cached
+from aiocache.base import BaseCache
 from fastapi.datastructures import State
 import io
 import mimetypes
@@ -226,7 +227,8 @@ class Pipe:
         # Clear cache if caching is disabled
         if not self.valves.CACHE_MODELS:
             log.debug("CACHE_MODELS is False, clearing model cache.")
-            self._get_genai_models.cache_clear()
+            cache_instance = getattr(self._get_genai_models, "cache")
+            await cast(BaseCache, cache_instance).clear()
 
         log.info("Fetching and filtering models from Google API.")
         # Get and filter models (potentially cached based on API key, base URL, white- and blacklist)
@@ -496,7 +498,7 @@ class Pipe:
             "description": error_msg,
         }
 
-    @cached
+    @cached()
     async def _get_genai_models(
         self,
         api_key: str | None,
