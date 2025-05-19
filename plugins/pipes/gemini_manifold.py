@@ -62,19 +62,8 @@ from typing import (
     TYPE_CHECKING,
     cast,
 )
-
-
-class GenaiApiError(Exception):
-    """Custom exception for errors during Genai API interactions."""
-
-    def __init__(self, message):
-        log.exception(message)
-        super().__init__(message)
-
-
 from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
-from open_webui.models.functions import Functions
 from open_webui.storage.provider import Storage
 
 if TYPE_CHECKING:
@@ -84,6 +73,13 @@ if TYPE_CHECKING:
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
+
+
+class GenaiApiError(Exception):
+    """Custom exception for errors during Genai API interactions."""
+
+    def __init__(self, message):
+        super().__init__(message)
 
 
 class Pipe:
@@ -101,15 +97,20 @@ class Pipe:
         )
         USE_VERTEX_AI: bool = Field(
             default=False,
-            description="Whether to use Google Cloud Vertex AI instead of the standard Gemini API.",
+            description="""Whether to allow using Google Cloud Vertex AI.
+            Default value is False.""",
         )
         VERTEX_PROJECT: str | None = Field(
             default=None,
-            description="The Google Cloud project ID to use with Vertex AI.",
+            description="""The Google Cloud project ID to use with Vertex AI.
+            Default value is None.
+            If you set this value then the plugin will start using Vertex AI by default.
+            Users can override this inside UserValves.""",
         )
         VERTEX_LOCATION: str = Field(
             default="global",
-            description="The Google Cloud region to use with Vertex AI.",
+            description="""The Google Cloud region to use with Vertex AI.
+            Default value is 'global'.""",
         )
         MODEL_WHITELIST: str = Field(
             default="*",
@@ -171,7 +172,7 @@ class Pipe:
             description="""The base URL for calling the Gemini API
             Default value is None.""",
         )
-        USE_VERTEX_AI: bool | None = Field(
+        USE_VERTEX_AI: bool | None | Literal[""] = Field(
             default=None,
             description="""Whether to use Google Cloud Vertex AI instead of the standard Gemini API.
             Default value is None.""",
@@ -186,24 +187,17 @@ class Pipe:
             description="""The Google Cloud region to use with Vertex AI.
             Default value is None.""",
         )
-        THINKING_BUDGET: int | None = Field(
-            default=None,  # ge / le constraints error for None default, thus are moved to a separate validator
+        THINKING_BUDGET: int | None | Literal[""] = Field(
+            default=None,
             description="""Gemini 2.5 Flash only. Indicates the thinking budget in tokens.
             0 means no thinking. Default value is None (uses the default from Valves).
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
         )
 
-        @field_validator("THINKING_BUDGET", mode="before")
-        @classmethod
-        def empty_str_to_none(cls, v):
-            if v == "":
-                return 8192
-            return v
-
         @field_validator("THINKING_BUDGET", mode="after")
         @classmethod
         def validate_thinking_budget_range(cls, v):
-            if v is not None:
+            if v is not None and v != "":
                 if not (0 <= v <= 24576):
                     raise ValueError(
                         "THINKING_BUDGET must be between 0 and 24576, inclusive."
@@ -216,20 +210,6 @@ class Pipe:
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
         self._add_log_handler(self.valves.LOG_LEVEL)
-
-        # FIXME: Hardcoded Gemini flagship models here
-        # while https://github.com/googleapis/python-genai/issues/679 is unresolved.
-        if self.valves.USE_VERTEX_AI:
-            return [
-                {
-                    "id": "google/gemini-2.5-flash-preview-04-17",
-                    "name": "Gemini 2.5 Flash Preview 04-17",
-                },
-                {
-                    "id": "google/gemini-2.5-pro-preview-05-06",
-                    "name": "Gemini 2.5 Pro Preview 05-06",
-                },
-            ]
 
         # Clear cache if caching is disabled
         if not self.valves.CACHE_MODELS:
@@ -249,6 +229,7 @@ class Pipe:
 
         log.info(f"Returning {len(filtered_models)} models to Open WebUI.")
         log.debug("Model list:", payload=filtered_models, _log_truncation_enabled=False)
+
         return filtered_models
 
     async def pipe(
@@ -259,7 +240,21 @@ class Pipe:
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __metadata__: dict[str, Any],
     ) -> AsyncGenerator | str | None:
+
         self._add_log_handler(self.valves.LOG_LEVEL)
+
+        # Apply settings from the user
+        valves: Pipe.Valves = self._get_merged_valves(
+            self.valves, __user__.get("valves")
+        )
+        log.debug(
+            f"USE_VERTEX_AI: {valves.USE_VERTEX_AI}, VERTEX_PROJECT set: {bool(valves.VERTEX_PROJECT)}, API_KEY set: {bool(valves.GEMINI_API_KEY)}"
+        )
+
+        log.debug(
+            f"Getting genai client (potentially cached) for user {__user__['email']}."
+        )
+        client = self._get_user_client(valves, __user__["email"])
 
         log.trace("__metadata__:", payload=__metadata__)
         # Check if user is chatting with an error model for some reason.
@@ -308,11 +303,6 @@ class Pipe:
             "safety_settings"
         )
         model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
-
-        # Apply settings from the user
-        valves: Pipe.Valves = self._get_merged_valves(
-            self.valves, __user__.get("valves")
-        )
 
         # API does not stream thoughts sadly. See https://github.com/googleapis/python-genai/issues/226#issuecomment-2631657100
         thinking_conf = None
@@ -374,9 +364,6 @@ class Pipe:
         }
         log.debug("Passing these args to the Google API:", payload=gen_content_args)
 
-        # Obtain Genai client
-        client = self._get_user_client(valves, __user__["email"])
-
         if body.get("stream", False):
             # Streaming response
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
@@ -418,9 +405,9 @@ class Pipe:
     # region 1. Helper methods inside the Pipe class
 
     # region 1.1 Client initialization and model retrival from Google API
+    @staticmethod
     @cache
     def _get_or_create_genai_client(
-        self,
         api_key: str | None = None,
         base_url: str | None = None,
         use_vertex_ai: bool | None = None,
@@ -431,61 +418,52 @@ class Pipe:
         Creates a genai.Client instance or retrieves it from cache.
         Raises GenaiApiError on failure.
         """
-        if use_vertex_ai and not vertex_project:
-            msg = "USE_VERTEX_AI is True but VERTEX_PROJECT is missing."
+
+        if not vertex_project and not api_key:
+            msg = "Neither VERTEX_PROJECT nor GEMINI_API_KEY is set."
             raise GenaiApiError(msg)
 
-        if not use_vertex_ai and not api_key:
-            msg = "USE_VERTEX_AI is False but GEMINI_API_KEY is missing."
-            raise GenaiApiError(msg)
-
-        if use_vertex_ai:
+        if use_vertex_ai and vertex_project:
             kwargs = {
                 "vertexai": True,
                 "project": vertex_project,
                 "location": vertex_location,
             }
-        else:
+            api = "Vertex AI"
+        else:  # Covers (use_vertex_ai and not vertex_project) OR (not use_vertex_ai)
+            if use_vertex_ai and not vertex_project:
+                log.warning(
+                    "Vertex AI is enabled but no project is set. "
+                    "Using Gemini Developer API."
+                )
+            # This also implicitly covers the case where api_key might be None,
+            # which is handled by the initial check or the SDK.
             kwargs = {
                 "api_key": api_key,
                 "http_options": types.HttpOptions(base_url=base_url),
             }
+            api = "Gemini Developer API"
 
         try:
             client = genai.Client(**kwargs)
-            log.success("Genai client successfully initialized")
+            log.success(f"{api} Genai client successfully initialized.")
             return client
         except Exception as e:
-            raise GenaiApiError(f"Genai client initialization failed: {e}") from e
+            raise GenaiApiError(f"{api} Genai client initialization failed: {e}") from e
 
     def _get_user_client(self, valves: "Pipe.Valves", user_email: str) -> genai.Client:
-        user_provides_own_key = bool(valves.GEMINI_API_KEY or valves.USE_VERTEX_AI)
-
-        if self.valves.REQUIRE_USER_API_KEY and not user_provides_own_key:
-            error_msg = (
-                f"User-specific GEMINI or VERTEX API key are required (REQUIRE_USER_API_KEY is true), "
-                f"but user {user_email} has not defined their own in UserValves."
-            )
-            log.error(error_msg)
-            raise ValueError(error_msg)
-
-        # Determine the source of the valve values
-        if user_provides_own_key:
-            log.debug(f"Using user API key(s) for user {user_email}.")
-        else:
-            log.debug(f"No API key(s) for user {user_email}. Using default.")
-
         try:
             client_args = self._prepare_client_args(valves)
             client = self._get_or_create_genai_client(*client_args)
         except GenaiApiError as e:
             error_msg = f"Failed to initialize genai client for user {user_email}: {e}"
-            log.error(error_msg)
+            # FIXME: include correct traceback.
             raise ValueError(error_msg) from e
         return client
 
+    @staticmethod
     def _return_error_model(
-        self, error_msg: str, warning: bool = False, exception: bool = True
+        error_msg: str, warning: bool = False, exception: bool = True
     ) -> "ModelData":
         """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
         if warning:
@@ -562,11 +540,29 @@ class Pipe:
         log.info(
             f"Filtered {len(generative_models)} raw models down to {len(filtered_models)} models based on white/blacklists."
         )
+        # FIXME: Hardcoded Gemini flagship models here
+        # while https://github.com/googleapis/python-genai/issues/679 is unresolved.
+        if use_vertex_ai:
+            # Add Vertex AI models to the list
+            vertex_models: list["ModelData"] = [
+                {
+                    "id": "google/gemini-2.5-flash-preview-04-17",
+                    "name": "Vertex AI: Gemini 2.5 Flash Preview 04-17",
+                },
+                {
+                    "id": "google/gemini-2.5-pro-preview-05-06",
+                    "name": "Vertex AI: Gemini 2.5 Pro Preview 05-06",
+                },
+            ]
+            filtered_models.extend(vertex_models)
+            log.info(
+                f"Added {len(vertex_models)} Vertex AI models to the list of models."
+            )
         return filtered_models
 
-    @classmethod
+    @staticmethod
     def _prepare_client_args(
-        cls, source_valves: "Pipe.Valves | Pipe.UserValves"
+        source_valves: "Pipe.Valves | Pipe.UserValves",
     ) -> list[str | bool | None]:
         """Prepares arguments for _get_or_create_genai_client from source_valves."""
         ATTRS = [
@@ -1466,7 +1462,7 @@ class Pipe:
         for field_name in Pipe.UserValves.model_fields:
             # getattr is safe as field_name comes from model_fields of user_valves' type
             user_value = getattr(user_valves, field_name)
-            if user_value is not None:
+            if user_value is not None and user_value != "":
                 # Only update if the field is also part of the main Valves model
                 # (keys of merged_data are fields of default_valves)
                 if field_name in merged_data:
