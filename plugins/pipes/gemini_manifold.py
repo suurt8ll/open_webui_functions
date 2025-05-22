@@ -225,7 +225,7 @@ class Pipe:
             filtered_models = await self._get_genai_models(*client_args)
         except GenaiApiError:
             error_msg = "Error getting the models from Google API, check the logs."
-            return [self._return_error_model(error_msg, exception=False)]
+            return [self._return_error_model(error_msg, exception=True)]
 
         log.info(f"Returning {len(filtered_models)} models to Open WebUI.")
         log.debug("Model list:", payload=filtered_models, _log_truncation_enabled=False)
@@ -520,7 +520,7 @@ class Pipe:
 
         # Raise if there are not generative models
         if not generative_models:
-            raise GenaiApiError("No generative models found.")
+            log.warning("No generative models found.")
 
         # Filter based on whitelist and blacklist
         whitelist = whitelist_str.replace(" ", "").split(",") if whitelist_str else []
@@ -751,7 +751,7 @@ class Pipe:
         for match in pattern.finditer(text):
             # Add text before the current match
             text_segment = text[last_pos : match.start()]
-            if text_segment.strip(): # Ensure non-empty, stripped text
+            if text_segment.strip():  # Ensure non-empty, stripped text
                 parts.append(types.Part.from_text(text=text_segment.strip()))
 
             # Determine if it's an image or a YouTube URL
@@ -784,13 +784,13 @@ class Pipe:
 
         # Add remaining text after the last match
         remaining_text = text[last_pos:]
-        if remaining_text.strip(): # Ensure non-empty, stripped text
+        if remaining_text.strip():  # Ensure non-empty, stripped text
             parts.append(types.Part.from_text(text=remaining_text.strip()))
 
         # If no matches were found at all (e.g. plain text), the original text (stripped) is added as a single part.
         if not parts and text.strip():
             parts.append(types.Part.from_text(text=text.strip()))
-        
+
         # If parts list is empty and original text was only whitespace, return empty list.
         # Otherwise, if parts were added, or if it was plain text, it's handled above.
         # This check ensures that if text was "   ", we don't add a Part for "   ".
