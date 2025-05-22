@@ -197,7 +197,11 @@ class Pipe:
             0 means no thinking. Default value is None (uses the default from Valves).
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
         )
-
+        ENABLE_URL_CONTEXT_TOOL: bool = Field(
+            default=False,
+            description="Enable the URL context tool to allow the model to fetch and use content from provided URLs. This tool is only compatible with specific models.",
+        )
+        
         @field_validator("THINKING_BUDGET", mode="after")
         @classmethod
         def validate_thinking_budget_range(cls, v):
@@ -815,7 +819,7 @@ class Pipe:
         # If no matches were found at all (e.g. plain text), the original text (stripped) is added as a single part.
         if not parts and text.strip():
             parts.append(types.Part.from_text(text=text.strip()))
-        
+
         # If parts list is empty and original text was only whitespace, return empty list.
         # Otherwise, if parts were added, or if it was plain text, it's handled above.
         # This check ensures that if text was "   ", we don't add a Part for "   ".
