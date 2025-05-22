@@ -682,16 +682,9 @@ class Pipe:
                 c = cast("TextContent", c)
                 # Don't process empty strings.
                 if c_text := c.get("text"):
-                    # Check for YouTube URLs in text content
-                    # FIXME: Better ordering of Parts here.
-                    youtube_urls = self._extract_youtube_urls(c_text)
-                    if youtube_urls:
-                        for url in youtube_urls:
-                            user_parts.append(
-                                types.Part(file_data=types.FileData(file_uri=url))
-                            )
-
-                    user_parts.extend(self._genai_parts_from_text(c_text))
+                    # Logic to extract YouTube URLs and create parts is removed from here.
+                    # It will be handled in _genai_parts_from_text.
+                    user_parts.extend(self._genai_parts_from_text(c_text)) # Ensure this line is present and correctly calls _genai_parts_from_text
             elif c_type == "image_url":
                 c = cast("ImageContent", c)
                 if img_part := self._genai_part_from_image_url(
@@ -745,59 +738,66 @@ class Pipe:
             return None
 
     def _genai_parts_from_text(self, text: str) -> list[types.Part]:
-        """
-        Turns raw text into list of genai.types.Parts objects.
-        Extracts and converts markdown images to parts, preserving text order.
-        """
-        # TODO: Extract generated code and it's result into genai parts too.
-
         parts: list[types.Part] = []
         last_pos = 0
 
-        for match in re.finditer(
-            r"!\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)",
-            text,
-        ):
-            # Add text before the image
+        # Regex to find markdown images or YouTube URLs
+        # Markdown image: !\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)
+        # YouTube URL: (https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+)
+        # Combined regex (order matters for matching preference if overlap exists, though unlikely here):
+        pattern = re.compile(
+            r"!\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)|"
+            r"(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+)"
+        )
+
+        for match in pattern.finditer(text):
+            # Add text before the current match
             text_segment = text[last_pos : match.start()]
             if text_segment.strip():
                 parts.append(types.Part.from_text(text=text_segment))
 
-            # Determine if it's base64 or a file URL
-            if match.group(2):  # Base64 encoded image
-                try:
-                    mime_type = match.group(2)
-                    base64_data = match.group(3)
-                    log.debug(
-                        "Found base64 image link!",
-                        mime_type=mime_type,
-                        base64_data=match.group(3)[:64] + "[...]",
-                    )
-                    image_part = types.Part.from_bytes(
-                        data=base64.b64decode(base64_data),
-                        mime_type=mime_type,
-                    )
-                    parts.append(image_part)
-                except Exception:
-                    # TODO: Emit toast
-                    log.exception("Error decoding base64 image:")
-            elif match.group(4):  # File URL
-                log.debug("Found API image link!", id=match.group(4))
-                file_id = match.group(4)
-                image_bytes, mime_type = self._get_file_data(file_id)
-                if not image_bytes or not mime_type:
-                    continue
-                image_part = types.Part.from_bytes(
-                    data=image_bytes, mime_type=mime_type
-                )
-                parts.append(image_part)
+            # Now determine if it's an image or a YouTube URL
+            if match.group(1):  # It's a markdown image
+                if match.group(2):  # Base64 encoded image
+                    try:
+                        mime_type = match.group(2)
+                        base64_data = match.group(3)
+                        log.debug(
+                            "Found base64 image link!",
+                            mime_type=mime_type,
+                            base64_data=match.group(3)[:64] + "[...]",
+                        )
+                        image_part = types.Part.from_bytes(
+                            data=base64.b64decode(base64_data),
+                            mime_type=mime_type,
+                        )
+                        parts.append(image_part)
+                    except Exception:
+                        log.exception("Error decoding base64 image:")
+                elif match.group(4):  # File URL for image
+                    log.debug("Found API image link!", id=match.group(4))
+                    file_id = match.group(4)
+                    image_bytes, mime_type = self._get_file_data(file_id)
+                    if image_bytes and mime_type: # Ensure data is valid
+                        image_part = types.Part.from_bytes(
+                            data=image_bytes, mime_type=mime_type
+                        )
+                        parts.append(image_part)
+            elif match.group(5):  # It's a YouTube URL
+                youtube_url = match.group(5)
+                log.info(f"Found YouTube URL: {youtube_url}")
+                parts.append(types.Part(file_data=types.FileData(file_uri=youtube_url)))
 
             last_pos = match.end()
 
-        # Add remaining text
+        # Add remaining text after the last match
         remaining_text = text[last_pos:]
         if remaining_text.strip():
             parts.append(types.Part.from_text(text=remaining_text))
+
+        # If no matches were found at all, the original text is added as a single part.
+        if not parts and text.strip():
+            parts.append(types.Part.from_text(text=text))
 
         return parts
 
