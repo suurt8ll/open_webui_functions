@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 1.18.2
-requirements: google-genai==1.15.0
+requirements: google-genai==1.16.1
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API.
@@ -351,8 +351,12 @@ class Pipe:
                 "gemini-2.0-flash-live-001",
             ]
             if model_name in compatible_models_for_url_context:
-                log.info(f"Model {model_name} is compatible with URL context tool. Enabling.")
-                gen_content_conf.tools.append(types.Tool(url_context=types.UrlContext()))
+                log.info(
+                    f"Model {model_name} is compatible with URL context tool. Enabling."
+                )
+                gen_content_conf.tools.append(
+                    types.Tool(url_context=types.UrlContext())
+                )
             else:
                 log.warning(
                     f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
@@ -1256,23 +1260,28 @@ class Pipe:
 
         # Emit URL context metadata if available
         url_context_meta = candidate.url_context_metadata if candidate else None
-        if url_context_meta and hasattr(url_context_meta, 'retrieved_urls') and url_context_meta.retrieved_urls:
+        if (
+            url_context_meta
+            and hasattr(url_context_meta, "retrieved_urls")
+            and url_context_meta.retrieved_urls
+        ):
             # Convert UrlContextRetrievedUrl objects to a list of dicts
             # as the objects themselves might not be directly JSON serializable in the event.
             retrieved_urls_data = []
             for retrieved_url_obj in url_context_meta.retrieved_urls:
-                url_data = {"url": retrieved_url_obj.url, "title": retrieved_url_obj.title}
+                url_data = {
+                    "url": retrieved_url_obj.url,
+                    "title": retrieved_url_obj.title,
+                }
                 # Optionally, include favicon if it exists and is needed by the frontend
                 # if hasattr(retrieved_url_obj, 'favicon') and retrieved_url_obj.favicon:
                 #     url_data["favicon"] = retrieved_url_obj.favicon
                 retrieved_urls_data.append(url_data)
-            
-            if retrieved_urls_data: # Ensure we have something to send
+
+            if retrieved_urls_data:  # Ensure we have something to send
                 url_event = {
                     "type": "chat:url_context",
-                    "data": {
-                        "retrieved_urls": retrieved_urls_data
-                    }
+                    "data": {"retrieved_urls": retrieved_urls_data},
                 }
                 await event_emitter(url_event)
                 log.debug("Emitted URL context metadata:", payload=url_event)
