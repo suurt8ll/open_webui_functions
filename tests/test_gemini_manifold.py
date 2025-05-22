@@ -1,4 +1,7 @@
+from typing import cast
+from aiocache.base import BaseCache
 import pytest
+import pytest_asyncio
 from unittest.mock import (
     patch,
     MagicMock,
@@ -51,13 +54,9 @@ def mock_pipe_valves_data():
 
 # Helper to setup Pipe instance for tests that need it
 # This reduces boilerplate in each test function.
-@pytest.fixture
-def pipe_instance_fixture(mock_pipe_valves_data):
+@pytest_asyncio.fixture
+async def pipe_instance_fixture(mock_pipe_valves_data):
     mock_gemini_client_instance = MagicMock()
-    mock_functions_module.Functions.get_function_valves_by_id.reset_mock()  # Reset for independence
-    mock_functions_module.Functions.get_function_valves_by_id.return_value = (
-        mock_pipe_valves_data
-    )
 
     with patch(
         "plugins.pipes.gemini_manifold.genai.Client",
@@ -68,22 +67,18 @@ def pipe_instance_fixture(mock_pipe_valves_data):
         "sys.stdout", MagicMock()  # Suppress print/log output during setup
     ):
         pipe = Pipe()
-        # Basic verification that Pipe initialized successfully
-        mock_functions_module.Functions.get_function_valves_by_id.assert_called_once()
-        MockedGenAIClientConstructor.assert_called_once()
-        mock_internal_add_log_handler.assert_called_once()
+        pipe.valves = Pipe.Valves(**mock_pipe_valves_data)
         yield pipe  # Use yield to make it a fixture that provides the instance
+
+    # Teardown: Clear caches
+    Pipe._get_or_create_genai_client.cache_clear()
+    cache_instance = getattr(pipe._get_genai_models, "cache")
+    if cache_instance:
+        await cast(BaseCache, cache_instance).clear()
 
 
 def test_pipe_initialization_with_api_key(mock_pipe_valves_data):
-    # This test now uses a more focused setup for Pipe instantiation if needed,
-    # or can be simplified if pipe_instance_fixture covers its needs.
-    # For this specific test, let's keep its original detailed setup to show the direct interactions.
     mock_gemini_client_instance = MagicMock()
-    mock_functions_module.Functions.get_function_valves_by_id.reset_mock()
-    mock_functions_module.Functions.get_function_valves_by_id.return_value = (
-        mock_pipe_valves_data
-    )
 
     with patch(
         "plugins.pipes.gemini_manifold.genai.Client",
@@ -93,21 +88,29 @@ def test_pipe_initialization_with_api_key(mock_pipe_valves_data):
     ) as mock_internal_add_log_handler, patch(
         "sys.stdout", MagicMock()
     ):
-        pipe_instance = Pipe()
+        try:
+            pipe_instance = Pipe()
+            pipe_instance.valves = Pipe.Valves(**mock_pipe_valves_data)  # Added
 
-        mock_functions_module.Functions.get_function_valves_by_id.assert_called_once_with(
-            "gemini_manifold_google_genai"
-        )
-        assert isinstance(pipe_instance.valves, Pipe.Valves)
-        assert pipe_instance.valves.GEMINI_API_KEY == "test_default_api_key_from_valves"
-        mock_internal_add_log_handler.assert_called_once()
-        MockedGenAIClientConstructor.assert_called_once_with(
-            api_key="test_default_api_key_from_valves",
-            http_options=gemini_types.HttpOptions(
-                base_url="https://test.googleapis.com"
-            ),
-        )
-        assert pipe_instance.clients["default"] == mock_gemini_client_instance
+            assert isinstance(pipe_instance.valves, Pipe.Valves)
+            assert (
+                pipe_instance.valves.GEMINI_API_KEY
+                == "test_default_api_key_from_valves"
+            )
+
+            # Trigger client creation
+            pipe_instance._get_user_client(
+                pipe_instance.valves, "test_user_email@example.com"
+            )
+
+            MockedGenAIClientConstructor.assert_called_once_with(
+                api_key="test_default_api_key_from_valves",
+                http_options=gemini_types.HttpOptions(
+                    base_url="https://test.googleapis.com"
+                ),
+            )
+        finally:
+            Pipe._get_or_create_genai_client.cache_clear()
 
 
 @pytest.mark.asyncio
