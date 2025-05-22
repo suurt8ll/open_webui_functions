@@ -2,23 +2,22 @@ name: Python CI
 
 on:
   pull_request:
-    branches: [ main, master ]
+    branches: [ master ]
     types: [opened, synchronize, reopened]
   push:
-    branches: [ main, master ]
+    branches: [ master ]
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    # Add the permissions block here for the 'build' job
-    permissions:
-      checks: write
-      pull-requests: write
-
+  run-tests:
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ['3.11']
-
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.11', '3.12', '3.13']
+    
+    name: Test on ${{ matrix.os }} with Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -33,12 +32,5 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Run pytest and generate report
-      run: pytest --junitxml=test-results.xml tests/test_gemini_manifold.py || true
-
-    - name: Publish test results
-      uses: EnricoMi/publish-unit-test-result-action@v2
-      if: always()
-      with:
-        files: test-results.xml
-        check_name: Pytest Results (Python ${{ matrix.python-version }})
+    - name: Run pytest
+      run: pytest

@@ -707,15 +707,7 @@ class Pipe:
                 c = cast("TextContent", c)
                 # Don't process empty strings.
                 if c_text := c.get("text"):
-                    # Check for YouTube URLs in text content
-                    # FIXME: Better ordering of Parts here.
-                    youtube_urls = self._extract_youtube_urls(c_text)
-                    if youtube_urls:
-                        for url in youtube_urls:
-                            user_parts.append(
-                                types.Part(file_data=types.FileData(file_uri=url))
-                            )
-
+                    # YouTube URL extraction is now handled by _genai_parts_from_text
                     user_parts.extend(self._genai_parts_from_text(c_text))
             elif c_type == "image_url":
                 c = cast("ImageContent", c)
@@ -770,59 +762,66 @@ class Pipe:
             return None
 
     def _genai_parts_from_text(self, text: str) -> list[types.Part]:
-        """
-        Turns raw text into list of genai.types.Parts objects.
-        Extracts and converts markdown images to parts, preserving text order.
-        """
-        # TODO: Extract generated code and it's result into genai parts too.
-
         parts: list[types.Part] = []
         last_pos = 0
 
-        for match in re.finditer(
-            r"!\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)",
-            text,
-        ):
-            # Add text before the image
-            text_segment = text[last_pos : match.start()]
-            if text_segment.strip():
-                parts.append(types.Part.from_text(text=text_segment))
+        # Regex to find markdown images or YouTube URLs
+        # Markdown image: !\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)
+        # YouTube URL: (https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+)
+        pattern = re.compile(
+            r"!\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)|"
+            r"(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+)"
+        )
 
-            # Determine if it's base64 or a file URL
-            if match.group(2):  # Base64 encoded image
-                try:
-                    mime_type = match.group(2)
-                    base64_data = match.group(3)
-                    log.debug(
-                        "Found base64 image link!",
-                        mime_type=mime_type,
-                        base64_data=match.group(3)[:64] + "[...]",
-                    )
-                    image_part = types.Part.from_bytes(
-                        data=base64.b64decode(base64_data),
-                        mime_type=mime_type,
-                    )
-                    parts.append(image_part)
-                except Exception:
-                    # TODO: Emit toast
-                    log.exception("Error decoding base64 image:")
-            elif match.group(4):  # File URL
-                log.debug("Found API image link!", id=match.group(4))
-                file_id = match.group(4)
-                image_bytes, mime_type = self._get_file_data(file_id)
-                if not image_bytes or not mime_type:
-                    continue
-                image_part = types.Part.from_bytes(
-                    data=image_bytes, mime_type=mime_type
-                )
-                parts.append(image_part)
+        for match in pattern.finditer(text):
+            # Add text before the current match
+            text_segment = text[last_pos : match.start()]
+            if text_segment.strip(): # Ensure non-empty, stripped text
+                parts.append(types.Part.from_text(text=text_segment.strip()))
+
+            # Determine if it's an image or a YouTube URL
+            if match.group(1):  # It's a markdown image
+                if match.group(2):  # Base64 encoded image
+                    try:
+                        mime_type = match.group(2)
+                        base64_data = match.group(3)
+                        image_part = types.Part.from_bytes(
+                            data=base64.b64decode(base64_data),
+                            mime_type=mime_type,
+                        )
+                        parts.append(image_part)
+                    except Exception:
+                        log.exception("Error decoding base64 image:")
+                elif match.group(4):  # File URL for image
+                    file_id = match.group(4)
+                    image_bytes, mime_type = self._get_file_data(file_id)
+                    if image_bytes and mime_type:
+                        image_part = types.Part.from_bytes(
+                            data=image_bytes, mime_type=mime_type
+                        )
+                        parts.append(image_part)
+            elif match.group(5):  # It's a YouTube URL
+                youtube_url = match.group(5)
+                log.info(f"Found YouTube URL: {youtube_url}")
+                parts.append(types.Part(file_data=types.FileData(file_uri=youtube_url)))
 
             last_pos = match.end()
 
-        # Add remaining text
+        # Add remaining text after the last match
         remaining_text = text[last_pos:]
-        if remaining_text.strip():
-            parts.append(types.Part.from_text(text=remaining_text))
+        if remaining_text.strip(): # Ensure non-empty, stripped text
+            parts.append(types.Part.from_text(text=remaining_text.strip()))
+
+        # If no matches were found at all (e.g. plain text), the original text (stripped) is added as a single part.
+        if not parts and text.strip():
+            parts.append(types.Part.from_text(text=text.strip()))
+        
+        # If parts list is empty and original text was only whitespace, return empty list.
+        # Otherwise, if parts were added, or if it was plain text, it's handled above.
+        # This check ensures that if text was "   ", we don't add a Part for "   ".
+        # The .strip() in the conditions above should handle this, but as a safeguard:
+        if not parts and not text.strip():
+            return []
 
         return parts
 
