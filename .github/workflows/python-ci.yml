@@ -10,10 +10,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Add the permissions block here for the 'build' job
     permissions:
-      checks: write
-      pull-requests: write
+      contents: read # Needed for actions/checkout
 
     strategy:
       matrix:
@@ -34,11 +32,28 @@ jobs:
         pip install -r requirements.txt
 
     - name: Run pytest and generate report
+      # Use || true to ensure the step doesn't fail the job if tests fail,
+      # allowing the artifact upload to always happen.
       run: pytest --junitxml=test-results.xml tests/test_gemini_manifold.py || true
 
-    - name: Publish test results
-      uses: EnricoMi/publish-unit-test-result-action@v2
+    - name: Upload Test Results
+      # Always upload artifacts, even if tests failed
       if: always()
+      uses: actions/upload-artifact@v4
       with:
-        files: test-results.xml
-        check_name: Pytest Results (Python ${{ matrix.python-version }})
+        name: test-results-python-${{ matrix.python-version }} # Unique name for each matrix combination
+        path: test-results.xml
+
+  # Add a separate job to upload the event file
+  # This is crucial for the second workflow to correctly identify the PR context
+  upload-event-file:
+    name: Upload Event File
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Needed for actions/upload-artifact
+    steps:
+      - name: Upload GitHub Event File
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-event-file
+          path: ${{ github.event_path }}
