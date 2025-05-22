@@ -2,18 +2,14 @@ name: Python CI
 
 on:
   pull_request:
-    branches: [ main, master ]
+    branches: [ master ]
     types: [opened, synchronize, reopened]
   push:
-    branches: [ main, master ]
+    branches: [ master ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Add the permissions block here for the 'build' job
-    permissions:
-      checks: write
-      pull-requests: write
 
     strategy:
       matrix:
@@ -33,12 +29,5 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Run pytest and generate report
-      run: pytest --junitxml=test-results.xml tests/test_gemini_manifold.py || true
-
-    - name: Publish test results
-      uses: EnricoMi/publish-unit-test-result-action@v2
-      if: always()
-      with:
-        files: test-results.xml
-        check_name: Pytest Results (Python ${{ matrix.python-version }})
+    - name: Run pytest
+      run: pytest
