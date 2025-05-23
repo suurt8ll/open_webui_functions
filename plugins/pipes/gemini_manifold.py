@@ -240,7 +240,6 @@ class Pipe:
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __metadata__: dict[str, Any],
     ) -> AsyncGenerator | str | None:
-
         self._add_log_handler(self.valves.LOG_LEVEL)
 
         # Apply settings from the user
@@ -476,6 +475,18 @@ class Pipe:
             "description": error_msg,
         }
 
+    @staticmethod
+    def strip_prefix(model_name: str) -> str:
+        """
+        Extract the model identifier using regex, handling various naming conventions.
+        e.g., "gemini_manifold_google_genai.gemini-2.5-flash-preview-04-17" -> "gemini-2.5-flash-preview-04-17"
+        e.g., "models/gemini-1.5-flash-001" -> "gemini-1.5-flash-001"
+        e.g., "publishers/google/models/gemini-1.5-pro" -> "gemini-1.5-pro"
+        """
+        # Use regex to remove everything up to and including the last '/' or the first '.'
+        stripped = re.sub(r"^(?:.*/|[^.]*\.)", "", model_name)
+        return stripped
+
     @cached()
     async def _get_genai_models(
         self,
@@ -512,52 +523,37 @@ class Pipe:
             log.trace("All models returned by Google:", payload=all_google_models)
 
         # Filter Google models list down to generative models only.
-        generative_models = [
-            model
-            for model in all_google_models
-            if model.supported_actions and "generateContent" in model.supported_actions
-        ]
+        # FIXME: model.supported_actions is None with vertex models
+        # see https://github.com/googleapis/python-genai/issues/679
+        generative_models = []
+        for model in all_google_models:
+            actions = model.supported_actions
+            if actions is None or "generateContent" in actions:
+                generative_models.append(model)
 
         # Raise if there are not generative models
         if not generative_models:
             log.warning("No generative models found.")
 
         # Filter based on whitelist and blacklist
-        whitelist = whitelist_str.replace(" ", "").split(",") if whitelist_str else []
-        blacklist = blacklist_str.replace(" ", "").split(",") if blacklist_str else []
-        filtered_models: list["ModelData"] = [
-            {
-                "id": re.sub(r"^.*?[./]", "", model.name),
-                "name": model.display_name,
-                "description": model.description,
-            }
-            for model in generative_models
-            if model.name
-            and model.display_name
-            and any(fnmatch.fnmatch(model.name, f"models/{w}") for w in whitelist)
-            and not any(fnmatch.fnmatch(model.name, f"models/{b}") for b in blacklist)
-        ]
+        def match(name, list_str):
+            patterns = list_str.replace(" ", "").split(",") if list_str else []
+            return any(fnmatch.fnmatch(name, pat) for pat in patterns)
+
+        filtered_models: list["ModelData"] = []
+        for model in generative_models:
+            name = Pipe.strip_prefix(model.name)
+            if name and match(name, whitelist_str) and not match(name, blacklist_str):
+                filtered_models.append(
+                    {
+                        "id": name,
+                        "name": model.display_name or name,
+                        "description": model.description,
+                    }
+                )
         log.info(
-            f"Filtered {len(generative_models)} raw models down to {len(filtered_models)} models based on white/blacklists."
+            f"Filtered {len(generative_models)} models down to {len(filtered_models)} models based on white/blacklists."
         )
-        # FIXME: Hardcoded Gemini flagship models here
-        # while https://github.com/googleapis/python-genai/issues/679 is unresolved.
-        if use_vertex_ai:
-            # Add Vertex AI models to the list
-            vertex_models: list["ModelData"] = [
-                {
-                    "id": "google/gemini-2.5-flash-preview-04-17",
-                    "name": "Vertex AI: Gemini 2.5 Flash Preview 04-17",
-                },
-                {
-                    "id": "google/gemini-2.5-pro-preview-05-06",
-                    "name": "Vertex AI: Gemini 2.5 Pro Preview 05-06",
-                },
-            ]
-            filtered_models.extend(vertex_models)
-            log.info(
-                f"Added {len(vertex_models)} Vertex AI models to the list of models."
-            )
         return filtered_models
 
     @staticmethod
