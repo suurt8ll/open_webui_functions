@@ -1,4 +1,4 @@
-google-genai==1.15.0
+google-genai==1.16.1
 fastapi==0.115.7
 loguru==0.7.2
 

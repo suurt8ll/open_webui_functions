@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 1.18.2
-requirements: google-genai==1.15.0
+requirements: google-genai==1.16.1
 """
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API.
@@ -159,6 +159,10 @@ class Pipe:
             default="INFO",
             description="Select logging level. Use `docker logs -f open-webui` to view logs.",
         )
+        ENABLE_URL_CONTEXT_TOOL: bool = Field(
+            default=False,
+            description="Enable the URL context tool to allow the model to fetch and use content from provided URLs. This tool is only compatible with specific models.",
+        )
 
     class UserValves(BaseModel):
         # TODO: Add more options that can be changed by the user.
@@ -193,7 +197,11 @@ class Pipe:
             0 means no thinking. Default value is None (uses the default from Valves).
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
         )
-
+        ENABLE_URL_CONTEXT_TOOL: bool = Field(
+            default=False,
+            description="Enable the URL context tool to allow the model to fetch and use content from provided URLs. This tool is only compatible with specific models.",
+        )
+        
         @field_validator("THINKING_BUDGET", mode="after")
         @classmethod
         def validate_thinking_budget_range(cls, v):
@@ -337,6 +345,27 @@ class Pipe:
                     "Image Generation model does not support the system prompt message! Removing the system prompt."
                 )
         gen_content_conf.tools = []
+
+        # Add URL context tool if enabled and model is compatible
+        if valves.ENABLE_URL_CONTEXT_TOOL:
+            compatible_models_for_url_context = [
+                "gemini-2.5-pro-preview-05-06",
+                "gemini-2.5-flash-preview-05-20",
+                "gemini-2.0-flash",
+                "gemini-2.0-flash-live-001",
+            ]
+            if model_name in compatible_models_for_url_context:
+                log.info(
+                    f"Model {model_name} is compatible with URL context tool. Enabling."
+                )
+                gen_content_conf.tools.append(
+                    types.Tool(url_context=types.UrlContext())
+                )
+            else:
+                log.warning(
+                    f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
+                )
+
         if features.get("google_search_tool"):
             log.info("Using grounding with Google Search as a Tool.")
             gen_content_conf.tools.append(
@@ -1231,6 +1260,34 @@ class Pipe:
             return
         else:
             log.debug(f"Response has correct finish reason: {finish_reason}.")
+
+        # Emit URL context metadata if available
+        url_context_meta = candidate.url_context_metadata if candidate else None
+        if (
+            url_context_meta
+            and hasattr(url_context_meta, "retrieved_urls")
+            and url_context_meta.retrieved_urls
+        ):
+            # Convert UrlContextRetrievedUrl objects to a list of dicts
+            # as the objects themselves might not be directly JSON serializable in the event.
+            retrieved_urls_data = []
+            for retrieved_url_obj in url_context_meta.retrieved_urls:
+                url_data = {
+                    "url": retrieved_url_obj.url,
+                    "title": retrieved_url_obj.title,
+                }
+                # Optionally, include favicon if it exists and is needed by the frontend
+                # if hasattr(retrieved_url_obj, 'favicon') and retrieved_url_obj.favicon:
+                #     url_data["favicon"] = retrieved_url_obj.favicon
+                retrieved_urls_data.append(url_data)
+
+            if retrieved_urls_data:  # Ensure we have something to send
+                url_event = {
+                    "type": "chat:url_context",
+                    "data": {"retrieved_urls": retrieved_urls_data},
+                }
+                await event_emitter(url_event)
+                log.debug("Emitted URL context metadata:", payload=url_event)
 
         # Emit token usage data.
         if usage_event := self._get_usage_data_event(model_response):
