@@ -85,11 +85,16 @@ class GenaiApiError(Exception):
 class Pipe:
     class Valves(BaseModel):
         GEMINI_API_KEY: str | None = Field(default=None)
-        REQUIRE_USER_API_KEY: bool = Field(
+        USER_MUST_PROVIDE_AUTH_CONFIG: bool = Field(
             default=False,
-            description="""Whether to require user's own API key (applies to admins too).
-            User can give their own key through UserValves.
+            description="""Whether to require users (including admins) to provide their own authentication configuration.
+            User can provide these through UserValves. Setting this to True will disallow users from using Vertex AI.
             Default value is False.""",
+        )
+        AUTH_WHITELIST: str | None = Field(
+            default=None,
+            description="""Comma separated list of user emails that are allowed to bypassUSER_MUST_PROVIDE_AUTH_CONFIG and use the default authentication configuration.
+            Default value is None (no users are whitelisted).""",
         )
         GEMINI_API_BASE_URL: str = Field(
             default="https://generativelanguage.googleapis.com",
@@ -97,15 +102,15 @@ class Pipe:
         )
         USE_VERTEX_AI: bool = Field(
             default=False,
-            description="""Whether to allow using Google Cloud Vertex AI.
-            Default value is False.""",
+            description="""Whether to use Google Cloud Vertex AI instead of the standard Gemini API.
+            If VERTEX_PROJECT is not set then the plugin will use the Gemini Developer API.
+            Default value is False.
+            Users can opt out of this by setting USE_VERTEX_AI to False in their UserValves.""",
         )
         VERTEX_PROJECT: str | None = Field(
             default=None,
             description="""The Google Cloud project ID to use with Vertex AI.
-            Default value is None.
-            If you set this value then the plugin will start using Vertex AI by default.
-            Users can override this inside UserValves.""",
+            Default value is None.""",
         )
         VERTEX_LOCATION: str = Field(
             default="global",
@@ -252,7 +257,7 @@ class Pipe:
 
         # Apply settings from the user
         valves: Pipe.Valves = self._get_merged_valves(
-            self.valves, __user__.get("valves")
+            self.valves, __user__.get("valves"), __user__.get("email")
         )
         log.debug(
             f"USE_VERTEX_AI: {valves.USE_VERTEX_AI}, VERTEX_PROJECT set: {bool(valves.VERTEX_PROJECT)}, API_KEY set: {bool(valves.GEMINI_API_KEY)}"
@@ -448,6 +453,7 @@ class Pipe:
         """
 
         if not vertex_project and not api_key:
+            # FIXME: More detailed reason in the exception (tell user to set the API key).
             msg = "Neither VERTEX_PROJECT nor GEMINI_API_KEY is set."
             raise GenaiApiError(msg)
 
@@ -480,6 +486,20 @@ class Pipe:
             raise GenaiApiError(f"{api} Genai client initialization failed: {e}") from e
 
     def _get_user_client(self, valves: "Pipe.Valves", user_email: str) -> genai.Client:
+        user_whitelist = (
+            valves.AUTH_WHITELIST.split(",") if valves.AUTH_WHITELIST else []
+        )
+        log.debug(
+            f"User whitelist: {user_whitelist}, user email: {user_email}, "
+            f"USER_MUST_PROVIDE_AUTH_CONFIG: {valves.USER_MUST_PROVIDE_AUTH_CONFIG}"
+        )
+        if valves.USER_MUST_PROVIDE_AUTH_CONFIG and user_email not in user_whitelist:
+            if not valves.GEMINI_API_KEY:
+                error_msg = (
+                    "User must provide their own authentication configuration. "
+                    "Please set GEMINI_API_KEY in your UserValves."
+                )
+                raise ValueError(error_msg)
         try:
             client_args = self._prepare_client_args(valves)
             client = self._get_or_create_genai_client(*client_args)
@@ -1481,6 +1501,7 @@ class Pipe:
     def _get_merged_valves(
         default_valves: "Pipe.Valves",
         user_valves: "Pipe.UserValves | None",
+        user_email: str,
     ) -> "Pipe.Valves":
         """
         Merges UserValves into a base Valves configuration.
@@ -1490,7 +1511,7 @@ class Pipe:
         field value is used.
 
         Exceptions:
-        - If default_valves.REQUIRE_USER_API_KEY is True, then GEMINI_API_KEY and
+        - If default_valves.USER_MUST_PROVIDE_AUTH_CONFIG is True, then GEMINI_API_KEY and
           VERTEX_PROJECT in the merged result will be taken directly from
           user_valves (even if they are None), ignoring the values in default_valves.
 
@@ -1520,14 +1541,23 @@ class Pipe:
                 if field_name in merged_data:
                     merged_data[field_name] = user_value
 
-        # Apply special logic based on default_valves.REQUIRE_USER_API_KEY
-        if default_valves.REQUIRE_USER_API_KEY:
-            # If REQUIRE_USER_API_KEY is True, GEMINI_API_KEY and VERTEX_PROJECT
-            # must be taken from UserValves, or be None if UserValves has them as None.
-            # The base values from default_valves for these fields are effectively ignored in this case.
-            # This assignment happens after the general loop, ensuring it takes final precedence.
+        user_whitelist = (
+            default_valves.AUTH_WHITELIST.split(",")
+            if default_valves.AUTH_WHITELIST
+            else []
+        )
+
+        # Apply special logic based on default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
+        if (
+            default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
+            and user_email not in user_whitelist
+        ):
+            # If USER_MUST_PROVIDE_AUTH_CONFIG is True and user is not in the whitelist,
+            # then user must provide their own GEMINI_API_KEY
+            # User is disallowed from using Vertex AI in this case.
             merged_data["GEMINI_API_KEY"] = user_valves.GEMINI_API_KEY
-            merged_data["VERTEX_PROJECT"] = user_valves.VERTEX_PROJECT
+            merged_data["VERTEX_PROJECT"] = None
+            merged_data["USE_VERTEX_AI"] = False
 
         # Create a new Valves instance with the merged data.
         # Pydantic will validate the data against the Valves model definition during instantiation.
