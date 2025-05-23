@@ -91,6 +91,11 @@ class Pipe:
             User can provide these through UserValves. Setting this to True will disallow users from using Vertex AI.
             Default value is False.""",
         )
+        AUTH_WHITELIST: str | None = Field(
+            default=None,
+            description="""Comma separated list of user emails that are allowed to bypassUSER_MUST_PROVIDE_AUTH_CONFIG and use the default authentication configuration.
+            Default value is None (no users are whitelisted).""",
+        )
         GEMINI_API_BASE_URL: str = Field(
             default="https://generativelanguage.googleapis.com",
             description="The base URL for calling the Gemini API",
@@ -252,7 +257,7 @@ class Pipe:
 
         # Apply settings from the user
         valves: Pipe.Valves = self._get_merged_valves(
-            self.valves, __user__.get("valves")
+            self.valves, __user__.get("valves"), __user__.get("email")
         )
         log.debug(
             f"USE_VERTEX_AI: {valves.USE_VERTEX_AI}, VERTEX_PROJECT set: {bool(valves.VERTEX_PROJECT)}, API_KEY set: {bool(valves.GEMINI_API_KEY)}"
@@ -481,6 +486,20 @@ class Pipe:
             raise GenaiApiError(f"{api} Genai client initialization failed: {e}") from e
 
     def _get_user_client(self, valves: "Pipe.Valves", user_email: str) -> genai.Client:
+        user_whitelist = (
+            valves.AUTH_WHITELIST.split(",") if valves.AUTH_WHITELIST else []
+        )
+        log.debug(
+            f"User whitelist: {user_whitelist}, user email: {user_email}, "
+            f"USER_MUST_PROVIDE_AUTH_CONFIG: {valves.USER_MUST_PROVIDE_AUTH_CONFIG}"
+        )
+        if valves.USER_MUST_PROVIDE_AUTH_CONFIG and user_email not in user_whitelist:
+            if not valves.GEMINI_API_KEY:
+                error_msg = (
+                    "User must provide their own authentication configuration. "
+                    "Please set GEMINI_API_KEY in your UserValves."
+                )
+                raise ValueError(error_msg)
         try:
             client_args = self._prepare_client_args(valves)
             client = self._get_or_create_genai_client(*client_args)
@@ -1482,6 +1501,7 @@ class Pipe:
     def _get_merged_valves(
         default_valves: "Pipe.Valves",
         user_valves: "Pipe.UserValves | None",
+        user_email: str,
     ) -> "Pipe.Valves":
         """
         Merges UserValves into a base Valves configuration.
@@ -1521,9 +1541,19 @@ class Pipe:
                 if field_name in merged_data:
                     merged_data[field_name] = user_value
 
+        user_whitelist = (
+            default_valves.AUTH_WHITELIST.split(",")
+            if default_valves.AUTH_WHITELIST
+            else []
+        )
+
         # Apply special logic based on default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
-        if default_valves.USER_MUST_PROVIDE_AUTH_CONFIG:
-            # If USER_MUST_PROVIDE_AUTH_CONFIG is True, then user must provide their own GEMINI_API_KEY
+        if (
+            default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
+            and user_email not in user_whitelist
+        ):
+            # If USER_MUST_PROVIDE_AUTH_CONFIG is True and user is not in the whitelist,
+            # then user must provide their own GEMINI_API_KEY
             # User is disallowed from using Vertex AI in this case.
             merged_data["GEMINI_API_KEY"] = user_valves.GEMINI_API_KEY
             merged_data["VERTEX_PROJECT"] = None
