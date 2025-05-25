@@ -214,13 +214,6 @@ class ContentBuilder:
             log.exception(f"Error processing image URL: {image_url[:64]}[...]")
             return None
 
-    def _process_youtube_part_from_url(self, youtube_url: str) -> types.Part:
-        """
-        Processes a YouTube URL and returns a genai.types.Part object.
-        """
-        log.info(f"Found YouTube URL: {youtube_url}")
-        return types.Part(file_data=types.FileData(file_uri=youtube_url))
-
     def _genai_parts_from_text(self, text: str) -> list[types.Part]:
         """
         Parses the input text to extract and convert various content types into a list of genai.types.Part objects.
@@ -254,8 +247,8 @@ class ContentBuilder:
                 if image_part := self._genai_part_from_image_url(image_url):
                     parts.append(image_part)
             elif youtube_url := match.group("youtube_url"):  # It's a YouTube URL
-                youtube_part = self._process_youtube_part_from_url(youtube_url)
-                parts.append(youtube_part)
+                log.info(f"Found YouTube URL: {youtube_url}")
+                parts.append(types.Part(file_data=types.FileData(file_uri=youtube_url)))
 
             last_pos = match.end()
 
