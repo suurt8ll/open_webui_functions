@@ -43,7 +43,6 @@ from aiocache import cached
 from aiocache.base import BaseCache
 from fastapi.datastructures import State
 import io
-import mimetypes
 import os
 import uuid
 import base64
@@ -55,6 +54,7 @@ from fastapi import Request
 import pydantic_core
 from pydantic import BaseModel, Field, field_validator
 from collections.abc import AsyncIterator, Awaitable, Callable
+from itertools import chain
 from typing import (
     Any,
     AsyncGenerator,
@@ -65,6 +65,7 @@ from typing import (
 from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
 from open_webui.storage.provider import Storage
+from open_webui.utils.misc import pop_system_message
 
 if TYPE_CHECKING:
     from loguru import Record
@@ -80,6 +81,393 @@ class GenaiApiError(Exception):
 
     def __init__(self, message):
         super().__init__(message)
+
+
+class ContentBuilder:
+    def __init__(
+        self,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        metadata: dict,
+        user_data: dict,
+        body_messages: list["Message"],
+    ):
+        self.event_emitter = event_emitter
+        self.system_prompt: str | None = None
+        self.messages: list["Message"] = []
+        self.messages_db: list["ChatMessageTD"] | None = None
+        self.upload_documents: bool = False
+
+        # Check if the user has the upload_documents feature enabled
+        features = metadata.get("features", {}) or {}
+        self.upload_documents = features.get("upload_documents", False)
+
+        # Extract the system prompt from the body messages (if any)
+        # and store the message list without the system prompt.
+        system_message, self.messages = pop_system_message(body_messages)
+        if system_message is not None:
+            self.system_prompt = system_message["content"]
+
+        # Ensure consistency between the messages list and the database.
+        chat_id, user_id = metadata.get("chat_id", ""), user_data["id"]
+        chat = Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=user_id)
+
+        if not chat:
+            # Case 1: Chat not found, self.messages_db remains None
+            warn_msg = f"Chat with ID - {chat_id} - not found. Can't filter out the citation marks."
+            log.warning(warn_msg)
+        elif len(messages_db := chat.chat.get("messages", [])[:-1]) != len(
+            self.messages
+        ):
+            # Case 2: Chat found, but message lengths mismatch, self.messages_db remains None
+            # (Last message is the upcoming assistant response, at this point in the logic it's empty, it's popped out)
+            # This block is reached only if 'chat' is not None.
+            warn_msg = (
+                f"Messages in the body ({len(self.messages)}) and "
+                f"messages in the database ({len(messages_db)}) do not match. "
+                "This is likely due to a bug in Open WebUI. "
+                "Cannot filter out citation marks or upload files."
+            )
+            log.warning(warn_msg)
+        else:
+            # Case 3: Chat found and message lengths match (Success!),
+            # self.messages_db is set to the messages from the database.
+            # This block is reached only if 'chat' is not None AND lengths match.
+            self.messages_db = messages_db
+
+    async def _emit_toast(
+        self,
+        msg: str,
+        toastType: Literal["info", "success", "warning", "error"] = "info",
+    ) -> None:
+        """Emits a toast message to the front-end."""
+        event: "NotificationEvent" = {
+            "type": "notification",
+            "data": {"type": toastType, "content": msg},
+        }
+        await self.event_emitter(event)
+
+    async def _emit_warning(self, msg: str) -> None:
+        """Emits a warning message to the front-end and log it in the backend."""
+        log.warning(msg)
+        await self._emit_toast(msg, "warning")
+
+    def _get_file_data(self, file_id: str) -> tuple[bytes | None, str | None]:
+        if not file_id:
+            log.warning("file_id is empty. Cannot continue.")
+            return None, None
+        file_model = Files.get_file_by_id(file_id)
+        if file_model is None:
+            log.warning(f"File {file_id} not found in the backend's database.")
+            return None, None
+        if not (file_path := file_model.path):
+            log.warning(
+                f"File {file_id} was found in the database but it lacks `path` field. Cannot Continue."
+            )
+            return None, None
+        if file_model.meta is None:
+            log.warning(
+                f"File {file_path} was found in the database but it lacks `meta` field. Cannot continue."
+            )
+            return None, None
+        if not (content_type := file_model.meta.get("content_type")):
+            log.warning(
+                f"File {file_path} was found in the database but it lacks `meta.content_type` field. Cannot continue."
+            )
+            return None, None
+        try:
+            with open(file_path, "rb") as file:
+                image_data = file.read()
+            return image_data, content_type
+        except FileNotFoundError:
+            log.exception(f"File {file_path} not found on disk.")
+            return None, content_type
+        except Exception:
+            log.exception(f"Error processing file {file_path}")
+            return None, content_type
+
+    def _genai_part_from_image_url(self, image_url: str) -> types.Part | None:
+        """
+        Processes an image URL and returns a genai.types.Part object from it.
+        Handles GCS, data URIs, standard URLs, and Open WebUI internal file URLs.
+        """
+        try:
+            file_url_match = re.match(r"/api/v1/files/([a-f0-9\-]+)/content", image_url)
+            if file_url_match:  # It is an Open WebUI internal file URL
+                file_id = file_url_match.group(1)
+                image_bytes, mime_type = self._get_file_data(file_id)
+                if image_bytes and mime_type:
+                    return types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+                else:
+                    log.warning(f"Could not retrieve data for file ID: {file_id}")
+                    return None
+
+            base64_image_match = re.match(r"data:(image/\w+);base64,(.+)", image_url)
+            if base64_image_match:  # It is a base64-encoded image data URI
+                return types.Part.from_bytes(
+                    data=base64.b64decode(base64_image_match.group(2)),
+                    mime_type=base64_image_match.group(1),
+                )
+
+            # For other URLs (http/https, gs://), let genai handle it
+            return types.Part.from_uri(file_uri=image_url)
+        except Exception:
+            log.exception(f"Error processing image URL: {image_url[:64]}[...]")
+            return None
+
+    def _process_youtube_part_from_url(self, youtube_url: str) -> types.Part:
+        """
+        Processes a YouTube URL and returns a genai.types.Part object.
+        """
+        log.info(f"Found YouTube URL: {youtube_url}")
+        return types.Part(file_data=types.FileData(file_uri=youtube_url))
+
+    def _genai_parts_from_text(self, text: str) -> list[types.Part]:
+        """
+        Parses the input text to extract and convert various content types into a list of genai.types.Part objects.
+
+        This function identifies markdown-formatted image URLs (including data URIs and Open WebUI internal file URLs)
+        and YouTube video URLs within the provided text. It then segments the text and converts each segment
+        (plain text, images, or YouTube URLs) into the appropriate genai.types.Part representation.
+
+        Args:
+            text: The input string containing text, potentially with markdown images or YouTube URLs.
+
+        Returns:
+            A list of genai.types.Part objects representing the parsed content.
+            Returns an empty list if the input text is empty or contains only whitespace.
+        """
+        # Regex to find markdown images or YouTube URLs
+        # Using named groups for clarity and easier extraction
+        pattern = re.compile(
+            r"!\[.*?\]\((?P<image_url>(?:data:(?:image/\w+);base64,[^)]+)|(?:/api/v1/files/[a-f0-9\-]+/content)))\)|"
+            r"(?P<youtube_url>https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+)"
+        )
+
+        parts: list[types.Part] = []
+        last_pos = 0
+        for match in pattern.finditer(text):
+            # Process text before the first match / between matches
+            if text := text[last_pos : match.start()].strip():
+                parts.append(types.Part.from_text(text=text))
+
+            if image_url := match.group("image_url"):  # It's a markdown image
+                if image_part := self._genai_part_from_image_url(image_url):
+                    parts.append(image_part)
+            elif youtube_url := match.group("youtube_url"):  # It's a YouTube URL
+                youtube_part = self._process_youtube_part_from_url(youtube_url)
+                parts.append(youtube_part)
+
+            last_pos = match.end()
+
+        # Add remaining text after the last match
+        # This also handles the case where no matches were found
+        if remaining_text := text[last_pos:].strip():
+            parts.append(types.Part.from_text(text=remaining_text))
+
+        # If text was only whitespace, [] will be returned
+        return parts
+
+    def _remove_citation_markers(self, text: str, sources: list["Source"]) -> str:
+        original_text = text
+        processed: set[str] = set()
+        for source in sources:
+            supports = chain.from_iterable(
+                metadata["supports"]
+                for metadata in source.get("metadata", [])
+                if "supports" in metadata
+            )
+
+            for support in supports:
+                support = types.GroundingSupport(**support)
+                indices = support.grounding_chunk_indices
+                segment = support.segment
+                if not (indices and segment and segment.text):
+                    continue
+                segment_text = segment.text
+
+                # Using a shortened version because user could edit the assistant message in the front-end.
+                # If citation segment get's edited, then the markers would not be removed. Shortening reduces the
+                # chances of this happening.
+                segment_end = segment_text[-32:]
+                if segment_end in processed:
+                    continue
+                processed.add(segment_end)
+                citation_markers = "".join(f"[{index + 1}]" for index in indices)
+                # Find the position of the citation markers in the text
+                pos = text.find(segment_text + citation_markers)
+                if pos != -1:
+                    # Remove the citation markers
+                    text = (
+                        text[: pos + len(segment_text)]
+                        + text[pos + len(segment_text) + len(citation_markers) :]
+                    )
+        trim = len(original_text) - len(text)
+        log.debug(
+            f"Citation removal finished. Returning text str that is {trim} character shorter than the original input."
+        )
+        return text
+
+    async def _create_part_from_file_attachment(
+        self, file_item: "FileAttachmentTD"
+    ) -> Optional[types.Part]:
+        """
+        Processes a single file attachment and returns a types.Part if supported,
+        otherwise logs a warning and emits a toast.
+        """
+        file_id = file_item.get("file", {}).get("id", "unknown_id")
+        log.debug(f"Processing file attachment: {file_id}", payload=file_item)
+
+        document_bytes, mime_type = self._get_file_data(file_id)
+
+        if not document_bytes or not mime_type:
+            log.debug(f"No data or mime_type for file_id: {file_id}, skipping.")
+            return None
+
+        if mime_type.startswith("text/") or mime_type == "application/pdf":
+            log.debug(
+                f"MIME type {mime_type} for file {file_id} is supported. Creating types.Part."
+            )
+            return types.Part.from_bytes(data=document_bytes, mime_type=mime_type)
+
+        warn_msg = f"MIME type {mime_type} for file {file_id} is not supported by Google API. Skipping file."
+        await self._emit_warning(warn_msg)
+        return None
+
+    def _create_parts_from_text_content(
+        self, text_content_item: "TextContent"
+    ) -> list[types.Part]:
+        """
+        Processes a text content item, extracting YouTube URLs and generating parts from text.
+        """
+        if text := text_content_item.get("text"):
+            parts = self._genai_parts_from_text(text)
+            log.debug(f"Generated {len(parts)} parts from text: '{text[:50]}...'")
+            return parts
+        else:
+            log.debug("Text content item has no 'text' field, skipping.")
+            return []
+
+    def _create_part_from_image_content(
+        self, image_content_item: "ImageContent"
+    ) -> Optional[types.Part]:
+        """
+        Processes an image content item and returns a types.Part if valid.
+        """
+        image_url_dict = image_content_item.get("image_url")
+        if image_url_dict and (url := image_url_dict.get("url")):
+            log.debug(f"Processing image content from URL: {url}")
+            return self._genai_part_from_image_url(url)
+        else:
+            log.debug(
+                "Image content item has no 'image_url' or 'url' field, skipping image processing."
+            )
+            return None
+
+    async def _process_user_message(
+        self, message: "UserMessage", files: list["FileAttachmentTD"]
+    ) -> list[types.Part]:
+        user_parts: list[types.Part] = []
+
+        # 1. Process file attachments
+        if files:
+            log.info(f"Processing {len(files)} file attachments for the user message.")
+            for file_item in files:
+                part = await self._create_part_from_file_attachment(file_item)
+                if part:
+                    user_parts.append(part)
+        else:
+            log.debug("No file attachments to process for the user message.")
+
+        # 2. Determine user_content_list from message content
+        raw_user_content = message.get("content")
+        user_content_list: Optional[list["Content"]] = None
+
+        if isinstance(raw_user_content, str):
+            log.debug("User message content is a string. Wrapping in a list structure.")
+            user_content_list = [{"type": "text", "text": raw_user_content}]  # type: ignore
+        elif isinstance(raw_user_content, list):
+            log.debug("User message content is a list.")
+            user_content_list = raw_user_content  # type: ignore
+            # Assuming raw_user_content is list["Content"] if it's a list.
+        else:
+            type_name = type(raw_user_content).__name__
+            warn_msg = (
+                f"User message content is of type {type_name}, "
+                "not a string or list. Skipping content processing."
+            )
+            await self._emit_warning(warn_msg)
+            return user_parts
+
+        # 3. Process content items from user_content_list
+        log.info(
+            f"Processing {len(user_content_list)} content items from the user message."
+        )
+        for content_item in user_content_list:
+            content_type = content_item.get("type")
+            log.debug(f"Processing content item of type: {content_type}")
+
+            if content_type == "text":
+                text_parts = self._create_parts_from_text_content(
+                    cast("TextContent", content_item)
+                )
+                user_parts.extend(text_parts)
+            elif content_type == "image_url":
+                img_part = self._create_part_from_image_content(
+                    cast("ImageContent", content_item)
+                )
+                if img_part:
+                    user_parts.append(img_part)
+            else:
+                warn_msg = (
+                    f"User message content item type '{content_type}' is not supported. "
+                    "Skipping this content item."
+                )
+                await self._emit_warning(warn_msg)
+
+        log.info(
+            f"Finished processing user message. Generated {len(user_parts)} parts in total."
+        )
+        return user_parts
+
+    def _process_assistant_message(
+        self, message: "AssistantMessage", sources: list["Source"] | None
+    ) -> list[types.Part]:
+        assistant_text = message.get("content")
+        if sources:
+            assistant_text = self._remove_citation_markers(assistant_text, sources)
+        return self._genai_parts_from_text(assistant_text)
+
+    async def build_contents(self) -> list[types.Content]:
+        contents = []
+        for i, message_data in enumerate(self.messages):
+            current_role = message_data.get("role")
+            parts = []
+
+            # Leverage the guarantee: if self.messages_db exists, self.messages_db[i] is safe to access.
+            message_db_item = self.messages_db[i] if self.messages_db else None
+
+            if current_role == "user":
+                user_message = cast("UserMessage", message_data)
+                files = []
+                if message_db_item and self.upload_documents:
+                    files = message_db_item.get("files", [])
+                parts = await self._process_user_message(user_message, files)
+                contents.append(types.Content(role="user", parts=parts))
+
+            elif current_role == "assistant":
+                assistant_message = cast("AssistantMessage", message_data)
+                sources = None
+                if message_db_item:
+                    sources = message_db_item.get("sources")
+                parts = self._process_assistant_message(assistant_message, sources)
+                # Google API's assistant role is "model"
+                contents.append(types.Content(role="model", parts=parts))
+
+            else:
+                warn_msg = f"Message {i} has an invalid role: {current_role}. Skipping to the next message."
+                await self._emit_warning(warn_msg)
+
+        return contents
 
 
 class Pipe:
@@ -201,7 +589,7 @@ class Pipe:
             default=False,
             description="Enable the URL context tool to allow the model to fetch and use content from provided URLs. This tool is only compatible with specific models.",
         )
-        
+
         @field_validator("THINKING_BUDGET", mode="after")
         @classmethod
         def validate_thinking_budget_range(cls, v):
@@ -266,44 +654,21 @@ class Pipe:
         log.trace("__metadata__:", payload=__metadata__)
         # Check if user is chatting with an error model for some reason.
         if "error" in __metadata__["model"]["id"]:
-            error_msg = f"There has been an error during model retrival phase: {str(__metadata__['model'])}"
+            error_msg = f"There has been an error during model retrieval phase: {str(__metadata__['model'])}"
             raise ValueError(error_msg)
 
-        # Get the message history directly from the backend.
-        # This allows us to see data about sources and files data.
-        chat_id = __metadata__.get("chat_id", "")
-        if chat := Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=__user__["id"]):
-            chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
-            # Last message is the upcoming assistant response, at this point in the logic it's empty.
-            messages_db = chat_content.get("messages")[:-1]
-        else:
-            warn_msg = f"Chat with ID - {chat_id} - not found. Can't filter out the citation marks."
-            log.warning(warn_msg)
-            messages_db = None
-
-        system_prompt = self._pop_system_prompt(body.get("messages"))
-
-        if messages_db and len(messages_db) != len(body.get("messages")):
-            warn_msg = (
-                f"Messages in the body ({len(body.get('messages'))}) and "
-                f"messages in the database ({len(messages_db)}) do not match. "
-                "This is likely due to a bug in Open WebUI. "
-                "Cannot filter out citation marks or upload files."
-            )
-            log.warning(warn_msg)
-            await self._emit_toast(warn_msg, __event_emitter__, "warning")
-            messages_db = None
-
         features = __metadata__.get("features", {}) or {}
+        content_builder = ContentBuilder(
+            event_emitter=__event_emitter__,
+            metadata=__metadata__,
+            user_data=__user__,
+            body_messages=body.get("messages"),
+        )
+
         log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
         )
-        contents = await self._genai_contents_from_messages(
-            body.get("messages"),
-            messages_db,
-            features.get("upload_documents", False),
-            __event_emitter__,
-        )
+        contents = await content_builder.build_contents()
 
         # Assemble GenerateContentConfig
         safety_settings: list[types.SafetySetting] | None = __metadata__.get(
@@ -321,7 +686,7 @@ class Pipe:
             )
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
-            system_instruction=system_prompt,
+            system_instruction=content_builder.system_prompt,
             temperature=body.get("temperature"),
             top_p=body.get("top_p"),
             top_k=body.get("top_k"),
@@ -602,249 +967,6 @@ class Pipe:
     # endregion 1.1 Client initialization and model retrival from Google API
 
     # region 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
-
-    def _pop_system_prompt(self, messages: list["Message"]) -> str | None:
-        """
-        Pops the system prompt from the messages list.
-        System prompt is always the first message in the list.
-        """
-        if not messages:
-            return None
-        first_message = messages[0]
-        if first_message.get("role") == "system":
-            first_message = cast("SystemMessage", first_message)
-            system_prompt = first_message.get("content")
-            log.info("System prompt found in the messages list.")
-            log.debug("System prompt:", payload=system_prompt)
-            messages.pop(0)
-            return system_prompt
-        return None
-
-    async def _genai_contents_from_messages(
-        self,
-        messages_body: list["Message"],
-        messages_db: list["ChatMessageTD"] | None,
-        upload_documents: bool,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-    ) -> list[types.Content]:
-        """Transforms `body.messages` list into list of `genai.types.Content` objects"""
-
-        contents = []
-        parts = []
-        for i, message in enumerate(messages_body):
-            role = message.get("role")
-            if role == "user":
-                message = cast("UserMessage", message)
-                files = []
-                if messages_db:
-                    message_db = messages_db[i]
-                    if upload_documents:
-                        files = message_db.get("files", [])
-                parts = await self._process_user_message(message, files, event_emitter)
-            elif role == "assistant":
-                message = cast("AssistantMessage", message)
-                # Google API's assistant role is "model"
-                role = "model"
-                sources = None
-                if messages_db:
-                    message_db = messages_db[i]
-                    sources = message_db.get("sources")
-                parts = self._process_assistant_message(message, sources)
-            else:
-                warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
-                log.warning(warn_msg)
-                await self._emit_toast(warn_msg, event_emitter, "warning")
-                continue
-            contents.append(types.Content(role=role, parts=parts))
-        return contents
-
-    async def _process_user_message(
-        self,
-        message: "UserMessage",
-        files: list["FileAttachmentTD"],
-        event_emitter: Callable[["Event"], Awaitable[None]],
-    ) -> list[types.Part]:
-        user_parts = []
-
-        if files:
-            log.info(f"Adding {len(files)} files to the user message.")
-        for file in files:
-            log.debug("Processing file:", payload=file)
-            file_id = file.get("file", {}).get("id")
-            document_bytes, mime_type = self._get_file_data(file_id)
-            if not document_bytes or not mime_type:
-                # Warnings are logged by the method above.
-                continue
-
-            if mime_type.startswith("text/") or mime_type == "application/pdf":
-                log.debug(
-                    f"{mime_type} is supported by Google API! Creating `types.Part` model for it."
-                )
-                user_parts.append(
-                    types.Part.from_bytes(data=document_bytes, mime_type=mime_type)
-                )
-            else:
-                warn_msg = f"{mime_type} is not supported by Google API! Skipping file {file_id}."
-                log.warning(warn_msg)
-                await self._emit_toast(warn_msg, event_emitter, "warning")
-
-        user_content = message.get("content")
-        if isinstance(user_content, str):
-            user_content_list: list["Content"] = [
-                {"type": "text", "text": user_content}
-            ]
-        elif isinstance(user_content, list):
-            user_content_list = user_content
-        else:
-            warn_msg = f"User message content is not a string or list, skipping to the next message."
-            log.warning(warn_msg)
-            await self._emit_toast(warn_msg, event_emitter, "warning")
-            return user_parts
-
-        for c in user_content_list:
-            c_type = c.get("type")
-            if c_type == "text":
-                c = cast("TextContent", c)
-                # Don't process empty strings.
-                if c_text := c.get("text"):
-                    # YouTube URL extraction is now handled by _genai_parts_from_text
-                    user_parts.extend(self._genai_parts_from_text(c_text))
-            elif c_type == "image_url":
-                c = cast("ImageContent", c)
-                if img_part := self._genai_part_from_image_url(
-                    c.get("image_url").get("url")
-                ):
-                    user_parts.append(img_part)
-            else:
-                warn_msg = f"User message content type {c_type} is not supported, skipping to the next message."
-                log.warning(warn_msg)
-                await self._emit_toast(warn_msg, event_emitter, "warning")
-                continue
-
-        return user_parts
-
-    def _process_assistant_message(
-        self, message: "AssistantMessage", sources: list["Source"] | None
-    ) -> list[types.Part]:
-        assistant_text = message.get("content")
-        if sources:
-            assistant_text = self._remove_citation_markers(assistant_text, sources)
-        return self._genai_parts_from_text(assistant_text)
-
-    def _genai_part_from_image_url(self, image_url: str) -> types.Part | None:
-        """
-        Processes an image URL and returns a genai.types.Part object from it
-        Handles GCS, data URIs, and standard URLs.
-        """
-        try:
-            if image_url.startswith("gs://"):
-                # FIXME: mime type helper would error out here, it only handles filenames.
-                return types.Part.from_uri(
-                    file_uri=image_url, mime_type=self._get_mime_type(image_url)
-                )
-            elif image_url.startswith("data:image"):
-                match = re.match(r"data:(image/\w+);base64,(.+)", image_url)
-                if match:
-                    return types.Part.from_bytes(
-                        data=base64.b64decode(match.group(2)),
-                        mime_type=match.group(1),
-                    )
-                else:
-                    raise ValueError("Invalid data URI for image.")
-            else:  # Assume standard URL
-                # FIXME: mime type helper would error out here too, it only handles filenames.
-                return types.Part.from_uri(
-                    file_uri=image_url, mime_type=self._get_mime_type(image_url)
-                )
-        except Exception:
-            # TODO: Send warnin toast to user in front-end.
-            log.exception(f"Error processing image URL: {image_url[:64]}[...]")
-            return None
-
-    def _genai_parts_from_text(self, text: str) -> list[types.Part]:
-        parts: list[types.Part] = []
-        last_pos = 0
-
-        # Regex to find markdown images or YouTube URLs
-        # Markdown image: !\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)
-        # YouTube URL: (https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+)
-        pattern = re.compile(
-            r"!\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)|"
-            r"(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+)"
-        )
-
-        for match in pattern.finditer(text):
-            # Add text before the current match
-            text_segment = text[last_pos : match.start()]
-            if text_segment.strip():  # Ensure non-empty, stripped text
-                parts.append(types.Part.from_text(text=text_segment.strip()))
-
-            # Determine if it's an image or a YouTube URL
-            if match.group(1):  # It's a markdown image
-                if match.group(2):  # Base64 encoded image
-                    try:
-                        mime_type = match.group(2)
-                        base64_data = match.group(3)
-                        image_part = types.Part.from_bytes(
-                            data=base64.b64decode(base64_data),
-                            mime_type=mime_type,
-                        )
-                        parts.append(image_part)
-                    except Exception:
-                        log.exception("Error decoding base64 image:")
-                elif match.group(4):  # File URL for image
-                    file_id = match.group(4)
-                    image_bytes, mime_type = self._get_file_data(file_id)
-                    if image_bytes and mime_type:
-                        image_part = types.Part.from_bytes(
-                            data=image_bytes, mime_type=mime_type
-                        )
-                        parts.append(image_part)
-            elif match.group(5):  # It's a YouTube URL
-                youtube_url = match.group(5)
-                log.info(f"Found YouTube URL: {youtube_url}")
-                parts.append(types.Part(file_data=types.FileData(file_uri=youtube_url)))
-
-            last_pos = match.end()
-
-        # Add remaining text after the last match
-        remaining_text = text[last_pos:]
-        if remaining_text.strip():  # Ensure non-empty, stripped text
-            parts.append(types.Part.from_text(text=remaining_text.strip()))
-
-        # If no matches were found at all (e.g. plain text), the original text (stripped) is added as a single part.
-        if not parts and text.strip():
-            parts.append(types.Part.from_text(text=text.strip()))
-
-        # If parts list is empty and original text was only whitespace, return empty list.
-        # Otherwise, if parts were added, or if it was plain text, it's handled above.
-        # This check ensures that if text was "   ", we don't add a Part for "   ".
-        # The .strip() in the conditions above should handle this, but as a safeguard:
-        if not parts and not text.strip():
-            return []
-
-        return parts
-
-    def _extract_youtube_urls(self, text: str) -> list[str]:
-        """
-        Extracts YouTube URLs from a given text.
-        Supports standard youtube.com/watch?v= URLs and shortened youtu.be URLs
-        """
-        youtube_urls = []
-        # Match standard YouTube URLs
-        for match in re.finditer(
-            r"https?://(?:www\.)?youtube\.com/watch\?v=[^&\s]+", text
-        ):
-            youtube_urls.append(match.group(0))
-        # Match shortened YouTube URLs
-        for match in re.finditer(r"https?://(?:www\.)?youtu\.be/[^&\s]+", text):
-            youtube_urls.append(match.group(0))
-
-        if youtube_urls:
-            # TODO: toast
-            log.info(f"Extracted YouTube URLs: {youtube_urls}")
-
-        return youtube_urls
 
     # endregion 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
 
@@ -1318,47 +1440,6 @@ class Pipe:
         else:
             log.debug(f"Response {message_id} does not have grounding metadata.")
 
-    def _remove_citation_markers(self, text: str, sources: list["Source"]) -> str:
-        original_text = text
-        processed: set[str] = set()
-        for source in sources:
-            supports = [
-                metadata["supports"]
-                for metadata in source.get("metadata", [])
-                if "supports" in metadata
-            ]
-            supports = [item for sublist in supports for item in sublist]
-            for support in supports:
-                support = types.GroundingSupport(**support)
-                indices = support.grounding_chunk_indices
-                segment = support.segment
-                if not (indices and segment):
-                    continue
-                segment_text = segment.text
-                if not segment_text:
-                    continue
-                # Using a shortened version because user could edit the assistant message in the front-end.
-                # If citation segment get's edited, then the markers would not be removed. Shortening reduces the
-                # chances of this happening.
-                segment_end = segment_text[-32:]
-                if segment_end in processed:
-                    continue
-                processed.add(segment_end)
-                citation_markers = "".join(f"[{index + 1}]" for index in indices)
-                # Find the position of the citation markers in the text
-                pos = text.find(segment_text + citation_markers)
-                if pos != -1:
-                    # Remove the citation markers
-                    text = (
-                        text[: pos + len(segment_text)]
-                        + text[pos + len(segment_text) + len(citation_markers) :]
-                    )
-        trim = len(original_text) - len(text)
-        log.debug(
-            f"Citation removal finished. Returning text str that is {trim} character shorter than the original input."
-        )
-        return text
-
     def _get_usage_data_event(
         self,
         response: types.GenerateContentResponse,
@@ -1759,15 +1840,6 @@ class Pipe:
                 f"Added new handler to loguru for {__name__} with level {desired_level_name}."
             )
 
-    def _get_mime_type(self, file_uri: str) -> str:
-        """
-        Determines MIME type based on file extension using the mimetypes module.
-        """
-        mime_type, encoding = mimetypes.guess_type(file_uri)
-        if mime_type is None:
-            return "application/octet-stream"  # Default MIME type if unknown
-        return mime_type
-
     def _get_first_candidate(
         self, candidates: list[types.Candidate] | None
     ) -> types.Candidate | None:
@@ -1778,47 +1850,6 @@ class Pipe:
         if len(candidates) > 1:
             log.warning("Multiple candidates found, defaulting to first candidate.")
         return candidates[0]
-
-    def _get_file_data(self, file_id: str) -> tuple[bytes | None, str | None]:
-        if not file_id:
-            # TODO: Emit toast
-            log.warning(f"file_id is empty. Cannot continue.")
-            return None, None
-        file_model = Files.get_file_by_id(file_id)
-        if file_model is None:
-            # TODO: Emit toast
-            log.warning(f"File {file_id} not found in the backend's database.")
-            return None, None
-        if not (file_path := file_model.path):
-            # TODO: Emit toast
-            log.warning(
-                f"File {file_id} was found in the database but it lacks `path` field. Cannot Continue."
-            )
-            return None, None
-        if file_model.meta is None:
-            # TODO: Emit toast
-            log.warning(
-                f"File {file_path} was found in the database but it lacks `meta` field. Cannot continue."
-            )
-            return None, None
-        if not (content_type := file_model.meta.get("content_type")):
-            # TODO: Emit toast
-            log.warning(
-                f"File {file_path} was found in the database but it lacks `meta.content_type` field. Cannot continue."
-            )
-            return None, None
-        try:
-            with open(file_path, "rb") as file:
-                image_data = file.read()
-            return image_data, content_type
-        except FileNotFoundError:
-            # TODO: Emit toast
-            log.exception(f"File {file_path} not found on disk.")
-            return None, content_type
-        except Exception:
-            # TODO: Emit toast
-            log.exception(f"Error processing file {file_path}")
-            return None, content_type
 
     # endregion 1.7 Utility helpers
 
