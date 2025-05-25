@@ -326,36 +326,6 @@ class ContentBuilder:
         await self._emit_warning(warn_msg)
         return None
 
-    def _create_parts_from_text_content(
-        self, text_content_item: "TextContent"
-    ) -> list[types.Part]:
-        """
-        Processes a text content item, extracting YouTube URLs and generating parts from text.
-        """
-        if text := text_content_item.get("text"):
-            parts = self._genai_parts_from_text(text)
-            log.debug(f"Generated {len(parts)} parts from text: '{text[:50]}...'")
-            return parts
-        else:
-            log.debug("Text content item has no 'text' field, skipping.")
-            return []
-
-    def _create_part_from_image_content(
-        self, image_content_item: "ImageContent"
-    ) -> Optional[types.Part]:
-        """
-        Processes an image content item and returns a types.Part if valid.
-        """
-        image_url_dict = image_content_item.get("image_url")
-        if image_url_dict and (url := image_url_dict.get("url")):
-            log.debug(f"Processing image content from URL: {url}")
-            return self._genai_part_from_image_url(url)
-        else:
-            log.debug(
-                "Image content item has no 'image_url' or 'url' field, skipping image processing."
-            )
-            return None
-
     async def _process_user_message(
         self, message: "UserMessage", files: list["FileAttachmentTD"]
     ) -> list[types.Part]:
@@ -395,24 +365,20 @@ class ContentBuilder:
         log.info(
             f"Processing {len(user_content_list)} content items from the user message."
         )
-        for content_item in user_content_list:
-            content_type = content_item.get("type")
-            log.debug(f"Processing content item of type: {content_type}")
+        for item in user_content_list:
+            kind = item.get("type")
+            log.debug(f"Processing content item of type: {kind}")
 
-            if content_type == "text":
-                text_parts = self._create_parts_from_text_content(
-                    cast("TextContent", content_item)
-                )
+            if kind == "text" and (text := item.get("text")):
+                text_parts = self._genai_parts_from_text(text)
                 user_parts.extend(text_parts)
-            elif content_type == "image_url":
-                img_part = self._create_part_from_image_content(
-                    cast("ImageContent", content_item)
-                )
+            elif kind == "image_url" and (url := item.get("image_url", {}).get("url")):
+                img_part = self._genai_part_from_image_url(url)
                 if img_part:
                     user_parts.append(img_part)
             else:
                 warn_msg = (
-                    f"User message content item type '{content_type}' is not supported. "
+                    f"User message content item type '{kind}' is not supported. "
                     "Skipping this content item."
                 )
                 await self._emit_warning(warn_msg)
