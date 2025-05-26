@@ -15,6 +15,7 @@ mock_chats_module = MagicMock()
 mock_files_module = MagicMock()
 mock_functions_module = MagicMock()
 mock_storage_module = MagicMock()
+mock_utils_module = MagicMock()
 
 mock_chats_module.Chats = MagicMock()
 mock_files_module.FileForm = MagicMock()
@@ -26,6 +27,7 @@ sys.modules["open_webui.models.chats"] = mock_chats_module
 sys.modules["open_webui.models.files"] = mock_files_module
 sys.modules["open_webui.models.functions"] = mock_functions_module
 sys.modules["open_webui.storage.provider"] = mock_storage_module
+sys.modules["open_webui.utils.misc"] = mock_utils_module
 
 # --- Now, the import of your plugin should use the mocks ---
 from plugins.pipes.gemini_manifold import (
@@ -58,13 +60,18 @@ def mock_pipe_valves_data():
 async def pipe_instance_fixture(mock_pipe_valves_data):
     mock_gemini_client_instance = MagicMock()
 
-    with patch(
-        "plugins.pipes.gemini_manifold.genai.Client",
-        return_value=mock_gemini_client_instance,
-    ) as MockedGenAIClientConstructor, patch.object(
-        Pipe, "_add_log_handler", MagicMock()
-    ) as mock_internal_add_log_handler, patch(
-        "sys.stdout", MagicMock()  # Suppress print/log output during setup
+    with (
+        patch(
+            "plugins.pipes.gemini_manifold.genai.Client",
+            return_value=mock_gemini_client_instance,
+        ) as MockedGenAIClientConstructor,
+        patch.object(
+            Pipe, "_add_log_handler", MagicMock()
+        ) as mock_internal_add_log_handler,
+        patch(
+            "sys.stdout",
+            MagicMock(),  # Suppress print/log output during setup
+        ),
     ):
         pipe = Pipe()
         pipe.valves = Pipe.Valves(**mock_pipe_valves_data)
@@ -80,13 +87,15 @@ async def pipe_instance_fixture(mock_pipe_valves_data):
 def test_pipe_initialization_with_api_key(mock_pipe_valves_data):
     mock_gemini_client_instance = MagicMock()
 
-    with patch(
-        "plugins.pipes.gemini_manifold.genai.Client",
-        return_value=mock_gemini_client_instance,
-    ) as MockedGenAIClientConstructor, patch.object(
-        Pipe, "_add_log_handler", MagicMock()
-    ) as mock_internal_add_log_handler, patch(
-        "sys.stdout", MagicMock()
+    with (
+        patch(
+            "plugins.pipes.gemini_manifold.genai.Client",
+            return_value=mock_gemini_client_instance,
+        ) as MockedGenAIClientConstructor,
+        patch.object(
+            Pipe, "_add_log_handler", MagicMock()
+        ) as mock_internal_add_log_handler,
+        patch("sys.stdout", MagicMock()),
     ):
         try:
             pipe_instance = Pipe()
@@ -213,9 +222,9 @@ async def test_genai_contents_from_messages_youtube_link_mixed_with_text(
         # This is the core of the test, expecting proper interleaving.
         # Current code likely produces 2 parts: [YouTubePart, FullTextPart(including URL)]
 
-        assert (
-            len(content_item.parts) == 3
-        ), f"Expected 3 parts (text, youtube, text), but got {len(content_item.parts)}. Parts: {[str(p) for p in content_item.parts]}"
+        assert len(content_item.parts) == 3, (
+            f"Expected 3 parts (text, youtube, text), but got {len(content_item.parts)}. Parts: {[str(p) for p in content_item.parts]}"
+        )
 
         # Verify calls to types.Part.from_text
         # Expected: two calls, one for text_before_stripped, one for text_after_stripped.
@@ -229,39 +238,39 @@ async def test_genai_contents_from_messages_youtube_link_mixed_with_text(
         # but for this simple case, call_args_list would be stricter.
         # However, given the side_effect, checking the objects in content_item.parts is more direct.
         # Let's check call_count first, then the actual parts.
-        assert (
-            mock_part_from_text.call_count == 2
-        ), f"Expected Part.from_text to be called 2 times, but was called {mock_part_from_text.call_count} times. Calls: {mock_part_from_text.call_args_list}"
+        assert mock_part_from_text.call_count == 2, (
+            f"Expected Part.from_text to be called 2 times, but was called {mock_part_from_text.call_count} times. Calls: {mock_part_from_text.call_args_list}"
+        )
 
         # Assert the content and order of parts
         # Part 1: Text before the YouTube link
-        assert (
-            content_item.parts[0] is mock_text_part_before_obj
-        ), f"Part 0 was not the expected 'text_before' mock. Got: {content_item.parts[0]}"
+        assert content_item.parts[0] is mock_text_part_before_obj, (
+            f"Part 0 was not the expected 'text_before' mock. Got: {content_item.parts[0]}"
+        )
 
         # Part 2: The YouTube link
         youtube_part = content_item.parts[1]
-        assert isinstance(
-            youtube_part, gemini_types.Part
-        ), f"Part 1 is not a gemini_types.Part. Got: {type(youtube_part)}"
-        assert hasattr(
-            youtube_part, "file_data"
-        ), "YouTube part (Part 1) should have 'file_data' attribute"
-        assert (
-            youtube_part.file_data is not None
-        ), "YouTube part's file_data should not be None"
-        assert (
-            youtube_part.file_data.file_uri == youtube_url
-        ), f"YouTube part URI mismatch. Expected: {youtube_url}, Got: {youtube_part.file_data.file_uri}"
+        assert isinstance(youtube_part, gemini_types.Part), (
+            f"Part 1 is not a gemini_types.Part. Got: {type(youtube_part)}"
+        )
+        assert hasattr(youtube_part, "file_data"), (
+            "YouTube part (Part 1) should have 'file_data' attribute"
+        )
+        assert youtube_part.file_data is not None, (
+            "YouTube part's file_data should not be None"
+        )
+        assert youtube_part.file_data.file_uri == youtube_url, (
+            f"YouTube part URI mismatch. Expected: {youtube_url}, Got: {youtube_part.file_data.file_uri}"
+        )
         # Ensure it's not accidentally a text part
-        assert (
-            not hasattr(youtube_part, "text") or youtube_part.text is None
-        ), "YouTube part should not have a 'text' attribute or it should be None"
+        assert not hasattr(youtube_part, "text") or youtube_part.text is None, (
+            "YouTube part should not have a 'text' attribute or it should be None"
+        )
 
         # Part 3: Text after the YouTube link
-        assert (
-            content_item.parts[2] is mock_text_part_after_obj
-        ), f"Part 2 was not the expected 'text_after' mock. Got: {content_item.parts[2]}"
+        assert content_item.parts[2] is mock_text_part_after_obj, (
+            f"Part 2 was not the expected 'text_after' mock. Got: {content_item.parts[2]}"
+        )
 
         # Ensure event_emitter was not called for this simple case
         mock_event_emitter.assert_not_called()
@@ -313,16 +322,19 @@ async def test_genai_contents_from_messages_user_text_with_pdf(pipe_instance_fix
     mock_text_part_obj = MagicMock(spec=gemini_types.Part, name="TextPart")
 
     # Patch _get_file_data, Part.from_bytes, and Part.from_text
-    with patch.object(
-        Pipe, "_get_file_data", return_value=(fake_pdf_bytes, pdf_mime_type)
-    ) as mock_get_file_data, patch(
-        "plugins.pipes.gemini_manifold.types.Part.from_bytes",
-        return_value=mock_pdf_part_obj,
-    ) as mock_part_from_bytes, patch(
-        "plugins.pipes.gemini_manifold.types.Part.from_text",
-        return_value=mock_text_part_obj,
-    ) as mock_part_from_text:
-
+    with (
+        patch.object(
+            Pipe, "_get_file_data", return_value=(fake_pdf_bytes, pdf_mime_type)
+        ) as mock_get_file_data,
+        patch(
+            "plugins.pipes.gemini_manifold.types.Part.from_bytes",
+            return_value=mock_pdf_part_obj,
+        ) as mock_part_from_bytes,
+        patch(
+            "plugins.pipes.gemini_manifold.types.Part.from_text",
+            return_value=mock_text_part_obj,
+        ) as mock_part_from_text,
+    ):
         # Act
         contents = await pipe_instance._genai_contents_from_messages(
             messages_body,
@@ -344,12 +356,12 @@ async def test_genai_contents_from_messages_user_text_with_pdf(pipe_instance_fix
         assert len(user_content_obj.parts) == 2
 
         # Check order: PDF part should be first, then text part
-        assert (
-            user_content_obj.parts[0] is mock_pdf_part_obj
-        ), "First part should be the PDF mock."
-        assert (
-            user_content_obj.parts[1] is mock_text_part_obj
-        ), "Second part should be the text mock."
+        assert user_content_obj.parts[0] is mock_pdf_part_obj, (
+            "First part should be the PDF mock."
+        )
+        assert user_content_obj.parts[1] is mock_text_part_obj, (
+            "Second part should be the text mock."
+        )
 
         mock_event_emitter.assert_not_called()
 
@@ -360,3 +372,4 @@ def teardown_module(module):
     del sys.modules["open_webui.models.files"]
     del sys.modules["open_webui.models.functions"]
     del sys.modules["open_webui.storage.provider"]
+    del sys.modules["open_webui.utils.misc"]
