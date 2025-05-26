@@ -206,7 +206,7 @@ class Pipe:
             default=False,
             description="Enable the URL context tool to allow the model to fetch and use content from provided URLs. This tool is only compatible with specific models.",
         )
-        
+
         @field_validator("THINKING_BUDGET", mode="after")
         @classmethod
         def validate_thinking_budget_range(cls, v):
@@ -437,7 +437,7 @@ class Pipe:
 
     # region 1. Helper methods inside the Pipe class
 
-    # region 1.1 Client initialization and model retrival from Google API
+    # region 1.1 Client initialization
     @staticmethod
     @cache
     def _get_or_create_genai_client(
@@ -510,32 +510,22 @@ class Pipe:
         return client
 
     @staticmethod
-    def _return_error_model(
-        error_msg: str, warning: bool = False, exception: bool = True
-    ) -> "ModelData":
-        """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
-        if warning:
-            log.opt(depth=1, exception=False).warning(error_msg)
-        else:
-            log.opt(depth=1, exception=exception).error(error_msg)
-        return {
-            "id": "error",
-            "name": "[gemini_manifold] " + error_msg,
-            "description": error_msg,
-        }
+    def _prepare_client_args(
+        source_valves: "Pipe.Valves | Pipe.UserValves",
+    ) -> list[str | bool | None]:
+        """Prepares arguments for _get_or_create_genai_client from source_valves."""
+        ATTRS = [
+            "GEMINI_API_KEY",
+            "GEMINI_API_BASE_URL",
+            "USE_VERTEX_AI",
+            "VERTEX_PROJECT",
+            "VERTEX_LOCATION",
+        ]
+        return [getattr(source_valves, attr) for attr in ATTRS]
 
-    @staticmethod
-    def strip_prefix(model_name: str) -> str:
-        """
-        Extract the model identifier using regex, handling various naming conventions.
-        e.g., "gemini_manifold_google_genai.gemini-2.5-flash-preview-04-17" -> "gemini-2.5-flash-preview-04-17"
-        e.g., "models/gemini-1.5-flash-001" -> "gemini-1.5-flash-001"
-        e.g., "publishers/google/models/gemini-1.5-pro" -> "gemini-1.5-pro"
-        """
-        # Use regex to remove everything up to and including the last '/' or the first '.'
-        stripped = re.sub(r"^(?:.*/|[^.]*\.)", "", model_name)
-        return stripped
+    # endregion 1.1 Client initialization
 
+    # region 1.2 Model retrival from Google API
     @cached()
     async def _get_genai_models(
         self,
@@ -606,22 +596,35 @@ class Pipe:
         return filtered_models
 
     @staticmethod
-    def _prepare_client_args(
-        source_valves: "Pipe.Valves | Pipe.UserValves",
-    ) -> list[str | bool | None]:
-        """Prepares arguments for _get_or_create_genai_client from source_valves."""
-        ATTRS = [
-            "GEMINI_API_KEY",
-            "GEMINI_API_BASE_URL",
-            "USE_VERTEX_AI",
-            "VERTEX_PROJECT",
-            "VERTEX_LOCATION",
-        ]
-        return [getattr(source_valves, attr) for attr in ATTRS]
+    def _return_error_model(
+        error_msg: str, warning: bool = False, exception: bool = True
+    ) -> "ModelData":
+        """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        return {
+            "id": "error",
+            "name": "[gemini_manifold] " + error_msg,
+            "description": error_msg,
+        }
 
-    # endregion 1.1 Client initialization and model retrival from Google API
+    @staticmethod
+    def strip_prefix(model_name: str) -> str:
+        """
+        Extract the model identifier using regex, handling various naming conventions.
+        e.g., "gemini_manifold_google_genai.gemini-2.5-flash-preview-04-17" -> "gemini-2.5-flash-preview-04-17"
+        e.g., "models/gemini-1.5-flash-001" -> "gemini-1.5-flash-001"
+        e.g., "publishers/google/models/gemini-1.5-pro" -> "gemini-1.5-pro"
+        """
+        # Use regex to remove everything up to and including the last '/' or the first '.'
+        stripped = re.sub(r"^(?:.*/|[^.]*\.)", "", model_name)
+        return stripped
 
-    # region 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
+    # endregion 1.2 Model retrival from Google API
+
+    # region 1.3 Open WebUI's body.messages -> list[genai.types.Content] conversion
 
     def _pop_system_prompt(self, messages: list["Message"]) -> str | None:
         """
@@ -866,9 +869,9 @@ class Pipe:
 
         return youtube_urls
 
-    # endregion 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
+    # endregion 1.3 Open WebUI's body.messages -> list[genai.types.Content] conversion
 
-    # region 1.3 Model response streaming
+    # region 1.4 Model response streaming
     async def _stream_response_generator(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
@@ -1108,9 +1111,9 @@ class Pipe:
         else:
             return None
 
-    # endregion 1.3 Model response streaming
+    # endregion 1.4 Model response streaming
 
-    # region 1.4 Thinking status message
+    # region 1.5 Thinking status message
     def _get_budget_str(self, model_name: str, thinking_budget: int) -> str:
         return (
             f" • {thinking_budget} tokens budget"
@@ -1236,9 +1239,9 @@ class Pipe:
                 final_status, event_emitter=event_emitter, done=True, hidden=True
             )
 
-    # endregion 1.4 Thinking status message
+    # endregion 1.5 Thinking status message
 
-    # region 1.5 Post-processing
+    # region 1.6 Post-processing
     async def _do_post_processing(
         self,
         model_response: types.GenerateContentResponse | None,
@@ -1419,9 +1422,9 @@ class Pipe:
         }
         return completion_event
 
-    # endregion 1.5 Post-processing
+    # endregion 1.6 Post-processing
 
-    # region 1.6 Event emissions
+    # region 1.7 Event emissions
     async def _emit_completion(
         self,
         event_emitter: Callable[["Event"], Awaitable[None]],
@@ -1493,9 +1496,9 @@ class Pipe:
         }
         await event_emitter(event)
 
-    # endregion 1.6 Event emissions
+    # endregion 1.7 Event emissions
 
-    # region 1.7 Utility helpers
+    # region 1.8 Utility helpers
 
     @staticmethod
     def _get_merged_valves(
@@ -1850,6 +1853,6 @@ class Pipe:
             log.exception(f"Error processing file {file_path}")
             return None, content_type
 
-    # endregion 1.7 Utility helpers
+    # endregion 1.8 Utility helpers
 
     # endregion 1. Helper methods inside the Pipe class
