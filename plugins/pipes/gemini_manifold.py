@@ -302,7 +302,7 @@ class ContentBuilder:
 
     async def _create_part_from_file_attachment(
         self, file_item: "FileAttachmentTD"
-    ) -> Optional[types.Part]:
+    ) -> types.Part | None:
         """
         Processes a single file attachment and returns a types.Part if supported,
         otherwise logs a warning and emits a toast.
@@ -343,7 +343,7 @@ class ContentBuilder:
 
         # 2. Determine user_content_list from message content
         raw_user_content = message.get("content")
-        user_content_list: Optional[list["Content"]] = None
+        user_content_list: list["Content"] | None = None
 
         if isinstance(raw_user_content, str):
             log.debug("User message content is a string. Wrapping in a list structure.")
