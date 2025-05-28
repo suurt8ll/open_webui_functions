@@ -1473,33 +1473,7 @@ class Pipe:
         else:
             log.debug(f"Response has correct finish reason: {finish_reason}.")
 
-        # Emit URL context metadata if available
-        url_context_meta = candidate.url_context_metadata if candidate else None
-        if (
-            url_context_meta
-            and hasattr(url_context_meta, "retrieved_urls")
-            and url_context_meta.retrieved_urls
-        ):
-            # Convert UrlContextRetrievedUrl objects to a list of dicts
-            # as the objects themselves might not be directly JSON serializable in the event.
-            retrieved_urls_data = []
-            for retrieved_url_obj in url_context_meta.retrieved_urls:
-                url_data = {
-                    "url": retrieved_url_obj.url,
-                    "title": retrieved_url_obj.title,
-                }
-                # Optionally, include favicon if it exists and is needed by the frontend
-                # if hasattr(retrieved_url_obj, 'favicon') and retrieved_url_obj.favicon:
-                #     url_data["favicon"] = retrieved_url_obj.favicon
-                retrieved_urls_data.append(url_data)
-
-            if retrieved_urls_data:  # Ensure we have something to send
-                url_event = {
-                    "type": "chat:url_context",
-                    "data": {"retrieved_urls": retrieved_urls_data},
-                }
-                await event_emitter(url_event)
-                log.debug("Emitted URL context metadata:", payload=url_event)
+        # TODO: Emit a toast message if url context retrieval was not successful.
 
         # Emit token usage data.
         if usage_event := self._get_usage_data_event(model_response):
