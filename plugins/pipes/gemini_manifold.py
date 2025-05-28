@@ -30,10 +30,10 @@ requirements: google-genai==1.16.1
 #   TODO Audio input support.
 #   TODO Video input support (other than YouTube URLs).
 
-import inspect
 from google import genai
 from google.genai import types
 
+import inspect
 import asyncio
 import copy
 import json
@@ -96,6 +96,7 @@ class Pipe:
             description="""Comma separated list of user emails that are allowed to bypassUSER_MUST_PROVIDE_AUTH_CONFIG and use the default authentication configuration.
             Default value is None (no users are whitelisted).""",
         )
+        # FIXME: Default to None.
         GEMINI_API_BASE_URL: str = Field(
             default="https://generativelanguage.googleapis.com",
             description="The base URL for calling the Gemini API",
@@ -112,6 +113,7 @@ class Pipe:
             description="""The Google Cloud project ID to use with Vertex AI.
             Default value is None.""",
         )
+        # FIXME: Default to None.
         VERTEX_LOCATION: str = Field(
             default="global",
             description="""The Google Cloud region to use with Vertex AI.
@@ -206,7 +208,7 @@ class Pipe:
             default=False,
             description="Enable the URL context tool to allow the model to fetch and use content from provided URLs. This tool is only compatible with specific models.",
         )
-        
+
         @field_validator("THINKING_BUDGET", mode="after")
         @classmethod
         def validate_thinking_budget_range(cls, v):
@@ -437,7 +439,7 @@ class Pipe:
 
     # region 1. Helper methods inside the Pipe class
 
-    # region 1.1 Client initialization and model retrival from Google API
+    # region 1.1 Client initialization
     @staticmethod
     @cache
     def _get_or_create_genai_client(
@@ -510,6 +512,283 @@ class Pipe:
         return client
 
     @staticmethod
+    def _prepare_client_args(
+        source_valves: "Pipe.Valves | Pipe.UserValves",
+    ) -> list[str | bool | None]:
+        """Prepares arguments for _get_or_create_genai_client from source_valves."""
+        ATTRS = [
+            "GEMINI_API_KEY",
+            "GEMINI_API_BASE_URL",
+            "USE_VERTEX_AI",
+            "VERTEX_PROJECT",
+            "VERTEX_LOCATION",
+        ]
+        return [getattr(source_valves, attr) for attr in ATTRS]
+
+    # endregion 1.1 Client initialization
+
+    # region 1.2 Model retrival from Google API
+    @cached()  # aiocache.cached for async method
+    async def _get_genai_models(
+        self,
+        api_key: str | None,
+        base_url: str | None,
+        use_vertex_ai: bool | None,  # User's preference from config
+        vertex_project: str | None,
+        vertex_location: str | None,
+        whitelist_str: str,
+        blacklist_str: str | None,
+    ) -> list["ModelData"]:
+        """
+        Gets valid Google models from API(s) and filters them.
+        If use_vertex_ai, vertex_project, and api_key are all provided,
+        models are fetched from both Vertex AI and Gemini Developer API and merged.
+        """
+        all_raw_models: list[types.Model] = []
+
+        # Condition for fetching from both sources
+        fetch_both = bool(use_vertex_ai and vertex_project and api_key)
+
+        if fetch_both:
+            log.info(
+                "Attempting to fetch models from both Gemini Developer API and Vertex AI."
+            )
+            gemini_models_list: list[types.Model] = []
+            vertex_models_list: list[types.Model] = []
+
+            # TODO: perf, consider parallelizing these two fetches
+            # 1. Fetch from Gemini Developer API
+            try:
+                gemini_client = self._get_or_create_genai_client(
+                    api_key=api_key,
+                    base_url=base_url,
+                    use_vertex_ai=False,  # Explicitly target Gemini API
+                    vertex_project=None,
+                    vertex_location=None,
+                )
+                gemini_models_list = await self._fetch_models_from_client_internal(
+                    gemini_client, "Gemini Developer API"
+                )
+            except GenaiApiError as e:
+                log.warning(
+                    f"Failed to initialize or retrieve models from Gemini Developer API: {e}"
+                )
+            except Exception as e:
+                log.warning(
+                    f"An unexpected error occurred with Gemini Developer API models: {e}",
+                    exc_info=True,
+                )
+
+            # 2. Fetch from Vertex AI
+            try:
+                vertex_client = self._get_or_create_genai_client(
+                    use_vertex_ai=True,  # Explicitly target Vertex AI
+                    vertex_project=vertex_project,
+                    vertex_location=vertex_location,
+                    api_key=None,  # API key is not used for Vertex AI with project auth
+                    base_url=base_url,  # Pass base_url for potential Vertex custom endpoints
+                )
+                vertex_models_list = await self._fetch_models_from_client_internal(
+                    vertex_client, "Vertex AI"
+                )
+            except GenaiApiError as e:
+                log.warning(
+                    f"Failed to initialize or retrieve models from Vertex AI: {e}"
+                )
+            except Exception as e:
+                log.warning(
+                    f"An unexpected error occurred with Vertex AI models: {e}",
+                    exc_info=True,
+                )
+
+            # 3. Combine and de-duplicate
+            # Prioritize models from Gemini Developer API in case of ID collision
+            combined_models_dict: dict[str, types.Model] = {}
+
+            for model in gemini_models_list:
+                if model.name:
+                    model_id = Pipe.strip_prefix(model.name)
+                    if model_id and model_id not in combined_models_dict:
+                        combined_models_dict[model_id] = model
+                else:
+                    log.trace(
+                        f"Gemini model without a name encountered: {model.display_name or 'N/A'}"
+                    )
+
+            for model in vertex_models_list:
+                if model.name:
+                    model_id = Pipe.strip_prefix(model.name)
+                    if model_id:
+                        if model_id not in combined_models_dict:
+                            combined_models_dict[model_id] = model
+                        else:
+                            log.info(
+                                f"Duplicate model ID '{model_id}' from Vertex AI already sourced from Gemini API. Keeping Gemini API version."
+                            )
+                else:
+                    log.trace(
+                        f"Vertex AI model without a name encountered: {model.display_name or 'N/A'}"
+                    )
+
+            all_raw_models = list(combined_models_dict.values())
+
+            log.info(
+                f"Fetched {len(gemini_models_list)} models from Gemini API, "
+                f"{len(vertex_models_list)} from Vertex AI. "
+                f"Combined to {len(all_raw_models)} unique models."
+            )
+
+            if not all_raw_models and (gemini_models_list or vertex_models_list):
+                log.warning(
+                    "Models were fetched but resulted in an empty list after de-duplication, possibly due to missing names or empty/duplicate IDs."
+                )
+
+            if not all_raw_models and not gemini_models_list and not vertex_models_list:
+                raise GenaiApiError(
+                    "Failed to retrieve models: Both Gemini Developer API and Vertex AI attempts yielded no models."
+                )
+
+        else:  # Single source logic
+            # Determine if we are effectively using Vertex AI or Gemini API
+            # This depends on user's config (use_vertex_ai) and availability of project/key
+            client_target_is_vertex = bool(use_vertex_ai and vertex_project)
+            client_source_name = (
+                "Vertex AI" if client_target_is_vertex else "Gemini Developer API"
+            )
+            log.info(
+                f"Attempting to fetch models from a single source: {client_source_name}."
+            )
+
+            try:
+                client = self._get_or_create_genai_client(
+                    api_key=api_key,
+                    base_url=base_url,
+                    use_vertex_ai=client_target_is_vertex,  # Pass the determined target
+                    vertex_project=vertex_project if client_target_is_vertex else None,
+                    vertex_location=(
+                        vertex_location if client_target_is_vertex else None
+                    ),
+                )
+                all_raw_models = await self._fetch_models_from_client_internal(
+                    client, client_source_name
+                )
+
+                if not all_raw_models:
+                    raise GenaiApiError(
+                        f"No models retrieved from {client_source_name}. This could be due to an API error, network issue, or no models being available."
+                    )
+
+            except GenaiApiError as e:
+                raise GenaiApiError(
+                    f"Failed to get models from {client_source_name}: {e}"
+                ) from e
+            except Exception as e:
+                log.error(
+                    f"An unexpected error occurred while configuring client or fetching models from {client_source_name}: {e}",
+                    exc_info=True,
+                )
+                raise GenaiApiError(
+                    f"An unexpected error occurred while retrieving models from {client_source_name}: {e}"
+                ) from e
+
+        # --- Common processing for all_raw_models ---
+
+        if not all_raw_models:
+            log.warning("No models available after attempting all configured sources.")
+            return []
+
+        log.info(f"Processing {len(all_raw_models)} unique raw models.")
+
+        generative_models: list[types.Model] = []
+        for model in all_raw_models:
+            if model.name is None:
+                log.trace(
+                    f"Skipping model with no name during generative filter: {model.display_name or 'N/A'}"
+                )
+                continue
+            actions = model.supported_actions
+            if (
+                actions is None or "generateContent" in actions
+            ):  # Includes models if actions is None (e.g., Vertex)
+                generative_models.append(model)
+            else:
+                log.trace(
+                    f"Model '{model.name}' (ID: {Pipe.strip_prefix(model.name)}) skipped, not generative (actions: {actions})."
+                )
+
+        if not generative_models:
+            log.warning(
+                "No generative models found after filtering all retrieved models."
+            )
+            return []
+
+        def match_patterns(
+            name_to_check: str, list_of_patterns_str: str | None
+        ) -> bool:
+            if not list_of_patterns_str:
+                return False
+            patterns = [
+                pat for pat in list_of_patterns_str.replace(" ", "").split(",") if pat
+            ]  # Ensure pat is not empty
+            return any(fnmatch.fnmatch(name_to_check, pat) for pat in patterns)
+
+        filtered_models_data: list["ModelData"] = []
+        for model in generative_models:
+            # model.name is guaranteed non-None by generative_models filter logic
+            stripped_name = Pipe.strip_prefix(model.name)  # type: ignore
+
+            if not stripped_name:
+                log.warning(
+                    f"Model '{model.name}' (display: {model.display_name}) resulted in an empty ID after stripping. Skipping."
+                )
+                continue
+
+            passes_whitelist = not whitelist_str or match_patterns(
+                stripped_name, whitelist_str
+            )
+            passes_blacklist = not blacklist_str or not match_patterns(
+                stripped_name, blacklist_str
+            )
+
+            if passes_whitelist and passes_blacklist:
+                filtered_models_data.append(
+                    {
+                        "id": stripped_name,
+                        "name": model.display_name or stripped_name,
+                        "description": model.description,
+                    }
+                )
+            else:
+                log.trace(
+                    f"Model ID '{stripped_name}' filtered out by whitelist/blacklist. Whitelist match: {passes_whitelist}, Blacklist pass: {passes_blacklist}"
+                )
+
+        log.info(
+            f"Filtered {len(generative_models)} generative models down to {len(filtered_models_data)} models based on white/blacklists."
+        )
+        return filtered_models_data
+
+    # TODO: Use cache for this method too?
+    async def _fetch_models_from_client_internal(
+        self, client: genai.Client, source_name: str
+    ) -> list[types.Model]:
+        """Helper to fetch models from a given client and handle common exceptions."""
+        try:
+            google_models_pager = await client.aio.models.list(
+                config={"query_base": True}  # Fetch base models by default
+            )
+            models = [model async for model in google_models_pager]
+            log.info(f"Retrieved {len(models)} models from {source_name}.")
+            log.trace(
+                f"All models returned by {source_name}:", payload=models
+            )  # Can be verbose
+            return models
+        except Exception as e:
+            log.error(f"Retrieving models from {source_name} failed: {e}")
+            # Return empty list; caller decides if this is fatal for the whole operation.
+            return []
+
+    @staticmethod
     def _return_error_model(
         error_msg: str, warning: bool = False, exception: bool = True
     ) -> "ModelData":
@@ -536,92 +815,9 @@ class Pipe:
         stripped = re.sub(r"^(?:.*/|[^.]*\.)", "", model_name)
         return stripped
 
-    @cached()
-    async def _get_genai_models(
-        self,
-        api_key: str | None,
-        base_url: str | None,
-        use_vertex_ai: bool | None,
-        vertex_project: str | None,
-        vertex_location: str | None,
-        whitelist_str: str,
-        blacklist_str: str | None,
-    ) -> list["ModelData"]:
-        """
-        Gets valid Google models from the API and filters them based on configured white- and blacklist.
-        Returns a list[dict] that can be directly returned by the `pipes` method.
-        The result is cached based on the provided api_key, base_url, whitelist_str, and blacklist_str.
-        """
-        # Get a client using the provided API key and base URL
-        client = self._get_or_create_genai_client(
-            api_key, base_url, use_vertex_ai, vertex_project, vertex_location
-        )
+    # endregion 1.2 Model retrival from Google API
 
-        try:
-            # Get the AsyncPager object
-            google_models_pager = await client.aio.models.list(
-                config={"query_base": True}
-            )
-            # Iterate the pager to get the full list of models
-            # This is where the actual API calls for subsequent pages happen if needed
-            all_google_models = [model async for model in google_models_pager]
-        except Exception as e:
-            raise GenaiApiError(f"Retrieving models from Google API failed: {e}") from e
-        else:
-            log.info(f"Retrieved {len(all_google_models)} models from Google API.")
-            log.trace("All models returned by Google:", payload=all_google_models)
-
-        # Filter Google models list down to generative models only.
-        # FIXME: model.supported_actions is None with vertex models
-        # see https://github.com/googleapis/python-genai/issues/679
-        generative_models = []
-        for model in all_google_models:
-            actions = model.supported_actions
-            if actions is None or "generateContent" in actions:
-                generative_models.append(model)
-
-        # Raise if there are not generative models
-        if not generative_models:
-            log.warning("No generative models found.")
-
-        # Filter based on whitelist and blacklist
-        def match(name, list_str):
-            patterns = list_str.replace(" ", "").split(",") if list_str else []
-            return any(fnmatch.fnmatch(name, pat) for pat in patterns)
-
-        filtered_models: list["ModelData"] = []
-        for model in generative_models:
-            name = Pipe.strip_prefix(model.name)
-            if name and match(name, whitelist_str) and not match(name, blacklist_str):
-                filtered_models.append(
-                    {
-                        "id": name,
-                        "name": model.display_name or name,
-                        "description": model.description,
-                    }
-                )
-        log.info(
-            f"Filtered {len(generative_models)} models down to {len(filtered_models)} models based on white/blacklists."
-        )
-        return filtered_models
-
-    @staticmethod
-    def _prepare_client_args(
-        source_valves: "Pipe.Valves | Pipe.UserValves",
-    ) -> list[str | bool | None]:
-        """Prepares arguments for _get_or_create_genai_client from source_valves."""
-        ATTRS = [
-            "GEMINI_API_KEY",
-            "GEMINI_API_BASE_URL",
-            "USE_VERTEX_AI",
-            "VERTEX_PROJECT",
-            "VERTEX_LOCATION",
-        ]
-        return [getattr(source_valves, attr) for attr in ATTRS]
-
-    # endregion 1.1 Client initialization and model retrival from Google API
-
-    # region 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
+    # region 1.3 Open WebUI's body.messages -> list[genai.types.Content] conversion
 
     def _pop_system_prompt(self, messages: list["Message"]) -> str | None:
         """
@@ -866,9 +1062,9 @@ class Pipe:
 
         return youtube_urls
 
-    # endregion 1.2 Open WebUI's body.messages -> list[genai.types.Content] conversion
+    # endregion 1.3 Open WebUI's body.messages -> list[genai.types.Content] conversion
 
-    # region 1.3 Model response streaming
+    # region 1.4 Model response streaming
     async def _stream_response_generator(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
@@ -1108,9 +1304,9 @@ class Pipe:
         else:
             return None
 
-    # endregion 1.3 Model response streaming
+    # endregion 1.4 Model response streaming
 
-    # region 1.4 Thinking status message
+    # region 1.5 Thinking status message
     def _get_budget_str(self, model_name: str, thinking_budget: int) -> str:
         return (
             f" • {thinking_budget} tokens budget"
@@ -1236,9 +1432,9 @@ class Pipe:
                 final_status, event_emitter=event_emitter, done=True, hidden=True
             )
 
-    # endregion 1.4 Thinking status message
+    # endregion 1.5 Thinking status message
 
-    # region 1.5 Post-processing
+    # region 1.6 Post-processing
     async def _do_post_processing(
         self,
         model_response: types.GenerateContentResponse | None,
@@ -1419,9 +1615,9 @@ class Pipe:
         }
         return completion_event
 
-    # endregion 1.5 Post-processing
+    # endregion 1.6 Post-processing
 
-    # region 1.6 Event emissions
+    # region 1.7 Event emissions
     async def _emit_completion(
         self,
         event_emitter: Callable[["Event"], Awaitable[None]],
@@ -1493,9 +1689,9 @@ class Pipe:
         }
         await event_emitter(event)
 
-    # endregion 1.6 Event emissions
+    # endregion 1.7 Event emissions
 
-    # region 1.7 Utility helpers
+    # region 1.8 Utility helpers
 
     @staticmethod
     def _get_merged_valves(
@@ -1850,6 +2046,6 @@ class Pipe:
             log.exception(f"Error processing file {file_path}")
             return None, content_type
 
-    # endregion 1.7 Utility helpers
+    # endregion 1.8 Utility helpers
 
     # endregion 1. Helper methods inside the Pipe class

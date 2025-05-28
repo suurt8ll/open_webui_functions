@@ -271,6 +271,7 @@ def test_client_creation_falls_back_to_gemini_api_with_warning(pipe_instance_fix
 
 # endregion Test _get_or_create_genai_client
 
+
 # region Test USER_MUST_PROVIDE_AUTH_CONFIG=True scenarios
 USER_EMAIL_UNPRIVILEGED = "unprivileged_user@example.com"
 ADMIN_API_KEY_DEFAULT = "admin_api_key_should_not_be_used"
@@ -447,6 +448,7 @@ def test_user_must_auth_user_tries_vertex_with_user_gemini_key_falls_back_to_use
 
 # endregion Test USER_MUST_PROVIDE_AUTH_CONFIG=True scenarios
 
+
 # region Test USER_MUST_PROVIDE_AUTH_CONFIG=True with whitelisted user
 # You might already have these or similar constants
 USER_EMAIL_WHITELISTED = "whitelisted_user@example.com"
@@ -614,6 +616,7 @@ def test_whitelist_user_provides_own_vertex_config_overrides_admin(
 
 # endregion Test USER_MUST_PROVIDE_AUTH_CONFIG=True with whitelisted user
 
+
 # region Test user's ability to override admin's settings
 # You might already have these or similar constants
 USER_EMAIL_REGULAR = (
@@ -748,6 +751,11 @@ def test_user_overrides_admin_vertex_project_location(pipe_instance_fixture):
 
 
 # endregion Test user's ability to override admin's settings
+
+
+# region Test _get_genai_models
+# TODO: Add tests for _get_genai_models
+# endregion Test _get_genai_models
 
 
 # region Test _genai_contents_from_messages
