@@ -3,7 +3,7 @@ name: Plugin Release
 on:
   push:
     tags:
-      - '*/v*'
+      - '*/v*' # This will match tags like my-plugin/v1.0.0 and my-plugin/v1.1.0rc1
 
 jobs:
   release:
@@ -48,6 +48,7 @@ jobs:
           body: ${{ steps.changelog.outputs.changelog_body }}
           files: ${{ steps.find_plugin_file.outputs.plugin_path }}
           draft: true # Create a draft release instead of publishing immediately
-          prerelease: false
+          # Dynamically set prerelease based on the parsed tag
+          prerelease: ${{ steps.parse_tag.outputs.is_prerelease == 'true' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
