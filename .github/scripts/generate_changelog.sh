@@ -12,22 +12,18 @@ echo "Current Tag: $CURRENT_TAG"
 echo "Plugin Path: $PLUGIN_PATH"
 
 # Default body if path is missing
-GENERATED_BODY="Could not determine plugin file path."
+GENERATED_CHANGELOG_BODY="Could not determine plugin file path."
 
 if [[ -z "$PLUGIN_PATH" ]]; then
   echo "::error:: Plugin path is empty. Cannot generate specific changelog."
-  echo "changelog_body=${GENERATED_BODY}" >> "$GITHUB_OUTPUT"
+  echo "changelog_body=${GENERATED_CHANGELOG_BODY}" >> "$GITHUB_OUTPUT"
   exit 1
 fi
 
 # --- Determine if the CURRENT_TAG is a pre-release ---
-# Extract version part from current tag (e.g., v1.1.0rc1 from plugin/v1.1.0rc1)
 CURRENT_VERSION_PART=$(echo "$CURRENT_TAG" | rev | cut -d'/' -f1 | rev)
-# Remove 'v' prefix for pre-release check
-CURRENT_VERSION_NO_V="${CURRENT_VERSION_PART#v}" # e.g., 1.1.0rc1 or 1.1.0
-
+CURRENT_VERSION_NO_V="${CURRENT_VERSION_PART#v}"
 IS_CURRENT_TAG_PRERELEASE="false"
-# Check for common PEP 440 pre-release identifiers (rc, a, b)
 if [[ "$CURRENT_VERSION_NO_V" == *rc* || "$CURRENT_VERSION_NO_V" == *a* || "$CURRENT_VERSION_NO_V" == *b* ]]; then
   IS_CURRENT_TAG_PRERELEASE="true"
 fi
@@ -38,55 +34,49 @@ PREVIOUS_TAG=""
 ALL_PLUGIN_TAGS_SORTED=$(git tag -l "${PLUGIN_NAME}/v*" | sort -V)
 
 if [[ "$IS_CURRENT_TAG_PRERELEASE" == "true" ]]; then
-  # For pre-releases, find the immediately preceding tag (can be stable or another pre-release)
   PREVIOUS_TAG=$(echo "$ALL_PLUGIN_TAGS_SORTED" | grep -B 1 "^${CURRENT_TAG}$" | head -n 1 || echo "")
-  if [[ "$PREVIOUS_TAG" == "$CURRENT_TAG" ]]; then # Handles case where current tag is the very first tag
+  if [[ "$PREVIOUS_TAG" == "$CURRENT_TAG" ]]; then
     PREVIOUS_TAG=""
   fi
 else
-  # For stable releases, find the latest STABLE tag strictly before this one.
-  # Filter out pre-release tags from the list of all plugin tags
-  # Regex: /v<digits>.<digits>...<rc|a|b><digits>
-  # We want to KEEP tags that DO NOT match this pre-release pattern.
   STABLE_PLUGIN_TAGS_SORTED=$(echo "$ALL_PLUGIN_TAGS_SORTED" | grep -Ev "/v[0-9.]+(a|b|rc|alpha|beta|c|pre|post|dev)[0-9]*$")
-
   if [[ -n "$STABLE_PLUGIN_TAGS_SORTED" ]]; then
     PREVIOUS_TAG=$(echo "$STABLE_PLUGIN_TAGS_SORTED" | grep -B 1 "^${CURRENT_TAG}$" | head -n 1 || echo "")
-    if [[ "$PREVIOUS_TAG" == "$CURRENT_TAG" ]]; then # Handles case where current tag is the first stable tag
+    if [[ "$PREVIOUS_TAG" == "$CURRENT_TAG" ]]; then
       PREVIOUS_TAG=""
     fi
   else
-    # This case should ideally not be hit if CURRENT_TAG is stable and present in ALL_PLUGIN_TAGS_SORTED
-    # but as a fallback, if no stable tags are found (e.g. only RCs exist), treat as first release.
     PREVIOUS_TAG=""
   fi
 fi
 
-
-# Handle finding the previous tag (or not)
+# --- Determine Commit Range ---
 COMMIT_RANGE=""
 if [[ -z "$PREVIOUS_TAG" ]]; then
-  echo "No suitable previous tag found for ${PLUGIN_NAME} based on release type. Generating changelog from the beginning of history for the plugin path."
-  CURRENT_COMMIT=$(git rev-list -n 1 "$CURRENT_TAG")
-  COMMIT_RANGE="$CURRENT_COMMIT"
+  echo "No suitable previous tag found for ${PLUGIN_NAME}. Generating changelog from the beginning of history for the plugin path up to ${CURRENT_TAG}."
+  # For the first release, the range is all commits leading up to CURRENT_TAG affecting PLUGIN_PATH
+  COMMIT_RANGE="$CURRENT_TAG"
 else
   echo "Found previous tag for changelog: $PREVIOUS_TAG"
   echo "Generating changelog from ${PREVIOUS_TAG} to ${CURRENT_TAG}"
   COMMIT_RANGE="${PREVIOUS_TAG}..${CURRENT_TAG}"
 fi
 
-# Generate the changelog body using git log
-CHANGELOG_HEADING="## What's Changed"
-COMMIT_LOG=$(git log --no-merges --pretty="format:* %s (%h)" "$COMMIT_RANGE" -- "$PLUGIN_PATH")
+# --- Generate the "What's Changed" section ---
+CHANGELOG_HEADING="## 👀 What's Changed"
+# Use %B for full commit message body, or %s for subject only. %b for body only.
+# Using %s for brevity.
+COMMIT_LOG=$(git log --no-merges --pretty="format:* %s (%h by %an)" "$COMMIT_RANGE" -- "$PLUGIN_PATH")
 
 if [[ -z "$COMMIT_LOG" ]]; then
   echo "No relevant non-merge commits found in range $COMMIT_RANGE for path $PLUGIN_PATH."
-  ANY_COMMIT_LOG=$(git log --pretty="format:* %s (%h)" "$COMMIT_RANGE" -- "$PLUGIN_PATH")
+  # Check for any commits, including merges, if no non-merges were found
+  ANY_COMMIT_LOG=$(git log --pretty="format:* %s (%h by %an)" "$COMMIT_RANGE" -- "$PLUGIN_PATH")
    if [[ -z "$ANY_COMMIT_LOG" ]]; then
-      GENERATED_BODY="No code changes found for this plugin (${PLUGIN_PATH}) since ${PREVIOUS_TAG:-the first release}."
+      GENERATED_CHANGELOG_BODY="No code changes found for this plugin (${PLUGIN_PATH}) since ${PREVIOUS_TAG:-the first release}."
    else
       echo "Only merge commits found affecting the path. Including them."
-      GENERATED_BODY=$(cat <<EOF
+      GENERATED_CHANGELOG_BODY=$(cat <<EOF
 ${CHANGELOG_HEADING}
 
 ${ANY_COMMIT_LOG}
@@ -98,7 +88,7 @@ EOF
 else
   echo "Generated Commit Log:"
   echo "$COMMIT_LOG"
-  GENERATED_BODY=$(cat <<EOF
+  GENERATED_CHANGELOG_BODY=$(cat <<EOF
 ${CHANGELOG_HEADING}
 
 ${COMMIT_LOG}
@@ -106,8 +96,104 @@ EOF
 )
 fi
 
-echo "changelog_body<<EOF" >> "$GITHUB_OUTPUT"
-echo "$GENERATED_BODY" >> "$GITHUB_OUTPUT"
-echo "EOF" >> "$GITHUB_OUTPUT"
+# --- Generate Contributors Section ---
+CONTRIBUTORS_SECTION_CONTENT=""
+declare -a FIRST_TIME_CONTRIBUTORS_ARRAY=()
+declare -a RETURNING_CONTRIBUTORS_ARRAY=()
 
-echo "Changelog generation complete."
+# Get unique author names (respecting .mailmap) for commits in the range affecting the plugin path
+# This list includes authors from both merge and non-merge commits if ANY_COMMIT_LOG was populated.
+# If only non-merge commits, then authors from those.
+# We should base authors on the same set of commits used for the changelog body.
+# If COMMIT_LOG is non-empty, use that as basis. Else if ANY_COMMIT_LOG is non-empty, use that.
+AUTHORS_SOURCE_COMMIT_LOG="$COMMIT_LOG"
+if [[ -z "$COMMIT_LOG" && -n "$ANY_COMMIT_LOG" ]]; then
+    AUTHORS_SOURCE_COMMIT_LOG="$ANY_COMMIT_LOG" # Not the log itself, but indicates we should use broader author search
+fi
+
+if [[ -n "$AUTHORS_SOURCE_COMMIT_LOG" ]]; then # If there's any log (merge or non-merge)
+    # Get authors from all commits (merge or non-merge) in the range for the plugin path
+    AUTHORS_IN_THIS_RELEASE_FOR_PLUGIN_LIST=$(git log --format='%aN' "$COMMIT_RANGE" -- "$PLUGIN_PATH" | sort -u | grep -v "^\s*$") # Get Author Names, sort unique, remove empty lines
+
+    if [[ -n "$AUTHORS_IN_THIS_RELEASE_FOR_PLUGIN_LIST" ]]; then
+        echo "Authors in this release for $PLUGIN_NAME ($PLUGIN_PATH):"
+        echo "$AUTHORS_IN_THIS_RELEASE_FOR_PLUGIN_LIST"
+
+        while IFS= read -r AUTHOR_NAME; do
+            if [[ -z "$AUTHOR_NAME" ]]; then continue; fi
+
+            # Find the SHA of the very first commit by this author to this specific plugin path in the entire repo history
+            FIRST_COMMIT_EVER_BY_AUTHOR_TO_PLUGIN_PATH=$(git log --author="$AUTHOR_NAME" --format='%H' --reverse -- "$PLUGIN_PATH" | head -n 1)
+
+            if [[ -z "$FIRST_COMMIT_EVER_BY_AUTHOR_TO_PLUGIN_PATH" ]]; then
+                echo "::warning:: Could not find any commit for author '$AUTHOR_NAME' on path '$PLUGIN_PATH'. Classifying as returning contributor by default."
+                RETURNING_CONTRIBUTORS_ARRAY+=("$AUTHOR_NAME")
+                continue
+            fi
+
+            # Check if this earliest commit is part of the current release's commit list for the plugin
+            # `git rev-list` lists commit SHAs. We use it to get all SHAs in the range for the path.
+            if git rev-list "$COMMIT_RANGE" -- "$PLUGIN_PATH" | grep -Fxq "$FIRST_COMMIT_EVER_BY_AUTHOR_TO_PLUGIN_PATH"; then
+                FIRST_TIME_CONTRIBUTORS_ARRAY+=("$AUTHOR_NAME")
+            else
+                RETURNING_CONTRIBUTORS_ARRAY+=("$AUTHOR_NAME")
+            fi
+        done <<< "$AUTHORS_IN_THIS_RELEASE_FOR_PLUGIN_LIST"
+    fi
+
+
+    # Construct the shout-out markdown string
+    CONTRIBUTOR_SHOUTOUT_LINES=()
+    if [[ ${#FIRST_TIME_CONTRIBUTORS_ARRAY[@]} -gt 0 || ${#RETURNING_CONTRIBUTORS_ARRAY[@]} -gt 0 ]]; then
+        CONTRIBUTOR_SHOUTOUT_LINES+=("## 💖 Contributors")
+        CONTRIBUTOR_SHOUTOUT_LINES+=("")
+        CONTRIBUTOR_SHOUTOUT_LINES+=("A big thank you to everyone who contributed to **${PLUGIN_NAME} v${CURRENT_VERSION_PART}**!")
+        CONTRIBUTOR_SHOUTOUT_LINES+=("")
+
+        if [[ ${#FIRST_TIME_CONTRIBUTORS_ARRAY[@]} -gt 0 ]]; then
+            CONTRIBUTOR_SHOUTOUT_LINES+=("### 🎉 New Contributors")
+            CONTRIBUTOR_SHOUTOUT_LINES+=("Welcome and thank you to our first-time contributors to this plugin:")
+            mapfile -t SORTED_FIRST_TIME_CONTRIBUTORS < <(printf "%s\n" "${FIRST_TIME_CONTRIBUTORS_ARRAY[@]}" | sort -u)
+            for contributor in "${SORTED_FIRST_TIME_CONTRIBUTORS[@]}"; do
+                CONTRIBUTOR_SHOUTOUT_LINES+=("* @${contributor}") # Using @ for mention style
+            done
+            CONTRIBUTOR_SHOUTOUT_LINES+=("")
+        fi
+
+        if [[ ${#RETURNING_CONTRIBUTORS_ARRAY[@]} -gt 0 ]]; then
+            if [[ ${#FIRST_TIME_CONTRIBUTORS_ARRAY[@]} -gt 0 ]]; then
+                CONTRIBUTOR_SHOUTOUT_LINES+=("### 🚀 Returning Contributors")
+                CONTRIBUTOR_SHOUTOUT_LINES+=("And a huge thanks to our returning contributors:")
+            else # Only returning contributors
+                CONTRIBUTOR_SHOUTOUT_LINES+=("### 🚀 Contributors")
+            fi
+            mapfile -t SORTED_RETURNING_CONTRIBUTORS < <(printf "%s\n" "${RETURNING_CONTRIBUTORS_ARRAY[@]}" | sort -u)
+            for contributor in "${SORTED_RETURNING_CONTRIBUTORS[@]}"; do
+                CONTRIBUTOR_SHOUTOUT_LINES+=("* @${contributor}")
+            done
+            CONTRIBUTOR_SHOUTOUT_LINES+=("")
+        fi
+        CONTRIBUTOR_SHOUTOUT_LINES+=("*We appreciate all your hard work!*")
+    fi
+
+    if [[ ${#CONTRIBUTOR_SHOUTOUT_LINES[@]} -gt 0 ]]; then
+        printf -v CONTRIBUTORS_SECTION_CONTENT '%s\n' "${CONTRIBUTOR_SHOUTOUT_LINES[@]}"
+        # Remove last trailing newline as we'll add specific spacing later
+        CONTRIBUTORS_SECTION_CONTENT="${CONTRIBUTORS_SECTION_CONTENT%\\n}"
+    fi
+fi
+
+# --- Combine Changelog and Contributors Section ---
+FINAL_RELEASE_BODY="$GENERATED_CHANGELOG_BODY"
+
+if [[ -n "$CONTRIBUTORS_SECTION_CONTENT" ]]; then
+    # Add two newlines (one blank line in Markdown) before appending the contributors section
+    FINAL_RELEASE_BODY="${FINAL_RELEASE_BODY}"$'\n\n'"${CONTRIBUTORS_SECTION_CONTENT}"
+fi
+
+# --- Output ---
+echo "changelog_body<<EOFBODY" >> "$GITHUB_OUTPUT"
+echo "$FINAL_RELEASE_BODY" >> "$GITHUB_OUTPUT"
+echo "EOFBODY" >> "$GITHUB_OUTPUT"
+
+echo "Changelog and contributor list generation complete."
