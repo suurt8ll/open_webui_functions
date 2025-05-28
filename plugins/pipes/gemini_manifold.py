@@ -140,14 +140,14 @@ class Pipe:
             ge=0,
             le=24576,
             default=8192,
-            description="""Gemini 2.5 Flash only. Indicates the thinking budget in tokens.
+            description="""Gemini 2.5 only. Indicates the thinking budget in tokens.
             0 means no thinking. Default value is 8192.
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
         )
         SHOW_THINKING_SUMMARY: bool = Field(
             default=True,
             description="""Whether to show the thinking summary in the response.
-            This is only applicable for Gemini 2.5 Flash models.
+            This is only applicable for Gemini 2.5 models.
             Default value is True.""",
         )
         USE_FILES_API: bool = Field(
@@ -207,7 +207,7 @@ class Pipe:
         )
         THINKING_BUDGET: int | None | Literal[""] = Field(
             default=None,
-            description="""Gemini 2.5 Flash only. Indicates the thinking budget in tokens.
+            description="""Gemini 2.5 only. Indicates the thinking budget in tokens.
             0 means no thinking. Default value is None (uses the default from Valves).
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
         )
