@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.19.0rc1
+version: 1.19.0rc2
 requirements: google-genai==1.16.1
 """
 
@@ -25,6 +25,7 @@ requirements: google-genai==1.16.1
 #   - Each user can decide to use their own API key.
 #   - Token usage data
 #   - Code execution tool. (Gemini Manifold Companion >= 1.1.0 required)
+#   - Summary of thinking process (Gemini 2.5 Flash and Pro models only).
 
 # Features that are supported by API but not yet implemented in the manifold:
 #   TODO Audio input support.
@@ -142,6 +143,12 @@ class Pipe:
             description="""Gemini 2.5 Flash only. Indicates the thinking budget in tokens.
             0 means no thinking. Default value is 8192.
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
+        )
+        SHOW_THINKING_SUMMARY: bool = Field(
+            default=True,
+            description="""Whether to show the thinking summary in the response.
+            This is only applicable for Gemini 2.5 Flash models.
+            Default value is True.""",
         )
         USE_FILES_API: bool = Field(
             title="Use Files API",
@@ -320,11 +327,11 @@ class Pipe:
 
         # API does not stream thoughts sadly. See https://github.com/googleapis/python-genai/issues/226#issuecomment-2631657100
         thinking_conf = None
-        if model_name == "gemini-2.5-flash-preview-04-17":
+        if self.is_thinking_model(model_name):
             log.info(f"Model ID '{model_name}' allows adjusting the thinking settings.")
             thinking_conf = types.ThinkingConfig(
                 thinking_budget=valves.THINKING_BUDGET,
-                include_thoughts=None,
+                include_thoughts=valves.SHOW_THINKING_SUMMARY,
             )
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
@@ -1088,20 +1095,11 @@ class Pipe:
             model_name, event_emitter, thinking_budget
         )
 
+        is_think_tag_opened = False
+
         try:
             async for chunk in response_stream:
                 final_response_chunk = chunk
-
-                # Stop the timer when we receive the first chunk
-                await self._cancel_thinking_timer(
-                    thinking_timer_task,
-                    start_time,
-                    event_emitter,
-                    model_name,
-                    thinking_budget,
-                )
-                # Set timer task to None to avoid duplicate cancellation in finally block and subsequent stream chunks.
-                thinking_timer_task = None
 
                 if not (candidate := self._get_first_candidate(chunk.candidates)):
                     log.warning("Stream chunk has no candidates, skipping.")
@@ -1113,9 +1111,33 @@ class Pipe:
                     continue
                 # Process parts and yield text
                 for part in parts:
+                    if not part.thought:
+                        # Stop the timer when we receive the first non-thinking chunk
+                        await self._cancel_thinking_timer(
+                            thinking_timer_task,
+                            start_time,
+                            event_emitter,
+                            model_name,
+                            thinking_budget,
+                        )
+                        # Set timer task to None to avoid duplicate cancellation in finally block and subsequent stream chunks.
+                        thinking_timer_task = None
+
                     # To my knowledge it's not possible for a part to have multiple fields below at the same time.
                     if part.text:
-                        yield part.text
+                        if part.thought:
+                            thinking_text = part.text
+                            if not is_think_tag_opened:
+                                is_think_tag_opened = True
+                                thinking_text = f"<think>{thinking_text}"
+                            yield thinking_text
+                            continue
+
+                        result_text = part.text
+                        if is_think_tag_opened:                            
+                            is_think_tag_opened = False
+                            result_text = f"</think>{result_text}"
+                        yield result_text                          
                     elif part.inline_data:
                         # _process_image_part returns a Markdown URL.
                         yield (
@@ -1310,7 +1332,7 @@ class Pipe:
     def _get_budget_str(self, model_name: str, thinking_budget: int) -> str:
         return (
             f" • {thinking_budget} tokens budget"
-            if model_name == "gemini-2.5-flash-preview-04-17" and thinking_budget > 0
+            if self.is_thinking_model(model_name) and thinking_budget > 0
             else ""
         )
 
@@ -1333,9 +1355,7 @@ class Pipe:
     ) -> tuple[float | None, asyncio.Task[None] | None]:
         # Check if this is a thinking model and exit early if not.
         # Exit also if thinking budget is explicitly set to 0 and Gemini 2.5 Flash is selected.
-        if not self.is_thinking_model(model_name) or (
-            thinking_budget == 0 and model_name == "gemini-2.5-flash-preview-04-17"
-        ):
+        if not self.is_thinking_model(model_name) or thinking_budget == 0:
             return None, None
         # Indicates if emitted status messages should be visible in the front-end.
         hidden = not self.valves.EMIT_STATUS_UPDATES
