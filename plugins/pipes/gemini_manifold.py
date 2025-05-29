@@ -25,7 +25,6 @@ requirements: google-genai==1.16.1
 #   - Each user can decide to use their own API key.
 #   - Token usage data
 #   - Code execution tool. (Gemini Manifold Companion >= 1.1.0 required)
-#   - Summary of thinking process (Gemini 2.5 Flash and Pro models only).
 
 # Features that are supported by API but not yet implemented in the manifold:
 #   TODO Audio input support.
