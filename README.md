@@ -7,7 +7,7 @@ This repository contains a collection of Open WebUI plugins I have personally co
 The plugins are organized by type within the `plugins/` directory:
 
 -   `plugins/pipes/`: Contains pipe plugins that integrate custom models and behaviors.
-    -   `gemini_manifold.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/gemini_manifold_google_genai) | This plugin provides support for Google's Gemini Studio API. See the [Detailed Documentation](docs/plugins/pipes/gemini_manifold.md) for more information.
+    -   `gemini_manifold.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/gemini_manifold_google_genai) | This plugin provides support for Google's Gemini Studio API and Vertex AI. See the [Detailed Documentation](docs/plugins/pipes/gemini_manifold.md) for more information.
     -   `venice_manifold.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/venice_image_generation) | Enables image creation by using any diffusion model offered by Venice.ai API.
 -   `plugins/filters/`: Contains filter plugins that modify request and response data.
     -   `gemini_manifold_companion.py`: A companion filter for "Gemini Manifold google_genai" pipe providing enhanced functionality, such as Google Search grounding. See the [Detailed Documentation](docs/plugins/filters/gemini_manifold_companion.md) for more information.

@@ -1,7 +1,7 @@
 """
 title: Gemini Manifold google_genai
 id: gemini_manifold_google_genai
-description: Manifold function for Gemini Developer API. Supports native image generation, grounding with Google Search and streaming. Uses google-genai.
+description: Manifold function for Gemini Developer API and Vertex AI. Uses the newer google-genai SDK. Aims to support as many features from it as possible.
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
@@ -10,25 +10,29 @@ version: 1.19.0rc1
 requirements: google-genai==1.16.1
 """
 
-# This is a helper function that provides a manifold for Google's Gemini Studio API.
+# This is a helper function that provides a manifold for Google's Gemini Studio API and Vertex AI.
 # Be sure to check out my GitHub repository for more information! Contributions, questions and suggestions are very welcome.
 
 # Supported features:
 #   - Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
-#   - Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 required)
-#   - Display citations in the front-end.
+#   - Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 filter required, see GitHub README)
 #   - Image input
 #   - YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
-#   - Streaming
-#   - Grounding with Google Search (this requires installing "Gemini Manifold Companion" >= 1.2.0 filter, see GitHub README)
+#   - Grounding with Google Search (Gemini Manifold Companion >= 1.2.0 required)
+#   - Display citations in the front-end. (Gemini Manifold Companion >= 1.2.0 required)
 #   - Permissive safety settings (Gemini Manifold Companion >= 1.3.0 required)
 #   - Each user can decide to use their own API key.
 #   - Token usage data
 #   - Code execution tool. (Gemini Manifold Companion >= 1.1.0 required)
+#   - URL context tool (Gemini Manifold Companion >= 1.2.0 required if you want to see citations in the front-end).
+#   - Streaming and non-streaming responses.
 
 # Features that are supported by API but not yet implemented in the manifold:
-#   TODO Audio input support.
-#   TODO Video input support (other than YouTube URLs).
+#   TODO Audio input support
+#   TODO Video input support (other than YouTube URLs)
+#   TODO Google Files API
+#   TODO Native tool calling
+#   TODO Display thinking summary
 
 from google import genai
 from google.genai import types
