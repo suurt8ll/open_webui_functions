@@ -245,7 +245,6 @@ class Filter:
 
             current_content = body["messages"][-1]["content"]
             if isinstance(current_content, list):
-                # Extract text from list (could be empty if only images)
                 text_to_use = ""
                 for item in current_content:
                     if item.get("type") == "text":
@@ -255,24 +254,39 @@ class Filter:
             else:
                 text_to_use = current_content
 
-            cited_text = await self._get_text_w_citation_markers(
+            # Insert citation markers into the response text
+            cited_text = self._get_text_w_citation_markers(
                 stored_metadata,
                 text_to_use,
-                __event_emitter__,
             )
 
             if cited_text:
                 content = body["messages"][-1]["content"]
                 if isinstance(content, list):
-                    # Update existing text element if present
                     for item in content:
                         if item.get("type") == "text":
                             item = cast("TextContent", item)
                             item["text"] = cited_text
-                            break  # Stop after first text element
+                            break
                 else:
                     body["messages"][-1]["content"] = cited_text
 
+            # Emit sources to the front-end.
+            gs_supports = stored_metadata.grounding_supports
+            gs_chunks = stored_metadata.grounding_chunks
+            if gs_supports and gs_chunks:
+                await self._resolve_and_emit_sources(
+                    grounding_chunks=gs_chunks,
+                    supports=gs_supports,
+                    event_emitter=__event_emitter__,
+                )
+            else:
+                log.info(
+                    "Grounding metadata missing supports or chunks (checked in outlet); "
+                    "skipping source resolution and emission."
+                )
+
+            # Emit status event with search queries
             await self._emit_status_event_w_queries(stored_metadata, __event_emitter__)
             delattr(app_state, storage_key)
         else:
@@ -284,14 +298,13 @@ class Filter:
 
     # region 1.1 Add citations
 
-    async def _get_text_w_citation_markers(
+    def _get_text_w_citation_markers(
         self,
         grounding_metadata: types.GroundingMetadata,
         raw_str: str,
-        event_emitter: Callable[["Event"], Awaitable[None]],
     ) -> str | None:
         """
-        Returns the model response with citation markers and launches background URL resolution.
+        Returns the model response with citation markers.
         Thoughts, if present as THOUGHT_START_TAG...THOUGHT_END_TAG at the beginning of raw_str,
         are preserved but excluded from the citation indexing process.
         Everything up to the *last* THOUGHT_END_TAG tag is considered part of the thought.
@@ -308,45 +321,21 @@ class Filter:
 
         log.trace("raw_str:", payload=raw_str, _log_truncation_enabled=False)
 
-        initial_metadatas: list[tuple[int, str]] = []
-        for i, g_c in enumerate(grounding_chunks):
-            web_info = g_c.web
-            if web_info and web_info.uri:
-                initial_metadatas.append((i, web_info.uri))
-
-        source_metadatas_template: list["SourceMetadata"] = [
-            {
-                "source": None,
-                "original_url": None,
-                "supports": [],
-            }
-            for _ in grounding_chunks
-        ]
-
         thought_prefix = ""
         content_for_citation_processing = raw_str
 
         THOUGHT_START_TAG = "<details"
         THOUGHT_END_TAG = "</details>\n"
 
-        # Check if raw_str starts with the thought tag.
         if raw_str.startswith(THOUGHT_START_TAG):
-            # Find the last occurrence of the closing thought tag.
             last_end_thought_tag_idx = raw_str.rfind(THOUGHT_END_TAG)
-
-            # Ensure the found closing tag is actually after the initial opening tag.
-            # (This check is mostly for robustness; if startswith is true, rfind should find it
-            # at or after the start tag's position, unless the string is malformed like "THOUGHT_START_TAGfooTHOUGHT_END_TAGTHOUGHT_START_TAG")
             if (
                 last_end_thought_tag_idx != -1
                 and last_end_thought_tag_idx >= len(THOUGHT_START_TAG) - 1
             ):
-                # A complete thought block is found at the beginning, ending with the last closing tag.
-                # Calculate the offset for the end of the entire thought block.
                 thought_block_end_offset = last_end_thought_tag_idx + len(
                     THOUGHT_END_TAG
                 )
-
                 thought_prefix = raw_str[:thought_block_end_offset]
                 content_for_citation_processing = raw_str[thought_block_end_offset:]
                 log.info(
@@ -354,48 +343,31 @@ class Filter:
                     "Citations will be processed on the content following the last thought block."
                 )
             else:
-                # THOUGHT_START_TAG found at start, but no matching THOUGHT_END_TAG subsequently,
-                # or the closing tag was found in an unexpected position.
-                # This is a malformed case. For safety, process the entire raw_str as content.
                 log.warning(
                     "Detected THOUGHT_START_TAG at the start of raw_str without a subsequent closing THOUGHT_END_TAG "
                     "or a malformed thought block. The entire raw_str will be processed for citations. "
                     "This might lead to incorrect marker placement if thoughts were intended and indices "
                     "are relative to content after thoughts."
                 )
-                # content_for_citation_processing remains raw_str
-                # thought_prefix remains ""
 
-        # This variable will hold the content part after processing (or its fallback).
         processed_content_part_with_markers = content_for_citation_processing
 
-        if (
-            content_for_citation_processing
-        ):  # Only attempt to inject if there's content to process
+        if content_for_citation_processing:
             try:
                 modified_content_bytes = bytearray(
                     content_for_citation_processing.encode("utf-8")
                 )
-                for support in reversed(
-                    supports
-                ):  # Iterate reversed to handle index changes correctly
+                for support in reversed(supports):
                     segment = support.segment
                     indices = support.grounding_chunk_indices
-
                     if not (
                         indices is not None
                         and segment
-                        and segment.end_index is not None  # segment.end_index can be 0
+                        and segment.end_index is not None
                     ):
                         log.debug(f"Skipping support due to missing data: {support}")
                         continue
-
-                    end_pos = (
-                        segment.end_index
-                    )  # This end_pos is relative to content_for_citation_processing
-
-                    # Validate end_pos: it's an exclusive end index for a byte slice,
-                    # so it can range from 0 to len(modified_content_bytes).
+                    end_pos = segment.end_index
                     if not (0 <= end_pos <= len(modified_content_bytes)):
                         log.warning(
                             f"Support segment end_index ({end_pos}) is out of bounds for the processable content "
@@ -403,12 +375,9 @@ class Filter:
                             f"Content (first 50 chars): '{content_for_citation_processing[:50]}...'. Skipping this support. Support: {support}"
                         )
                         continue
-
                     citation_markers = "".join(f"[{index + 1}]" for index in indices)
                     encoded_citation_markers = citation_markers.encode("utf-8")
-
                     modified_content_bytes[end_pos:end_pos] = encoded_citation_markers
-
                 processed_content_part_with_markers = modified_content_bytes.decode(
                     "utf-8"
                 )
@@ -417,35 +386,16 @@ class Filter:
                     f"Error injecting citation markers into content: {e}. "
                     f"Using content part (after potential thought stripping) without new markers."
                 )
-                # Fallback: processed_content_part_with_markers is already content_for_citation_processing
-                # No change needed here as it was initialized to content_for_citation_processing
         else:
-            # This branch is hit if content_for_citation_processing is empty.
-            # This could be because raw_str was initially empty, or raw_str consisted only of thoughts.
-            if (
-                raw_str and not content_for_citation_processing
-            ):  # raw_str was not empty, but became empty (all thoughts)
+            if raw_str and not content_for_citation_processing:
                 log.info(
                     "Content for citation processing is empty (e.g., raw_str contained only thoughts). "
                     "No citation markers will be injected."
                 )
-            elif not raw_str:  # raw_str was initially empty
+            elif not raw_str:
                 log.warning("Raw string is empty, cannot inject citation markers.")
-            # In both sub-cases, processed_content_part_with_markers is already "" (empty string)
 
-        # Combine the thought prefix (if any) with the (potentially modified) content part.
         final_result_str = thought_prefix + processed_content_part_with_markers
-
-        if initial_metadatas:
-            await self._resolve_and_emit_sources(
-                initial_metadatas=initial_metadatas,
-                source_metadatas_template=source_metadatas_template,
-                supports=supports,
-                event_emitter=event_emitter,
-            )
-        else:
-            log.info("No source URIs found, skipping background URL resolution task.")
-
         return final_result_str
 
     async def _resolve_url(
@@ -457,10 +407,8 @@ class Filter:
         base_delay: float = 0.5,
     ) -> str:
         """Resolves a given URL using the provided aiohttp session, with multiple retries on failure."""
-
         if not url:
             return ""
-
         for attempt in range(max_retries + 1):
             try:
                 async with session.get(
@@ -488,12 +436,11 @@ class Filter:
             except Exception as e:
                 log.error(f"Unexpected error resolving URL '{url}': {e}")
                 return url
-        return url  # Shouldn't reach here if loop is correct
+        return url
 
     async def _resolve_and_emit_sources(
         self,
-        initial_metadatas: list[tuple[int, str]],
-        source_metadatas_template: list["SourceMetadata"],
+        grounding_chunks: list[types.GroundingChunk],
         supports: list[types.GroundingSupport],
         event_emitter: Callable[["Event"], Awaitable[None]],
     ):
@@ -501,6 +448,30 @@ class Filter:
         Resolves URLs in the background and emits a chat completion event
         containing only the source information.
         """
+        # Create initial_metadatas from grounding_chunks
+        initial_metadatas: list[tuple[int, str]] = []
+        for i, g_c in enumerate(grounding_chunks):
+            web_info = g_c.web
+            if web_info and web_info.uri:
+                initial_metadatas.append((i, web_info.uri))
+
+        if not initial_metadatas:
+            log.info(
+                "No source URIs found in grounding_chunks (checked in _resolve_and_emit_sources), "
+                "skipping background URL resolution task."
+            )
+            return
+
+        # Create source_metadatas_template based on grounding_chunks length
+        source_metadatas_template: list["SourceMetadata"] = [
+            {
+                "source": None,
+                "original_url": None,
+                "supports": [],
+            }
+            for _ in grounding_chunks
+        ]
+
         resolved_uris_map = {}
         try:
             urls_to_resolve = [url for _, url in initial_metadatas]
@@ -516,14 +487,11 @@ class Filter:
 
         except Exception as e:
             log.error(f"Error during URL resolution: {e}")
-            # Populate map with original URLs as fallback if resolution fails
             resolved_uris_map = {url: url for _, url in initial_metadatas}
 
-        # Populate a *copy* of the template
         populated_metadatas = [m.copy() for m in source_metadatas_template]
 
         for chunk_index, original_uri in initial_metadatas:
-            # Use resolved URI if available, otherwise fallback to original
             resolved_uri = resolved_uris_map.get(original_uri, original_uri)
             if 0 <= chunk_index < len(populated_metadatas):
                 populated_metadatas[chunk_index]["original_url"] = original_uri
@@ -533,13 +501,11 @@ class Filter:
                     f"Chunk index {chunk_index} out of bounds when populating resolved URLs."
                 )
 
-        # Add support metadata back
         for support in supports:
             segment = support.segment
             indices = support.grounding_chunk_indices
             if not (indices is not None and segment and segment.end_index is not None):
                 continue
-
             for index in indices:
                 if 0 <= index < len(populated_metadatas):
                     populated_metadatas[index]["supports"].append(support.model_dump())  # type: ignore
@@ -548,15 +514,12 @@ class Filter:
                         f"Invalid grounding chunk index {index} found in support during background processing."
                     )
 
-        # Filter out metadata entries that didn't have an original URL
-        # (Shouldn't happen with the fallback logic, but keep as safeguard)
         valid_source_metadatas = [
             m for m in populated_metadatas if m.get("original_url") is not None
         ]
 
         sources_list: list["Source"] = []
         if valid_source_metadatas:
-            # Ensure document list matches metadata length
             doc_list = [""] * len(valid_source_metadatas)
             sources_list.append(
                 {
@@ -566,7 +529,6 @@ class Filter:
                 }
             )
 
-        # Prepare and emit the sources-only event
         event: "ChatCompletionEvent" = {
             "type": "chat:completion",
             "data": {"sources": sources_list},
@@ -586,12 +548,12 @@ class Filter:
         """
         if not grounding_metadata.web_search_queries:
             log.warning("Grounding metadata does not contain any search queries.")
-            return None
+            return
 
         search_queries = grounding_metadata.web_search_queries
         if not search_queries:
             log.debug("web_search_queries list is empty.")
-            return None
+            return
         google_search_urls = [
             f"https://www.google.com/search?q={query}" for query in search_queries
         ]
