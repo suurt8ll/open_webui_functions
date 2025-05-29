@@ -1019,7 +1019,16 @@ class Pipe:
             elif match.group(5):  # It's a YouTube URL
                 youtube_url = match.group(5)
                 log.info(f"Found YouTube URL: {youtube_url}")
-                parts.append(types.Part(file_data=types.FileData(file_uri=youtube_url)))
+                if (
+                    self.valves.USE_VERTEX_AI
+                ):  # Vertex AI expects from_uri part instead of files
+                    parts.append(
+                        types.Part.from_uri(file_uri=youtube_url, mime_type="video/mp4")
+                    )
+                else:
+                    parts.append(
+                        types.Part(file_data=types.FileData(file_uri=youtube_url))
+                    )
 
             last_pos = match.end()
 
