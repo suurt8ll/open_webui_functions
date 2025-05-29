@@ -14,6 +14,7 @@ requirements: google-genai==1.16.1
 # Be sure to check out my GitHub repository for more information! Contributions, questions and suggestions are very welcome.
 
 # Supported features:
+#   - Display thinking summary
 #   - Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
 #   - Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 filter required, see GitHub README)
 #   - Image input
@@ -32,7 +33,6 @@ requirements: google-genai==1.16.1
 #   TODO Video input support (other than YouTube URLs)
 #   TODO Google Files API
 #   TODO Native tool calling
-#   TODO Display thinking summary
 
 from google import genai
 from google.genai import types

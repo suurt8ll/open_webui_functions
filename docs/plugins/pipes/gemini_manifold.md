@@ -12,6 +12,7 @@ Here's a breakdown of implemented and planned features for the Gemini Manifold p
 
 **Implemented Features:**
 
+-   [x] Display thinking summary
 -   [x] Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
 -   [x] Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 filter required, see see [it's doc](../filters/gemini_manifold_companion.md))
 -   [x] Image input
@@ -31,7 +32,6 @@ Here's a breakdown of implemented and planned features for the Gemini Manifold p
 -   [ ] Video input support (other than YouTube URLs)
 -   [ ] Google Files API
 -   [ ] Native tool calling
--   [ ] Display thinking summary
 
 ## Installation
 
