@@ -24,12 +24,10 @@ from fastapi import Request
 from fastapi.datastructures import State
 from loguru import logger
 from pydantic import BaseModel, Field
+import pydantic_core
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal, TYPE_CHECKING, cast
 
-import pydantic_core
-
-from open_webui.utils.logger import stdout_format
 from open_webui.models.functions import Functions
 
 if TYPE_CHECKING:
@@ -39,6 +37,8 @@ if TYPE_CHECKING:
 
 # According to https://ai.google.dev/gemini-api/docs/models
 ALLOWED_GROUNDING_MODELS = {
+    "gemini-2.5-flash-preview-05-20",
+    "gemini-2.5-pro-preview-05-06",
     "gemini-2.5-flash-preview-04-17",
     "gemini-2.5-pro-preview-03-25",
     "gemini-2.5-pro-exp-03-25",
@@ -53,6 +53,8 @@ ALLOWED_GROUNDING_MODELS = {
     "gemini-1.0-pro",
 }
 ALLOWED_CODE_EXECUTION_MODELS = {
+    "gemini-2.5-flash-preview-05-20",
+    "gemini-2.5-pro-preview-05-06",
     "gemini-2.5-flash-preview-04-17",
     "gemini-2.5-pro-preview-03-25",
     "gemini-2.5-pro-exp-03-25",
@@ -224,7 +226,6 @@ class Filter:
         __request__: Request,
         __metadata__: dict[str, Any],
         __event_emitter__: Callable[["Event"], Awaitable[None]],
-        **kwargs,
     ) -> "Body":
         """Modifies the complete response payload after it's received from the LLM. Operates on the final `body` dictionary."""
 
@@ -259,7 +260,6 @@ class Filter:
                 text_to_use,
                 __event_emitter__,
             )
-            log.trace(f"Text with citations:\n{cited_text}")
 
             if cited_text:
                 content = body["messages"][-1]["content"]
@@ -292,16 +292,21 @@ class Filter:
     ) -> str | None:
         """
         Returns the model response with citation markers and launches background URL resolution.
+        Thoughts, if present as THOUGHT_START_TAG...THOUGHT_END_TAG at the beginning of raw_str,
+        are preserved but excluded from the citation indexing process.
+        Everything up to the *last* THOUGHT_END_TAG tag is considered part of the thought.
         """
 
         supports = grounding_metadata.grounding_supports
         grounding_chunks = grounding_metadata.grounding_chunks
         if not supports or not grounding_chunks:
             log.info(
-                "Grounding metadata missing supports or chunks, can't insert citation markers."
+                "Grounding metadata missing supports or chunks, can't insert citation markers. "
                 "Response was probably just not grounded."
             )
-            return
+            return None
+
+        log.trace("raw_str:", payload=raw_str, _log_truncation_enabled=False)
 
         initial_metadatas: list[tuple[int, str]] = []
         for i, g_c in enumerate(grounding_chunks):
@@ -318,38 +323,118 @@ class Filter:
             for _ in grounding_chunks
         ]
 
-        # Ensure raw_str is not empty before processing
-        final_content_with_markers = raw_str
-        if raw_str:
+        thought_prefix = ""
+        content_for_citation_processing = raw_str
+
+        THOUGHT_START_TAG = "<details"
+        THOUGHT_END_TAG = "</details>\n"
+
+        # Check if raw_str starts with the thought tag.
+        if raw_str.startswith(THOUGHT_START_TAG):
+            # Find the last occurrence of the closing thought tag.
+            last_end_thought_tag_idx = raw_str.rfind(THOUGHT_END_TAG)
+
+            # Ensure the found closing tag is actually after the initial opening tag.
+            # (This check is mostly for robustness; if startswith is true, rfind should find it
+            # at or after the start tag's position, unless the string is malformed like "THOUGHT_START_TAGfooTHOUGHT_END_TAGTHOUGHT_START_TAG")
+            if (
+                last_end_thought_tag_idx != -1
+                and last_end_thought_tag_idx >= len(THOUGHT_START_TAG) - 1
+            ):
+                # A complete thought block is found at the beginning, ending with the last closing tag.
+                # Calculate the offset for the end of the entire thought block.
+                thought_block_end_offset = last_end_thought_tag_idx + len(
+                    THOUGHT_END_TAG
+                )
+
+                thought_prefix = raw_str[:thought_block_end_offset]
+                content_for_citation_processing = raw_str[thought_block_end_offset:]
+                log.info(
+                    "Model thoughts detected at the beginning of the response. "
+                    "Citations will be processed on the content following the last thought block."
+                )
+            else:
+                # THOUGHT_START_TAG found at start, but no matching THOUGHT_END_TAG subsequently,
+                # or the closing tag was found in an unexpected position.
+                # This is a malformed case. For safety, process the entire raw_str as content.
+                log.warning(
+                    "Detected THOUGHT_START_TAG at the start of raw_str without a subsequent closing THOUGHT_END_TAG "
+                    "or a malformed thought block. The entire raw_str will be processed for citations. "
+                    "This might lead to incorrect marker placement if thoughts were intended and indices "
+                    "are relative to content after thoughts."
+                )
+                # content_for_citation_processing remains raw_str
+                # thought_prefix remains ""
+
+        # This variable will hold the content part after processing (or its fallback).
+        processed_content_part_with_markers = content_for_citation_processing
+
+        if (
+            content_for_citation_processing
+        ):  # Only attempt to inject if there's content to process
             try:
-                modified_content_bytes = bytearray(raw_str.encode("utf-8"))
-                for support in reversed(supports):
+                modified_content_bytes = bytearray(
+                    content_for_citation_processing.encode("utf-8")
+                )
+                for support in reversed(
+                    supports
+                ):  # Iterate reversed to handle index changes correctly
                     segment = support.segment
                     indices = support.grounding_chunk_indices
 
                     if not (
                         indices is not None
                         and segment
-                        and segment.end_index is not None
+                        and segment.end_index is not None  # segment.end_index can be 0
                     ):
                         log.debug(f"Skipping support due to missing data: {support}")
                         continue
 
-                    end_pos = segment.end_index
+                    end_pos = (
+                        segment.end_index
+                    )  # This end_pos is relative to content_for_citation_processing
+
+                    # Validate end_pos: it's an exclusive end index for a byte slice,
+                    # so it can range from 0 to len(modified_content_bytes).
+                    if not (0 <= end_pos <= len(modified_content_bytes)):
+                        log.warning(
+                            f"Support segment end_index ({end_pos}) is out of bounds for the processable content "
+                            f"(length {len(modified_content_bytes)} bytes after potential thought stripping). "
+                            f"Content (first 50 chars): '{content_for_citation_processing[:50]}...'. Skipping this support. Support: {support}"
+                        )
+                        continue
+
                     citation_markers = "".join(f"[{index + 1}]" for index in indices)
                     encoded_citation_markers = citation_markers.encode("utf-8")
 
                     modified_content_bytes[end_pos:end_pos] = encoded_citation_markers
 
-                final_content_with_markers = modified_content_bytes.decode("utf-8")
+                processed_content_part_with_markers = modified_content_bytes.decode(
+                    "utf-8"
+                )
             except Exception as e:
                 log.error(
-                    f"Error injecting citation markers: {e}. Emitting original text."
+                    f"Error injecting citation markers into content: {e}. "
+                    f"Using content part (after potential thought stripping) without new markers."
                 )
-                final_content_with_markers = raw_str  # Fallback to original text
-
+                # Fallback: processed_content_part_with_markers is already content_for_citation_processing
+                # No change needed here as it was initialized to content_for_citation_processing
         else:
-            log.warning("Raw string is empty, cannot inject citation markers.")
+            # This branch is hit if content_for_citation_processing is empty.
+            # This could be because raw_str was initially empty, or raw_str consisted only of thoughts.
+            if (
+                raw_str and not content_for_citation_processing
+            ):  # raw_str was not empty, but became empty (all thoughts)
+                log.info(
+                    "Content for citation processing is empty (e.g., raw_str contained only thoughts). "
+                    "No citation markers will be injected."
+                )
+            elif not raw_str:  # raw_str was initially empty
+                log.warning("Raw string is empty, cannot inject citation markers.")
+            # In both sub-cases, processed_content_part_with_markers is already "" (empty string)
+
+        # Combine the thought prefix (if any) with the (potentially modified) content part.
+        final_result_str = thought_prefix + processed_content_part_with_markers
 
         if initial_metadatas:
             await self._resolve_and_emit_sources(
@@ -361,7 +446,7 @@ class Filter:
         else:
             log.info("No source URIs found, skipping background URL resolution task.")
 
-        return final_content_with_markers
+        return final_result_str
 
     async def _resolve_url(
         self,
