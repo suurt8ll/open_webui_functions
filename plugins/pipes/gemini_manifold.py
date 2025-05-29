@@ -358,15 +358,21 @@ class Pipe:
                 "gemini-2.5-pro-preview-05-06",
                 "gemini-2.5-flash-preview-05-20",
                 "gemini-2.0-flash",
+                "gemini-2.0-flash-001",
                 "gemini-2.0-flash-live-001",
             ]
             if model_name in compatible_models_for_url_context:
-                log.info(
-                    f"Model {model_name} is compatible with URL context tool. Enabling."
-                )
-                gen_content_conf.tools.append(
-                    types.Tool(url_context=types.UrlContext())
-                )
+                if client.vertexai:
+                    log.warning(
+                        "URL context tool is enabled, but Vertex AI does not support it. Skipping."
+                    )
+                else:
+                    log.info(
+                        f"Model {model_name} is compatible with URL context tool. Enabling."
+                    )
+                    gen_content_conf.tools.append(
+                        types.Tool(url_context=types.UrlContext())
+                    )
             else:
                 log.warning(
                     f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
