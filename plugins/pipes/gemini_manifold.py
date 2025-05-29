@@ -200,6 +200,12 @@ class Pipe:
             0 means no thinking. Default value is None (uses the default from Valves).
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
         )
+        SHOW_THINKING_SUMMARY: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Whether to show the thinking summary in the response.
+            This is only applicable for Gemini 2.5 models.
+            Default value is None.""",
+        )
         ENABLE_URL_CONTEXT_TOOL: bool = Field(
             default=False,
             description="Enable the URL context tool to allow the model to fetch and use content from provided URLs. This tool is only compatible with specific models.",
