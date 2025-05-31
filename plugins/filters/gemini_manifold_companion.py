@@ -7,6 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 1.5.0
+requirements: google-genai==1.16.1
 """
 
 # This filter can detect that a feature like web search or code execution is enabled in the front-end,
