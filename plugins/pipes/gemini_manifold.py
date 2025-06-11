@@ -260,7 +260,7 @@ class Pipe:
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __metadata__: dict[str, Any],
-    ) -> AsyncGenerator | str | None:
+    ) -> AsyncGenerator[dict, None] | str:
         self._add_log_handler(self.valves.LOG_LEVEL)
 
         # Apply settings from the user
@@ -1084,18 +1084,17 @@ class Pipe:
     # endregion 1.3 Open WebUI's body.messages -> list[genai.types.Content] conversion
 
     # region 1.4 Model response streaming
-    async def _process_parts_to_text(
+    async def _process_parts_to_structured_stream(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
         __request__: Request,
         gen_content_args: dict,
         user_id: str,
-    ) -> AsyncGenerator[tuple[str, int, types.GenerateContentResponse | None], None]:
+    ) -> AsyncGenerator[tuple[dict, types.GenerateContentResponse | None], None]:
         """
-        Processes a stream of Gemini responses, yielding text chunks, a substitution
-        count, and the raw chunk.
+        Processes a stream of Gemini responses, yielding structured dictionaries
+        in the OpenAI-compatible format and the raw chunk.
         """
-        is_think_tag_opened = False
         try:
             async for chunk in response_stream:
                 if not (candidate := self._get_first_candidate(chunk.candidates)):
@@ -1106,43 +1105,46 @@ class Pipe:
                     continue
 
                 for part in parts:
-                    is_current_part_a_thought = part.text and part.thought
-                    if is_think_tag_opened and not is_current_part_a_thought:
-                        # No substitutions for our manually yielded tags.
-                        yield "</think>", 0, chunk
-                        is_think_tag_opened = False
-
+                    # This is the new core logic. We match the part type and yield
+                    # a dictionary with the appropriate key ("reasoning" or "content").
+                    payload = None
                     match part:
                         case types.Part(text=str(text), thought=True):
-                            if not is_think_tag_opened:
-                                yield "<think>", 0, chunk
-                                is_think_tag_opened = True
-
-                            modified_text, count = self._disable_special_tags(text)
-                            yield modified_text, count, chunk
+                            # If it's a thought, we use the "reasoning" key.
+                            payload = {"reasoning": text}
 
                         case types.Part(text=str(text)):
-                            modified_text, count = self._disable_special_tags(text)
-                            yield modified_text, count, chunk
+                            # For regular text, we use the "content" key.
+                            payload = {"content": text}
 
                         case types.Part(inline_data=data):
                             processed_text = self._process_image_part(
                                 data, gen_content_args, user_id, __request__
                             )
-                            yield processed_text or "", 0, chunk
+                            if processed_text:
+                                payload = {"content": processed_text}
 
                         case types.Part(executable_code=code):
                             processed_text = self._process_executable_code_part(code)
-                            yield processed_text or "", 0, chunk
+                            if processed_text:
+                                payload = {"content": processed_text}
 
                         case types.Part(code_execution_result=result):
                             processed_text = self._process_code_execution_result_part(
                                 result
                             )
-                            yield processed_text or "", 0, chunk
-        finally:
-            if is_think_tag_opened:
-                yield "</think>", 0, None
+                            if processed_text:
+                                payload = {"content": processed_text}
+
+                    if payload:
+                        # We wrap the payload in the required OpenAI stream format.
+                        # This is the structure the Open WebUI backend expects.
+                        structured_chunk = {"choices": [{"delta": payload}]}
+                        yield structured_chunk, chunk
+
+        except Exception:
+            # Re-raise the exception to be handled by the outer generator.
+            raise
 
     async def _stream_response_generator(
         self,
@@ -1152,44 +1154,32 @@ class Pipe:
         event_emitter: Callable[["Event"], Awaitable[None]],
         metadata: dict[str, Any],
         user_id: str,
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[dict, None]:
         """
-        Yields text chunks from the stream, counts tag substitutions for a final
-        toast notification, and spawns metadata processing task on completion.
+        Yields structured dictionary chunks from the stream and handles post-processing.
         """
         final_response_chunk: types.GenerateContentResponse | None = None
         error_occurred = False
-        total_substitutions = 0
 
         try:
-            part_processor = self._process_parts_to_text(
+            # The part processor now yields structured dictionaries directly.
+            part_processor = self._process_parts_to_structured_stream(
                 response_stream, __request__, gen_content_args, user_id
             )
-            # The loop now unpacks a 3-tuple.
-            async for text_chunk, count, raw_chunk in part_processor:
-                if count > 0:
-                    total_substitutions += count
-                    log.debug(
-                        f"Disabled {count} special tag(s) in chunk: {repr(text_chunk)}"
-                    )
-
+            async for structured_chunk, raw_chunk in part_processor:
                 if raw_chunk:
                     final_response_chunk = raw_chunk
-                yield text_chunk
+                # Yield the structured chunk directly to the Open WebUI backend.
+                yield structured_chunk
 
         except Exception as e:
             error_occurred = True
             error_msg = f"Stream ended with error: {e}"
+            # FIXME: raise the error instead?
             await self._emit_error(error_msg, event_emitter)
         finally:
-            # Emit the summary toast only if substitutions were made and no errors occurred.
-            if total_substitutions > 0 and not error_occurred:
-                plural_s = "s" if total_substitutions > 1 else ""
-                toast_msg = (
-                    f"For clarity, {total_substitutions} special tag{plural_s} "
-                    "were disabled in the response by injecting a zero-width space (ZWS)."
-                )
-                await self._emit_toast(toast_msg, event_emitter, "info")
+            # The logic for disabling tags and counting substitutions is no longer needed.
+            # We can remove the toast notification about it.
 
             if not error_occurred:
                 log.info("Stream finished successfully!")
@@ -1209,38 +1199,6 @@ class Pipe:
                 log.exception(error_msg)
 
             log.debug("AsyncGenerator finished.")
-
-    @staticmethod
-    def _disable_special_tags(text: str) -> tuple[str, int]:
-        """
-        Finds special tags in a text chunk and inserts a Zero-Width Space (ZWS)
-        to prevent them from being parsed by the Open WebUI backend.
-        """
-        if not text:
-            return "", 0
-
-        ZWS = "\u200b"
-        # The list of special start tags recognized by the Open WebUI backend.
-        # We will "disable" these to prevent them from being parsed.
-        SPECIAL_TAGS_TO_DISABLE = [
-            "think",
-            "thinking",
-            "reason",
-            "reasoning",
-            "thought",
-            "Thought",
-            "|begin_of_thought|",
-            "code_interpreter",
-            "|begin_of_solution|",
-        ]
-        # Pre-compile the regex for efficiency. This joins all tags with '|' (OR),
-        # properly escapes them, and creates a capture group for the tag name.
-        TAG_REGEX = re.compile(
-            r"<(/?" + "|".join(re.escape(tag) for tag in SPECIAL_TAGS_TO_DISABLE) + r")"
-        )
-        # Use re.subn to get both the modified string and the count of substitutions.
-        modified_text, num_substitutions = TAG_REGEX.subn(rf"<{ZWS}\1", text)
-        return modified_text, num_substitutions
 
     def _process_image_part(
         self, inline_data, gen_content_args: dict, user_id: str, request: Request
