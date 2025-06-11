@@ -76,6 +76,21 @@ if TYPE_CHECKING:
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
 
+# These tags will be "disabled" in the response, meaning that they will not be parsed by the backend.
+SPECIAL_TAGS_TO_DISABLE = [
+    "details",
+    "think",
+    "thinking",
+    "reason",
+    "reasoning",
+    "thought",
+    "Thought",
+    "|begin_of_thought|",
+    "code_interpreter",
+    "|begin_of_solution|",
+]
+ZWS = "\u200b"
+
 
 class GenaiApiError(Exception):
     """Custom exception for errors during Genai API interactions."""
@@ -987,7 +1002,42 @@ class Pipe:
             log.exception(f"Error processing image URL: {image_url[:64]}[...]")
             return None
 
+    @staticmethod
+    def _enable_special_tags(text: str) -> str:
+        """
+        Reverses the action of _disable_special_tags by removing the ZWS
+        from special tags. This is used to clean up history messages before
+        sending them to the model, so it can understand the context correctly.
+        """
+        if not text:
+            return ""
+
+        # The regex finds '<ZWS' followed by an optional '/' and then one of the special tags.
+        # The inner parentheses group the tags, so the optional '/' applies to all of them.
+        REVERSE_TAG_REGEX = re.compile(
+            r"<"
+            + ZWS
+            + r"(/?"
+            + "("
+            + "|".join(re.escape(tag) for tag in SPECIAL_TAGS_TO_DISABLE)
+            + ")"
+            + r")"
+        )
+        # The substitution restores the original tag, e.g., '<ZWS/think' becomes '</think'.
+        restored_text, count = REVERSE_TAG_REGEX.subn(r"<\1", text)
+        if count > 0:
+            log.debug(f"Re-enabled {count} special tag(s) for model context.")
+
+        return restored_text
+
     def _genai_parts_from_text(self, text: str) -> list[types.Part]:
+        if not text:
+            return []
+
+        # Restore special tags that were disabled for front-end safety.
+        # This ensures the model receives the original, intended text.
+        text = self._enable_special_tags(text)
+
         parts: list[types.Part] = []
         last_pos = 0
 
@@ -1220,22 +1270,16 @@ class Pipe:
         if not text:
             return "", 0
 
-        ZWS = "\u200b"
-        SPECIAL_TAGS_TO_DISABLE = [
-            "details",
-            "think",
-            "thinking",
-            "reason",
-            "reasoning",
-            "thought",
-            "Thought",
-            "|begin_of_thought|",
-            "code_interpreter",
-            "|begin_of_solution|",
-        ]
+        # The regex finds '<' followed by an optional '/' and then one of the special tags.
+        # The inner parentheses group the tags, so the optional '/' applies to all of them.
         TAG_REGEX = re.compile(
-            r"<(/?" + "|".join(re.escape(tag) for tag in SPECIAL_TAGS_TO_DISABLE) + r")"
+            r"<(/?"
+            + "("
+            + "|".join(re.escape(tag) for tag in SPECIAL_TAGS_TO_DISABLE)
+            + ")"
+            + r")"
         )
+        # The substitution injects a ZWS, e.g., '</think>' becomes '<ZWS/think'.
         modified_text, num_substitutions = TAG_REGEX.subn(rf"<{ZWS}\1", text)
         return modified_text, num_substitutions
 
