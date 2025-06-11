@@ -1236,7 +1236,7 @@ class Pipe:
         # Pre-compile the regex for efficiency. This joins all tags with '|' (OR),
         # properly escapes them, and creates a capture group for the tag name.
         TAG_REGEX = re.compile(
-            r"<(" + "|".join(re.escape(tag) for tag in SPECIAL_TAGS_TO_DISABLE) + r")"
+            r"<(/?" + "|".join(re.escape(tag) for tag in SPECIAL_TAGS_TO_DISABLE) + r")"
         )
         # Use re.subn to get both the modified string and the count of substitutions.
         modified_text, num_substitutions = TAG_REGEX.subn(rf"<{ZWS}\1", text)
