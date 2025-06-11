@@ -1126,10 +1126,12 @@ class Pipe:
                             if not is_think_tag_opened:
                                 yield "<think>", chunk
                                 is_think_tag_opened = True
-                            yield text, chunk
+                            # Apply the ZWS trick to the model's thought content
+                            yield self._disable_special_tags(text), chunk
 
                         case types.Part(text=str(text)):
-                            yield text, chunk
+                            # Apply the ZWS trick to the model's regular content
+                            yield self._disable_special_tags(text), chunk
 
                         case types.Part(inline_data=data):
                             processed_text = self._process_image_part(
@@ -1148,7 +1150,7 @@ class Pipe:
                             yield processed_text or "", chunk
         finally:
             # This 'finally' block is crucial. It ensures that if the stream
-            # ends while a <​think> tag is open, we close it properly.
+            # ends while a <think> tag is open, we close it properly.
             if is_think_tag_opened:
                 # We don't have a final "chunk" here, but we must close the tag.
                 # The final_response_chunk will be tracked by the calling method.
@@ -1205,6 +1207,46 @@ class Pipe:
                 log.exception(error_msg)
 
             log.debug("AsyncGenerator finished.")
+
+    def _disable_special_tags(self, text: str) -> str:
+        """
+        Finds special tags in a text chunk and inserts a Zero-Width Space (ZWS)
+        to prevent them from being parsed by the Open WebUI backend.
+        """
+        ZWS = "\u200b"
+        # The list of special start tags recognized by the Open WebUI backend.
+        # We will "disable" these to prevent them from being parsed.
+        SPECIAL_TAGS_TO_DISABLE = [
+            "think",
+            "thinking",
+            "reason",
+            "reasoning",
+            "thought",
+            "Thought",
+            "|begin_of_thought|",
+            "code_interpreter",
+            "|begin_of_solution|",
+        ]
+
+        # Pre-compile the regex for efficiency. This joins all tags with '|' (OR),
+        # properly escapes them, and creates a capture group for the tag name.
+        TAG_REGEX = re.compile(
+            r"<(" + "|".join(re.escape(tag) for tag in SPECIAL_TAGS_TO_DISABLE) + r")"
+        )
+
+        # Use re.subn to get both the modified string and the count of substitutions.
+        modified_text, num_substitutions = TAG_REGEX.subn(rf"<{ZWS}\1", text)
+
+        if num_substitutions > 0:
+            log.debug(
+                f"Found and disabled {num_substitutions} special tag(s).",
+                payload={
+                    "original": repr(text),
+                    "modified": repr(modified_text),
+                },
+            )
+
+        return modified_text
 
     def _process_image_part(
         self, inline_data, gen_content_args: dict, user_id: str, request: Request
@@ -1563,6 +1605,7 @@ class Pipe:
         event_emitter: Callable[["Event"], Awaitable[None]],
         toastType: Literal["info", "success", "warning", "error"] = "info",
     ) -> None:
+        """Emits a toast notification to the front-end."""
         # TODO: Use this method in more places, even for info toasts.
         event: NotificationEvent = {
             "type": "notification",
