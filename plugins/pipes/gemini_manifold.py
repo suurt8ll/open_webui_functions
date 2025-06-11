@@ -419,7 +419,6 @@ class Pipe:
             return self._stream_response_generator(
                 response_stream,
                 __request__,
-                valves,
                 gen_content_args,
                 __event_emitter__,
                 __metadata__,
@@ -1085,11 +1084,80 @@ class Pipe:
     # endregion 1.3 Open WebUI's body.messages -> list[genai.types.Content] conversion
 
     # region 1.4 Model response streaming
+    async def _process_parts_to_text(
+        self,
+        response_stream: AsyncIterator[types.GenerateContentResponse],
+        __request__: Request,
+        gen_content_args: dict,
+        user_id: str,
+    ) -> AsyncGenerator[tuple[str, types.GenerateContentResponse | None], None]:
+        """
+        Processes a stream of Gemini responses, yielding text chunks and the final response.
+
+        This is a helper generator that encapsulates the logic for handling different
+        content parts and managing state (like the <think> tags).
+
+        Yields:
+            A tuple containing the processed text chunk (str) and the raw chunk
+            (types.GenerateContentResponse) it came from. The raw chunk is used
+            to track the final response for metadata processing.
+        """
+        is_think_tag_opened = False
+        try:
+            async for chunk in response_stream:
+                if not (candidate := self._get_first_candidate(chunk.candidates)):
+                    log.warning("Stream chunk has no candidates, skipping.")
+                    continue
+                if not (parts := candidate.content and candidate.content.parts):
+                    log.warning("Candidate has no content parts, skipping.")
+                    continue
+
+                for part in parts:
+                    # Determine if we need to close an open <​think> tag before processing this part.
+                    # A thought block ends when a non-thought part is encountered.
+                    is_current_part_a_thought = part.text and part.thought
+                    if is_think_tag_opened and not is_current_part_a_thought:
+                        yield "</think>", chunk
+                        is_think_tag_opened = False
+
+                    # Use structural pattern matching for clarity and extensibility.
+                    match part:
+                        case types.Part(text=str(text), thought=True):
+                            if not is_think_tag_opened:
+                                yield "<think>", chunk
+                                is_think_tag_opened = True
+                            yield text, chunk
+
+                        case types.Part(text=str(text)):
+                            yield text, chunk
+
+                        case types.Part(inline_data=data):
+                            processed_text = self._process_image_part(
+                                data, gen_content_args, user_id, __request__
+                            )
+                            yield processed_text or "", chunk
+
+                        case types.Part(executable_code=code):
+                            processed_text = self._process_executable_code_part(code)
+                            yield processed_text or "", chunk
+
+                        case types.Part(code_execution_result=result):
+                            processed_text = self._process_code_execution_result_part(
+                                result
+                            )
+                            yield processed_text or "", chunk
+        finally:
+            # This 'finally' block is crucial. It ensures that if the stream
+            # ends while a <​think> tag is open, we close it properly.
+            if is_think_tag_opened:
+                # We don't have a final "chunk" here, but we must close the tag.
+                # The final_response_chunk will be tracked by the calling method.
+                yield "</think>", None
+
     async def _stream_response_generator(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
         __request__: Request,
-        valves: "Pipe.Valves",
         gen_content_args: dict,
         event_emitter: Callable[["Event"], Awaitable[None]],
         metadata: dict[str, Any],
@@ -1097,75 +1165,34 @@ class Pipe:
     ) -> AsyncGenerator[str, None]:
         """
         Yields text chunks from the stream and spawns metadata processing task on completion.
+        This method orchestrates the streaming process, delegating part processing
+        to a helper and handling top-level errors and post-processing.
         """
         final_response_chunk: types.GenerateContentResponse | None = None
         error_occurred = False
-        is_think_tag_opened = False
 
         try:
-            async for chunk in response_stream:
-                final_response_chunk = chunk
+            # Delegate the core processing to a dedicated async generator.
+            part_processor = self._process_parts_to_text(
+                response_stream, __request__, gen_content_args, user_id
+            )
+            async for text_chunk, raw_chunk in part_processor:
+                # The raw_chunk can be None for the final closing </think> tag.
+                if raw_chunk:
+                    final_response_chunk = raw_chunk
+                yield text_chunk
 
-                if not (candidate := self._get_first_candidate(chunk.candidates)):
-                    log.warning("Stream chunk has no candidates, skipping.")
-                    continue
-                if not (parts := candidate.content and candidate.content.parts):
-                    log.warning(
-                        "candidate does not contain content or content.parts, skipping."
-                    )
-                    continue
-                # Process parts and yield text
-                for part in parts:
-                    # To my knowledge it's not possible for a part to have multiple fields below at the same time.
-                    if part.text:
-                        if part.thought:
-                            thinking_text = part.text
-                            if not is_think_tag_opened:
-                                is_think_tag_opened = True
-                                thinking_text = f"<think>{thinking_text}"
-                            yield thinking_text
-                            continue
-
-                        result_text = part.text
-                        if is_think_tag_opened:
-                            is_think_tag_opened = False
-                            result_text = f"</think>{result_text}"
-                        yield result_text
-                    elif part.inline_data:
-                        # _process_image_part returns a Markdown URL.
-                        yield (
-                            self._process_image_part(
-                                part.inline_data,
-                                gen_content_args,
-                                user_id,
-                                __request__,
-                            )
-                            or ""
-                        )
-                    elif part.executable_code:
-                        yield (
-                            self._process_executable_code_part(part.executable_code)
-                            or ""
-                        )
-                    elif part.code_execution_result:
-                        yield (
-                            self._process_code_execution_result_part(
-                                part.code_execution_result
-                            )
-                            or ""
-                        )
         except Exception as e:
             error_occurred = True
             error_msg = f"Stream ended with error: {e}"
             await self._emit_error(error_msg, event_emitter)
         finally:
             if not error_occurred:
-                log.info(f"Stream finished successfully!")
+                log.info("Stream finished successfully!")
                 log.debug("Last chunk:", payload=final_response_chunk)
+
             try:
-                # Catch and emit any errors that might happen here as a toast message.
                 await self._do_post_processing(
-                    # Metadata about the model response is always in the final chunk of the stream.
                     final_response_chunk,
                     event_emitter,
                     metadata,
@@ -1174,9 +1201,9 @@ class Pipe:
                 )
             except Exception as e:
                 error_msg = f"Post-processing failed with error:\n\n{e}"
-                # Using toast here in order to keep the inital AI response untouched.
                 await self._emit_toast(error_msg, event_emitter, "error")
                 log.exception(error_msg)
+
             log.debug("AsyncGenerator finished.")
 
     def _process_image_part(
