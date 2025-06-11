@@ -1090,17 +1090,10 @@ class Pipe:
         __request__: Request,
         gen_content_args: dict,
         user_id: str,
-    ) -> AsyncGenerator[tuple[str, types.GenerateContentResponse | None], None]:
+    ) -> AsyncGenerator[tuple[str, int, types.GenerateContentResponse | None], None]:
         """
-        Processes a stream of Gemini responses, yielding text chunks and the final response.
-
-        This is a helper generator that encapsulates the logic for handling different
-        content parts and managing state (like the <think> tags).
-
-        Yields:
-            A tuple containing the processed text chunk (str) and the raw chunk
-            (types.GenerateContentResponse) it came from. The raw chunk is used
-            to track the final response for metadata processing.
+        Processes a stream of Gemini responses, yielding text chunks, a substitution
+        count, and the raw chunk.
         """
         is_think_tag_opened = False
         try:
@@ -1113,46 +1106,43 @@ class Pipe:
                     continue
 
                 for part in parts:
-                    # Determine if we need to close an open <​think> tag before processing this part.
-                    # A thought block ends when a non-thought part is encountered.
                     is_current_part_a_thought = part.text and part.thought
                     if is_think_tag_opened and not is_current_part_a_thought:
-                        yield "</think>", chunk
+                        # No substitutions for our manually yielded tags.
+                        yield "</think>", 0, chunk
                         is_think_tag_opened = False
 
-                    # Use structural pattern matching for clarity and extensibility.
                     match part:
                         case types.Part(text=str(text), thought=True):
                             if not is_think_tag_opened:
-                                yield "<think>", chunk
+                                yield "<think>", 0, chunk
                                 is_think_tag_opened = True
-                            yield text, chunk
+
+                            modified_text, count = self._disable_special_tags(text)
+                            yield modified_text, count, chunk
 
                         case types.Part(text=str(text)):
-                            yield text, chunk
+                            modified_text, count = self._disable_special_tags(text)
+                            yield modified_text, count, chunk
 
                         case types.Part(inline_data=data):
                             processed_text = self._process_image_part(
                                 data, gen_content_args, user_id, __request__
                             )
-                            yield processed_text or "", chunk
+                            yield processed_text or "", 0, chunk
 
                         case types.Part(executable_code=code):
                             processed_text = self._process_executable_code_part(code)
-                            yield processed_text or "", chunk
+                            yield processed_text or "", 0, chunk
 
                         case types.Part(code_execution_result=result):
                             processed_text = self._process_code_execution_result_part(
                                 result
                             )
-                            yield processed_text or "", chunk
+                            yield processed_text or "", 0, chunk
         finally:
-            # This 'finally' block is crucial. It ensures that if the stream
-            # ends while a <​think> tag is open, we close it properly.
             if is_think_tag_opened:
-                # We don't have a final "chunk" here, but we must close the tag.
-                # The final_response_chunk will be tracked by the calling method.
-                yield "</think>", None
+                yield "</think>", 0, None
 
     async def _stream_response_generator(
         self,
@@ -1164,20 +1154,25 @@ class Pipe:
         user_id: str,
     ) -> AsyncGenerator[str, None]:
         """
-        Yields text chunks from the stream and spawns metadata processing task on completion.
-        This method orchestrates the streaming process, delegating part processing
-        to a helper and handling top-level errors and post-processing.
+        Yields text chunks from the stream, counts tag substitutions for a final
+        toast notification, and spawns metadata processing task on completion.
         """
         final_response_chunk: types.GenerateContentResponse | None = None
         error_occurred = False
+        total_substitutions = 0
 
         try:
-            # Delegate the core processing to a dedicated async generator.
             part_processor = self._process_parts_to_text(
                 response_stream, __request__, gen_content_args, user_id
             )
-            async for text_chunk, raw_chunk in part_processor:
-                # The raw_chunk can be None for the final closing </think> tag.
+            # The loop now unpacks a 3-tuple.
+            async for text_chunk, count, raw_chunk in part_processor:
+                if count > 0:
+                    total_substitutions += count
+                    log.debug(
+                        f"Disabled {count} special tag(s) in chunk: {repr(text_chunk)}"
+                    )
+
                 if raw_chunk:
                     final_response_chunk = raw_chunk
                 yield text_chunk
@@ -1187,6 +1182,15 @@ class Pipe:
             error_msg = f"Stream ended with error: {e}"
             await self._emit_error(error_msg, event_emitter)
         finally:
+            # Emit the summary toast only if substitutions were made and no errors occurred.
+            if total_substitutions > 0 and not error_occurred:
+                plural_s = "s" if total_substitutions > 1 else ""
+                toast_msg = (
+                    f"For clarity, {total_substitutions} special tag{plural_s} "
+                    "were disabled in the response by injecting a zero-width space (ZWS)."
+                )
+                await self._emit_toast(toast_msg, event_emitter, "info")
+
             if not error_occurred:
                 log.info("Stream finished successfully!")
                 log.debug("Last chunk:", payload=final_response_chunk)
@@ -1205,6 +1209,38 @@ class Pipe:
                 log.exception(error_msg)
 
             log.debug("AsyncGenerator finished.")
+
+    @staticmethod
+    def _disable_special_tags(text: str) -> tuple[str, int]:
+        """
+        Finds special tags in a text chunk and inserts a Zero-Width Space (ZWS)
+        to prevent them from being parsed by the Open WebUI backend.
+        """
+        if not text:
+            return "", 0
+
+        ZWS = "\u200b"
+        # The list of special start tags recognized by the Open WebUI backend.
+        # We will "disable" these to prevent them from being parsed.
+        SPECIAL_TAGS_TO_DISABLE = [
+            "think",
+            "thinking",
+            "reason",
+            "reasoning",
+            "thought",
+            "Thought",
+            "|begin_of_thought|",
+            "code_interpreter",
+            "|begin_of_solution|",
+        ]
+        # Pre-compile the regex for efficiency. This joins all tags with '|' (OR),
+        # properly escapes them, and creates a capture group for the tag name.
+        TAG_REGEX = re.compile(
+            r"<(/?" + "|".join(re.escape(tag) for tag in SPECIAL_TAGS_TO_DISABLE) + r")"
+        )
+        # Use re.subn to get both the modified string and the count of substitutions.
+        modified_text, num_substitutions = TAG_REGEX.subn(rf"<{ZWS}\1", text)
+        return modified_text, num_substitutions
 
     def _process_image_part(
         self, inline_data, gen_content_args: dict, user_id: str, request: Request
@@ -1563,6 +1599,7 @@ class Pipe:
         event_emitter: Callable[["Event"], Awaitable[None]],
         toastType: Literal["info", "success", "warning", "error"] = "info",
     ) -> None:
+        """Emits a toast notification to the front-end."""
         # TODO: Use this method in more places, even for info toasts.
         event: NotificationEvent = {
             "type": "notification",
