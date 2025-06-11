@@ -1090,10 +1090,10 @@ class Pipe:
         __request__: Request,
         gen_content_args: dict,
         user_id: str,
-    ) -> AsyncGenerator[tuple[dict, types.GenerateContentResponse | None], None]:
+    ) -> AsyncGenerator[tuple[dict, int, types.GenerateContentResponse | None], None]:
         """
-        Processes a stream of Gemini responses, yielding structured dictionaries
-        in the OpenAI-compatible format and the raw chunk.
+        Processes a stream of Gemini responses, yielding structured dictionaries,
+        a substitution count for the ZWS safeguard, and the raw chunk.
         """
         try:
             async for chunk in response_stream:
@@ -1105,45 +1105,46 @@ class Pipe:
                     continue
 
                 for part in parts:
-                    # This is the new core logic. We match the part type and yield
-                    # a dictionary with the appropriate key ("reasoning" or "content").
-                    payload = None
+                    # Initialize variables at the start of each loop to satisfy the linter
+                    # and ensure they always have a defined state.
+                    payload: dict | None = None
+                    count: int = 0
+                    key: str = "content"
+
                     match part:
                         case types.Part(text=str(text), thought=True):
-                            # If it's a thought, we use the "reasoning" key.
-                            payload = {"reasoning": text}
-
+                            # It's a thought, so we'll use the "reasoning" key.
+                            key = "reasoning"
+                            sanitized_text, count = self._disable_special_tags(text)
+                            payload = {key: sanitized_text}
                         case types.Part(text=str(text)):
-                            # For regular text, we use the "content" key.
-                            payload = {"content": text}
-
+                            # It's regular content, using the default "content" key.
+                            sanitized_text, count = self._disable_special_tags(text)
+                            payload = {key: sanitized_text}
                         case types.Part(inline_data=data):
+                            # Image parts don't need tag disabling.
                             processed_text = self._process_image_part(
                                 data, gen_content_args, user_id, __request__
                             )
                             if processed_text:
                                 payload = {"content": processed_text}
-
                         case types.Part(executable_code=code):
                             processed_text = self._process_executable_code_part(code)
+                            # Code blocks are already formatted and safe.
                             if processed_text:
                                 payload = {"content": processed_text}
-
                         case types.Part(code_execution_result=result):
                             processed_text = self._process_code_execution_result_part(
                                 result
                             )
+                            # Code results are also safe.
                             if processed_text:
                                 payload = {"content": processed_text}
 
                     if payload:
-                        # We wrap the payload in the required OpenAI stream format.
-                        # This is the structure the Open WebUI backend expects.
                         structured_chunk = {"choices": [{"delta": payload}]}
-                        yield structured_chunk, chunk
-
+                        yield structured_chunk, count, chunk
         except Exception:
-            # Re-raise the exception to be handled by the outer generator.
             raise
 
     async def _stream_response_generator(
@@ -1156,20 +1157,24 @@ class Pipe:
         user_id: str,
     ) -> AsyncGenerator[dict, None]:
         """
-        Yields structured dictionary chunks from the stream and handles post-processing.
+        Yields structured dictionary chunks from the stream, counts tag substitutions
+        for a final toast notification, and handles post-processing.
         """
         final_response_chunk: types.GenerateContentResponse | None = None
         error_occurred = False
+        total_substitutions = 0
 
         try:
-            # The part processor now yields structured dictionaries directly.
             part_processor = self._process_parts_to_structured_stream(
                 response_stream, __request__, gen_content_args, user_id
             )
-            async for structured_chunk, raw_chunk in part_processor:
+            async for structured_chunk, count, raw_chunk in part_processor:
+                if count > 0:
+                    total_substitutions += count
+                    log.debug(f"Disabled {count} special tag(s) in a chunk.")
+
                 if raw_chunk:
                     final_response_chunk = raw_chunk
-                # Yield the structured chunk directly to the Open WebUI backend.
                 yield structured_chunk
 
         except Exception as e:
@@ -1178,8 +1183,13 @@ class Pipe:
             # FIXME: raise the error instead?
             await self._emit_error(error_msg, event_emitter)
         finally:
-            # The logic for disabling tags and counting substitutions is no longer needed.
-            # We can remove the toast notification about it.
+            if total_substitutions > 0 and not error_occurred:
+                plural_s = "s" if total_substitutions > 1 else ""
+                toast_msg = (
+                    f"For clarity, {total_substitutions} special tag{plural_s} "
+                    "were disabled in the response by injecting a zero-width space (ZWS)."
+                )
+                await self._emit_toast(toast_msg, event_emitter, "info")
 
             if not error_occurred:
                 log.info("Stream finished successfully!")
@@ -1199,6 +1209,35 @@ class Pipe:
                 log.exception(error_msg)
 
             log.debug("AsyncGenerator finished.")
+
+    @staticmethod
+    def _disable_special_tags(text: str) -> tuple[str, int]:
+        """
+        Finds special tags in a text chunk and inserts a Zero-Width Space (ZWS)
+        to prevent them from being parsed by the Open WebUI backend's legacy system.
+        This is a safeguard against accidental tag generation by the model.
+        """
+        if not text:
+            return "", 0
+
+        ZWS = "\u200b"
+        SPECIAL_TAGS_TO_DISABLE = [
+            "details",
+            "think",
+            "thinking",
+            "reason",
+            "reasoning",
+            "thought",
+            "Thought",
+            "|begin_of_thought|",
+            "code_interpreter",
+            "|begin_of_solution|",
+        ]
+        TAG_REGEX = re.compile(
+            r"<(/?" + "|".join(re.escape(tag) for tag in SPECIAL_TAGS_TO_DISABLE) + r")"
+        )
+        modified_text, num_substitutions = TAG_REGEX.subn(rf"<{ZWS}\1", text)
+        return modified_text, num_substitutions
 
     def _process_image_part(
         self, inline_data, gen_content_args: dict, user_id: str, request: Request
