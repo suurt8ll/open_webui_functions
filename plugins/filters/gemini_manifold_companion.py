@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
 # According to https://ai.google.dev/gemini-api/docs/models
 ALLOWED_GROUNDING_MODELS = {
+    "gemini-2.5-pro-preview-06-05",
     "gemini-2.5-flash-preview-05-20",
     "gemini-2.5-pro-preview-05-06",
     "gemini-2.5-flash-preview-04-17",
@@ -54,6 +55,7 @@ ALLOWED_GROUNDING_MODELS = {
     "gemini-1.0-pro",
 }
 ALLOWED_CODE_EXECUTION_MODELS = {
+    "gemini-2.5-pro-preview-06-05",
     "gemini-2.5-flash-preview-05-20",
     "gemini-2.5-pro-preview-05-06",
     "gemini-2.5-flash-preview-04-17",
@@ -81,7 +83,7 @@ class Filter:
     class Valves(BaseModel):
         SET_TEMP_TO_ZERO: bool = Field(
             default=False,
-            description="""Decide if you want to set the temperature to 0 for grounded answers, 
+            description="""Decide if you want to set the temperature to 0 for grounded answers,
             Google reccomends it in their docs.""",
         )
         GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD: float | None = Field(
