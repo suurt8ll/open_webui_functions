@@ -11,13 +11,11 @@ requirements:
 """
 
 import json
+import datetime
+import inspect
+from collections.abc import Iterator, AsyncGenerator, Generator, Callable, Awaitable
 from typing import (
     Any,
-    AsyncGenerator,
-    Awaitable,
-    Generator,
-    Iterator,
-    Callable,
     TYPE_CHECKING,
 )
 from pydantic import BaseModel, Field
@@ -41,14 +39,19 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
-        print(f"{[__name__]} Function has been initialized!")
+        self._log("Function has been initialized!")
+
+    def _log(self, message: str):
+        timestamp = datetime.datetime.now().isoformat()
+        caller_name = inspect.stack()[1].function
+        print(f"[{timestamp}] [{__name__}.{caller_name}] {message}")
 
     async def pipes(self) -> list["ModelData"]:
         models: list["ModelData"] = [
             {"id": "model_id_1", "name": "model_1"},
             {"id": "model_id_2", "name": "model_2"},
         ]
-        print(f"{[__name__]} Registering models: {models}")
+        self._log(f"Registering models: {models}")
         return models
 
     async def pipe(
@@ -56,46 +59,28 @@ class Pipe:
         body: dict[str, Any],
         __user__: "UserData",
         __request__: Request,
-        __event_emitter__: Callable[["Event"], Awaitable[None]],
-        __event_call__: Callable[[dict[str, Any]], Awaitable[Any]],
-        __task__: str,
-        __task_body__: dict[str, Any],
-        __files__: list[dict[str, Any]],
         __metadata__: dict[str, Any],
-        __tools__: list[Any],
+        __tools__: dict[str, dict],
+        __event_emitter__: Callable[["Event"], Awaitable[None]] | None,
+        __event_call__: Callable[[dict[str, Any]], Awaitable[Any]] | None,
+        __task__: str | None,
+        __task_body__: dict[str, Any] | None,
+        __files__: list[dict[str, Any]] | None,
+        __message_id__: str | None,
+        __chat_id__: str | None,
+        __session_id__: str | None,
     ) -> (
         str
         | dict[str, Any]
+        | BaseModel
         | StreamingResponse
         | Iterator
         | AsyncGenerator
         | Generator
-        | None
     ):
-
-        string_from_valve = self.valves.EXAMPLE_STRING
-        string_from_user_valve = getattr(
-            __user__.get("valves"), "EXAMPLE_STRING_USER", None
+        message_content = (
+            "Returning all local variables as JSON:\n"
+            f"{json.dumps(locals(), indent=2, default=str)}"
         )
-
-        print(f"{[__name__]} String from valve: {string_from_valve}")
-        print(f"{[__name__]} String from user valve: {string_from_user_valve}")
-
-        all_params = {
-            "body": body,
-            "__user__": __user__,
-            "__request__": __request__,
-            "__event_emitter__": __event_emitter__,
-            "__event_call__": __event_call__,
-            "__task__": __task__,
-            "__task_body__": __task_body__,
-            "__files__": __files__,
-            "__metadata__": __metadata__,
-            "__tools__": __tools__,
-        }
-
-        print(
-            f"{[__name__]} Returning all parameters as JSON:\n{json.dumps(all_params, indent=2, default=str)}"
-        )
-
-        return f"Message from: {[__name__]}."
+        self._log(message_content)
+        return f"Hello! I'm {__name__}."
