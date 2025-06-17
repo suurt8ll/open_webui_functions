@@ -14,7 +14,7 @@ requirements: google-genai==1.16.1
 # Be sure to check out my GitHub repository for more information! Contributions, questions and suggestions are very welcome.
 
 # Supported features:
-#   - Display thinking summary
+#   - Display thinking summary (Open WebUI >= 0.6.14 required)
 #   - Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
 #   - Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 filter required, see GitHub README)
 #   - Image input
@@ -344,6 +344,17 @@ class Pipe:
             log.info(f"Model ID '{model_name}' allows adjusting the thinking settings.")
             thinking_conf = types.ThinkingConfig(
                 thinking_budget=valves.THINKING_BUDGET,
+                include_thoughts=valves.SHOW_THINKING_SUMMARY,
+            )
+        # Gemini 2.5 Pro supports reasoning budget but not toggling reasoning on/off.
+        if re.search(r"gemini-2.5-flash", model_name, re.IGNORECASE) and not body.get(
+            "reason", False
+        ):
+            log.info(
+                f"Model ID '{model_name}' allows turning off the reasoning feature. It is currently disabled. Setting thinking budget to 0."
+            )
+            thinking_conf = types.ThinkingConfig(
+                thinking_budget=0,
                 include_thoughts=valves.SHOW_THINKING_SUMMARY,
             )
         # TODO: Take defaults from the general front-end config.
