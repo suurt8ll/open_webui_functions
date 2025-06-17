@@ -67,6 +67,7 @@ from typing import (
 from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
 from open_webui.storage.provider import Storage
+from open_webui.models.functions import Functions
 
 if TYPE_CHECKING:
     from loguru import Record
@@ -346,16 +347,25 @@ class Pipe:
                 thinking_budget=valves.THINKING_BUDGET,
                 include_thoughts=valves.SHOW_THINKING_SUMMARY,
             )
-        # Gemini 2.5 Pro supports reasoning budget but not toggling reasoning on/off.
-        if re.search(r"gemini-2.5-flash", model_name, re.IGNORECASE) and not body.get(
-            "reason", False
-        ):
-            log.info(
-                f"Model ID '{model_name}' allows turning off the reasoning feature. It is currently disabled. Setting thinking budget to 0."
-            )
-            thinking_conf = types.ThinkingConfig(
-                thinking_budget=0,
-                include_thoughts=valves.SHOW_THINKING_SUMMARY,
+
+        # TODO: Check availability of companion filter too with this method.
+        if self._is_function_active("gemini_reasoning_toggle"):
+            # NOTE: Gemini 2.5 Pro supports reasoning budget but not toggling reasoning on/off.
+            if re.search(
+                r"gemini-2.5-flash", model_name, re.IGNORECASE
+            ) and not body.get("reason", False):
+                log.info(
+                    f"Model ID '{model_name}' allows turning off the reasoning feature. "
+                    "Reasoning is currently toggled off in the UI. Setting thinking budget to 0."
+                )
+                thinking_conf = types.ThinkingConfig(
+                    thinking_budget=0,
+                    include_thoughts=valves.SHOW_THINKING_SUMMARY,
+                )
+        else:
+            log.warning(
+                "Gemini Reasoning Toggle filter is not active. "
+                "Install or enable it if you want to toggle Gemini 2.5 Flash reasoning on/off."
             )
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
@@ -1662,6 +1672,13 @@ class Pipe:
     # endregion 1.6 Event emissions
 
     # region 1.7 Utility helpers
+
+    @staticmethod
+    def _is_function_active(id: str) -> bool:
+        # Get the filter's data from the database.
+        companion_filter = Functions.get_function_by_id(id)
+        # Return if the filter is installed and active.
+        return bool(companion_filter and companion_filter.is_active)
 
     @staticmethod
     def _get_merged_valves(
