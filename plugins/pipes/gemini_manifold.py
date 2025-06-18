@@ -15,17 +15,19 @@ requirements: google-genai==1.20.0
 
 # Supported features:
 #   - Display thinking summary (Open WebUI >= 0.6.14 required)
-#   - Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
+#   - Thinking budget
+#   - Gemini Reasoning Toggle (Reason filter required, see GitHub README)
+#   - Native image generation (image output), use "gemini-2.0-flash-preview-image-generation"
 #   - Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 filter required, see GitHub README)
 #   - Image input
 #   - YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
 #   - Grounding with Google Search (Gemini Manifold Companion >= 1.2.0 required)
-#   - Display citations in the front-end. (Gemini Manifold Companion >= 1.2.0 required)
+#   - Display citations in the front-end. (Gemini Manifold Companion >= 1.5.0 required)
 #   - Permissive safety settings (Gemini Manifold Companion >= 1.3.0 required)
 #   - Each user can decide to use their own API key.
 #   - Token usage data
 #   - Code execution tool. (Gemini Manifold Companion >= 1.1.0 required)
-#   - URL context tool (Gemini Manifold Companion >= 1.2.0 required if you want to see citations in the front-end).
+#   - URL context tool (Gemini Manifold Companion >= 1.5.0 required if you want to see citations in the front-end).
 #   - Streaming and non-streaming responses.
 
 # Features that are supported by API but not yet implemented in the manifold:
