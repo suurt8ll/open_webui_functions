@@ -1675,80 +1675,7 @@ class Pipe:
 
     # endregion 1.6 Event emissions
 
-    # region 1.7 Utility helpers
-
-    @staticmethod
-    def _is_function_active(id: str) -> bool:
-        # Get the filter's data from the database.
-        companion_filter = Functions.get_function_by_id(id)
-        # Return if the filter is installed and active.
-        return bool(companion_filter and companion_filter.is_active)
-
-    @staticmethod
-    def _get_merged_valves(
-        default_valves: "Pipe.Valves",
-        user_valves: "Pipe.UserValves | None",
-        user_email: str,
-    ) -> "Pipe.Valves":
-        """
-        Merges UserValves into a base Valves configuration.
-
-        The general rule is that if a field in UserValves is not None, it overrides
-        the corresponding field in the default_valves. Otherwise, the default_valves
-        field value is used.
-
-        Exceptions:
-        - If default_valves.USER_MUST_PROVIDE_AUTH_CONFIG is True, then GEMINI_API_KEY and
-          VERTEX_PROJECT in the merged result will be taken directly from
-          user_valves (even if they are None), ignoring the values in default_valves.
-
-        Args:
-            default_valves: The base Valves object with default configurations.
-            user_valves: An optional UserValves object with user-specific overrides.
-                         If None, a copy of default_valves is returned.
-
-        Returns:
-            A new Valves object representing the merged configuration.
-        """
-        if user_valves is None:
-            # If no user-specific valves are provided, return a copy of the default valves.
-            return default_valves.model_copy(deep=True)
-
-        # Start with the values from the base `Valves`
-        merged_data = default_valves.model_dump()
-
-        # Override with non-None values from `UserValves`
-        # Iterate over fields defined in the UserValves model
-        for field_name in Pipe.UserValves.model_fields:
-            # getattr is safe as field_name comes from model_fields of user_valves' type
-            user_value = getattr(user_valves, field_name)
-            if user_value is not None and user_value != "":
-                # Only update if the field is also part of the main Valves model
-                # (keys of merged_data are fields of default_valves)
-                if field_name in merged_data:
-                    merged_data[field_name] = user_value
-
-        user_whitelist = (
-            default_valves.AUTH_WHITELIST.split(",")
-            if default_valves.AUTH_WHITELIST
-            else []
-        )
-
-        # Apply special logic based on default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
-        if (
-            default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
-            and user_email not in user_whitelist
-        ):
-            # If USER_MUST_PROVIDE_AUTH_CONFIG is True and user is not in the whitelist,
-            # then user must provide their own GEMINI_API_KEY
-            # User is disallowed from using Vertex AI in this case.
-            merged_data["GEMINI_API_KEY"] = user_valves.GEMINI_API_KEY
-            merged_data["VERTEX_PROJECT"] = None
-            merged_data["USE_VERTEX_AI"] = False
-
-        # Create a new Valves instance with the merged data.
-        # Pydantic will validate the data against the Valves model definition during instantiation.
-        return Pipe.Valves(**merged_data)
+    # region 1.7 Logging
 
     def _is_flat_dict(self, data: Any) -> bool:
         """
@@ -1976,6 +1903,83 @@ class Pipe:
                 f"Added new handler to loguru for {__name__} with level {desired_level_name}."
             )
 
+    # endregion 1.7 Logging
+
+    # region 1.8 Utility helpers
+
+    @staticmethod
+    def _is_function_active(id: str) -> bool:
+        # Get the filter's data from the database.
+        companion_filter = Functions.get_function_by_id(id)
+        # Return if the filter is installed and active.
+        return bool(companion_filter and companion_filter.is_active)
+
+    @staticmethod
+    def _get_merged_valves(
+        default_valves: "Pipe.Valves",
+        user_valves: "Pipe.UserValves | None",
+        user_email: str,
+    ) -> "Pipe.Valves":
+        """
+        Merges UserValves into a base Valves configuration.
+
+        The general rule is that if a field in UserValves is not None, it overrides
+        the corresponding field in the default_valves. Otherwise, the default_valves
+        field value is used.
+
+        Exceptions:
+        - If default_valves.USER_MUST_PROVIDE_AUTH_CONFIG is True, then GEMINI_API_KEY and
+          VERTEX_PROJECT in the merged result will be taken directly from
+          user_valves (even if they are None), ignoring the values in default_valves.
+
+        Args:
+            default_valves: The base Valves object with default configurations.
+            user_valves: An optional UserValves object with user-specific overrides.
+                         If None, a copy of default_valves is returned.
+
+        Returns:
+            A new Valves object representing the merged configuration.
+        """
+        if user_valves is None:
+            # If no user-specific valves are provided, return a copy of the default valves.
+            return default_valves.model_copy(deep=True)
+
+        # Start with the values from the base `Valves`
+        merged_data = default_valves.model_dump()
+
+        # Override with non-None values from `UserValves`
+        # Iterate over fields defined in the UserValves model
+        for field_name in Pipe.UserValves.model_fields:
+            # getattr is safe as field_name comes from model_fields of user_valves' type
+            user_value = getattr(user_valves, field_name)
+            if user_value is not None and user_value != "":
+                # Only update if the field is also part of the main Valves model
+                # (keys of merged_data are fields of default_valves)
+                if field_name in merged_data:
+                    merged_data[field_name] = user_value
+
+        user_whitelist = (
+            default_valves.AUTH_WHITELIST.split(",")
+            if default_valves.AUTH_WHITELIST
+            else []
+        )
+
+        # Apply special logic based on default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
+        if (
+            default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
+            and user_email not in user_whitelist
+        ):
+            # If USER_MUST_PROVIDE_AUTH_CONFIG is True and user is not in the whitelist,
+            # then user must provide their own GEMINI_API_KEY
+            # User is disallowed from using Vertex AI in this case.
+            merged_data["GEMINI_API_KEY"] = user_valves.GEMINI_API_KEY
+            merged_data["VERTEX_PROJECT"] = None
+            merged_data["USE_VERTEX_AI"] = False
+
+        # Create a new Valves instance with the merged data.
+        # Pydantic will validate the data against the Valves model definition during instantiation.
+        return Pipe.Valves(**merged_data)
+
     def _get_mime_type(self, file_uri: str) -> str:
         """
         Determines MIME type based on file extension using the mimetypes module.
@@ -2037,6 +2041,6 @@ class Pipe:
             log.exception(f"Error processing file {file_path}")
             return None, content_type
 
-    # endregion 1.7 Utility helpers
+    # endregion 1.8 Utility helpers
 
     # endregion 1. Helper methods inside the Pipe class
