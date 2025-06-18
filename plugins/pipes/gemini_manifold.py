@@ -200,6 +200,40 @@ class Pipe:
         )
 
     class UserValves(BaseModel):
+        """Defines user-specific settings that can override the default `Valves`.
+
+        The `UserValves` class provides a mechanism for individual users to customize
+        their Gemini API settings for each request. This system is designed as a
+        practical workaround for backend/frontend limitations, enabling per-user
+        configurations.
+
+        Think of the main `Valves` as the global, admin-configured template for the
+        plugin. `UserValves` acts as a user-provided "overlay" or "patch" that
+        is applied on top of that template at runtime.
+
+        How it works:
+        1.  **Default Behavior:** At the start of a request, the system merges the
+            user's `UserValves` with the admin's `Valves`. If a field in
+            `UserValves` has a value (i.e., is not `None` or an empty string `""`),
+            it overrides the corresponding value from the main `Valves`. If a
+            field is `None` or `""`, the admin's default is used.
+
+        2.  **Special Authentication Logic:** A critical exception exists to enforce
+            security and usage policies. If the admin sets `USER_MUST_PROVIDE_AUTH_CONFIG`
+            to `True` in the main `Valves`, the merging logic changes for any user
+            not on the `AUTH_WHITELIST`:
+            - The user's `GEMINI_API_KEY` is taken directly from their `UserValves`,
+              bypassing the admin's key entirely.
+            - The ability to use the admin-configured Vertex AI is disabled
+              (`USE_VERTEX_AI` is forced to `False`).
+            This ensures that when required, users must use their own credentials
+            and cannot fall back on the shared, system-level authentication.
+
+        This two-tiered configuration allows administrators to set sensible defaults
+        and enforce policies, while still giving users the flexibility to tailor
+        certain parameters, like their API key or model settings, for their own use.
+        """
+
         GEMINI_API_KEY: str | None = Field(
             default=None,
             description="""Gemini Developer API key.
