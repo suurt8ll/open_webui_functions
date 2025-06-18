@@ -13,17 +13,19 @@ Here's a breakdown of implemented and planned features for the Gemini Manifold p
 **Implemented Features:**
 
 -   [x] Display thinking summary
+-   [x] Thinking budget
+-   [x] Gemini Reasoning Toggle (Reason filter required, see [it's doc](../filters/gemini_reasoning_toggle.md))
 -   [x] Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
--   [x] Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 filter required, see see [it's doc](../filters/gemini_manifold_companion.md))
+-   [x] Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 filter required, see [it's doc](../filters/gemini_manifold_companion.md))
 -   [x] Image input
 -   [x] YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
 -   [x] Grounding with Google Search (Gemini Manifold Companion >= 1.2.0 required)
--   [x] Display citations in the front-end. (Gemini Manifold Companion >= 1.2.0 required)
+-   [x] Display citations in the front-end. (Gemini Manifold Companion >= 1.5.0 required)
 -   [x] Permissive safety settings (Gemini Manifold Companion >= 1.3.0 required)
 -   [x] Each user can decide to use their own API key.
 -   [x] Token usage data
 -   [x] Code execution tool. (Gemini Manifold Companion >= 1.1.0 required)
--   [x] URL context tool (Gemini Manifold Companion >= 1.2.0 required if you want to see citations in the front-end).
+-   [x] URL context tool (Gemini Manifold Companion >= 1.5.0 required if you want to see citations in the front-end).
 -   [x] Streaming and non-streaming responses.
 
 **Planned Features:**
