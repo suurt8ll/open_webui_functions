@@ -114,10 +114,10 @@ class Pipe:
             description="""Comma separated list of user emails that are allowed to bypassUSER_MUST_PROVIDE_AUTH_CONFIG and use the default authentication configuration.
             Default value is None (no users are whitelisted).""",
         )
-        # FIXME: Default to None.
-        GEMINI_API_BASE_URL: str = Field(
-            default="https://generativelanguage.googleapis.com",
-            description="The base URL for calling the Gemini API",
+        GEMINI_API_BASE_URL: str | None = Field(
+            default=None,
+            description="""The base URL for calling the Gemini API. 
+            Default value is None.""",
         )
         USE_VERTEX_AI: bool = Field(
             default=False,
@@ -131,7 +131,6 @@ class Pipe:
             description="""The Google Cloud project ID to use with Vertex AI.
             Default value is None.""",
         )
-        # FIXME: Default to None.
         VERTEX_LOCATION: str = Field(
             default="global",
             description="""The Google Cloud region to use with Vertex AI.
@@ -151,15 +150,25 @@ class Pipe:
         )
         CACHE_MODELS: bool = Field(
             default=True,
-            description="Whether to request models only on first load and when white- or blacklist changes.",
+            description="""Whether to request models only on first load and when white- or blacklist changes. 
+            Default value is True.""",
         )
         THINKING_BUDGET: int = Field(
-            ge=0,
-            le=24576,
             default=8192,
-            description="""Gemini 2.5 only. Indicates the thinking budget in tokens.
-            0 means no thinking. Default value is 8192.
-            See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
+            ge=0,
+            # The widest possible range is 0 (for Lite/Flash) to 32768 (for Pro).
+            # Model-specific constraints are detailed in the description.
+            le=32768,
+            description="""Specifies the token budget for the model's internal thinking process,
+            used for complex tasks like tool use. Applicable to Gemini 2.5 models.
+            Default value is 8192.
+
+            The valid token range depends on the specific model tier:
+            - **Pro models**: Must be a value between 128 and 32,768.
+            - **Flash and Lite models**: A value between 0 and 24,576. For these
+              models, a value of 0 disables the thinking feature.
+
+            See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more details.""",
         )
         SHOW_THINKING_SUMMARY: bool = Field(
             default=True,
@@ -168,27 +177,63 @@ class Pipe:
             Default value is True.""",
         )
         USE_FILES_API: bool = Field(
-            title="Use Files API",
             default=True,
-            description="Save the image files using Open WebUI's API for files.",
+            description="""Save the image files using Open WebUI's API for files. 
+            Default value is True.""",
         )
         THINKING_MODEL_PATTERN: str = Field(
             default=r"gemini-2.5",
-            description="Regex pattern to identify thinking models.",
+            description="""Regex pattern to identify thinking models. 
+            Default value is r"gemini-2.5".""",
+        )
+        ENABLE_URL_CONTEXT_TOOL: bool = Field(
+            default=False,
+            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs. 
+            This tool is only compatible with specific models. Default value is False.""",
         )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
             default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
-        )
-        ENABLE_URL_CONTEXT_TOOL: bool = Field(
-            default=False,
-            description="Enable the URL context tool to allow the model to fetch and use content from provided URLs. This tool is only compatible with specific models.",
+            description="""Select logging level. Use `docker logs -f open-webui` to view logs.
+            Default value is INFO.""",
         )
 
     class UserValves(BaseModel):
-        # TODO: Add more options that can be changed by the user.
+        """Defines user-specific settings that can override the default `Valves`.
+
+        The `UserValves` class provides a mechanism for individual users to customize
+        their Gemini API settings for each request. This system is designed as a
+        practical workaround for backend/frontend limitations, enabling per-user
+        configurations.
+
+        Think of the main `Valves` as the global, admin-configured template for the
+        plugin. `UserValves` acts as a user-provided "overlay" or "patch" that
+        is applied on top of that template at runtime.
+
+        How it works:
+        1.  **Default Behavior:** At the start of a request, the system merges the
+            user's `UserValves` with the admin's `Valves`. If a field in
+            `UserValves` has a value (i.e., is not `None` or an empty string `""`),
+            it overrides the corresponding value from the main `Valves`. If a
+            field is `None` or `""`, the admin's default is used.
+
+        2.  **Special Authentication Logic:** A critical exception exists to enforce
+            security and usage policies. If the admin sets `USER_MUST_PROVIDE_AUTH_CONFIG`
+            to `True` in the main `Valves`, the merging logic changes for any user
+            not on the `AUTH_WHITELIST`:
+            - The user's `GEMINI_API_KEY` is taken directly from their `UserValves`,
+              bypassing the admin's key entirely.
+            - The ability to use the admin-configured Vertex AI is disabled
+              (`USE_VERTEX_AI` is forced to `False`).
+            This ensures that when required, users must use their own credentials
+            and cannot fall back on the shared, system-level authentication.
+
+        This two-tiered configuration allows administrators to set sensible defaults
+        and enforce policies, while still giving users the flexibility to tailor
+        certain parameters, like their API key or model settings, for their own use.
+        """
+
         GEMINI_API_KEY: str | None = Field(
             default=None,
             description="""Gemini Developer API key.
@@ -216,9 +261,16 @@ class Pipe:
         )
         THINKING_BUDGET: int | None | Literal[""] = Field(
             default=None,
-            description="""Gemini 2.5 only. Indicates the thinking budget in tokens.
-            0 means no thinking. Default value is None (uses the default from Valves).
-            See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
+            description="""Specifies the token budget for the model's internal thinking process,
+            used for complex tasks like tool use. Applicable to Gemini 2.5 models.
+            Default value is None.
+
+            The valid token range depends on the specific model tier:
+            - **Pro models**: Must be a value between 128 and 32,768.
+            - **Flash and Lite models**: A value between 0 and 24,576. For these
+              models, a value of 0 disables the thinking feature.
+
+            See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more details.""",
         )
         SHOW_THINKING_SUMMARY: bool | None | Literal[""] = Field(
             default=None,
@@ -226,18 +278,29 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is None.""",
         )
-        ENABLE_URL_CONTEXT_TOOL: bool = Field(
-            default=False,
-            description="Enable the URL context tool to allow the model to fetch and use content from provided URLs. This tool is only compatible with specific models.",
+        USE_FILES_API: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Save the image files using Open WebUI's API for files.
+            Default value is None.""",
+        )
+        THINKING_MODEL_PATTERN: str | None = Field(
+            default=None,
+            description="""Regex pattern to identify thinking models.
+            Default value is None.""",
+        )
+        ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs. 
+            This tool is only compatible with specific models. Default value is None.""",
         )
 
         @field_validator("THINKING_BUDGET", mode="after")
         @classmethod
         def validate_thinking_budget_range(cls, v):
             if v is not None and v != "":
-                if not (0 <= v <= 24576):
+                if not (0 <= v <= 32768):
                     raise ValueError(
-                        "THINKING_BUDGET must be between 0 and 24576, inclusive."
+                        "THINKING_BUDGET must be between 0 and 32768, inclusive."
                     )
             return v
 
@@ -1675,80 +1738,7 @@ class Pipe:
 
     # endregion 1.6 Event emissions
 
-    # region 1.7 Utility helpers
-
-    @staticmethod
-    def _is_function_active(id: str) -> bool:
-        # Get the filter's data from the database.
-        companion_filter = Functions.get_function_by_id(id)
-        # Return if the filter is installed and active.
-        return bool(companion_filter and companion_filter.is_active)
-
-    @staticmethod
-    def _get_merged_valves(
-        default_valves: "Pipe.Valves",
-        user_valves: "Pipe.UserValves | None",
-        user_email: str,
-    ) -> "Pipe.Valves":
-        """
-        Merges UserValves into a base Valves configuration.
-
-        The general rule is that if a field in UserValves is not None, it overrides
-        the corresponding field in the default_valves. Otherwise, the default_valves
-        field value is used.
-
-        Exceptions:
-        - If default_valves.USER_MUST_PROVIDE_AUTH_CONFIG is True, then GEMINI_API_KEY and
-          VERTEX_PROJECT in the merged result will be taken directly from
-          user_valves (even if they are None), ignoring the values in default_valves.
-
-        Args:
-            default_valves: The base Valves object with default configurations.
-            user_valves: An optional UserValves object with user-specific overrides.
-                         If None, a copy of default_valves is returned.
-
-        Returns:
-            A new Valves object representing the merged configuration.
-        """
-        if user_valves is None:
-            # If no user-specific valves are provided, return a copy of the default valves.
-            return default_valves.model_copy(deep=True)
-
-        # Start with the values from the base `Valves`
-        merged_data = default_valves.model_dump()
-
-        # Override with non-None values from `UserValves`
-        # Iterate over fields defined in the UserValves model
-        for field_name in Pipe.UserValves.model_fields:
-            # getattr is safe as field_name comes from model_fields of user_valves' type
-            user_value = getattr(user_valves, field_name)
-            if user_value is not None and user_value != "":
-                # Only update if the field is also part of the main Valves model
-                # (keys of merged_data are fields of default_valves)
-                if field_name in merged_data:
-                    merged_data[field_name] = user_value
-
-        user_whitelist = (
-            default_valves.AUTH_WHITELIST.split(",")
-            if default_valves.AUTH_WHITELIST
-            else []
-        )
-
-        # Apply special logic based on default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
-        if (
-            default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
-            and user_email not in user_whitelist
-        ):
-            # If USER_MUST_PROVIDE_AUTH_CONFIG is True and user is not in the whitelist,
-            # then user must provide their own GEMINI_API_KEY
-            # User is disallowed from using Vertex AI in this case.
-            merged_data["GEMINI_API_KEY"] = user_valves.GEMINI_API_KEY
-            merged_data["VERTEX_PROJECT"] = None
-            merged_data["USE_VERTEX_AI"] = False
-
-        # Create a new Valves instance with the merged data.
-        # Pydantic will validate the data against the Valves model definition during instantiation.
-        return Pipe.Valves(**merged_data)
+    # region 1.7 Logging
 
     def _is_flat_dict(self, data: Any) -> bool:
         """
@@ -1976,6 +1966,83 @@ class Pipe:
                 f"Added new handler to loguru for {__name__} with level {desired_level_name}."
             )
 
+    # endregion 1.7 Logging
+
+    # region 1.8 Utility helpers
+
+    @staticmethod
+    def _is_function_active(id: str) -> bool:
+        # Get the filter's data from the database.
+        companion_filter = Functions.get_function_by_id(id)
+        # Return if the filter is installed and active.
+        return bool(companion_filter and companion_filter.is_active)
+
+    @staticmethod
+    def _get_merged_valves(
+        default_valves: "Pipe.Valves",
+        user_valves: "Pipe.UserValves | None",
+        user_email: str,
+    ) -> "Pipe.Valves":
+        """
+        Merges UserValves into a base Valves configuration.
+
+        The general rule is that if a field in UserValves is not None, it overrides
+        the corresponding field in the default_valves. Otherwise, the default_valves
+        field value is used.
+
+        Exceptions:
+        - If default_valves.USER_MUST_PROVIDE_AUTH_CONFIG is True, then GEMINI_API_KEY and
+          VERTEX_PROJECT in the merged result will be taken directly from
+          user_valves (even if they are None), ignoring the values in default_valves.
+
+        Args:
+            default_valves: The base Valves object with default configurations.
+            user_valves: An optional UserValves object with user-specific overrides.
+                         If None, a copy of default_valves is returned.
+
+        Returns:
+            A new Valves object representing the merged configuration.
+        """
+        if user_valves is None:
+            # If no user-specific valves are provided, return a copy of the default valves.
+            return default_valves.model_copy(deep=True)
+
+        # Start with the values from the base `Valves`
+        merged_data = default_valves.model_dump()
+
+        # Override with non-None values from `UserValves`
+        # Iterate over fields defined in the UserValves model
+        for field_name in Pipe.UserValves.model_fields:
+            # getattr is safe as field_name comes from model_fields of user_valves' type
+            user_value = getattr(user_valves, field_name)
+            if user_value is not None and user_value != "":
+                # Only update if the field is also part of the main Valves model
+                # (keys of merged_data are fields of default_valves)
+                if field_name in merged_data:
+                    merged_data[field_name] = user_value
+
+        user_whitelist = (
+            default_valves.AUTH_WHITELIST.split(",")
+            if default_valves.AUTH_WHITELIST
+            else []
+        )
+
+        # Apply special logic based on default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
+        if (
+            default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
+            and user_email not in user_whitelist
+        ):
+            # If USER_MUST_PROVIDE_AUTH_CONFIG is True and user is not in the whitelist,
+            # then user must provide their own GEMINI_API_KEY
+            # User is disallowed from using Vertex AI in this case.
+            merged_data["GEMINI_API_KEY"] = user_valves.GEMINI_API_KEY
+            merged_data["VERTEX_PROJECT"] = None
+            merged_data["USE_VERTEX_AI"] = False
+
+        # Create a new Valves instance with the merged data.
+        # Pydantic will validate the data against the Valves model definition during instantiation.
+        return Pipe.Valves(**merged_data)
+
     def _get_mime_type(self, file_uri: str) -> str:
         """
         Determines MIME type based on file extension using the mimetypes module.
@@ -2037,6 +2104,6 @@ class Pipe:
             log.exception(f"Error processing file {file_path}")
             return None, content_type
 
-    # endregion 1.7 Utility helpers
+    # endregion 1.8 Utility helpers
 
     # endregion 1. Helper methods inside the Pipe class
