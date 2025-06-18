@@ -352,7 +352,7 @@ class Pipe:
         if self._is_function_active("gemini_reasoning_toggle"):
             # NOTE: Gemini 2.5 Pro supports reasoning budget but not toggling reasoning on/off.
             if re.search(
-                r"gemini-2.5-flash", model_name, re.IGNORECASE
+                r"gemini-2.5-(flash|lite)", model_name, re.IGNORECASE
             ) and not body.get("reason", False):
                 log.info(
                     f"Model ID '{model_name}' allows turning off the reasoning feature. "
@@ -365,7 +365,7 @@ class Pipe:
         else:
             log.warning(
                 "Gemini Reasoning Toggle filter is not active. "
-                "Install or enable it if you want to toggle Gemini 2.5 Flash reasoning on/off."
+                "Install or enable it if you want to toggle Gemini 2.5 Flash or Lite reasoning on/off."
             )
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
@@ -396,6 +396,9 @@ class Pipe:
         # Add URL context tool if enabled and model is compatible
         if valves.ENABLE_URL_CONTEXT_TOOL:
             compatible_models_for_url_context = [
+                "gemini-2.5-pro",
+                "gemini-2.5-flash",
+                "gemini-2.5-flash-lite-preview-06-17",
                 "gemini-2.5-pro-preview-06-05",
                 "gemini-2.5-pro-preview-05-06",
                 "gemini-2.5-flash-preview-05-20",
@@ -463,7 +466,7 @@ class Pipe:
             )
         else:
             # Non-streaming response.
-            if "gemini-2.0-flash-exp-image-generation" in model_name:
+            if "gemini-2.0-flash-preview-image-generation" in model_name:
                 warn_msg = "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
                 raise NotImplementedError(warn_msg)
             # TODO: Support native image gen here too.
