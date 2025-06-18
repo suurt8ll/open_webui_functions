@@ -114,10 +114,10 @@ class Pipe:
             description="""Comma separated list of user emails that are allowed to bypassUSER_MUST_PROVIDE_AUTH_CONFIG and use the default authentication configuration.
             Default value is None (no users are whitelisted).""",
         )
-        # FIXME: Default to None.
-        GEMINI_API_BASE_URL: str = Field(
-            default="https://generativelanguage.googleapis.com",
-            description="The base URL for calling the Gemini API",
+        GEMINI_API_BASE_URL: str | None = Field(
+            default=None,
+            description="""The base URL for calling the Gemini API. 
+            Default value is None.""",
         )
         USE_VERTEX_AI: bool = Field(
             default=False,
@@ -131,7 +131,6 @@ class Pipe:
             description="""The Google Cloud project ID to use with Vertex AI.
             Default value is None.""",
         )
-        # FIXME: Default to None.
         VERTEX_LOCATION: str = Field(
             default="global",
             description="""The Google Cloud region to use with Vertex AI.
@@ -151,10 +150,12 @@ class Pipe:
         )
         CACHE_MODELS: bool = Field(
             default=True,
-            description="Whether to request models only on first load and when white- or blacklist changes.",
+            description="""Whether to request models only on first load and when white- or blacklist changes. 
+            Default value is True.""",
         )
         THINKING_BUDGET: int = Field(
             ge=0,
+            # FIXME: Flash and Lite have this max and min, Pro has 128-32768.
             le=24576,
             default=8192,
             description="""Gemini 2.5 only. Indicates the thinking budget in tokens.
@@ -168,27 +169,29 @@ class Pipe:
             Default value is True.""",
         )
         USE_FILES_API: bool = Field(
-            title="Use Files API",
             default=True,
-            description="Save the image files using Open WebUI's API for files.",
+            description="""Save the image files using Open WebUI's API for files. 
+            Default value is True.""",
         )
         THINKING_MODEL_PATTERN: str = Field(
             default=r"gemini-2.5",
-            description="Regex pattern to identify thinking models.",
+            description="""Regex pattern to identify thinking models. 
+            Default value is r"gemini-2.5".""",
+        )
+        ENABLE_URL_CONTEXT_TOOL: bool = Field(
+            default=False,
+            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs. 
+            This tool is only compatible with specific models. Default value is False.""",
         )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
             default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
-        )
-        ENABLE_URL_CONTEXT_TOOL: bool = Field(
-            default=False,
-            description="Enable the URL context tool to allow the model to fetch and use content from provided URLs. This tool is only compatible with specific models.",
+            description="""Select logging level. Use `docker logs -f open-webui` to view logs.
+            Default value is INFO.""",
         )
 
     class UserValves(BaseModel):
-        # TODO: Add more options that can be changed by the user.
         GEMINI_API_KEY: str | None = Field(
             default=None,
             description="""Gemini Developer API key.
@@ -216,8 +219,8 @@ class Pipe:
         )
         THINKING_BUDGET: int | None | Literal[""] = Field(
             default=None,
-            description="""Gemini 2.5 only. Indicates the thinking budget in tokens.
-            0 means no thinking. Default value is None (uses the default from Valves).
+            description="""Gemini 2.5 only. Indicates the thinking budget in tokens. 0 means no thinking. 
+            Default value is None.
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
         )
         SHOW_THINKING_SUMMARY: bool | None | Literal[""] = Field(
@@ -226,15 +229,27 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is None.""",
         )
-        ENABLE_URL_CONTEXT_TOOL: bool = Field(
-            default=False,
-            description="Enable the URL context tool to allow the model to fetch and use content from provided URLs. This tool is only compatible with specific models.",
+        USE_FILES_API: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Save the image files using Open WebUI's API for files.
+            Default value is None.""",
+        )
+        THINKING_MODEL_PATTERN: str | None = Field(
+            default=None,
+            description="""Regex pattern to identify thinking models.
+            Default value is None.""",
+        )
+        ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs. 
+            This tool is only compatible with specific models. Default value is None.""",
         )
 
         @field_validator("THINKING_BUDGET", mode="after")
         @classmethod
         def validate_thinking_budget_range(cls, v):
             if v is not None and v != "":
+                # FIXME: See comment in Valves class.
                 if not (0 <= v <= 24576):
                     raise ValueError(
                         "THINKING_BUDGET must be between 0 and 24576, inclusive."
