@@ -154,13 +154,21 @@ class Pipe:
             Default value is True.""",
         )
         THINKING_BUDGET: int = Field(
-            ge=0,
-            # FIXME: Flash and Lite have this max and min, Pro has 128-32768.
-            le=24576,
             default=8192,
-            description="""Gemini 2.5 only. Indicates the thinking budget in tokens.
-            0 means no thinking. Default value is 8192.
-            See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
+            ge=0,
+            # The widest possible range is 0 (for Lite/Flash) to 32768 (for Pro).
+            # Model-specific constraints are detailed in the description.
+            le=32768,
+            description="""Specifies the token budget for the model's internal thinking process,
+            used for complex tasks like tool use. Applicable to Gemini 2.5 models.
+            Default value is 8192.
+
+            The valid token range depends on the specific model tier:
+            - **Pro models**: Must be a value between 128 and 32,768.
+            - **Flash and Lite models**: A value between 0 and 24,576. For these
+              models, a value of 0 disables the thinking feature.
+
+            See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more details.""",
         )
         SHOW_THINKING_SUMMARY: bool = Field(
             default=True,
@@ -219,9 +227,16 @@ class Pipe:
         )
         THINKING_BUDGET: int | None | Literal[""] = Field(
             default=None,
-            description="""Gemini 2.5 only. Indicates the thinking budget in tokens. 0 means no thinking. 
+            description="""Specifies the token budget for the model's internal thinking process,
+            used for complex tasks like tool use. Applicable to Gemini 2.5 models.
             Default value is None.
-            See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more.""",
+
+            The valid token range depends on the specific model tier:
+            - **Pro models**: Must be a value between 128 and 32,768.
+            - **Flash and Lite models**: A value between 0 and 24,576. For these
+              models, a value of 0 disables the thinking feature.
+
+            See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more details.""",
         )
         SHOW_THINKING_SUMMARY: bool | None | Literal[""] = Field(
             default=None,
@@ -249,10 +264,9 @@ class Pipe:
         @classmethod
         def validate_thinking_budget_range(cls, v):
             if v is not None and v != "":
-                # FIXME: See comment in Valves class.
-                if not (0 <= v <= 24576):
+                if not (0 <= v <= 32768):
                     raise ValueError(
-                        "THINKING_BUDGET must be between 0 and 24576, inclusive."
+                        "THINKING_BUDGET must be between 0 and 32768, inclusive."
                     )
             return v
 
