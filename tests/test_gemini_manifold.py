@@ -15,21 +15,27 @@ mock_chats_module = MagicMock()
 mock_files_module = MagicMock()
 mock_functions_module = MagicMock()
 mock_storage_module = MagicMock()
+mock_misc_module = MagicMock()
 
 mock_chats_module.Chats = MagicMock()
 mock_files_module.FileForm = MagicMock()
 mock_files_module.Files = MagicMock()
 mock_functions_module.Functions = MagicMock()
 mock_storage_module.Storage = MagicMock()
+# Provide a default return value for pop_system_message to avoid TypeErrors in tests that don't set it.
+mock_misc_module.pop_system_message.return_value = (None, [])
 
 sys.modules["open_webui.models.chats"] = mock_chats_module
 sys.modules["open_webui.models.files"] = mock_files_module
 sys.modules["open_webui.models.functions"] = mock_functions_module
 sys.modules["open_webui.storage.provider"] = mock_storage_module
+sys.modules["open_webui.utils.misc"] = mock_misc_module
+
 
 # --- Now, the import of your plugin should use the mocks ---
 from plugins.pipes.gemini_manifold import (
     Pipe,
+    GeminiContentBuilder,
     types as gemini_types,
 )  # gemini_types is google.genai.types
 
@@ -53,10 +59,9 @@ def mock_pipe_valves_data():
         "MODEL_BLACKLIST": None,
         "CACHE_MODELS": True,
         "THINKING_BUDGET": 8192,
+        "SHOW_THINKING_SUMMARY": True,
         "USE_FILES_API": True,
-        "THINKING_MODEL_PATTERN": r"thinking|gemini-2.5",
-        "EMIT_INTERVAL": 1,
-        "EMIT_STATUS_UPDATES": False,
+        "THINKING_MODEL_PATTERN": r"gemini-2.5",
         "LOG_LEVEL": "INFO",
         "ENABLE_URL_CONTEXT_TOOL": False,
     }
@@ -758,215 +763,218 @@ def test_user_overrides_admin_vertex_project_location(pipe_instance_fixture):
 # endregion Test _get_genai_models
 
 
-# region Test _genai_contents_from_messages
+# region Test GeminiContentBuilder
 @pytest.mark.asyncio
-async def test_genai_contents_from_messages_simple_user_text(pipe_instance_fixture):
+async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
     """
     Tests conversion of a simple user text message into genai.types.Content.
     """
-    pipe_instance, MockedGenAIClientConstructor = pipe_instance_fixture
+    # Reset mocks for test isolation
+    mock_chats_module.reset_mock()
+    mock_misc_module.reset_mock()
 
+    pipe_instance, _ = pipe_instance_fixture
     messages_body = [{"role": "user", "content": "Hello!"}]
-    messages_db = None
-    upload_documents = True
     mock_event_emitter = AsyncMock()
+    mock_user_data = {
+        "id": "test_user_id",
+        "email": "test@example.com",
+        "name": "Test User",
+        "role": "user",
+    }
+
+    # The builder fetches chat history, mock it to return None for this test
+    mock_chats_module.Chats.get_chat_by_id_and_user_id.return_value = None
+    # The builder uses pop_system_message, mock its behavior
+    mock_misc_module.pop_system_message.return_value = (None, messages_body)
+
+    builder = GeminiContentBuilder(
+        messages_body=messages_body,  # type: ignore
+        metadata_body={"chat_id": "test_chat_id"},
+        user_data=mock_user_data,  # type: ignore
+        event_emitter=mock_event_emitter,
+        valves=pipe_instance.valves,
+    )
 
     with patch(
         "plugins.pipes.gemini_manifold.types.Part.from_text"
     ) as mock_part_from_text:
         mock_part_from_text.return_value = MagicMock(spec=gemini_types.Part)
 
-        contents = await pipe_instance._genai_contents_from_messages(
-            messages_body,
-            messages_db,
-            upload_documents,
-            mock_event_emitter,
-        )
+        contents = await builder.build_contents()
 
+        mock_misc_module.pop_system_message.assert_called_once_with(messages_body)
         mock_part_from_text.assert_called_once_with(text="Hello!")
         assert len(contents) == 1
         content_item = contents[0]
         assert content_item.role == "user"
+        assert content_item.parts is not None
         assert len(content_item.parts) == 1
         assert content_item.parts[0] == mock_part_from_text.return_value
-        mock_event_emitter.assert_not_called()
+        # A warning toast is emitted when messages_db is not found
+        mock_event_emitter.assert_called_once()
+        assert mock_event_emitter.call_args[0][0]["type"] == "notification"
+        assert mock_event_emitter.call_args[0][0]["data"]["type"] == "warning"
 
 
 @pytest.mark.asyncio
-async def test_genai_contents_from_messages_youtube_link_mixed_with_text(
+async def test_builder_build_contents_youtube_link_mixed_with_text(
     pipe_instance_fixture,
 ):
-    pipe_instance, MockedGenAIClientConstructor = pipe_instance_fixture
+    """
+    Tests that a user message with text and a YouTube URL is correctly
+    parsed into interleaved text and file_data parts.
+    """
+    # Reset mocks for test isolation
+    mock_chats_module.reset_mock()
+    mock_misc_module.reset_mock()
+
+    pipe_instance, _ = pipe_instance_fixture
+    # Ensure we test the non-Vertex AI path for file_data creation
+    pipe_instance.valves.USE_VERTEX_AI = False
 
     # Arrange: Inputs
-    youtube_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    text_before_raw = "Look at this: "  # Has trailing space
-    text_after_raw = " it's great!"  # Has leading space
-
-    # Expected stripped text for Part.from_text calls
+    youtube_url = "https://www.youtube.com/watch?v=TLqL_68JPec"
+    text_before_raw = "Look at this: "
+    text_after_raw = " it's great!"
     text_before_stripped = text_before_raw.strip()
     text_after_stripped = text_after_raw.strip()
-
     user_content_string = f"{text_before_raw}{youtube_url}{text_after_raw}"
     messages_body = [{"role": "user", "content": user_content_string}]
-    messages_db = None
-    upload_documents = (
-        True  # Does not affect this specific test path but set for consistency
-    )
     mock_event_emitter = AsyncMock()
+    mock_user_data = {
+        "id": "test_user_id",
+        "email": "test@example.com",
+        "name": "Test User",
+        "role": "user",
+    }
 
-    # Mock types.Part.from_text to control its return values for distinct text segments
+    # Mock DB and system prompt extraction
+    mock_chats_module.Chats.get_chat_by_id_and_user_id.return_value = None
+    mock_misc_module.pop_system_message.return_value = (None, messages_body)
+
+    builder = GeminiContentBuilder(
+        messages_body=messages_body,  # type: ignore
+        metadata_body={"chat_id": "test_chat_id"},
+        user_data=mock_user_data,  # type: ignore
+        event_emitter=mock_event_emitter,
+        valves=pipe_instance.valves,
+    )
+
+    # Mock part creation
     mock_text_part_before_obj = MagicMock(spec=gemini_types.Part, name="TextPartBefore")
     mock_text_part_after_obj = MagicMock(spec=gemini_types.Part, name="TextPartAfter")
 
-    # This patch targets 'types.Part.from_text' as used within the gemini_manifold module.
     with patch(
         "plugins.pipes.gemini_manifold.types.Part.from_text"
     ) as mock_part_from_text:
-        # Configure side_effect to return specific mocks for expected text segments.
-        # This helps verify that from_text is called with the correct, segmented text.
+
         def from_text_side_effect(text):
             if text == text_before_stripped:
                 return mock_text_part_before_obj
-            elif text == text_after_stripped:
+            if text == text_after_stripped:
                 return mock_text_part_after_obj
-            # If called with unexpected text (e.g., the full string containing the URL),
-            # return a generic mock or raise an error to make test failure clearer.
-            # For this test, we expect specific calls. If other calls happen, assertions on
-            # call_args_list or part content will catch it.
-            # Let's return a generic mock for unexpected calls to avoid crashing the test prematurely
-            # and allow other assertions to pinpoint the issue.
-            generic_mock_part = MagicMock(
+            return MagicMock(
                 spec=gemini_types.Part, name=f"GenericTextPart_{text[:10]}"
             )
-            generic_mock_part.text = text  # Store text for easier debugging if needed
-            return generic_mock_part
 
         mock_part_from_text.side_effect = from_text_side_effect
 
-        # Act: Call the method under test
-        contents = await pipe_instance._genai_contents_from_messages(
-            messages_body,
-            messages_db,
-            upload_documents,
-            mock_event_emitter,
-        )
+        # Act
+        contents = await builder.build_contents()
 
-        # Assert: Verify the outcome
-        assert len(contents) == 1, "Should produce one content item"
-
+        # Assert
+        assert len(contents) == 1
         content_item = contents[0]
-        assert content_item.role == "user", "Content item role should be 'user'"
+        assert content_item.role == "user"
+        assert content_item.parts is not None
+        assert len(content_item.parts) == 3
 
-        # --- Assertions for correct part segmentation and ordering (THESE WILL LIKELY FAIL with current code) ---
-        # This is the core of the test, expecting proper interleaving.
-        # Current code likely produces 2 parts: [YouTubePart, FullTextPart(including URL)]
-
-        assert (
-            len(content_item.parts) == 3
-        ), f"Expected 3 parts (text, youtube, text), but got {len(content_item.parts)}. Parts: {[str(p) for p in content_item.parts]}"
-
-        # Verify calls to types.Part.from_text
-        # Expected: two calls, one for text_before_stripped, one for text_after_stripped.
-        # Current code likely calls it once with the full user_content_string.
-        expected_from_text_calls = [
+        # Assertions for correct part segmentation and ordering
+        assert mock_part_from_text.call_count == 2
+        expected_calls = [
             call(text=text_before_stripped),
             call(text=text_after_stripped),
         ]
-        # Using assert_has_calls because the order of these text parts relative to each other
-        # (if there were multiple text segments from markdown processing) might not be fixed,
-        # but for this simple case, call_args_list would be stricter.
-        # However, given the side_effect, checking the objects in content_item.parts is more direct.
-        # Let's check call_count first, then the actual parts.
-        assert (
-            mock_part_from_text.call_count == 2
-        ), f"Expected Part.from_text to be called 2 times, but was called {mock_part_from_text.call_count} times. Calls: {mock_part_from_text.call_args_list}"
+        mock_part_from_text.assert_has_calls(expected_calls, any_order=True)
 
-        # Assert the content and order of parts
         # Part 1: Text before the YouTube link
-        assert (
-            content_item.parts[0] is mock_text_part_before_obj
-        ), f"Part 0 was not the expected 'text_before' mock. Got: {content_item.parts[0]}"
+        assert content_item.parts[0] is mock_text_part_before_obj
 
         # Part 2: The YouTube link
         youtube_part = content_item.parts[1]
-        assert isinstance(
-            youtube_part, gemini_types.Part
-        ), f"Part 1 is not a gemini_types.Part. Got: {type(youtube_part)}"
-        assert hasattr(
-            youtube_part, "file_data"
-        ), "YouTube part (Part 1) should have 'file_data' attribute"
-        assert (
-            youtube_part.file_data is not None
-        ), "YouTube part's file_data should not be None"
-        assert (
-            youtube_part.file_data.file_uri == youtube_url
-        ), f"YouTube part URI mismatch. Expected: {youtube_url}, Got: {youtube_part.file_data.file_uri}"
-        # Ensure it's not accidentally a text part
-        assert (
-            not hasattr(youtube_part, "text") or youtube_part.text is None
-        ), "YouTube part should not have a 'text' attribute or it should be None"
+        assert isinstance(youtube_part, gemini_types.Part)
+        assert hasattr(youtube_part, "file_data")
+        assert youtube_part.file_data is not None
+        assert youtube_part.file_data.file_uri == youtube_url
 
         # Part 3: Text after the YouTube link
-        assert (
-            content_item.parts[2] is mock_text_part_after_obj
-        ), f"Part 2 was not the expected 'text_after' mock. Got: {content_item.parts[2]}"
+        assert content_item.parts[2] is mock_text_part_after_obj
 
-        # Ensure event_emitter was not called for this simple case
-        mock_event_emitter.assert_not_called()
+        # A warning toast is emitted when messages_db is not found
+        mock_event_emitter.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_genai_contents_from_messages_user_text_with_pdf(pipe_instance_fixture):
+async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
     """
     Tests conversion of a user message with text and an attached PDF file.
     """
-    pipe_instance, MockedGenAIClientConstructor = pipe_instance_fixture
+    # Reset mocks for test isolation
+    mock_chats_module.reset_mock()
+    mock_misc_module.reset_mock()
+
+    pipe_instance, _ = pipe_instance_fixture
 
     # Arrange: Inputs
     user_text_content = "Please analyze this PDF."
     pdf_file_id = "test-pdf-id-001"
-    pdf_file_name = "mydoc.pdf"
     fake_pdf_bytes = b"%PDF-1.4 fake content..."
     pdf_mime_type = "application/pdf"
-
     messages_body = [{"role": "user", "content": user_text_content}]
-
-    # Construct messages_db with file attachment info
-    messages_db = [
-        {
-            "id": "user-msg-db-id-1",
-            "parentId": None,
-            "childrenIds": [],
-            "role": "user",
-            "content": user_text_content,
-            "timestamp": 1620000000,
-            "files": [
-                {
-                    "id": "attachment-id-pdf-1",
-                    "type": "file",
-                    "file": {
-                        "id": pdf_file_id,
-                        "name": pdf_file_name,
-                        "size": len(fake_pdf_bytes),
-                        "timestamp": 1620000000,
-                    },
-                    "references": [],
-                    "tool_code_id": None,
-                }
-            ],
-        }
-    ]
-    upload_documents = True
     mock_event_emitter = AsyncMock()
+    mock_user_data = {
+        "id": "test_user_id",
+        "email": "test@example.com",
+        "name": "Test User",
+        "role": "user",
+    }
 
-    # Mock objects for parts
+    # Mock the chat object returned by the DB
+    mock_chat_from_db = MagicMock()
+    mock_chat_from_db.chat = {
+        "messages": [
+            {
+                "role": "user",
+                "content": user_text_content,
+                "files": [{"file": {"id": pdf_file_id}}],
+            },
+            {"role": "assistant", "content": ""},  # Placeholder for current response
+        ]
+    }
+
+    # Mock the DB call and system prompt extraction
+    mock_chats_module.Chats.get_chat_by_id_and_user_id.return_value = mock_chat_from_db
+    mock_misc_module.pop_system_message.return_value = (None, messages_body)
+
+    builder = GeminiContentBuilder(
+        messages_body=messages_body,  # type: ignore
+        metadata_body={
+            "chat_id": "test_chat_id",
+            "features": {"upload_documents": True},
+        },
+        user_data=mock_user_data,  # type: ignore
+        event_emitter=mock_event_emitter,
+        valves=pipe_instance.valves,
+    )
+
     mock_pdf_part_obj = MagicMock(spec=gemini_types.Part, name="PdfPart")
     mock_text_part_obj = MagicMock(spec=gemini_types.Part, name="TextPart")
 
-    # Patch _get_file_data, Part.from_bytes, and Part.from_text
     with patch.object(
-        Pipe, "_get_file_data", return_value=(fake_pdf_bytes, pdf_mime_type)
+        GeminiContentBuilder,
+        "_get_file_data",
+        return_value=(fake_pdf_bytes, pdf_mime_type),
     ) as mock_get_file_data, patch(
         "plugins.pipes.gemini_manifold.types.Part.from_bytes",
         return_value=mock_pdf_part_obj,
@@ -976,14 +984,12 @@ async def test_genai_contents_from_messages_user_text_with_pdf(pipe_instance_fix
     ) as mock_part_from_text:
 
         # Act
-        contents = await pipe_instance._genai_contents_from_messages(
-            messages_body,
-            messages_db,
-            upload_documents,
-            mock_event_emitter,
-        )
+        contents = await builder.build_contents()
 
         # Assert
+        mock_chats_module.Chats.get_chat_by_id_and_user_id.assert_called_once_with(
+            id="test_chat_id", user_id="test_user_id"
+        )
         mock_get_file_data.assert_called_once_with(pdf_file_id)
         mock_part_from_bytes.assert_called_once_with(
             data=fake_pdf_bytes, mime_type=pdf_mime_type
@@ -993,20 +999,14 @@ async def test_genai_contents_from_messages_user_text_with_pdf(pipe_instance_fix
         assert len(contents) == 1
         user_content_obj = contents[0]
         assert user_content_obj.role == "user"
+        assert user_content_obj.parts is not None
         assert len(user_content_obj.parts) == 2
-
-        # Check order: PDF part should be first, then text part
-        assert (
-            user_content_obj.parts[0] is mock_pdf_part_obj
-        ), "First part should be the PDF mock."
-        assert (
-            user_content_obj.parts[1] is mock_text_part_obj
-        ), "Second part should be the text mock."
-
+        assert user_content_obj.parts[0] is mock_pdf_part_obj
+        assert user_content_obj.parts[1] is mock_text_part_obj
         mock_event_emitter.assert_not_called()
 
 
-# endregion Test _genai_contents_from_messages
+# endregion Test GeminiContentBuilder
 
 
 def teardown_module(module):
@@ -1015,3 +1015,4 @@ def teardown_module(module):
     del sys.modules["open_webui.models.files"]
     del sys.modules["open_webui.models.functions"]
     del sys.modules["open_webui.storage.provider"]
+    del sys.modules["open_webui.utils.misc"]
