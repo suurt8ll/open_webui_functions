@@ -1,5 +1,5 @@
 """
-title: Filter Template
+title: Filter Function Template
 description: Very basic filter function.
 id: filter_template
 author: suurt8ll
@@ -8,9 +8,13 @@ funding_url: https://github.com/suurt8ll/open_webui_functions
 version: 0.0.0
 """
 
+import datetime
+import inspect
 import json
-from pydantic import BaseModel
-from typing import Any, Awaitable, Callable, TYPE_CHECKING
+from pydantic import BaseModel, Field
+from fastapi import Request
+from collections.abc import Awaitable, Callable
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
@@ -19,49 +23,85 @@ if TYPE_CHECKING:
 class Filter:
 
     class Valves(BaseModel):
-        pass
+        EXAMPLE_STRING: str = Field(
+            default="", title="Admin String", description="String configurable by admin"
+        )
+
+    class UserValves(BaseModel):
+        EXAMPLE_STRING_USER: str = Field(
+            default="", title="User String", description="String configurable by user"
+        )
 
     def __init__(self):
         self.valves = self.Valves()
-        print(f"{[__name__]} Function has been initialized.")
+        self._log("Function has been initialized!")
 
-    def inlet(self, body: "Body", **kwargs) -> "Body":
+    def _log(self, message: str):
+        timestamp = datetime.datetime.now().isoformat()
+        caller_name = inspect.stack()[1].function
+        print(f"[{timestamp}] [{__name__}.{caller_name}] {message}")
 
-        print(f"\n--- Inlet Filter ---")
-        print(f"{[__name__]} Original Request Body:")
-        print(json.dumps(body, indent=2, default=str))
-        # print(f"{[__name__]} Original __metadata__:")
-        # print(json.dumps(__metadata__, indent=2, default=str))
+    async def inlet(
+        self,
+        body: "Body",
+        __id__: str,
+        __metadata__: "Metadata",
+        __user__: "UserData",
+        __request__: Request,
+        __model__: dict,
+        __event_emitter__: Callable[["Event"], Awaitable[None]],
+        __event_call__: Callable[["Event"], Awaitable[Any]],
+    ) -> "Body":
 
-        # body["files"] = []
-        body["messages"][-1]["content"] = "This was injected by Filter inlet method."
-
-        print(f"{[__name__]} Modified Request Body (before sending to LLM):")
-        print(json.dumps(body, indent=2, default=str))
+        message_content = (
+            "Returning all local variables as JSON:\n"
+            f"{json.dumps(locals(), indent=2, default=str)}"
+        )
+        self._log(message_content)
 
         return body
 
-    async def stream(self, event: dict[str, Any]) -> dict[str, Any]:
-        # print(f"\n--- Stream Filter ---")
-        # print("Event Object:")
-        # print(json.dumps(event, indent=2, default=str))
+    async def stream(
+        self,
+        event: dict[str, Any],
+        __id__: str,
+        __metadata__: "Metadata",
+        __user__: "UserData",
+        __request__: Request,
+        __model__: dict,
+        __event_emitter__: Callable[[dict], Awaitable[None]],
+        __event_call__: Callable[[dict], Awaitable[Any]],
+    ) -> dict | None:
+
+        message_content = (
+            "Returning all local variables as JSON:\n"
+            f"{json.dumps(locals(), indent=2, default=str)}"
+        )
+        self._log(message_content)
+
         return event
 
     async def outlet(
-        self, body: "Body", __event_emitter__: Callable[["Event"], Awaitable[None]]
+        self,
+        body: "Body",
+        __id__: str,
+        __metadata__: "Metadata",
+        __user__: "UserData",
+        __request__: Request,
+        __model__: dict,
+        __event_emitter__: Callable[[dict], Awaitable[None]],
+        __event_call__: Callable[[dict], Awaitable[Any]],
     ) -> "Body":
 
-        print(f"\n--- Outlet Filter ---")
-        print(f"{[__name__]} Original Response Body:")
-        print(json.dumps(body, indent=2, default=str))
-
-        body["messages"][-1]["content"] = "This was injected by Filter outlet method."
-
-        print(f"{[__name__]} Modified Response Body:")
-        print(json.dumps(body, indent=2, default=str))
+        message_content = (
+            "Returning all local variables as JSON:\n"
+            f"{json.dumps(locals(), indent=2, default=str)}"
+        )
+        self._log(message_content)
 
         return body
 
-    # region ----- Helper methods inside the Pipe class -----
 
-    # endregion
+# region ----- Helper methods inside the Pipe class -----
+
+# endregion

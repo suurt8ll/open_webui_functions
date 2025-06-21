@@ -11,7 +11,11 @@ version: 1.0.0
 
 # Shoutout to jrkropp for making me aware of Filter.toggle!
 
+from typing import TYPE_CHECKING, cast
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 
 class Filter:
@@ -27,8 +31,16 @@ class Filter:
 
     async def inlet(
         self,
-        body: dict,
-    ) -> dict:
+        body: "Body",
+    ) -> "Body":
         # Signal downstream Gemini Manifold pipe that reasoning is enabled.
-        body["reason"] = True
+
+        # Ensure features field exists
+        metadata = body.get("metadata")
+        metadata_features = metadata.get("features")
+        if metadata_features is None:
+            metadata_features = cast(Features, {})
+            metadata["features"] = metadata_features
+
+        metadata_features["reason"] = True
         return body
