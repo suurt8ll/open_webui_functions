@@ -820,6 +820,18 @@ class Pipe:
         log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
         )
+        # URL context front-end button takes precedence over valves setting if it is enabled.
+        if self._is_function_active("gemini_url_context_toggle"):
+            valves.ENABLE_URL_CONTEXT_TOOL = features.get("url_context", False)
+            log.info(
+                "URL context toggle filter is active. "
+                f"Setting valves.ENABLE_URL_CONTEXT_TOOL to {valves.ENABLE_URL_CONTEXT_TOOL}."
+            )
+        else:
+            log.warning(
+                "Gemini URL Context Toggle filter is not active. "
+                "Install or enable it if you want to toggle URL context tool on/off through a front-end button."
+            )
 
         builder = GeminiContentBuilder(
             messages_body=body.get("messages"),
@@ -860,7 +872,7 @@ class Pipe:
         else:
             log.warning(
                 "Gemini Reasoning Toggle filter is not active. "
-                "Install or enable it if you want to toggle Gemini 2.5 Flash or Lite reasoning on/off."
+                "Install or enable it if you want to toggle Gemini 2.5 Flash or Lite reasoning on/off through a front-end button."
             )
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(

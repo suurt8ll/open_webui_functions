@@ -178,6 +178,7 @@ class Features(TypedDict):
     google_code_execution: NotRequired[bool]
     upload_documents: NotRequired[bool]
     reason: NotRequired[bool]
+    url_context: NotRequired[bool]
 
 
 class Metadata(TypedDict):
