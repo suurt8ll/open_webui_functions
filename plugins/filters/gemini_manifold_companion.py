@@ -155,9 +155,12 @@ class Filter:
         features = body.get("features", {})
         log.debug(f"body.features:", payload=features)
 
-        # Ensure metadata structure exists and add new feature
-        metadata = body.setdefault("metadata", {})  # type: ignore
-        metadata_features = metadata.setdefault("features", {})
+        # Ensure features field exists
+        metadata = body.get("metadata")
+        metadata_features = metadata.get("features")
+        if metadata_features is None:
+            metadata_features = cast(Features, {})
+            metadata["features"] = metadata_features
 
         if is_grounding_model:
             web_search_enabled = (
