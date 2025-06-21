@@ -844,12 +844,11 @@ class Pipe:
                 include_thoughts=valves.SHOW_THINKING_SUMMARY,
             )
 
-        # TODO: Check availability of companion filter too with this method.
         if self._is_function_active("gemini_reasoning_toggle"):
             # NOTE: Gemini 2.5 Pro supports reasoning budget but not toggling reasoning on/off.
             if re.search(
                 r"gemini-2.5-(flash|lite)", model_name, re.IGNORECASE
-            ) and not body.get("reason", False):
+            ) and not features.get("reason"):
                 log.info(
                     f"Model ID '{model_name}' allows turning off the reasoning feature. "
                     "Reasoning is currently toggled off in the UI. Setting thinking budget to 0."
@@ -2058,6 +2057,7 @@ class Pipe:
 
     # region 1.7 Utility helpers
 
+    # TODO: Check availability of companion filter too with this method.
     @staticmethod
     def _is_function_active(id: str) -> bool:
         # Get the filter's data from the database.
