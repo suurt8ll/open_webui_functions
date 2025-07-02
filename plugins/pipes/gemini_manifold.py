@@ -38,6 +38,8 @@ requirements: google-genai==1.20.0
 
 from google import genai
 from google.genai import types
+from google.cloud import storage
+from google.api_core import exceptions
 
 import inspect
 import copy
@@ -504,6 +506,34 @@ class GeminiContentBuilder:
                 f"File {file_path} was found in the database but it lacks `meta.content_type` field. Cannot continue."
             )
             return None, None
+        if file_path.startswith("gs://"):
+            try:
+                # Initialize the GCS client
+                storage_client = storage.Client()
+
+                # Parse the GCS path
+                # The path should be in the format "gs://bucket-name/object-name"
+                if len(file_path.split("/", 3)) < 4:
+                    raise ValueError(
+                        f"Invalid GCS path: '{file_path}'. "
+                        "Path must be in the format 'gs://bucket-name/object-name'."
+                    )
+
+                bucket_name, blob_name = file_path.removeprefix("gs://").split("/", 1)
+
+                # Get the bucket and blob (file object)
+                bucket = storage_client.bucket(bucket_name)
+                blob = bucket.blob(blob_name)
+
+                # Download the file's content as bytes
+                print(f"Reading from GCS: {file_path}")
+                return blob.download_as_bytes(), content_type
+            except exceptions.NotFound:
+                print(f"Error: GCS object not found at {file_path}")
+                raise
+            except Exception as e:
+                print(f"An error occurred while reading from GCS: {e}")
+                raise
         try:
             with open(file_path, "rb") as file:
                 image_data = file.read()
