@@ -10,31 +10,12 @@ version: 1.21.0
 requirements: google-genai==1.20.0
 """
 
+# Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
+# They don't have any effect on the plugin's functionality.
+
+
 # This is a helper function that provides a manifold for Google's Gemini Studio API and Vertex AI.
 # Be sure to check out my GitHub repository for more information! Contributions, questions and suggestions are very welcome.
-
-# Supported features:
-#   - Display thinking summary (Open WebUI >= 0.6.14 required)
-#   - Thinking budget
-#   - Gemini Reasoning Toggle (Reason filter required, see GitHub README)
-#   - Native image generation (image output), use "gemini-2.0-flash-preview-image-generation"
-#   - Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 filter required, see GitHub README)
-#   - Image input
-#   - YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
-#   - Grounding with Google Search (Gemini Manifold Companion >= 1.2.0 required)
-#   - Display citations in the front-end. (Gemini Manifold Companion >= 1.5.0 required)
-#   - Permissive safety settings (Gemini Manifold Companion >= 1.3.0 required)
-#   - Each user can decide to use their own API key.
-#   - Token usage data
-#   - Code execution tool. (Gemini Manifold Companion >= 1.1.0 required)
-#   - URL context tool (Gemini Manifold Companion >= 1.5.0 required if you want to see citations in the front-end).
-#   - Streaming and non-streaming responses.
-
-# Features that are supported by API but not yet implemented in the manifold:
-#   TODO Audio input support
-#   TODO Video input support (other than YouTube URLs)
-#   TODO Google Files API
-#   TODO Native tool calling
 
 from google import genai
 from google.genai import types
@@ -820,6 +801,18 @@ class Pipe:
         log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
         )
+        # URL context front-end button takes precedence over valves setting if it is enabled.
+        if self._is_function_active("gemini_url_context_toggle"):
+            valves.ENABLE_URL_CONTEXT_TOOL = features.get("url_context", False)
+            log.info(
+                "URL context toggle filter is active. "
+                f"Setting valves.ENABLE_URL_CONTEXT_TOOL to {valves.ENABLE_URL_CONTEXT_TOOL}."
+            )
+        else:
+            log.warning(
+                "Gemini URL Context Toggle filter is not active. "
+                "Install or enable it if you want to toggle URL context tool on/off through a front-end button."
+            )
 
         builder = GeminiContentBuilder(
             messages_body=body.get("messages"),
@@ -844,12 +837,11 @@ class Pipe:
                 include_thoughts=valves.SHOW_THINKING_SUMMARY,
             )
 
-        # TODO: Check availability of companion filter too with this method.
         if self._is_function_active("gemini_reasoning_toggle"):
             # NOTE: Gemini 2.5 Pro supports reasoning budget but not toggling reasoning on/off.
             if re.search(
                 r"gemini-2.5-(flash|lite)", model_name, re.IGNORECASE
-            ) and not body.get("reason", False):
+            ) and not features.get("reason"):
                 log.info(
                     f"Model ID '{model_name}' allows turning off the reasoning feature. "
                     "Reasoning is currently toggled off in the UI. Setting thinking budget to 0."
@@ -861,7 +853,7 @@ class Pipe:
         else:
             log.warning(
                 "Gemini Reasoning Toggle filter is not active. "
-                "Install or enable it if you want to toggle Gemini 2.5 Flash or Lite reasoning on/off."
+                "Install or enable it if you want to toggle Gemini 2.5 Flash or Lite reasoning on/off through a front-end button."
             )
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
@@ -2058,6 +2050,7 @@ class Pipe:
 
     # region 1.7 Utility helpers
 
+    # TODO: Check availability of companion filter too with this method.
     @staticmethod
     def _is_function_active(id: str) -> bool:
         # Get the filter's data from the database.
