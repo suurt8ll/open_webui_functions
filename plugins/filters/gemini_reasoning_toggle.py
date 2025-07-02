@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.0.0
+version: 1.1.0
 """
 
 # Shoutout to jrkropp for making me aware of Filter.toggle!
