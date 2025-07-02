@@ -166,6 +166,21 @@ class GeminiContentBuilder:
                 parts = await self._process_user_message(
                     message, files, self.event_emitter
                 )
+                has_text_component = any(p.text for p in parts if p.text)
+
+                if not has_text_component:
+                    # This condition is met if:
+                    # 1. 'parts' is empty (user sent absolutely nothing).
+                    # 2. 'parts' contains non-text items (e.g., an image) but no text part.
+                    log.info(
+                        "User input is empty or lacks a text component (e.g., image-only). "
+                        "Adding default text prompt."
+                    )
+                    default_prompt_text = "The user dit not send any text message with the additional context. Answer by summarizing the newly added context."
+                    default_text_parts = self._genai_parts_from_text(
+                        default_prompt_text
+                    )
+                    parts.extend(default_text_parts)
             elif role == "assistant":
                 message = cast("AssistantMessage", message)
                 # Google API's assistant role is "model"
