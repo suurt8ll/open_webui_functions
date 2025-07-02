@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 1.21.0
-requirements: google-genai==1.20.0
+requirements: google-genai==1.24.0
 """
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
@@ -161,7 +161,7 @@ class GeminiContentBuilder:
                 log.warning(warn_msg)
                 await emit_toast(warn_msg, self.event_emitter, "warning")
                 continue
-            contents.append(types.Content(role=role, parts=parts))
+            contents.append(types.Content(parts=parts, role=role))
         return contents
 
     @staticmethod
