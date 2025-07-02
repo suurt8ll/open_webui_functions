@@ -948,9 +948,9 @@ class Pipe:
                 "gemini-2.0-flash-live-001",
             ]
             if model_name in compatible_models_for_url_context:
-                if client.vertexai:
+                if client.vertexai and (len(gen_content_conf.tools) > 0):
                     log.warning(
-                        "URL context tool is enabled, but Vertex AI does not support it. Skipping."
+                        "URL context tool is enabled, but Vertex AI is used with multiple tools. Skipping."
                     )
                 else:
                     log.info(
