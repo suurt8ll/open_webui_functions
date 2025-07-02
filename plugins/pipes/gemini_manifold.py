@@ -691,6 +691,10 @@ class Pipe:
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs. 
             This tool is only compatible with specific models. Default value is False.""",
         )
+        USE_ENTERPRISE_SEARCH : bool = Field(
+            default=False,
+            description="""Enable the Enterprise Search tool to allow the model to fetch and use content from provided URLs. """
+        )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
@@ -934,6 +938,39 @@ class Pipe:
                 )
         gen_content_conf.tools = []
 
+        if features.get("google_search_tool"):
+            log.info("Using grounding with Google Search as a Tool.")
+            if valves.USE_ENTERPRISE_SEARCH and client.vertexai:
+                log.info("Using Enterprise Web Search instead of Google Search.")
+                gen_content_conf.tools.append(
+                    types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
+                )
+            else:
+                gen_content_conf.tools.append(
+                    types.Tool(google_search=types.GoogleSearch())
+                )
+        elif features.get("google_search_retrieval"):
+            log.info("Using grounding with Google Search Retrieval.")
+            gs = types.GoogleSearchRetrieval(
+                dynamic_retrieval_config=types.DynamicRetrievalConfig(
+                    dynamic_threshold=features.get("google_search_retrieval_threshold")
+                )
+            )
+            gen_content_conf.tools.append(types.Tool(google_search_retrieval=gs))
+        # NB: It is not possible to use both Search and Code execution at the same time,
+        # however, it can be changed later, so let's just handle it as a common error
+        if features.get("google_code_execution"):
+            log.info("Using code execution on Google side.")
+            gen_content_conf.tools.append(
+                types.Tool(code_execution=types.ToolCodeExecution())
+            )
+        gen_content_args = {
+            "model": model_name,
+            "contents": contents,
+            "config": gen_content_conf,
+        }
+        log.debug("Passing these args to the Google API:", payload=gen_content_args)
+
         # Add URL context tool if enabled and model is compatible
         if valves.ENABLE_URL_CONTEXT_TOOL:
             compatible_models_for_url_context = [
@@ -963,34 +1000,6 @@ class Pipe:
                 log.warning(
                     f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
                 )
-
-        if features.get("google_search_tool"):
-            log.info("Using grounding with Google Search as a Tool.")
-            gen_content_conf.tools.append(
-                types.Tool(google_search=types.GoogleSearch())
-            )
-        elif features.get("google_search_retrieval"):
-            log.info("Using grounding with Google Search Retrieval.")
-            gs = types.GoogleSearchRetrieval(
-                dynamic_retrieval_config=types.DynamicRetrievalConfig(
-                    dynamic_threshold=features.get("google_search_retrieval_threshold")
-                )
-            )
-            gen_content_conf.tools.append(types.Tool(google_search_retrieval=gs))
-        # NB: It is not possible to use both Search and Code execution at the same time,
-        # however, it can be changed later, so let's just handle it as a common error
-        if features.get("google_code_execution"):
-            log.info("Using code execution on Google side.")
-            gen_content_conf.tools.append(
-                types.Tool(code_execution=types.ToolCodeExecution())
-            )
-        gen_content_args = {
-            "model": model_name,
-            "contents": contents,
-            "config": gen_content_conf,
-        }
-        log.debug("Passing these args to the Google API:", payload=gen_content_args)
-
         if body.get("stream", False):
             # Streaming response
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
