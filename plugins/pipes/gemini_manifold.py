@@ -10,31 +10,12 @@ version: 1.21.0
 requirements: google-genai==1.20.0
 """
 
+# Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
+# They don't have any effect on the plugin's functionality.
+
+
 # This is a helper function that provides a manifold for Google's Gemini Studio API and Vertex AI.
 # Be sure to check out my GitHub repository for more information! Contributions, questions and suggestions are very welcome.
-
-# Supported features:
-#   - Display thinking summary (Open WebUI >= 0.6.14 required)
-#   - Thinking budget
-#   - Gemini Reasoning Toggle (Reason filter required, see GitHub README)
-#   - Native image generation (image output), use "gemini-2.0-flash-preview-image-generation"
-#   - Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 filter required, see GitHub README)
-#   - Image input
-#   - YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
-#   - Grounding with Google Search (Gemini Manifold Companion >= 1.2.0 required)
-#   - Display citations in the front-end. (Gemini Manifold Companion >= 1.5.0 required)
-#   - Permissive safety settings (Gemini Manifold Companion >= 1.3.0 required)
-#   - Each user can decide to use their own API key.
-#   - Token usage data
-#   - Code execution tool. (Gemini Manifold Companion >= 1.1.0 required)
-#   - URL context tool (Gemini Manifold Companion >= 1.5.0 required if you want to see citations in the front-end).
-#   - Streaming and non-streaming responses.
-
-# Features that are supported by API but not yet implemented in the manifold:
-#   TODO Audio input support
-#   TODO Video input support (other than YouTube URLs)
-#   TODO Google Files API
-#   TODO Native tool calling
 
 from google import genai
 from google.genai import types
