@@ -9,3 +9,5 @@ aiohttp
 aiofiles
 python-dotenv
 aiocache
+google-cloud-storage
+google-api-core
