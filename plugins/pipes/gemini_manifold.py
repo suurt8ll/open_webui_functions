@@ -128,6 +128,7 @@ class GeminiContentBuilder:
         user_data: "UserData",
         event_emitter: Callable[["Event"], Awaitable[None]],
         valves: "Pipe.Valves",
+        vertexai: bool = False,
     ):
         self.messages_body = messages_body
         self.upload_documents = (metadata_body.get("features", {}) or {}).get(
@@ -135,6 +136,7 @@ class GeminiContentBuilder:
         )
         self.event_emitter = event_emitter
         self.valves = valves
+        self.vertexai = vertexai
 
         self.system_prompt, self.messages_body = self._extract_system_prompt(
             self.messages_body
@@ -168,21 +170,42 @@ class GeminiContentBuilder:
                 parts = await self._process_user_message(
                     message, files, self.event_emitter
                 )
-                has_text_component = any(p.text for p in parts if p.text)
-
-                if not has_text_component:
-                    # This condition is met if:
-                    # 1. 'parts' is empty (user sent absolutely nothing).
-                    # 2. 'parts' contains non-text items (e.g., an image) but no text part.
+                # Case 1: User content is completely empty (no text, no files).
+                if not parts:
                     log.info(
-                        "User input is empty or lacks a text component (e.g., image-only). "
-                        "Adding default text prompt."
+                        "User input is completely empty. Injecting a prompt to ask for clarification."
                     )
-                    default_prompt_text = "The user dit not send any text message with the additional context. Answer by summarizing the newly added context."
-                    default_text_parts = self._genai_parts_from_text(
-                        default_prompt_text
+                    clarification_prompt = (
+                        "The user sent an empty message. Please ask the user for "
+                        "clarification on what they would like to ask or discuss."
                     )
-                    parts.extend(default_text_parts)
+                    # This will become the only part for this user message.
+                    parts = self._genai_parts_from_text(clarification_prompt)
+                else:
+                    # Case 2: User has sent content, check if it includes text.
+                    has_text_component = any(p.text for p in parts if p.text)
+                    if not has_text_component:
+                        # The user sent content (e.g., files) but no accompanying text.
+                        if self.vertexai:
+                            # Vertex AI requires a text part in multi-modal messages.
+                            log.info(
+                                "User input lacks a text component for Vertex AI. "
+                                "Adding default text prompt."
+                            )
+                            default_prompt_text = (
+                                "The user did not send any text message with the additional context. "
+                                "Answer by summarizing the newly added context."
+                            )
+                            default_text_parts = self._genai_parts_from_text(
+                                default_prompt_text
+                            )
+                            parts.extend(default_text_parts)
+                        else:
+                            # Google Developer API allows no-text user content.
+                            log.info(
+                                "User input lacks a text component for Google Developer API. "
+                                "Proceeding with non-text parts only."
+                            )
             elif role == "assistant":
                 message = cast("AssistantMessage", message)
                 # Google API's assistant role is "model"
@@ -691,9 +714,9 @@ class Pipe:
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs. 
             This tool is only compatible with specific models. Default value is False.""",
         )
-        USE_ENTERPRISE_SEARCH : bool = Field(
+        USE_ENTERPRISE_SEARCH: bool = Field(
             default=False,
-            description="""Enable the Enterprise Search tool to allow the model to fetch and use content from provided URLs. """
+            description="""Enable the Enterprise Search tool to allow the model to fetch and use content from provided URLs. """,
         )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
@@ -876,6 +899,7 @@ class Pipe:
             user_data=__user__,
             event_emitter=__event_emitter__,
             valves=self.valves,
+            vertexai=client.vertexai,
         )
         contents = await builder.build_contents()
 
