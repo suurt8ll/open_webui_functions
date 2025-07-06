@@ -173,8 +173,13 @@ class GeminiContentBuilder:
                 # Case 1: User content is completely empty (no text, no files).
                 if not parts:
                     log.info(
-                        "User input is completely empty. Injecting a prompt to ask for clarification."
+                        f"User message at index {i} is completely empty. "
+                        "Injecting a prompt to ask for clarification."
                     )
+                    # Inform the user via a toast notification.
+                    toast_msg = f"Your message #{i + 1} was empty. The assistant will ask for clarification."
+                    await emit_toast(toast_msg, self.event_emitter, "info")
+
                     clarification_prompt = (
                         "The user sent an empty message. Please ask the user for "
                         "clarification on what they would like to ask or discuss."
@@ -189,9 +194,16 @@ class GeminiContentBuilder:
                         if self.vertexai:
                             # Vertex AI requires a text part in multi-modal messages.
                             log.info(
-                                "User input lacks a text component for Vertex AI. "
+                                f"User message at index {i} lacks a text component for Vertex AI. "
                                 "Adding default text prompt."
                             )
+                            # Inform the user via a toast notification.
+                            toast_msg = (
+                                f"For your message #{i + 1}, a default prompt was added as text is required "
+                                "for requests with attachments when using Vertex AI."
+                            )
+                            await emit_toast(toast_msg, self.event_emitter, "info")
+
                             default_prompt_text = (
                                 "The user did not send any text message with the additional context. "
                                 "Answer by summarizing the newly added context."
@@ -203,7 +215,7 @@ class GeminiContentBuilder:
                         else:
                             # Google Developer API allows no-text user content.
                             log.info(
-                                "User input lacks a text component for Google Developer API. "
+                                f"User message at index {i} lacks a text component for Google Developer API. "
                                 "Proceeding with non-text parts only."
                             )
             elif role == "assistant":
