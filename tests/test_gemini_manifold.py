@@ -794,12 +794,16 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
         user_data=mock_user_data,  # type: ignore
         event_emitter=mock_event_emitter,
         valves=pipe_instance.valves,
+        vertexai=False,  # Explicitly set for clarity
     )
 
     with patch(
         "plugins.pipes.gemini_manifold.types.Part.from_text"
     ) as mock_part_from_text:
-        mock_part_from_text.return_value = MagicMock(spec=gemini_types.Part)
+        # The mock Part object needs a 'text' attribute for the new check in `build_contents`.
+        mock_text_part = MagicMock(spec=gemini_types.Part)
+        mock_text_part.text = "Hello!"
+        mock_part_from_text.return_value = mock_text_part
 
         contents = await builder.build_contents()
 
@@ -810,7 +814,7 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
         assert content_item.role == "user"
         assert content_item.parts is not None
         assert len(content_item.parts) == 1
-        assert content_item.parts[0] == mock_part_from_text.return_value
+        assert content_item.parts[0] == mock_text_part
         # A warning toast is emitted when messages_db is not found
         mock_event_emitter.assert_called_once()
         assert mock_event_emitter.call_args[0][0]["type"] == "notification"
@@ -859,11 +863,14 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
         user_data=mock_user_data,  # type: ignore
         event_emitter=mock_event_emitter,
         valves=pipe_instance.valves,
+        vertexai=False,  # Explicitly set for clarity
     )
 
-    # Mock part creation
+    # Mock part objects need 'text' attribute for new checks
     mock_text_part_before_obj = MagicMock(spec=gemini_types.Part, name="TextPartBefore")
+    mock_text_part_before_obj.text = text_before_stripped
     mock_text_part_after_obj = MagicMock(spec=gemini_types.Part, name="TextPartAfter")
+    mock_text_part_after_obj.text = text_after_stripped
 
     with patch(
         "plugins.pipes.gemini_manifold.types.Part.from_text"
@@ -874,9 +881,11 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
                 return mock_text_part_before_obj
             if text == text_after_stripped:
                 return mock_text_part_after_obj
-            return MagicMock(
+            generic_mock = MagicMock(
                 spec=gemini_types.Part, name=f"GenericTextPart_{text[:10]}"
             )
+            generic_mock.text = text
+            return generic_mock
 
         mock_part_from_text.side_effect = from_text_side_effect
 
@@ -907,6 +916,8 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
         assert hasattr(youtube_part, "file_data")
         assert youtube_part.file_data is not None
         assert youtube_part.file_data.file_uri == youtube_url
+        # A real file part should have a falsy .text attribute
+        assert not youtube_part.text
 
         # Part 3: Text after the YouTube link
         assert content_item.parts[2] is mock_text_part_after_obj
@@ -966,10 +977,15 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
         user_data=mock_user_data,  # type: ignore
         event_emitter=mock_event_emitter,
         valves=pipe_instance.valves,
+        vertexai=False,  # Explicitly set for clarity
     )
 
+    # Mock part objects need 'text' attribute for new checks.
+    # A file part should have a falsy .text, a text part should have a truthy .text.
     mock_pdf_part_obj = MagicMock(spec=gemini_types.Part, name="PdfPart")
+    mock_pdf_part_obj.text = None
     mock_text_part_obj = MagicMock(spec=gemini_types.Part, name="TextPart")
+    mock_text_part_obj.text = user_text_content
 
     with patch.object(
         GeminiContentBuilder,
