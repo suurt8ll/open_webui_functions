@@ -172,7 +172,10 @@ class FilesAPIManager:
             # Use model_validate to load the object from the dict
             cached_file = types.File.model_validate(cached_data)
 
-            if datetime.now(timezone.utc) < cached_file.expiration_time:
+            if (
+                cached_file.expiration_time
+                and datetime.now(timezone.utc) < cached_file.expiration_time
+            ):
                 log.success(
                     f"File {owui_file_id[:8]} is fresh in cache. Returning immediately."
                 )
@@ -192,6 +195,11 @@ class FilesAPIManager:
         )
         try:
             file = await self.client.aio.files.get(name=deterministic_name)
+            if not file.name:
+                raise FilesAPIError(
+                    f"Stateless recovery for {deterministic_name} returned a file without a name."
+                )
+
             log.success(
                 f"Stateless recovery successful for {deterministic_name}. File exists on server."
             )
@@ -261,10 +269,14 @@ class FilesAPIManager:
             uploaded_file = await self.client.aio.files.upload(
                 file=file_io, config=upload_config
             )
+            if not uploaded_file.name:
+                raise FilesAPIError(
+                    f"File upload for {deterministic_name} did not return a file name."
+                )
+
             log.debug(
                 f"Upload initiated for {uploaded_file.name}. Polling for ACTIVE state."
             )
-
             active_file = await self._poll_for_active_state(uploaded_file.name)
             log.success(f"File {active_file.name} is now ACTIVE.")
 
@@ -302,8 +314,9 @@ class FilesAPIManager:
                     )
                 raise FilesAPIError(error_message)
 
+            state_name = file.state.name if file.state else None
             log.trace(
-                f"File {file_name} is still {file.state.name}. Waiting {poll_interval}s..."
+                f"File {file_name} is still {state_name}. Waiting {poll_interval}s..."
             )
             await asyncio.sleep(poll_interval)
 
