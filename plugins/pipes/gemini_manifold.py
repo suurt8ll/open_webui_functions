@@ -19,13 +19,18 @@ requirements: google-genai==1.24.0
 
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
 
-import inspect
+import time
 import copy
 import json
+import asyncio
+import inspect
+import hashlib
 from functools import cache
 from aiocache import cached
 from aiocache.base import BaseCache
+from datetime import datetime, timezone
 from fastapi.datastructures import State
 import io
 import mimetypes
@@ -96,6 +101,215 @@ class GenaiApiError(Exception):
 
     def __init__(self, message):
         super().__init__(message)
+
+
+class FilesAPIError(Exception):
+    """Custom exception for errors during Files API operations."""
+
+    pass
+
+
+class FilesAPIManager:
+    """
+    Manages uploading, caching, and retrieving files using the Google Gemini Files API.
+
+    This class provides a stateless and efficient way to handle files. It uses a
+    three-tiered approach:
+    1. Hot Path (In-Memory Cache): For instantly retrieving fresh, recently used files.
+    2. Warm Path (Stateless GET): For quickly recovering file state after a server
+       restart by using a deterministic name and a single `get` API call.
+    3. Cold Path (Upload): As a last resort, for uploading new files or re-uploading
+       expired ones.
+    """
+
+    def __init__(self, client: genai.Client, cache: BaseCache):
+        """
+        Initializes the FilesAPIManager.
+
+        Args:
+            client: An initialized `google.genai.Client` instance.
+            cache: An initialized `aiocache` instance for in-memory caching.
+        """
+        self.client = client
+        self.cache = cache
+
+    async def get_or_upload_file(
+        self,
+        owui_file_id: str,
+        file_bytes: bytes,
+        mime_type: str,
+    ) -> types.File:
+        """
+        The main public method to get a file, using caching, recovery, or uploading.
+
+        Args:
+            owui_file_id: The unique ID of the file from Open WebUI, used as the cache key.
+            file_bytes: The raw byte content of the file.
+            mime_type: The MIME type of the file (e.g., 'image/png').
+
+        Returns:
+            An `ACTIVE` `google.genai.types.File` object.
+
+        Raises:
+            FilesAPIError: If the file fails to upload or process.
+        """
+        # Step 1: Get the hash and construct the deterministic name for Google's servers.
+        file_hash = self._get_file_hash(file_bytes)
+        # The file ID part must be <= 40 chars. "owui-v1-" is 8 chars. 40-8=32.
+        deterministic_name = f"files/owui-v1-{file_hash[:32]}"
+        log.debug(
+            f"Processing file {owui_file_id[:8]} with deterministic name: {deterministic_name}"
+        )
+
+        # Step 2: The Hot Path (Check Local Cache)
+        cached_json_str: str | None = await self.cache.get(owui_file_id)
+        if cached_json_str:
+            log.debug(
+                f"Cache HIT for file {owui_file_id[:8]}. Deserializing from JSON."
+            )
+            # Use json.loads to parse the clean JSON string into a dict
+            cached_data = json.loads(cached_json_str)
+            # Use model_validate to load the object from the dict
+            cached_file = types.File.model_validate(cached_data)
+
+            if datetime.now(timezone.utc) < cached_file.expiration_time:
+                log.success(
+                    f"File {owui_file_id[:8]} is fresh in cache. Returning immediately."
+                )
+                return cached_file
+            else:
+                log.info(
+                    f"File {owui_file_id[:8]} in cache has expired. Purging and re-uploading."
+                )
+                await self.cache.delete(owui_file_id)
+                return await self._upload_and_process_file(
+                    owui_file_id, file_bytes, mime_type, deterministic_name
+                )
+
+        # Step 3: The Warm Path (Stateless `get` on Cache Miss)
+        log.debug(
+            f"Cache MISS for file {owui_file_id[:8]}. Attempting stateless recovery with GET."
+        )
+        try:
+            file = await self.client.aio.files.get(name=deterministic_name)
+            log.success(
+                f"Stateless recovery successful for {deterministic_name}. File exists on server."
+            )
+            active_file = await self._poll_for_active_state(file.name)
+            # Get a standard python dict from the model
+            file_dict = active_file.model_dump(mode="json")
+            # Explicitly dump the dict to a clean JSON string
+            await self.cache.set(owui_file_id, json.dumps(file_dict))
+            return active_file
+        except genai_errors.ClientError as e:
+            # Based on logs, the API returns 403 PERMISSION_DENIED when a file
+            # does not exist. We treat this as our "not found" signal.
+            if e.code == 403:
+                log.info(
+                    f"File {deterministic_name} not found on server (received 403). Proceeding to upload."
+                )
+                # Proceed to the upload path.
+                return await self._upload_and_process_file(
+                    owui_file_id, file_bytes, mime_type, deterministic_name
+                )
+            else:
+                # If it's a different client error (e.g., 400 INVALID_ARGUMENT),
+                # we should not proceed. Re-raise the exception.
+                log.exception(
+                    f"A non-403 client error occurred during stateless recovery for {deterministic_name}."
+                )
+                raise FilesAPIError(
+                    f"Failed to check file status for {deterministic_name}: {e}"
+                ) from e
+        except Exception as e:
+            # Catch any other unexpected errors.
+            log.exception(
+                f"An unexpected error occurred during stateless recovery for {deterministic_name}."
+            )
+            raise FilesAPIError(
+                f"Failed to check file status for {deterministic_name}: {e}"
+            ) from e
+
+    def _get_file_hash(self, file_bytes: bytes) -> str:
+        """
+        Calculates the SHA-256 hash of file bytes and returns it as a hex digest.
+
+        TODO: Research if Open WebUI provides a pre-computed hash in the file
+              metadata to avoid this calculation for large files.
+        """
+        hasher = hashlib.sha256()
+        hasher.update(file_bytes)
+        # Use hexdigest() to get a lowercase alphanumeric string, which is
+        # compliant with the Gemini Files API naming rules.
+        return hasher.hexdigest()
+
+    async def _upload_and_process_file(
+        self,
+        owui_file_id: str,
+        file_bytes: bytes,
+        mime_type: str,
+        deterministic_name: str,
+    ) -> types.File:
+        """Handles the full upload and post-upload processing workflow."""
+        log.info(f"Starting upload for {deterministic_name}...")
+        try:
+            file_io = io.BytesIO(file_bytes)
+            # Pass our deterministic name in the upload config.
+            upload_config = types.UploadFileConfig(
+                name=deterministic_name, mime_type=mime_type
+            )
+            uploaded_file = await self.client.aio.files.upload(
+                file=file_io, config=upload_config
+            )
+            log.debug(
+                f"Upload initiated for {uploaded_file.name}. Polling for ACTIVE state."
+            )
+
+            active_file = await self._poll_for_active_state(uploaded_file.name)
+            log.success(f"File {active_file.name} is now ACTIVE.")
+
+            # Get a standard python dict from the model
+            file_dict = active_file.model_dump(mode="json")
+            # Explicitly dump the dict to a clean JSON string
+            await self.cache.set(owui_file_id, json.dumps(file_dict))
+            log.debug(f"Cached new file object (as JSON) for {owui_file_id[:8]}.")
+
+            return active_file
+        except Exception as e:
+            log.exception(f"File upload or processing failed for {deterministic_name}.")
+            raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
+
+    async def _poll_for_active_state(
+        self, file_name: str, timeout: int = 60, poll_interval: int = 1
+    ) -> types.File:
+        """Polls the file's status until it is ACTIVE or fails."""
+        end_time = time.monotonic() + timeout
+        while time.monotonic() < end_time:
+            try:
+                file = await self.client.aio.files.get(name=file_name)
+            except Exception as e:
+                raise FilesAPIError(
+                    f"Polling failed: Could not get status for {file_name}. Reason: {e}"
+                ) from e
+
+            if file.state == types.FileState.ACTIVE:
+                return file
+            if file.state == types.FileState.FAILED:
+                error_message = f"File processing failed on server for {file_name}."
+                if file.error:
+                    error_message += (
+                        f" Reason: {file.error.message} (Code: {file.error.code})"
+                    )
+                raise FilesAPIError(error_message)
+
+            log.trace(
+                f"File {file_name} is still {file.state.name}. Waiting {poll_interval}s..."
+            )
+            await asyncio.sleep(poll_interval)
+
+        raise FilesAPIError(
+            f"File {file_name} did not become ACTIVE within {timeout} seconds."
+        )
 
 
 class GeminiContentBuilder:
