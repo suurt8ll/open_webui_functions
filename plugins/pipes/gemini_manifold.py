@@ -128,7 +128,8 @@ class FilesAPIManager:
 
         Args:
             client: An initialized `google.genai.Client` instance.
-            cache: An initialized `aiocache` instance for in-memory caching.
+            cache: An initialized `aiocache.SimpleMemoryCache` instance configured
+                   with `aiocache.serializers.NullSerializer`.
         """
         self.client = client
         self.cache = cache
@@ -162,16 +163,9 @@ class FilesAPIManager:
         )
 
         # Step 2: The Hot Path (Check Local Cache)
-        cached_json_str: str | None = await self.cache.get(owui_file_id)
-        if cached_json_str:
-            log.debug(
-                f"Cache HIT for file {owui_file_id[:8]}. Deserializing from JSON."
-            )
-            # Use json.loads to parse the clean JSON string into a dict
-            cached_data = json.loads(cached_json_str)
-            # Use model_validate to load the object from the dict
-            cached_file = types.File.model_validate(cached_data)
-
+        cached_file: types.File | None = await self.cache.get(owui_file_id)
+        if cached_file:
+            log.debug(f"Cache HIT for file {owui_file_id[:8]}.")
             if (
                 cached_file.expiration_time
                 and datetime.now(timezone.utc) < cached_file.expiration_time
@@ -185,6 +179,7 @@ class FilesAPIManager:
                     f"File {owui_file_id[:8]} in cache has expired. Purging and re-uploading."
                 )
                 await self.cache.delete(owui_file_id)
+                # Fall through to the upload path.
                 return await self._upload_and_process_file(
                     owui_file_id, file_bytes, mime_type, deterministic_name
                 )
@@ -204,10 +199,7 @@ class FilesAPIManager:
                 f"Stateless recovery successful for {deterministic_name}. File exists on server."
             )
             active_file = await self._poll_for_active_state(file.name)
-            # Get a standard python dict from the model
-            file_dict = active_file.model_dump(mode="json")
-            # Explicitly dump the dict to a clean JSON string
-            await self.cache.set(owui_file_id, json.dumps(file_dict))
+            await self.cache.set(owui_file_id, active_file)
             return active_file
         except genai_errors.ClientError as e:
             # Based on logs, the API returns 403 PERMISSION_DENIED when a file
@@ -216,7 +208,6 @@ class FilesAPIManager:
                 log.info(
                     f"File {deterministic_name} not found on server (received 403). Proceeding to upload."
                 )
-                # Proceed to the upload path.
                 return await self._upload_and_process_file(
                     owui_file_id, file_bytes, mime_type, deterministic_name
                 )
@@ -230,7 +221,6 @@ class FilesAPIManager:
                     f"Failed to check file status for {deterministic_name}: {e}"
                 ) from e
         except Exception as e:
-            # Catch any other unexpected errors.
             log.exception(
                 f"An unexpected error occurred during stateless recovery for {deterministic_name}."
             )
@@ -262,7 +252,6 @@ class FilesAPIManager:
         log.info(f"Starting upload for {deterministic_name}...")
         try:
             file_io = io.BytesIO(file_bytes)
-            # Pass our deterministic name in the upload config.
             upload_config = types.UploadFileConfig(
                 name=deterministic_name, mime_type=mime_type
             )
@@ -280,11 +269,8 @@ class FilesAPIManager:
             active_file = await self._poll_for_active_state(uploaded_file.name)
             log.success(f"File {active_file.name} is now ACTIVE.")
 
-            # Get a standard python dict from the model
-            file_dict = active_file.model_dump(mode="json")
-            # Explicitly dump the dict to a clean JSON string
-            await self.cache.set(owui_file_id, json.dumps(file_dict))
-            log.debug(f"Cached new file object (as JSON) for {owui_file_id[:8]}.")
+            await self.cache.set(owui_file_id, active_file)
+            log.debug(f"Cached new file object for {owui_file_id[:8]}.")
 
             return active_file
         except Exception as e:
