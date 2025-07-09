@@ -163,26 +163,14 @@ class FilesAPIManager:
         )
 
         # Step 2: The Hot Path (Check Local Cache)
+        # The cache is configured with a TTL matching the file's server-side
+        # expiration, so a cache hit means the file is valid.
         cached_file: types.File | None = await self.cache.get(owui_file_id)
         if cached_file:
-            log.debug(f"Cache HIT for file {owui_file_id[:8]}.")
-            if (
-                cached_file.expiration_time
-                and datetime.now(timezone.utc) < cached_file.expiration_time
-            ):
-                log.success(
-                    f"File {owui_file_id[:8]} is fresh in cache. Returning immediately."
-                )
-                return cached_file
-            else:
-                log.info(
-                    f"File {owui_file_id[:8]} in cache has expired. Purging and re-uploading."
-                )
-                await self.cache.delete(owui_file_id)
-                # Fall through to the upload path.
-                return await self._upload_and_process_file(
-                    owui_file_id, file_bytes, mime_type, deterministic_name
-                )
+            log.success(
+                f"Cache HIT for file {owui_file_id[:8]}. Returning immediately."
+            )
+            return cached_file
 
         # Step 3: The Warm Path (Stateless `get` on Cache Miss)
         log.debug(
@@ -199,7 +187,11 @@ class FilesAPIManager:
                 f"Stateless recovery successful for {deterministic_name}. File exists on server."
             )
             active_file = await self._poll_for_active_state(file.name)
-            await self.cache.set(owui_file_id, active_file)
+
+            # Calculate TTL from expiration time and set it in the cache.
+            ttl_seconds = self._calculate_ttl(active_file.expiration_time)
+            await self.cache.set(owui_file_id, active_file, ttl=ttl_seconds)
+
             return active_file
         except genai_errors.ClientError as e:
             # Based on logs, the API returns 403 PERMISSION_DENIED when a file
@@ -241,6 +233,23 @@ class FilesAPIManager:
         # compliant with the Gemini Files API naming rules.
         return hasher.hexdigest()
 
+    def _calculate_ttl(self, expiration_time: datetime | None) -> float | None:
+        """Calculates the TTL in seconds from an expiration datetime."""
+        if not expiration_time:
+            # No expiration time, cache "forever" (or until evicted).
+            # aiocache interprets ttl=None as using the cache's default, which is often indefinite.
+            return None
+
+        # The google-genai SDK provides timezone-aware datetime objects (in UTC).
+        now_utc = datetime.now(timezone.utc)
+
+        if expiration_time <= now_utc:
+            # If for some reason the file is already expired, set TTL to 0 to expire immediately.
+            return 0
+
+        # Return the remaining time in seconds.
+        return (expiration_time - now_utc).total_seconds()
+
     async def _upload_and_process_file(
         self,
         owui_file_id: str,
@@ -269,8 +278,12 @@ class FilesAPIManager:
             active_file = await self._poll_for_active_state(uploaded_file.name)
             log.success(f"File {active_file.name} is now ACTIVE.")
 
-            await self.cache.set(owui_file_id, active_file)
-            log.debug(f"Cached new file object for {owui_file_id[:8]}.")
+            # Calculate TTL and set in cache
+            ttl_seconds = self._calculate_ttl(active_file.expiration_time)
+            await self.cache.set(owui_file_id, active_file, ttl=ttl_seconds)
+            log.debug(
+                f"Cached new file object for {owui_file_id[:8]} with TTL: {ttl_seconds}s."
+            )
 
             return active_file
         except Exception as e:
