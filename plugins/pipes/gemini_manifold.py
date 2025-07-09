@@ -122,7 +122,12 @@ class FilesAPIManager:
        expired ones.
     """
 
-    def __init__(self, client: genai.Client, cache: BaseCache):
+    def __init__(
+        self,
+        client: genai.Client,
+        cache: BaseCache,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+    ):
         """
         Initializes the FilesAPIManager.
 
@@ -130,9 +135,11 @@ class FilesAPIManager:
             client: An initialized `google.genai.Client` instance.
             cache: An initialized `aiocache.SimpleMemoryCache` instance configured
                    with `aiocache.serializers.NullSerializer`.
+            event_emitter: A callable for emitting events to the front-end.
         """
         self.client = client
         self.cache = cache
+        self.event_emitter = event_emitter
 
     async def get_or_upload_file(
         self,
@@ -186,7 +193,7 @@ class FilesAPIManager:
             log.success(
                 f"Stateless recovery successful for {deterministic_name}. File exists on server."
             )
-            active_file = await self._poll_for_active_state(file.name)
+            active_file = await self._poll_for_active_state(file.name, owui_file_id)
 
             # Calculate TTL from expiration time and set it in the cache.
             ttl_seconds = self._calculate_ttl(active_file.expiration_time)
@@ -209,12 +216,22 @@ class FilesAPIManager:
                 log.exception(
                     f"A non-403 client error occurred during stateless recovery for {deterministic_name}."
                 )
+                await emit_toast(
+                    f"API error for file '{owui_file_id[:8]}...': {e.code}. Please check permissions.",
+                    self.event_emitter,
+                    "error",
+                )
                 raise FilesAPIError(
                     f"Failed to check file status for {deterministic_name}: {e}"
                 ) from e
         except Exception as e:
             log.exception(
                 f"An unexpected error occurred during stateless recovery for {deterministic_name}."
+            )
+            await emit_toast(
+                f"Unexpected error retrieving file '{owui_file_id[:8]}...'. Please try again.",
+                self.event_emitter,
+                "error",
             )
             raise FilesAPIError(
                 f"Failed to check file status for {deterministic_name}: {e}"
@@ -275,7 +292,9 @@ class FilesAPIManager:
             log.debug(
                 f"Upload initiated for {uploaded_file.name}. Polling for ACTIVE state."
             )
-            active_file = await self._poll_for_active_state(uploaded_file.name)
+            active_file = await self._poll_for_active_state(
+                uploaded_file.name, owui_file_id
+            )
             log.success(f"File {active_file.name} is now ACTIVE.")
 
             # Calculate TTL and set in cache
@@ -288,10 +307,19 @@ class FilesAPIManager:
             return active_file
         except Exception as e:
             log.exception(f"File upload or processing failed for {deterministic_name}.")
+            await emit_toast(
+                f"Upload failed for file '{owui_file_id[:8]}...'. Please check connection and try again.",
+                self.event_emitter,
+                "error",
+            )
             raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
 
     async def _poll_for_active_state(
-        self, file_name: str, timeout: int = 60, poll_interval: int = 1
+        self,
+        file_name: str,
+        owui_file_id: str,
+        timeout: int = 60,
+        poll_interval: int = 1,
     ) -> types.File:
         """Polls the file's status until it is ACTIVE or fails."""
         end_time = time.monotonic() + timeout
@@ -307,10 +335,15 @@ class FilesAPIManager:
                 return file
             if file.state == types.FileState.FAILED:
                 error_message = f"File processing failed on server for {file_name}."
+                toast_message = (
+                    f"Google could not process file '{owui_file_id[:8]}...'."
+                )
                 if file.error:
-                    error_message += (
-                        f" Reason: {file.error.message} (Code: {file.error.code})"
-                    )
+                    reason = f"Reason: {file.error.message} (Code: {file.error.code})"
+                    error_message += f" {reason}"
+                    toast_message += f" Reason: {file.error.message}"
+
+                await emit_toast(toast_message, self.event_emitter, "error")
                 raise FilesAPIError(error_message)
 
             state_name = file.state.name if file.state else None
