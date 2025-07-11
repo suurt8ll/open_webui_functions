@@ -533,66 +533,29 @@ class GeminiContentBuilder:
         files: list["FileAttachmentTD"],
         event_emitter: Callable[["Event"], Awaitable[None]],
     ) -> list[types.Part]:
-
         user_parts: list[types.Part] = []
         db_files_processed = False
 
         # PATH 1: Database is available (Normal Chat).
-        # We prioritize the database as the source of truth for all file attachments.
         if self.messages_db and files:
             db_files_processed = True
             log.info(f"Processing {len(files)} files from the database.")
-
             for file in files:
-                file_type = file.get("type")
                 log.debug("Processing DB file:", payload=file)
+                uri = ""
+                if file.get("type") == "image":
+                    uri = file.get("url", "")
+                elif file.get("type") == "file":
+                    # Reconstruct the local API URI to be handled by our unified function
+                    uri = f"/api/v1/files/{file.get('id', '')}/content"
 
-                # Handle images stored as data URIs in the DB
-                if file_type == "image":
-                    image_url = file.get("url")
-                    if image_url and image_url.startswith("data:image"):
-                        if img_part := await self._genai_part_from_image_url(image_url):
-                            user_parts.append(img_part)
-                        else:
-                            log.warning(
-                                "Failed to process image from DB data URI.",
-                                payload=file,
-                            )
-                    else:
-                        log.warning(
-                            "Image file in DB is missing a valid data URI.",
-                            payload=file,
-                        )
-
-                # Handle RAG-compatible documents stored on disk
-                elif file_type == "file":
-                    file_id = file.get("file", {}).get("id")
-                    document_bytes, mime_type = await self._get_file_data(file_id)
-                    if not document_bytes or not mime_type:
-                        continue  # Warnings are logged by the helper
-
-                    if mime_type.startswith("text/") or mime_type == "application/pdf":
-                        log.debug(
-                            f"{mime_type} is supported by Google API! Creating `types.Part` model for it."
-                        )
-                        user_parts.append(
-                            types.Part.from_bytes(
-                                data=document_bytes, mime_type=mime_type
-                            )
-                        )
-                    else:
-                        warn_msg = f"{mime_type} is not supported by Google API! Skipping file {file_id}."
-                        log.warning(warn_msg)
-                        await emit_toast(warn_msg, event_emitter, "warning")
+                if uri:
+                    if part := await self._genai_part_from_uri(uri):
+                        user_parts.append(part)
                 else:
-                    log.warning(
-                        f"Unknown file type '{file_type}' in database files list. Skipping.",
-                        payload=file,
-                    )
+                    log.warning("Could not determine URI for file in DB.", payload=file)
 
         # Now, process the content from the message payload.
-        # This includes the main text of the prompt and, for temporary chats,
-        # any images that are part of the payload itself.
         user_content = message.get("content")
         if isinstance(user_content, str):
             user_content_list: list["Content"] = [
@@ -604,7 +567,7 @@ class GeminiContentBuilder:
             warn_msg = "User message content is not a string or list, skipping."
             log.warning(warn_msg)
             await emit_toast(warn_msg, event_emitter, "warning")
-            return user_parts  # Return what we have so far
+            return user_parts
 
         for c in user_content_list:
             c_type = c.get("type")
@@ -614,28 +577,12 @@ class GeminiContentBuilder:
                     user_parts.extend(await self._genai_parts_from_text(c_text))
 
             # PATH 2: Temporary Chat Image Handling.
-            # Only process images from the payload if we haven't already processed
-            # files from the database, to avoid duplication.
-            elif c_type == "image_url":
-                if not db_files_processed:
-                    log.info("Processing image from payload (temporary chat mode).")
-                    c = cast("ImageContent", c)
-                    if img_part := await self._genai_part_from_image_url(
-                        c.get("image_url", {}).get("url")
-                    ):
-                        user_parts.append(img_part)
-                else:
-                    log.debug(
-                        "Skipping image_url in payload; files already processed from DB."
-                    )
-
-            # This handles any other unknown content types that might appear
-            elif c_type not in ("text", "image_url"):
-                warn_msg = (
-                    f"User message content type '{c_type}' is not supported, skipping."
-                )
-                log.warning(warn_msg)
-                await emit_toast(warn_msg, event_emitter, "warning")
+            elif c_type == "image_url" and not db_files_processed:
+                log.info("Processing image from payload (temporary chat mode).")
+                c = cast("ImageContent", c)
+                if uri := c.get("image_url", {}).get("url"):
+                    if part := await self._genai_part_from_uri(uri):
+                        user_parts.append(part)
 
         return user_parts
 
@@ -647,58 +594,78 @@ class GeminiContentBuilder:
             assistant_text = self._remove_citation_markers(assistant_text, sources)
         return await self._genai_parts_from_text(assistant_text)
 
-    async def _genai_part_from_image_url(self, image_url: str) -> types.Part | None:
+    async def _genai_part_from_uri(self, uri: str) -> types.Part | None:
         """
-        Processes an image URL and returns a genai.types.Part object from it.
-        Handles GCS, data URIs (via Files API), and standard URLs.
+        Processes any resource URI and returns a genai.types.Part.
+        This is the central dispatcher for all media processing, handling data URIs,
+        local API file paths, Google Cloud Storage, and YouTube URLs.
         """
+        if not uri:
+            log.warning("Received an empty URI, skipping.")
+            return None
         try:
-            if not image_url:
-                log.warning("Received an empty image_url, skipping.")
-                return None
-
-            if image_url.startswith("gs://"):
-                # FIXME: mime type helper would error out here, it only handles filenames.
-                return types.Part.from_uri(
-                    file_uri=image_url, mime_type=self._get_mime_type(image_url)
-                )
-            elif image_url.startswith("data:image"):
-                match = re.match(r"data:(image/\w+);base64,(.+)", image_url)
+            if uri.startswith("data:image"):
+                match = re.match(r"data:(image/\w+);base64,(.+)", uri)
                 if not match:
                     raise ValueError("Invalid data URI for image.")
 
-                mime_type = match.group(1)
-                base64_data = match.group(2)
+                mime_type, base64_data = match.group(1), match.group(2)
                 document_bytes = base64.b64decode(base64_data)
 
                 log.info(f"Using Files API for data URI image (mime: {mime_type}).")
-                try:
-                    gemini_file = await self.files_api_manager.get_or_upload_file(
-                        file_bytes=document_bytes,
-                        mime_type=mime_type,
-                    )
-                    log.debug(
-                        f"Successfully processed data: URI with Files API. Using URI: {gemini_file.uri}"
-                    )
-                    return types.Part(
-                        file_data=types.FileData(
-                            file_uri=gemini_file.uri, mime_type=gemini_file.mime_type
-                        )
-                    )
-                except FilesAPIError as e:
-                    error_msg = f"Files API failed for data: URI: {e}"
-                    log.error(error_msg)
-                    await emit_toast(error_msg, self.event_emitter, "error")
-                    return None
-
-            else:  # Assume standard URL
-                # FIXME: mime type helper would error out here too, it only handles filenames.
-                return types.Part.from_uri(
-                    file_uri=image_url, mime_type=self._get_mime_type(image_url)
+                gemini_file = await self.files_api_manager.get_or_upload_file(
+                    file_bytes=document_bytes, mime_type=mime_type
                 )
+                log.debug(
+                    f"Successfully processed data: URI with Files API. Using URI: {gemini_file.uri}"
+                )
+                return types.Part(
+                    file_data=types.FileData(
+                        file_uri=gemini_file.uri, mime_type=gemini_file.mime_type
+                    )
+                )
+
+            elif uri.startswith("/api/v1/files/"):
+                log.info(f"Processing local API file URI: {uri}")
+                # Expected format: /api/v1/files/{file_id}/content
+                file_id = uri.split("/")[4]
+                file_bytes, mime_type = await self._get_file_data(file_id)
+
+                if file_bytes and mime_type:
+                    # For consistency, process all images via the Files API
+                    if mime_type.startswith("image/"):
+                        log.info(f"Using Files API for local API image: {file_id}")
+                        gemini_file = await self.files_api_manager.get_or_upload_file(
+                            file_bytes=file_bytes, mime_type=mime_type
+                        )
+                        return types.Part(
+                            file_data=types.FileData(
+                                file_uri=gemini_file.uri,
+                                mime_type=gemini_file.mime_type,
+                            )
+                        )
+                    # For other file types, send the bytes directly
+                    return types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+                return None
+
+            elif "youtube.com/" in uri or "youtu.be/" in uri:
+                log.info(f"Found YouTube URL: {uri}")
+                # Vertex AI expects from_uri, Genai API expects FileData for YouTube
+                if self.valves.USE_VERTEX_AI:
+                    return types.Part.from_uri(file_uri=uri, mime_type="video/mp4")
+                else:
+                    return types.Part(file_data=types.FileData(file_uri=uri))
+
+            else:  # Fallback for other http(s) URLs
+                log.warning(f"Got Unsupported URI scheme {uri}, skipping.")
+
+        except FilesAPIError as e:
+            error_msg = f"Files API failed for URI '{uri[:64]}...': {e}"
+            log.error(error_msg)
+            await emit_toast(error_msg, self.event_emitter, "error")
+            return None
         except Exception:
-            # TODO: Send warning toast to user in front-end.
-            log.exception(f"Error processing image URL: {image_url[:64]}[...]")
+            log.exception(f"Error processing URI: {uri[:64]}[...]")
             return None
 
     @staticmethod
@@ -733,103 +700,45 @@ class GeminiContentBuilder:
         if not text:
             return []
 
-        # Restore special tags that were disabled for front-end safety.
-        # This ensures the model receives the original, intended text.
         text = self._enable_special_tags(text)
-
         parts: list[types.Part] = []
         last_pos = 0
 
-        # Regex to find markdown images or YouTube URLs
-        # Markdown image: !\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)
-        # YouTube URL: (https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+)
+        # A more general regex to find any markdown link or a standalone YouTube URL.
+        # It captures the full URI found inside the parentheses of a markdown link, or the URL itself.
         pattern = re.compile(
-            r"!\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)|"
-            r"(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+)"
+            r"!\[.*?\]\(([^)]+)\)|"  # Group 1: Markdown URI
+            r"(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+)"  # Group 2: YouTube URL
         )
 
         for match in pattern.finditer(text):
-            # Add text before the current match
-            text_segment = text[last_pos : match.start()]
-            if text_segment.strip():  # Ensure non-empty, stripped text
-                parts.append(types.Part.from_text(text=text_segment.strip()))
+            # Add the text segment that precedes the media link
+            if text_segment := text[last_pos : match.start()].strip():
+                parts.append(types.Part.from_text(text=text_segment))
 
-            # Determine if it's an image or a YouTube URL
-            if match.group(1):  # It's a markdown image
-                if match.group(2):  # Base64 encoded image
-                    try:
-                        mime_type = match.group(2)
-                        base64_data = match.group(3)
-                        image_part = types.Part.from_bytes(
-                            data=base64.b64decode(base64_data),
-                            mime_type=mime_type,
-                        )
-                        parts.append(image_part)
-                    except Exception:
-                        log.exception("Error decoding base64 image:")
-                elif match.group(4):  # File URL for image
-                    file_id = match.group(4)
-                    image_bytes, mime_type = await self._get_file_data(file_id)
-                    if image_bytes and mime_type:
-                        image_part = types.Part.from_bytes(
-                            data=image_bytes, mime_type=mime_type
-                        )
-                        parts.append(image_part)
-            elif match.group(5):  # It's a YouTube URL
-                youtube_url = match.group(5)
-                log.info(f"Found YouTube URL: {youtube_url}")
-                if (
-                    self.valves.USE_VERTEX_AI
-                ):  # Vertex AI expects from_uri part instead of files
-                    parts.append(
-                        types.Part.from_uri(file_uri=youtube_url, mime_type="video/mp4")
-                    )
-                else:
-                    parts.append(
-                        types.Part(file_data=types.FileData(file_uri=youtube_url))
-                    )
+            # The URI is either in the first or second capture group
+            uri = match.group(1) or match.group(2)
+            if not uri:
+                log.warning(
+                    f"Found unsupported URI format in text: {match.group(0)}. Skipping."
+                )
+                continue
+
+            # Delegate all URI processing to the unified helper
+            if media_part := await self._genai_part_from_uri(uri):
+                parts.append(media_part)
 
             last_pos = match.end()
 
-        # Add remaining text after the last match
-        remaining_text = text[last_pos:]
-        if remaining_text.strip():  # Ensure non-empty, stripped text
-            parts.append(types.Part.from_text(text=remaining_text.strip()))
+        # Add any remaining text after the last media link
+        if remaining_text := text[last_pos:].strip():
+            parts.append(types.Part.from_text(text=remaining_text))
 
-        # If no matches were found at all (e.g. plain text), the original text (stripped) is added as a single part.
+        # If no media links were found, the whole text is a single part
         if not parts and text.strip():
             parts.append(types.Part.from_text(text=text.strip()))
 
-        # If parts list is empty and original text was only whitespace, return empty list.
-        # Otherwise, if parts were added, or if it was plain text, it's handled above.
-        # This check ensures that if text was "   ", we don't add a Part for "   ".
-        # The .strip() in the conditions above should handle this, but as a safeguard:
-        if not parts and not text.strip():
-            return []
-
         return parts
-
-    @staticmethod
-    def _extract_youtube_urls(text: str) -> list[str]:
-        """
-        Extracts YouTube URLs from a given text.
-        Supports standard youtube.com/watch?v= URLs and shortened youtu.be URLs
-        """
-        youtube_urls = []
-        # Match standard YouTube URLs
-        for match in re.finditer(
-            r"https?://(?:www\.)?youtube\.com/watch\?v=[^&\s]+", text
-        ):
-            youtube_urls.append(match.group(0))
-        # Match shortened YouTube URLs
-        for match in re.finditer(r"https?://(?:www\.)?youtu\.be/[^&\s]+", text):
-            youtube_urls.append(match.group(0))
-
-        if youtube_urls:
-            # TODO: toast
-            log.info(f"Extracted YouTube URLs: {youtube_urls}")
-
-        return youtube_urls
 
     @staticmethod
     async def _get_file_data(file_id: str) -> tuple[bytes | None, str | None]:
