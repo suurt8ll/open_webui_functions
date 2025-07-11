@@ -63,12 +63,12 @@ class Pipe:
         __metadata__: dict[str, Any],
     ) -> str | None:
 
-        self.__event_emitter__ = __event_emitter__
-
         chat_id = __metadata__.get("chat_id")
         if not chat_id:
             error_msg = "Chat ID not found in request body or metadata."
-            await self._emit_error(error_msg, exception=False)
+            await self._emit_error(
+                error_msg, event_emitter=__event_emitter__, exception=False
+            )
             return None
 
         # Get the message history directly from the backend.
@@ -78,7 +78,9 @@ class Pipe:
             print(json.dumps(chat.model_dump(), indent=2, default=str))
         else:
             error_msg = f"Chat with ID {chat_id} not found."
-            await self._emit_error(error_msg, exception=False)
+            await self._emit_error(
+                error_msg, event_emitter=__event_emitter__, exception=False
+            )
             return None
         return "Hello World!"
 
@@ -86,8 +88,9 @@ class Pipe:
     ---------- Helper methods inside the Pipe class. ----------
     """
 
+    @staticmethod
     async def _emit_completion(
-        self,
+        event_emitter: Callable[["Event"], Awaitable[None]],
         content: str | None = None,
         done: bool = False,
         error: str | None = None,
@@ -104,35 +107,43 @@ class Pipe:
             emission["data"]["error"] = {"detail": error}
         if sources:
             emission["data"]["sources"] = sources
-        await self.__event_emitter__(emission)
+        await event_emitter(emission)
 
     async def _emit_error(
-        self, error_msg: str, warning: bool = False, exception: bool = True
+        self,
+        error_msg: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        warning: bool = False,
+        exception: bool = True,
     ) -> None:
         """Emits an event to the front-end that causes it to display a nice red error message."""
         if warning:
             log.opt(depth=1, exception=False).warning(error_msg)
         else:
             log.opt(depth=1, exception=exception).error(error_msg)
-        await self._emit_completion(error=f"\n{error_msg}", done=True)
+        await self._emit_completion(
+            error=f"\n{error_msg}", event_emitter=event_emitter, done=True
+        )
 
-    async def _process_chat_messages(self, chat: ChatChatModel) -> list[dict[str, Any]]:
+    async def _process_chat_messages(
+        self, chat: "ChatObjectDataTD"
+    ) -> list[dict[str, Any]]:
         """
         Turns the Open WebUI's ChatModel object into more lean dict object that contains only the messages.
         """
-        messages: list["MessageModel"] = chat.get("messages", [])
+        messages = chat.get("messages", [])
         result = []
         for message in messages:
             role = message.get("role")
             content = message.get("content")
             files = []
             if role == "user":
-                message = cast(UserMessageModel, message)
+                message = cast("UserMessage", message)
                 files_for_message = message.get("files")
                 if files_for_message:
                     files = [file_data.get("name") for file_data in files_for_message]
             elif role == "assistant":
-                message = cast(AssistantMessageModel, message)
+                message = cast("AssistantMessage", message)
                 if not hasattr(message, "done"):
                     continue
             result.append(
