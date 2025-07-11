@@ -24,13 +24,15 @@ from google.genai import errors as genai_errors
 import time
 import copy
 import json
-import asyncio
 import inspect
 import xxhash
-from functools import cache
+import asyncio
+import aiofiles
 from aiocache import cached
 from aiocache.base import BaseCache
+from aiocache.serializers import NullSerializer
 from aiocache.backends.memory import SimpleMemoryCache
+from functools import cache
 from datetime import datetime, timezone
 from fastapi.datastructures import State
 import io
@@ -53,6 +55,7 @@ from typing import (
     TYPE_CHECKING,
     cast,
 )
+
 from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
 from open_webui.storage.provider import Storage
@@ -90,7 +93,7 @@ async def emit_toast(
 ) -> None:
     """Emits a toast notification to the front-end."""
     # TODO: Use this method in more places, even for info toasts.
-    event: NotificationEvent = {
+    event: "NotificationEvent" = {
         "type": "notification",
         "data": {"type": toastType, "content": msg},
     }
@@ -100,8 +103,7 @@ async def emit_toast(
 class GenaiApiError(Exception):
     """Custom exception for errors during Genai API interactions."""
 
-    def __init__(self, message):
-        super().__init__(message)
+    pass
 
 
 class FilesAPIError(Exception):
@@ -349,7 +351,7 @@ class FilesAPIManager:
             active_file = await self._poll_for_active_state(
                 uploaded_file.name, owui_file_id
             )
-            log.success(f"File {active_file.name} is now ACTIVE.")
+            log.debug(f"File {active_file.name} is now ACTIVE.")
 
             # Calculate TTL and set in the main file cache using the content hash as the key.
             ttl_seconds = self._calculate_ttl(active_file.expiration_time)
@@ -419,6 +421,7 @@ class GeminiContentBuilder:
         user_data: "UserData",
         event_emitter: Callable[["Event"], Awaitable[None]],
         valves: "Pipe.Valves",
+        files_api_manager: "FilesAPIManager",
     ):
         self.messages_body = messages_body
         self.upload_documents = (metadata_body.get("features", {}) or {}).get(
@@ -426,6 +429,7 @@ class GeminiContentBuilder:
         )
         self.event_emitter = event_emitter
         self.valves = valves
+        self.files_api_manager = files_api_manager
 
         self.system_prompt, self.messages_body = self._extract_system_prompt(
             self.messages_body
@@ -515,6 +519,8 @@ class GeminiContentBuilder:
                 "This is likely due to a bug in Open WebUI. "
                 "Cannot process files or filter citations."
             )
+
+            # TODO: Emit a toast to the user in the front-end.
             log.warning(warn_msg)
             # Invalidate the db messages if they don't match
             return None
@@ -527,31 +533,66 @@ class GeminiContentBuilder:
         files: list["FileAttachmentTD"],
         event_emitter: Callable[["Event"], Awaitable[None]],
     ) -> list[types.Part]:
-        user_parts = []
 
-        if files:
-            log.info(f"Adding {len(files)} files to the user message.")
-        # TODO: Asyncronously process files.
-        for file in files:
-            log.debug("Processing file:", payload=file)
-            file_id = file.get("file", {}).get("id")
-            document_bytes, mime_type = await self._get_file_data(file_id)
-            if not document_bytes or not mime_type:
-                # Warnings are logged by the method above.
-                continue
+        user_parts: list[types.Part] = []
+        db_files_processed = False
 
-            if mime_type.startswith("text/") or mime_type == "application/pdf":
-                log.debug(
-                    f"{mime_type} is supported by Google API! Creating `types.Part` model for it."
-                )
-                user_parts.append(
-                    types.Part.from_bytes(data=document_bytes, mime_type=mime_type)
-                )
-            else:
-                warn_msg = f"{mime_type} is not supported by Google API! Skipping file {file_id}."
-                log.warning(warn_msg)
-                await emit_toast(warn_msg, event_emitter, "warning")
+        # PATH 1: Database is available (Normal Chat).
+        # We prioritize the database as the source of truth for all file attachments.
+        if self.messages_db and files:
+            db_files_processed = True
+            log.info(f"Processing {len(files)} files from the database.")
 
+            for file in files:
+                file_type = file.get("type")
+                log.debug("Processing DB file:", payload=file)
+
+                # Handle images stored as data URIs in the DB
+                if file_type == "image":
+                    image_url = file.get("url")
+                    if image_url and image_url.startswith("data:image"):
+                        if img_part := await self._genai_part_from_image_url(image_url):
+                            user_parts.append(img_part)
+                        else:
+                            log.warning(
+                                "Failed to process image from DB data URI.",
+                                payload=file,
+                            )
+                    else:
+                        log.warning(
+                            "Image file in DB is missing a valid data URI.",
+                            payload=file,
+                        )
+
+                # Handle RAG-compatible documents stored on disk
+                elif file_type == "file":
+                    file_id = file.get("file", {}).get("id")
+                    document_bytes, mime_type = await self._get_file_data(file_id)
+                    if not document_bytes or not mime_type:
+                        continue  # Warnings are logged by the helper
+
+                    if mime_type.startswith("text/") or mime_type == "application/pdf":
+                        log.debug(
+                            f"{mime_type} is supported by Google API! Creating `types.Part` model for it."
+                        )
+                        user_parts.append(
+                            types.Part.from_bytes(
+                                data=document_bytes, mime_type=mime_type
+                            )
+                        )
+                    else:
+                        warn_msg = f"{mime_type} is not supported by Google API! Skipping file {file_id}."
+                        log.warning(warn_msg)
+                        await emit_toast(warn_msg, event_emitter, "warning")
+                else:
+                    log.warning(
+                        f"Unknown file type '{file_type}' in database files list. Skipping.",
+                        payload=file,
+                    )
+
+        # Now, process the content from the message payload.
+        # This includes the main text of the prompt and, for temporary chats,
+        # any images that are part of the payload itself.
         user_content = message.get("content")
         if isinstance(user_content, str):
             user_content_list: list["Content"] = [
@@ -560,48 +601,62 @@ class GeminiContentBuilder:
         elif isinstance(user_content, list):
             user_content_list = user_content
         else:
-            warn_msg = f"User message content is not a string or list, skipping to the next message."
+            warn_msg = "User message content is not a string or list, skipping."
             log.warning(warn_msg)
             await emit_toast(warn_msg, event_emitter, "warning")
-            return user_parts
+            return user_parts  # Return what we have so far
 
-        # TODO: Asyncronously process user content.
         for c in user_content_list:
             c_type = c.get("type")
             if c_type == "text":
                 c = cast("TextContent", c)
-                # Don't process empty strings.
                 if c_text := c.get("text"):
-                    # YouTube URL extraction is now handled by _genai_parts_from_text
                     user_parts.extend(await self._genai_parts_from_text(c_text))
+
+            # PATH 2: Temporary Chat Image Handling.
+            # Only process images from the payload if we haven't already processed
+            # files from the database, to avoid duplication.
             elif c_type == "image_url":
-                c = cast("ImageContent", c)
-                if img_part := await self._genai_part_from_image_url(
-                    c.get("image_url").get("url")
-                ):
-                    user_parts.append(img_part)
-            else:
-                warn_msg = f"User message content type {c_type} is not supported, skipping to the next message."
+                if not db_files_processed:
+                    log.info("Processing image from payload (temporary chat mode).")
+                    c = cast("ImageContent", c)
+                    if img_part := await self._genai_part_from_image_url(
+                        c.get("image_url", {}).get("url")
+                    ):
+                        user_parts.append(img_part)
+                else:
+                    log.debug(
+                        "Skipping image_url in payload; files already processed from DB."
+                    )
+
+            # This handles any other unknown content types that might appear
+            elif c_type not in ("text", "image_url"):
+                warn_msg = (
+                    f"User message content type '{c_type}' is not supported, skipping."
+                )
                 log.warning(warn_msg)
                 await emit_toast(warn_msg, event_emitter, "warning")
-                continue
 
         return user_parts
 
-    def _process_assistant_message(
+    async def _process_assistant_message(
         self, message: "AssistantMessage", sources: list["Source"] | None
     ) -> list[types.Part]:
         assistant_text = message.get("content")
         if sources:
             assistant_text = self._remove_citation_markers(assistant_text, sources)
-        return self._genai_parts_from_text(assistant_text)
+        return await self._genai_parts_from_text(assistant_text)
 
-    def _genai_part_from_image_url(self, image_url: str) -> types.Part | None:
+    async def _genai_part_from_image_url(self, image_url: str) -> types.Part | None:
         """
-        Processes an image URL and returns a genai.types.Part object from it
-        Handles GCS, data URIs, and standard URLs.
+        Processes an image URL and returns a genai.types.Part object from it.
+        Handles GCS, data URIs (via Files API), and standard URLs.
         """
         try:
+            if not image_url:
+                log.warning("Received an empty image_url, skipping.")
+                return None
+
             if image_url.startswith("gs://"):
                 # FIXME: mime type helper would error out here, it only handles filenames.
                 return types.Part.from_uri(
@@ -609,20 +664,40 @@ class GeminiContentBuilder:
                 )
             elif image_url.startswith("data:image"):
                 match = re.match(r"data:(image/\w+);base64,(.+)", image_url)
-                if match:
-                    return types.Part.from_bytes(
-                        data=base64.b64decode(match.group(2)),
-                        mime_type=match.group(1),
-                    )
-                else:
+                if not match:
                     raise ValueError("Invalid data URI for image.")
+
+                mime_type = match.group(1)
+                base64_data = match.group(2)
+                document_bytes = base64.b64decode(base64_data)
+
+                log.info(f"Using Files API for data URI image (mime: {mime_type}).")
+                try:
+                    gemini_file = await self.files_api_manager.get_or_upload_file(
+                        file_bytes=document_bytes,
+                        mime_type=mime_type,
+                    )
+                    log.debug(
+                        f"Successfully processed data: URI with Files API. Using URI: {gemini_file.uri}"
+                    )
+                    return types.Part(
+                        file_data=types.FileData(
+                            file_uri=gemini_file.uri, mime_type=gemini_file.mime_type
+                        )
+                    )
+                except FilesAPIError as e:
+                    error_msg = f"Files API failed for data: URI: {e}"
+                    log.error(error_msg)
+                    await emit_toast(error_msg, self.event_emitter, "error")
+                    return None
+
             else:  # Assume standard URL
                 # FIXME: mime type helper would error out here too, it only handles filenames.
                 return types.Part.from_uri(
                     file_uri=image_url, mime_type=self._get_mime_type(image_url)
                 )
         except Exception:
-            # TODO: Send warnin toast to user in front-end.
+            # TODO: Send warning toast to user in front-end.
             log.exception(f"Error processing image URL: {image_url[:64]}[...]")
             return None
 
@@ -1068,6 +1143,8 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
+        self.file_content_cache = SimpleMemoryCache(serializer=NullSerializer())
+        self.file_id_to_hash_cache = SimpleMemoryCache(serializer=NullSerializer())
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
@@ -1117,6 +1194,13 @@ class Pipe:
         )
         client = self._get_user_client(valves, __user__["email"])
 
+        files_api_manager = FilesAPIManager(
+            client=client,
+            file_cache=self.file_content_cache,
+            id_hash_cache=self.file_id_to_hash_cache,
+            event_emitter=__event_emitter__,
+        )
+
         log.trace("__metadata__:", payload=__metadata__)
         # Check if user is chatting with an error model for some reason.
         if "error" in __metadata__["model"]["id"]:
@@ -1146,6 +1230,7 @@ class Pipe:
             user_data=__user__,
             event_emitter=__event_emitter__,
             valves=self.valves,
+            files_api_manager=files_api_manager,
         )
         contents = await builder.build_contents()
 
