@@ -445,6 +445,7 @@ class GeminiContentBuilder:
             )
             await emit_toast(warn_msg, self.event_emitter, "warning")
 
+        # TODO: Asyncronously process messages.
         contents = []
         parts = []
         for i, message in enumerate(self.messages_body):
@@ -467,7 +468,7 @@ class GeminiContentBuilder:
                 if self.messages_db:
                     message_db = self.messages_db[i]
                     sources = message_db.get("sources")
-                parts = self._process_assistant_message(message, sources)
+                parts = await self._process_assistant_message(message, sources)
             else:
                 warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
                 log.warning(warn_msg)
@@ -530,10 +531,11 @@ class GeminiContentBuilder:
 
         if files:
             log.info(f"Adding {len(files)} files to the user message.")
+        # TODO: Asyncronously process files.
         for file in files:
             log.debug("Processing file:", payload=file)
             file_id = file.get("file", {}).get("id")
-            document_bytes, mime_type = self._get_file_data(file_id)
+            document_bytes, mime_type = await self._get_file_data(file_id)
             if not document_bytes or not mime_type:
                 # Warnings are logged by the method above.
                 continue
@@ -563,6 +565,7 @@ class GeminiContentBuilder:
             await emit_toast(warn_msg, event_emitter, "warning")
             return user_parts
 
+        # TODO: Asyncronously process user content.
         for c in user_content_list:
             c_type = c.get("type")
             if c_type == "text":
@@ -570,10 +573,10 @@ class GeminiContentBuilder:
                 # Don't process empty strings.
                 if c_text := c.get("text"):
                     # YouTube URL extraction is now handled by _genai_parts_from_text
-                    user_parts.extend(self._genai_parts_from_text(c_text))
+                    user_parts.extend(await self._genai_parts_from_text(c_text))
             elif c_type == "image_url":
                 c = cast("ImageContent", c)
-                if img_part := self._genai_part_from_image_url(
+                if img_part := await self._genai_part_from_image_url(
                     c.get("image_url").get("url")
                 ):
                     user_parts.append(img_part)
@@ -651,7 +654,7 @@ class GeminiContentBuilder:
 
         return restored_text
 
-    def _genai_parts_from_text(self, text: str) -> list[types.Part]:
+    async def _genai_parts_from_text(self, text: str) -> list[types.Part]:
         if not text:
             return []
 
@@ -691,7 +694,7 @@ class GeminiContentBuilder:
                         log.exception("Error decoding base64 image:")
                 elif match.group(4):  # File URL for image
                     file_id = match.group(4)
-                    image_bytes, mime_type = self._get_file_data(file_id)
+                    image_bytes, mime_type = await self._get_file_data(file_id)
                     if image_bytes and mime_type:
                         image_part = types.Part.from_bytes(
                             data=image_bytes, mime_type=mime_type
@@ -754,44 +757,55 @@ class GeminiContentBuilder:
         return youtube_urls
 
     @staticmethod
-    def _get_file_data(file_id: str) -> tuple[bytes | None, str | None]:
+    async def _get_file_data(file_id: str) -> tuple[bytes | None, str | None]:
+        """
+        Asynchronously retrieves file metadata from the database and its content from disk.
+        """
+        # TODO: Emit toasts on unexpected conditions.
         if not file_id:
-            # TODO: Emit toast
-            log.warning(f"file_id is empty. Cannot continue.")
+            log.warning("file_id is empty. Cannot continue.")
             return None, None
-        file_model = Files.get_file_by_id(file_id)
+
+        # Run the synchronous, blocking database call in a separate thread
+        # to avoid blocking the main asyncio event loop.
+        try:
+            file_model = await asyncio.to_thread(Files.get_file_by_id, file_id)
+        except Exception as e:
+            log.exception(
+                f"An unexpected error occurred during database call for file_id {file_id}: {e}"
+            )
+            return None, None
+
         if file_model is None:
-            # TODO: Emit toast
+            # The get_file_by_id method already handles and logs the specific exception,
+            # so we just need to handle the None return value.
             log.warning(f"File {file_id} not found in the backend's database.")
             return None, None
+
         if not (file_path := file_model.path):
-            # TODO: Emit toast
             log.warning(
                 f"File {file_id} was found in the database but it lacks `path` field. Cannot Continue."
             )
             return None, None
         if file_model.meta is None:
-            # TODO: Emit toast
             log.warning(
                 f"File {file_path} was found in the database but it lacks `meta` field. Cannot continue."
             )
             return None, None
         if not (content_type := file_model.meta.get("content_type")):
-            # TODO: Emit toast
             log.warning(
                 f"File {file_path} was found in the database but it lacks `meta.content_type` field. Cannot continue."
             )
             return None, None
+
         try:
-            with open(file_path, "rb") as file:
-                image_data = file.read()
-            return image_data, content_type
+            async with aiofiles.open(file_path, "rb") as file:
+                file_data = await file.read()
+            return file_data, content_type
         except FileNotFoundError:
-            # TODO: Emit toast
             log.exception(f"File {file_path} not found on disk.")
             return None, content_type
         except Exception:
-            # TODO: Emit toast
             log.exception(f"Error processing file {file_path}")
             return None, content_type
 
