@@ -26,10 +26,11 @@ import copy
 import json
 import asyncio
 import inspect
-import hashlib
+import xxhash
 from functools import cache
 from aiocache import cached
 from aiocache.base import BaseCache
+from aiocache.backends.memory import SimpleMemoryCache
 from datetime import datetime, timezone
 from fastapi.datastructures import State
 import io
@@ -113,11 +114,16 @@ class FilesAPIManager:
     """
     Manages uploading, caching, and retrieving files using the Google Gemini Files API.
 
-    This class provides a stateless and efficient way to handle files. It uses a
-    three-tiered approach:
-    1. Hot Path (In-Memory Cache): For instantly retrieving fresh, recently used files.
+    This class provides a stateless and efficient way to handle files by using a fast,
+    non-cryptographic hash (xxHash) of the file's content as the primary identifier.
+    This enables content-addressable storage, preventing duplicate uploads of the
+    same file. It uses a multi-tiered approach:
+
+    1. Hot Path (In-Memory Caches): For instantly retrieving file objects and hashes
+       for recently used files.
     2. Warm Path (Stateless GET): For quickly recovering file state after a server
-       restart by using a deterministic name and a single `get` API call.
+       restart by using a deterministic name (derived from the content hash) and a
+       single `get` API call.
     3. Cold Path (Upload): As a last resort, for uploading new files or re-uploading
        expired ones.
     """
@@ -125,7 +131,8 @@ class FilesAPIManager:
     def __init__(
         self,
         client: genai.Client,
-        cache: BaseCache,
+        file_cache: SimpleMemoryCache,
+        id_hash_cache: SimpleMemoryCache,
         event_emitter: Callable[["Event"], Awaitable[None]],
     ):
         """
@@ -133,27 +140,35 @@ class FilesAPIManager:
 
         Args:
             client: An initialized `google.genai.Client` instance.
-            cache: An initialized `aiocache.SimpleMemoryCache` instance configured
-                   with `aiocache.serializers.NullSerializer`.
+            file_cache: An aiocache instance for mapping `content_hash -> types.File`.
+                        Must be configured with `aiocache.serializers.NullSerializer`.
+            id_hash_cache: An aiocache instance for mapping `owui_file_id -> content_hash`.
+                           This is an optimization to avoid re-hashing known files.
             event_emitter: A callable for emitting events to the front-end.
         """
         self.client = client
-        self.cache = cache
+        self.file_cache = file_cache
+        self.id_hash_cache = id_hash_cache
         self.event_emitter = event_emitter
 
     async def get_or_upload_file(
         self,
-        owui_file_id: str,
         file_bytes: bytes,
         mime_type: str,
+        *,
+        owui_file_id: str | None = None,
     ) -> types.File:
         """
         The main public method to get a file, using caching, recovery, or uploading.
 
+        This method uses a fast content hash (xxHash) as the primary key for all
+        caching and remote API interactions to ensure deduplication and performance.
+
         Args:
-            owui_file_id: The unique ID of the file from Open WebUI, used as the cache key.
-            file_bytes: The raw byte content of the file.
-            mime_type: The MIME type of the file (e.g., 'image/png').
+            file_bytes: The raw byte content of the file. Required.
+            mime_type: The MIME type of the file (e.g., 'image/png'). Required.
+            owui_file_id: The unique ID of the file from Open WebUI, if available.
+                          Used for logging and as a key for the hash cache optimization.
 
         Returns:
             An `ACTIVE` `google.genai.types.File` object.
@@ -161,28 +176,31 @@ class FilesAPIManager:
         Raises:
             FilesAPIError: If the file fails to upload or process.
         """
-        # Step 1: Get the hash and construct the deterministic name for Google's servers.
-        file_hash = self._get_file_hash(file_bytes)
-        # The file ID part must be <= 40 chars. "owui-v1-" is 8 chars. 40-8=32.
-        deterministic_name = f"files/owui-v1-{file_hash[:32]}"
-        log.debug(
-            f"Processing file {owui_file_id[:8]} with deterministic name: {deterministic_name}"
-        )
+        # Step 1: Get the fast content hash, using the ID cache as an optimization if possible.
+        content_hash = await self._get_content_hash(file_bytes, owui_file_id)
 
-        # Step 2: The Hot Path (Check Local Cache)
-        # The cache is configured with a TTL matching the file's server-side
-        # expiration, so a cache hit means the file is valid.
-        cached_file: types.File | None = await self.cache.get(owui_file_id)
+        # Step 2: The Hot Path (Check Local File Cache)
+        # The cache is keyed by the file's content hash and has a TTL matching
+        # the file's server-side expiration. A cache hit means the file is valid.
+        log.trace(
+            f"Current full contents of file cache:", payload=self.file_cache._cache
+        )
+        cached_file: types.File | None = await self.file_cache.get(content_hash)
         if cached_file:
+            log_id = f"OWUI ID: {owui_file_id}" if owui_file_id else "anonymous file"
             log.success(
-                f"Cache HIT for file {owui_file_id[:8]}. Returning immediately."
+                f"Cache HIT for file hash {content_hash} ({log_id}). Returning immediately."
             )
             return cached_file
 
-        # Step 3: The Warm Path (Stateless `get` on Cache Miss)
+        # Step 3: The Warm/Cold Path (On Cache Miss)
+        # Construct the deterministic name for Google's servers using the same fast hash.
+        # The 16-char hex digest from xxh64 fits well within the 40-char limit.
+        deterministic_name = f"files/owui-v1-{content_hash}"
         log.debug(
-            f"Cache MISS for file {owui_file_id[:8]}. Attempting stateless recovery with GET."
+            f"Cache MISS for hash {content_hash}. Attempting stateless recovery with GET: {deterministic_name}"
         )
+
         try:
             file = await self.client.aio.files.get(name=deterministic_name)
             if not file.name:
@@ -195,29 +213,29 @@ class FilesAPIManager:
             )
             active_file = await self._poll_for_active_state(file.name, owui_file_id)
 
-            # Calculate TTL from expiration time and set it in the cache.
+            # Calculate TTL from expiration time and set it in the file cache.
             ttl_seconds = self._calculate_ttl(active_file.expiration_time)
-            await self.cache.set(owui_file_id, active_file, ttl=ttl_seconds)
+            await self.file_cache.set(content_hash, active_file, ttl=ttl_seconds)
 
             return active_file
         except genai_errors.ClientError as e:
-            # Based on logs, the API returns 403 PERMISSION_DENIED when a file
-            # does not exist. We treat this as our "not found" signal.
-            if e.code == 403:
+            if e.code == 403:  # "Not found" signal from the API.
                 log.info(
                     f"File {deterministic_name} not found on server (received 403). Proceeding to upload."
                 )
                 return await self._upload_and_process_file(
-                    owui_file_id, file_bytes, mime_type, deterministic_name
+                    content_hash,
+                    file_bytes,
+                    mime_type,
+                    deterministic_name,
+                    owui_file_id,
                 )
             else:
-                # If it's a different client error (e.g., 400 INVALID_ARGUMENT),
-                # we should not proceed. Re-raise the exception.
                 log.exception(
                     f"A non-403 client error occurred during stateless recovery for {deterministic_name}."
                 )
                 await emit_toast(
-                    f"API error for file '{owui_file_id[:8]}...': {e.code}. Please check permissions.",
+                    f"API error for file: {e.code}. Please check permissions.",
                     self.event_emitter,
                     "error",
                 )
@@ -229,7 +247,7 @@ class FilesAPIManager:
                 f"An unexpected error occurred during stateless recovery for {deterministic_name}."
             )
             await emit_toast(
-                f"Unexpected error retrieving file '{owui_file_id[:8]}...'. Please try again.",
+                "Unexpected error retrieving a file. Please try again.",
                 self.event_emitter,
                 "error",
             )
@@ -237,42 +255,53 @@ class FilesAPIManager:
                 f"Failed to check file status for {deterministic_name}: {e}"
             ) from e
 
-    def _get_file_hash(self, file_bytes: bytes) -> str:
+    async def _get_content_hash(
+        self, file_bytes: bytes, owui_file_id: str | None
+    ) -> str:
         """
-        Calculates the SHA-256 hash of file bytes and returns it as a hex digest.
+        Retrieves the file's content hash, using a cache for known IDs or computing it.
 
-        TODO: Research if Open WebUI provides a pre-computed hash in the file
-              metadata to avoid this calculation for large files.
+        This acts as a memoization layer for the hashing process, avoiding
+        re-computation for files with a known Open WebUI ID. For anonymous files
+        (owui_file_id=None), it will always compute the hash.
         """
-        hasher = hashlib.sha256()
-        hasher.update(file_bytes)
-        # Use hexdigest() to get a lowercase alphanumeric string, which is
-        # compliant with the Gemini Files API naming rules.
-        return hasher.hexdigest()
+        if owui_file_id:
+            # First, check the ID-to-Hash cache for known files.
+            cached_hash: str | None = await self.id_hash_cache.get(owui_file_id)
+            if cached_hash:
+                log.trace(f"Hash cache HIT for OWUI ID {owui_file_id}.")
+                return cached_hash
+
+        # If not in cache or if file is anonymous, compute the fast hash.
+        log.trace(
+            f"Hash cache MISS for OWUI ID {owui_file_id if owui_file_id else 'N/A'}. Computing hash."
+        )
+        content_hash = xxhash.xxh64(file_bytes).hexdigest()
+
+        # If there was an ID, store the newly computed hash for next time.
+        if owui_file_id:
+            await self.id_hash_cache.set(owui_file_id, content_hash)
+
+        return content_hash
 
     def _calculate_ttl(self, expiration_time: datetime | None) -> float | None:
         """Calculates the TTL in seconds from an expiration datetime."""
         if not expiration_time:
-            # No expiration time, cache "forever" (or until evicted).
-            # aiocache interprets ttl=None as using the cache's default, which is often indefinite.
             return None
 
-        # The google-genai SDK provides timezone-aware datetime objects (in UTC).
         now_utc = datetime.now(timezone.utc)
-
         if expiration_time <= now_utc:
-            # If for some reason the file is already expired, set TTL to 0 to expire immediately.
             return 0
 
-        # Return the remaining time in seconds.
         return (expiration_time - now_utc).total_seconds()
 
     async def _upload_and_process_file(
         self,
-        owui_file_id: str,
+        content_hash: str,
         file_bytes: bytes,
         mime_type: str,
         deterministic_name: str,
+        owui_file_id: str | None,
     ) -> types.File:
         """Handles the full upload and post-upload processing workflow."""
         log.info(f"Starting upload for {deterministic_name}...")
@@ -297,18 +326,18 @@ class FilesAPIManager:
             )
             log.success(f"File {active_file.name} is now ACTIVE.")
 
-            # Calculate TTL and set in cache
+            # Calculate TTL and set in the main file cache using the content hash as the key.
             ttl_seconds = self._calculate_ttl(active_file.expiration_time)
-            await self.cache.set(owui_file_id, active_file, ttl=ttl_seconds)
+            await self.file_cache.set(content_hash, active_file, ttl=ttl_seconds)
             log.debug(
-                f"Cached new file object for {owui_file_id[:8]} with TTL: {ttl_seconds}s."
+                f"Cached new file object for hash {content_hash} with TTL: {ttl_seconds}s."
             )
 
             return active_file
         except Exception as e:
             log.exception(f"File upload or processing failed for {deterministic_name}.")
             await emit_toast(
-                f"Upload failed for file '{owui_file_id[:8]}...'. Please check connection and try again.",
+                "Upload failed for a file. Please check connection and try again.",
                 self.event_emitter,
                 "error",
             )
@@ -317,7 +346,7 @@ class FilesAPIManager:
     async def _poll_for_active_state(
         self,
         file_name: str,
-        owui_file_id: str,
+        owui_file_id: str | None,
         timeout: int = 60,
         poll_interval: int = 1,
     ) -> types.File:
@@ -334,10 +363,9 @@ class FilesAPIManager:
             if file.state == types.FileState.ACTIVE:
                 return file
             if file.state == types.FileState.FAILED:
+                log_id = f"'{owui_file_id}'" if owui_file_id else "an uploaded file"
                 error_message = f"File processing failed on server for {file_name}."
-                toast_message = (
-                    f"Google could not process file '{owui_file_id[:8]}...'."
-                )
+                toast_message = f"Google could not process {log_id}."
                 if file.error:
                     reason = f"Reason: {file.error.message} (Code: {file.error.code})"
                     error_message += f" {reason}"
@@ -346,7 +374,7 @@ class FilesAPIManager:
                 await emit_toast(toast_message, self.event_emitter, "error")
                 raise FilesAPIError(error_message)
 
-            state_name = file.state.name if file.state else None
+            state_name = file.state.name if file.state else "UNKNOWN"
             log.trace(
                 f"File {file_name} is still {state_name}. Waiting {poll_interval}s..."
             )
