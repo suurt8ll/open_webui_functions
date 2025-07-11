@@ -9,3 +9,4 @@ aiohttp
 aiofiles
 python-dotenv
 aiocache
+xxhash

@@ -19,13 +19,19 @@ requirements: google-genai==1.24.0
 
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
 
-import inspect
+import time
 import copy
 import json
+import asyncio
+import inspect
+import xxhash
 from functools import cache
 from aiocache import cached
 from aiocache.base import BaseCache
+from aiocache.backends.memory import SimpleMemoryCache
+from datetime import datetime, timezone
 from fastapi.datastructures import State
 import io
 import mimetypes
@@ -96,6 +102,312 @@ class GenaiApiError(Exception):
 
     def __init__(self, message):
         super().__init__(message)
+
+
+class FilesAPIError(Exception):
+    """Custom exception for errors during Files API operations."""
+
+    pass
+
+
+class FilesAPIManager:
+    """
+    Manages uploading, caching, and retrieving files using the Google Gemini Files API.
+
+    This class provides a stateless and efficient way to handle files by using a fast,
+    non-cryptographic hash (xxHash) of the file's content as the primary identifier.
+    This enables content-addressable storage, preventing duplicate uploads of the
+    same file. It uses a multi-tiered approach:
+
+    1. Hot Path (In-Memory Caches): For instantly retrieving file objects and hashes
+       for recently used files.
+    2. Warm Path (Stateless GET): For quickly recovering file state after a server
+       restart by using a deterministic name (derived from the content hash) and a
+       single `get` API call.
+    3. Cold Path (Upload): As a last resort, for uploading new files or re-uploading
+       expired ones.
+    """
+
+    def __init__(
+        self,
+        client: genai.Client,
+        file_cache: SimpleMemoryCache,
+        id_hash_cache: SimpleMemoryCache,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+    ):
+        """
+        Initializes the FilesAPIManager.
+
+        Args:
+            client: An initialized `google.genai.Client` instance.
+            file_cache: An aiocache instance for mapping `content_hash -> types.File`.
+                        Must be configured with `aiocache.serializers.NullSerializer`.
+            id_hash_cache: An aiocache instance for mapping `owui_file_id -> content_hash`.
+                           This is an optimization to avoid re-hashing known files.
+            event_emitter: A callable for emitting events to the front-end.
+        """
+        self.client = client
+        self.file_cache = file_cache
+        self.id_hash_cache = id_hash_cache
+        self.event_emitter = event_emitter
+        # A dictionary to manage locks for concurrent uploads.
+        # The key is the content_hash, the value is an asyncio.Lock.
+        self.upload_locks: dict[str, asyncio.Lock] = {}
+
+    async def get_or_upload_file(
+        self,
+        file_bytes: bytes,
+        mime_type: str,
+        *,
+        owui_file_id: str | None = None,
+    ) -> types.File:
+        """
+        The main public method to get a file, using caching, recovery, or uploading.
+
+        This method uses a fast content hash (xxHash) as the primary key for all
+        caching and remote API interactions to ensure deduplication and performance.
+        It is safe from race conditions during concurrent uploads.
+
+        Args:
+            file_bytes: The raw byte content of the file. Required.
+            mime_type: The MIME type of the file (e.g., 'image/png'). Required.
+            owui_file_id: The unique ID of the file from Open WebUI, if available.
+                          Used for logging and as a key for the hash cache optimization.
+
+        Returns:
+            An `ACTIVE` `google.genai.types.File` object.
+
+        Raises:
+            FilesAPIError: If the file fails to upload or process.
+        """
+        # Step 1: Get the fast content hash, using the ID cache as an optimization if possible.
+        content_hash = await self._get_content_hash(file_bytes, owui_file_id)
+
+        # Step 2: The Hot Path (Check Local File Cache)
+        # A cache hit means the file is valid and we can return immediately.
+        cached_file: types.File | None = await self.file_cache.get(content_hash)
+        if cached_file:
+            log_id = f"OWUI ID: {owui_file_id}" if owui_file_id else "anonymous file"
+            log.debug(
+                f"Cache HIT for file hash {content_hash} ({log_id}). Returning immediately."
+            )
+            return cached_file
+
+        # On cache miss, acquire a lock specific to this file's content to prevent race conditions.
+        # dict.setdefault is atomic, ensuring only one lock is created per hash.
+        lock = self.upload_locks.setdefault(content_hash, asyncio.Lock())
+        if lock.locked():
+            log.debug(
+                f"Lock for hash {content_hash} is held by another task. "
+                f"This call will now wait for the lock to be released."
+            )
+
+        async with lock:
+            # Step 2.5: Double-Checked Locking
+            # After acquiring the lock, check the cache again. Another task might have
+            # completed the upload while we were waiting for the lock.
+            cached_file = await self.file_cache.get(content_hash)
+            if cached_file:
+                log.debug(
+                    f"Cache HIT for file hash {content_hash} after acquiring lock. Returning."
+                )
+                return cached_file
+
+            # Step 3: The Warm/Cold Path (On Cache Miss)
+            deterministic_name = f"files/owui-v1-{content_hash}"
+            log.debug(
+                f"Cache MISS for hash {content_hash}. Attempting stateless recovery with GET: {deterministic_name}"
+            )
+
+            try:
+                # Attempt to get the file (Warm Path)
+                file = await self.client.aio.files.get(name=deterministic_name)
+                if not file.name:
+                    raise FilesAPIError(
+                        f"Stateless recovery for {deterministic_name} returned a file without a name."
+                    )
+
+                log.debug(
+                    f"Stateless recovery successful for {deterministic_name}. File exists on server."
+                )
+                active_file = await self._poll_for_active_state(file.name, owui_file_id)
+
+                ttl_seconds = self._calculate_ttl(active_file.expiration_time)
+                await self.file_cache.set(content_hash, active_file, ttl=ttl_seconds)
+
+                return active_file
+            except genai_errors.ClientError as e:
+                if e.code == 403:  # "Not found" signal from the API.
+                    log.info(
+                        f"File {deterministic_name} not found on server (received 403). Proceeding to upload."
+                    )
+                    # Proceed to upload (Cold Path)
+                    return await self._upload_and_process_file(
+                        content_hash,
+                        file_bytes,
+                        mime_type,
+                        deterministic_name,
+                        owui_file_id,
+                    )
+                else:
+                    log.exception(
+                        f"A non-403 client error occurred during stateless recovery for {deterministic_name}."
+                    )
+                    await emit_toast(
+                        f"API error for file: {e.code}. Please check permissions.",
+                        self.event_emitter,
+                        "error",
+                    )
+                    raise FilesAPIError(
+                        f"Failed to check file status for {deterministic_name}: {e}"
+                    ) from e
+            except Exception as e:
+                log.exception(
+                    f"An unexpected error occurred during stateless recovery for {deterministic_name}."
+                )
+                await emit_toast(
+                    "Unexpected error retrieving a file. Please try again.",
+                    self.event_emitter,
+                    "error",
+                )
+                raise FilesAPIError(
+                    f"Failed to check file status for {deterministic_name}: {e}"
+                ) from e
+            finally:
+                # Clean up the lock from the dictionary once processing is complete
+                # for this hash, preventing memory growth over time.
+                # This is safe because any future request for this hash will hit the cache.
+                if content_hash in self.upload_locks:
+                    del self.upload_locks[content_hash]
+
+    async def _get_content_hash(
+        self, file_bytes: bytes, owui_file_id: str | None
+    ) -> str:
+        """
+        Retrieves the file's content hash, using a cache for known IDs or computing it.
+
+        This acts as a memoization layer for the hashing process, avoiding
+        re-computation for files with a known Open WebUI ID. For anonymous files
+        (owui_file_id=None), it will always compute the hash.
+        """
+        if owui_file_id:
+            # First, check the ID-to-Hash cache for known files.
+            cached_hash: str | None = await self.id_hash_cache.get(owui_file_id)
+            if cached_hash:
+                log.trace(f"Hash cache HIT for OWUI ID {owui_file_id}.")
+                return cached_hash
+
+        # If not in cache or if file is anonymous, compute the fast hash.
+        log.trace(
+            f"Hash cache MISS for OWUI ID {owui_file_id if owui_file_id else 'N/A'}. Computing hash."
+        )
+        content_hash = xxhash.xxh64(file_bytes).hexdigest()
+
+        # If there was an ID, store the newly computed hash for next time.
+        if owui_file_id:
+            await self.id_hash_cache.set(owui_file_id, content_hash)
+
+        return content_hash
+
+    def _calculate_ttl(self, expiration_time: datetime | None) -> float | None:
+        """Calculates the TTL in seconds from an expiration datetime."""
+        if not expiration_time:
+            return None
+
+        now_utc = datetime.now(timezone.utc)
+        if expiration_time <= now_utc:
+            return 0
+
+        return (expiration_time - now_utc).total_seconds()
+
+    async def _upload_and_process_file(
+        self,
+        content_hash: str,
+        file_bytes: bytes,
+        mime_type: str,
+        deterministic_name: str,
+        owui_file_id: str | None,
+    ) -> types.File:
+        """Handles the full upload and post-upload processing workflow."""
+        log.info(f"Starting upload for {deterministic_name}...")
+        try:
+            file_io = io.BytesIO(file_bytes)
+            upload_config = types.UploadFileConfig(
+                name=deterministic_name, mime_type=mime_type
+            )
+            uploaded_file = await self.client.aio.files.upload(
+                file=file_io, config=upload_config
+            )
+            if not uploaded_file.name:
+                raise FilesAPIError(
+                    f"File upload for {deterministic_name} did not return a file name."
+                )
+
+            log.debug(
+                f"Upload initiated for {uploaded_file.name}. Polling for ACTIVE state."
+            )
+            active_file = await self._poll_for_active_state(
+                uploaded_file.name, owui_file_id
+            )
+            log.success(f"File {active_file.name} is now ACTIVE.")
+
+            # Calculate TTL and set in the main file cache using the content hash as the key.
+            ttl_seconds = self._calculate_ttl(active_file.expiration_time)
+            await self.file_cache.set(content_hash, active_file, ttl=ttl_seconds)
+            log.debug(
+                f"Cached new file object for hash {content_hash} with TTL: {ttl_seconds}s."
+            )
+
+            return active_file
+        except Exception as e:
+            log.exception(f"File upload or processing failed for {deterministic_name}.")
+            await emit_toast(
+                "Upload failed for a file. Please check connection and try again.",
+                self.event_emitter,
+                "error",
+            )
+            raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
+
+    async def _poll_for_active_state(
+        self,
+        file_name: str,
+        owui_file_id: str | None,
+        timeout: int = 60,
+        poll_interval: int = 1,
+    ) -> types.File:
+        """Polls the file's status until it is ACTIVE or fails."""
+        end_time = time.monotonic() + timeout
+        while time.monotonic() < end_time:
+            try:
+                file = await self.client.aio.files.get(name=file_name)
+            except Exception as e:
+                raise FilesAPIError(
+                    f"Polling failed: Could not get status for {file_name}. Reason: {e}"
+                ) from e
+
+            if file.state == types.FileState.ACTIVE:
+                return file
+            if file.state == types.FileState.FAILED:
+                log_id = f"'{owui_file_id}'" if owui_file_id else "an uploaded file"
+                error_message = f"File processing failed on server for {file_name}."
+                toast_message = f"Google could not process {log_id}."
+                if file.error:
+                    reason = f"Reason: {file.error.message} (Code: {file.error.code})"
+                    error_message += f" {reason}"
+                    toast_message += f" Reason: {file.error.message}"
+
+                await emit_toast(toast_message, self.event_emitter, "error")
+                raise FilesAPIError(error_message)
+
+            state_name = file.state.name if file.state else "UNKNOWN"
+            log.trace(
+                f"File {file_name} is still {state_name}. Waiting {poll_interval}s..."
+            )
+            await asyncio.sleep(poll_interval)
+
+        raise FilesAPIError(
+            f"File {file_name} did not become ACTIVE within {timeout} seconds."
+        )
 
 
 class GeminiContentBuilder:
