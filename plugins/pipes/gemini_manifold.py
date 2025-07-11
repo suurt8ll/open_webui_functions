@@ -150,6 +150,9 @@ class FilesAPIManager:
         self.file_cache = file_cache
         self.id_hash_cache = id_hash_cache
         self.event_emitter = event_emitter
+        # A dictionary to manage locks for concurrent uploads.
+        # The key is the content_hash, the value is an asyncio.Lock.
+        self.upload_locks: dict[str, asyncio.Lock] = {}
 
     async def get_or_upload_file(
         self,
@@ -163,6 +166,7 @@ class FilesAPIManager:
 
         This method uses a fast content hash (xxHash) as the primary key for all
         caching and remote API interactions to ensure deduplication and performance.
+        It is safe from race conditions during concurrent uploads.
 
         Args:
             file_bytes: The raw byte content of the file. Required.
@@ -180,80 +184,101 @@ class FilesAPIManager:
         content_hash = await self._get_content_hash(file_bytes, owui_file_id)
 
         # Step 2: The Hot Path (Check Local File Cache)
-        # The cache is keyed by the file's content hash and has a TTL matching
-        # the file's server-side expiration. A cache hit means the file is valid.
-        log.trace(
-            f"Current full contents of file cache:", payload=self.file_cache._cache
-        )
+        # A cache hit means the file is valid and we can return immediately.
         cached_file: types.File | None = await self.file_cache.get(content_hash)
         if cached_file:
             log_id = f"OWUI ID: {owui_file_id}" if owui_file_id else "anonymous file"
-            log.success(
+            log.debug(
                 f"Cache HIT for file hash {content_hash} ({log_id}). Returning immediately."
             )
             return cached_file
 
-        # Step 3: The Warm/Cold Path (On Cache Miss)
-        # Construct the deterministic name for Google's servers using the same fast hash.
-        # The 16-char hex digest from xxh64 fits well within the 40-char limit.
-        deterministic_name = f"files/owui-v1-{content_hash}"
-        log.debug(
-            f"Cache MISS for hash {content_hash}. Attempting stateless recovery with GET: {deterministic_name}"
-        )
-
-        try:
-            file = await self.client.aio.files.get(name=deterministic_name)
-            if not file.name:
-                raise FilesAPIError(
-                    f"Stateless recovery for {deterministic_name} returned a file without a name."
-                )
-
-            log.success(
-                f"Stateless recovery successful for {deterministic_name}. File exists on server."
+        # On cache miss, acquire a lock specific to this file's content to prevent race conditions.
+        # dict.setdefault is atomic, ensuring only one lock is created per hash.
+        lock = self.upload_locks.setdefault(content_hash, asyncio.Lock())
+        if lock.locked():
+            log.debug(
+                f"Lock for hash {content_hash} is held by another task. "
+                f"This call will now wait for the lock to be released."
             )
-            active_file = await self._poll_for_active_state(file.name, owui_file_id)
 
-            # Calculate TTL from expiration time and set it in the file cache.
-            ttl_seconds = self._calculate_ttl(active_file.expiration_time)
-            await self.file_cache.set(content_hash, active_file, ttl=ttl_seconds)
+        async with lock:
+            # Step 2.5: Double-Checked Locking
+            # After acquiring the lock, check the cache again. Another task might have
+            # completed the upload while we were waiting for the lock.
+            cached_file = await self.file_cache.get(content_hash)
+            if cached_file:
+                log.debug(
+                    f"Cache HIT for file hash {content_hash} after acquiring lock. Returning."
+                )
+                return cached_file
 
-            return active_file
-        except genai_errors.ClientError as e:
-            if e.code == 403:  # "Not found" signal from the API.
-                log.info(
-                    f"File {deterministic_name} not found on server (received 403). Proceeding to upload."
+            # Step 3: The Warm/Cold Path (On Cache Miss)
+            deterministic_name = f"files/owui-v1-{content_hash}"
+            log.debug(
+                f"Cache MISS for hash {content_hash}. Attempting stateless recovery with GET: {deterministic_name}"
+            )
+
+            try:
+                # Attempt to get the file (Warm Path)
+                file = await self.client.aio.files.get(name=deterministic_name)
+                if not file.name:
+                    raise FilesAPIError(
+                        f"Stateless recovery for {deterministic_name} returned a file without a name."
+                    )
+
+                log.debug(
+                    f"Stateless recovery successful for {deterministic_name}. File exists on server."
                 )
-                return await self._upload_and_process_file(
-                    content_hash,
-                    file_bytes,
-                    mime_type,
-                    deterministic_name,
-                    owui_file_id,
-                )
-            else:
+                active_file = await self._poll_for_active_state(file.name, owui_file_id)
+
+                ttl_seconds = self._calculate_ttl(active_file.expiration_time)
+                await self.file_cache.set(content_hash, active_file, ttl=ttl_seconds)
+
+                return active_file
+            except genai_errors.ClientError as e:
+                if e.code == 403:  # "Not found" signal from the API.
+                    log.info(
+                        f"File {deterministic_name} not found on server (received 403). Proceeding to upload."
+                    )
+                    # Proceed to upload (Cold Path)
+                    return await self._upload_and_process_file(
+                        content_hash,
+                        file_bytes,
+                        mime_type,
+                        deterministic_name,
+                        owui_file_id,
+                    )
+                else:
+                    log.exception(
+                        f"A non-403 client error occurred during stateless recovery for {deterministic_name}."
+                    )
+                    await emit_toast(
+                        f"API error for file: {e.code}. Please check permissions.",
+                        self.event_emitter,
+                        "error",
+                    )
+                    raise FilesAPIError(
+                        f"Failed to check file status for {deterministic_name}: {e}"
+                    ) from e
+            except Exception as e:
                 log.exception(
-                    f"A non-403 client error occurred during stateless recovery for {deterministic_name}."
+                    f"An unexpected error occurred during stateless recovery for {deterministic_name}."
                 )
                 await emit_toast(
-                    f"API error for file: {e.code}. Please check permissions.",
+                    "Unexpected error retrieving a file. Please try again.",
                     self.event_emitter,
                     "error",
                 )
                 raise FilesAPIError(
                     f"Failed to check file status for {deterministic_name}: {e}"
                 ) from e
-        except Exception as e:
-            log.exception(
-                f"An unexpected error occurred during stateless recovery for {deterministic_name}."
-            )
-            await emit_toast(
-                "Unexpected error retrieving a file. Please try again.",
-                self.event_emitter,
-                "error",
-            )
-            raise FilesAPIError(
-                f"Failed to check file status for {deterministic_name}: {e}"
-            ) from e
+            finally:
+                # Clean up the lock from the dictionary once processing is complete
+                # for this hash, preventing memory growth over time.
+                # This is safe because any future request for this hash will hit the cache.
+                if content_hash in self.upload_locks:
+                    del self.upload_locks[content_hash]
 
     async def _get_content_hash(
         self, file_bytes: bytes, owui_file_id: str | None
