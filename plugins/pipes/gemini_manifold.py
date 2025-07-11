@@ -598,7 +598,7 @@ class GeminiContentBuilder:
         """
         Processes any resource URI and returns a genai.types.Part.
         This is the central dispatcher for all media processing, handling data URIs,
-        local API file paths, Google Cloud Storage, and YouTube URLs.
+        local API file paths, and YouTube URLs.
         """
         if not uri:
             log.warning("Received an empty URI, skipping.")
@@ -610,14 +610,11 @@ class GeminiContentBuilder:
                     raise ValueError("Invalid data URI for image.")
 
                 mime_type, base64_data = match.group(1), match.group(2)
-                document_bytes = base64.b64decode(base64_data)
+                image_bytes = base64.b64decode(base64_data)
 
                 log.info(f"Using Files API for data URI image (mime: {mime_type}).")
                 gemini_file = await self.files_api_manager.get_or_upload_file(
-                    file_bytes=document_bytes, mime_type=mime_type
-                )
-                log.debug(
-                    f"Successfully processed data: URI with Files API. Using URI: {gemini_file.uri}"
+                    file_bytes=image_bytes, mime_type=mime_type
                 )
                 return types.Part(
                     file_data=types.FileData(
@@ -627,37 +624,47 @@ class GeminiContentBuilder:
 
             elif uri.startswith("/api/v1/files/"):
                 log.info(f"Processing local API file URI: {uri}")
-                # Expected format: /api/v1/files/{file_id}/content
                 file_id = uri.split("/")[4]
                 file_bytes, mime_type = await self._get_file_data(file_id)
 
                 if file_bytes and mime_type:
-                    # For consistency, process all images via the Files API
-                    if mime_type.startswith("image/"):
-                        log.info(f"Using Files API for local API image: {file_id}")
-                        gemini_file = await self.files_api_manager.get_or_upload_file(
-                            file_bytes=file_bytes, mime_type=mime_type
+                    # TODO: The Files API is strict about MIME types (e.g., text/plain,
+                    # application/pdf). In the future, inspect the content of files
+                    # with unsupported text-like MIME types (e.g., 'application/json',
+                    # 'text/markdown'). If the content is detected as plaintext,
+                    # override the `mime_type` variable to 'text/plain' to allow the upload.
+
+                    log.info(
+                        f"Using Files API for local file: {file_id} (mime: {mime_type})"
+                    )
+                    gemini_file = await self.files_api_manager.get_or_upload_file(
+                        file_bytes=file_bytes,
+                        mime_type=mime_type,
+                        owui_file_id=file_id,
+                    )
+                    return types.Part(
+                        file_data=types.FileData(
+                            file_uri=gemini_file.uri,
+                            mime_type=gemini_file.mime_type,
                         )
-                        return types.Part(
-                            file_data=types.FileData(
-                                file_uri=gemini_file.uri,
-                                mime_type=gemini_file.mime_type,
-                            )
-                        )
-                    # For other file types, send the bytes directly
-                    return types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+                    )
                 return None
+
+            # TODO: Google Cloud Storage bucket support.
+            # elif uri.startswith("gs://"): ...
 
             elif "youtube.com/" in uri or "youtu.be/" in uri:
                 log.info(f"Found YouTube URL: {uri}")
-                # Vertex AI expects from_uri, Genai API expects FileData for YouTube
                 if self.valves.USE_VERTEX_AI:
                     return types.Part.from_uri(file_uri=uri, mime_type="video/mp4")
                 else:
                     return types.Part(file_data=types.FileData(file_uri=uri))
 
-            else:  # Fallback for other http(s) URLs
-                log.warning(f"Got Unsupported URI scheme {uri}, skipping.")
+            else:
+                warn_msg = f"Unsupported URI: '{uri[:70]}...' Links must be to YouTube or a supported file type."
+                log.warning(warn_msg)
+                await emit_toast(warn_msg, self.event_emitter, "warning")
+                return None
 
         except FilesAPIError as e:
             error_msg = f"Files API failed for URI '{uri[:64]}...': {e}"
@@ -792,16 +799,6 @@ class GeminiContentBuilder:
         except Exception:
             log.exception(f"Error processing file {file_path}")
             return None, content_type
-
-    @staticmethod
-    def _get_mime_type(file_uri: str) -> str:
-        """
-        Determines MIME type based on file extension using the mimetypes module.
-        """
-        mime_type, encoding = mimetypes.guess_type(file_uri)
-        if mime_type is None:
-            return "application/octet-stream"  # Default MIME type if unknown
-        return mime_type
 
     @staticmethod
     def _remove_citation_markers(text: str, sources: list["Source"]) -> str:
