@@ -24,7 +24,6 @@ from google.genai import errors as genai_errors
 import time
 import copy
 import json
-import inspect
 import xxhash
 import asyncio
 import aiofiles
@@ -37,7 +36,6 @@ from datetime import datetime, timezone
 from fastapi.datastructures import State
 import io
 import mimetypes
-import os
 import uuid
 import base64
 import re
@@ -98,6 +96,24 @@ async def emit_toast(
         "data": {"type": toastType, "content": msg},
     }
     await event_emitter(event)
+
+
+async def emit_status(
+    message: str,
+    event_emitter: Callable[["Event"], Awaitable[None]],
+    done: bool = False,
+    hidden: bool = False,
+) -> None:
+    """Emit status updates asynchronously."""
+    try:
+        status_event: "StatusEvent" = {
+            "type": "status",
+            "data": {"description": message, "done": done, "hidden": hidden},
+        }
+        await event_emitter(status_event)
+        log.debug(f"Emitted status:", payload=status_event)
+    except Exception:
+        log.exception("Error emitting status")
 
 
 class GenaiApiError(Exception):
@@ -331,7 +347,16 @@ class FilesAPIManager:
         owui_file_id: str | None,
     ) -> types.File:
         """Handles the full upload and post-upload processing workflow."""
+
         log.info(f"Starting upload for {deterministic_name}...")
+        asyncio.create_task(
+            emit_status(
+                f"Uploading file ({mime_type})...",
+                self.event_emitter,
+                done=False,
+            )
+        )
+
         try:
             file_io = io.BytesIO(file_bytes)
             upload_config = types.UploadFileConfig(
@@ -345,9 +370,7 @@ class FilesAPIManager:
                     f"File upload for {deterministic_name} did not return a file name."
                 )
 
-            log.debug(
-                f"Upload initiated for {uploaded_file.name}. Polling for ACTIVE state."
-            )
+            log.debug(f"{uploaded_file.name} uploaded. Polling for ACTIVE state.")
             active_file = await self._poll_for_active_state(
                 uploaded_file.name, owui_file_id
             )
@@ -369,6 +392,14 @@ class FilesAPIManager:
                 "error",
             )
             raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
+        finally:
+            # Needs to stay blocking to prevent a race condition.
+            await emit_status(
+                "Upload complete",
+                self.event_emitter,
+                done=True,
+                hidden=True,
+            )
 
     async def _poll_for_active_state(
         self,
@@ -1103,7 +1134,6 @@ class Pipe:
             event_emitter=__event_emitter__,
         )
 
-        log.trace("__metadata__:", payload=__metadata__)
         # Check if user is chatting with an error model for some reason.
         if "error" in __metadata__["model"]["id"]:
             error_msg = f"There has been an error during model retrival phase: {str(__metadata__['model'])}"
@@ -1257,9 +1287,18 @@ class Pipe:
 
         if body.get("stream", False):
             # Streaming response
+
+            asyncio.create_task(
+                emit_status(
+                    "Waiting for first token from Google...",
+                    __event_emitter__,
+                    done=False,
+                )
+            )
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
                 await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
             )
+
             log.info("Streaming enabled. Returning AsyncGenerator.")
             return self._stream_response_generator(
                 response_stream,
@@ -1277,7 +1316,26 @@ class Pipe:
                 raise NotImplementedError(warn_msg)
             # TODO: Support native image gen here too.
             # TODO: Support code execution here too.
-            res = await client.aio.models.generate_content(**gen_content_args)
+            asyncio.create_task(
+                emit_status(
+                    "Waiting for response from Google...",
+                    __event_emitter__,
+                    done=False,
+                )
+            )
+            try:
+                # TODO: Support native image gen here too.
+                # TODO: Support code execution here too.
+                res = await client.aio.models.generate_content(**gen_content_args)
+            finally:
+                asyncio.create_task(
+                    emit_status(
+                        "Response received",
+                        __event_emitter__,
+                        done=True,
+                        hidden=True,
+                    )
+                )
             if raw_text := res.text:
                 log.info("Non-streaming response finished successfully!")
                 log.debug("Non-streaming response:", payload=res)
@@ -1694,7 +1752,13 @@ class Pipe:
 
         try:
             part_processor = self._process_parts_to_structured_stream(
-                response_stream, __request__, model, user_id, chat_id, message_id
+                response_stream,
+                __request__,
+                model,
+                user_id,
+                chat_id,
+                message_id,
+                event_emitter,
             )
             async for structured_chunk, count, raw_chunk in part_processor:
                 if count > 0:
@@ -1747,13 +1811,27 @@ class Pipe:
         user_id: str,
         chat_id: str,
         message_id: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
     ) -> AsyncGenerator[tuple[dict, int, types.GenerateContentResponse | None], None]:
         """
         Processes a stream of Gemini responses, yielding structured dictionaries,
         a substitution count for the ZWS safeguard, and the raw chunk.
         """
+        first_chunk_received = False
         try:
             async for chunk in response_stream:
+                if not first_chunk_received:
+                    # This is the first chunk. End the waiting status.
+                    asyncio.create_task(
+                        emit_status(
+                            "First token received",
+                            event_emitter,
+                            done=True,
+                            hidden=True,
+                        )
+                    )
+                    first_chunk_received = True
+
                 if not (candidate := self._get_first_candidate(chunk.candidates)):
                     log.warning("Stream chunk has no candidates, skipping.")
                     continue
@@ -1807,6 +1885,15 @@ class Pipe:
                         yield structured_chunk, count, chunk
         except Exception:
             raise
+        finally:
+            if not first_chunk_received:
+                # Emit done status if error occurs before the first chunk.
+                await emit_status(
+                    "Error occurred before receiving the first token from Google.",
+                    event_emitter,
+                    done=True,
+                    hidden=True,
+                )
 
     @staticmethod
     def _disable_special_tags(text: str) -> tuple[str, int]:
@@ -2114,24 +2201,6 @@ class Pipe:
         if sources:
             emission["data"]["sources"] = sources
         await event_emitter(emission)
-
-    async def _emit_status(
-        self,
-        message: str,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        done: bool = False,
-        hidden: bool = False,
-    ) -> None:
-        """Emit status updates asynchronously."""
-        try:
-            status_event: "StatusEvent" = {
-                "type": "status",
-                "data": {"description": message, "done": done, "hidden": hidden},
-            }
-            await event_emitter(status_event)
-            log.debug(f"Emitted status:", payload=status_event)
-        except Exception:
-            log.exception("Error emitting status")
 
     async def _emit_error(
         self,
