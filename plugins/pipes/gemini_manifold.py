@@ -128,6 +128,79 @@ class FilesAPIError(Exception):
     pass
 
 
+class UploadStatusManager:
+    """
+    Manages and centralizes status updates for concurrent file uploads.
+
+    This manager is self-configuring. It discovers the number of files that
+    require an actual upload at runtime, only showing a status message to the
+    user when network activity is necessary.
+
+    The communication protocol uses tuples sent via an asyncio.Queue:
+    - ('REGISTER_UPLOAD',): Sent by a worker when it determines an upload is needed.
+    - ('COMPLETE_UPLOAD',): Sent by a worker when its upload is finished.
+    - ('FINALIZE',): Sent by the orchestrator when all workers are done.
+    """
+
+    def __init__(self, event_emitter: Callable[["Event"], Awaitable[None]]):
+        self.event_emitter = event_emitter
+        self.queue = asyncio.Queue()
+        self.total_uploads_expected = 0
+        self.uploads_completed = 0
+        self.finalize_received = False
+        self.is_active = False
+
+    async def run(self) -> None:
+        """
+        Runs the manager loop, listening for updates and emitting status to the UI.
+        This should be started as a background task using asyncio.create_task().
+        """
+        while not (
+            self.finalize_received
+            and self.total_uploads_expected == self.uploads_completed
+        ):
+            msg = await self.queue.get()
+            msg_type = msg[0]
+
+            if msg_type == "REGISTER_UPLOAD":
+                self.is_active = True
+                self.total_uploads_expected += 1
+                await self._emit_progress_update()
+            elif msg_type == "COMPLETE_UPLOAD":
+                self.uploads_completed += 1
+                await self._emit_progress_update()
+            elif msg_type == "FINALIZE":
+                self.finalize_received = True
+
+            self.queue.task_done()
+
+        log.debug("UploadStatusManager finished its run.")
+
+    async def _emit_progress_update(self) -> None:
+        """Emits the current progress to the front-end if uploads are active."""
+        if not self.is_active:
+            return
+
+        is_done = (
+            self.total_uploads_expected > 0
+            and self.uploads_completed == self.total_uploads_expected
+        )
+        is_hidden = is_done
+
+        if is_done:
+            message = f"Upload complete. {self.uploads_completed} file(s) processed."
+        else:
+            # Show "Uploading 1 of N..."
+            message = f"Uploading file {self.uploads_completed + 1} of {self.total_uploads_expected}..."
+
+        await emit_status(
+            message,
+            self.event_emitter,
+            done=is_done,
+            hidden=is_hidden,
+        )
+
+
 class FilesAPIManager:
     """
     Manages uploading, caching, and retrieving files using the Google Gemini Files API.
@@ -178,6 +251,7 @@ class FilesAPIManager:
         mime_type: str,
         *,
         owui_file_id: str | None = None,
+        status_queue: asyncio.Queue | None = None,
     ) -> types.File:
         """
         The main public method to get a file, using caching, recovery, or uploading.
@@ -191,6 +265,7 @@ class FilesAPIManager:
             mime_type: The MIME type of the file (e.g., 'image/png'). Required.
             owui_file_id: The unique ID of the file from Open WebUI, if available.
                           Used for logging and as a key for the hash cache optimization.
+            status_queue: An optional asyncio.Queue to report upload lifecycle events.
 
         Returns:
             An `ACTIVE` `google.genai.types.File` object.
@@ -266,6 +341,7 @@ class FilesAPIManager:
                         mime_type,
                         deterministic_name,
                         owui_file_id,
+                        status_queue,
                     )
                 else:
                     log.exception(
@@ -345,17 +421,15 @@ class FilesAPIManager:
         mime_type: str,
         deterministic_name: str,
         owui_file_id: str | None,
+        status_queue: asyncio.Queue | None = None,
     ) -> types.File:
         """Handles the full upload and post-upload processing workflow."""
 
+        # Register with the manager that an actual upload is starting.
+        if status_queue:
+            await status_queue.put(("REGISTER_UPLOAD",))
+
         log.info(f"Starting upload for {deterministic_name}...")
-        asyncio.create_task(
-            emit_status(
-                f"Uploading file ({mime_type})...",
-                self.event_emitter,
-                done=False,
-            )
-        )
 
         try:
             file_io = io.BytesIO(file_bytes)
@@ -370,7 +444,7 @@ class FilesAPIManager:
                     f"File upload for {deterministic_name} did not return a file name."
                 )
 
-            log.debug(f"{uploaded_file.name} uploaded. Polling for ACTIVE state.")
+            log.debug(f"{uploaded_file.name} uploaded.")
             log.trace("Uploaded file details:", payload=uploaded_file)
 
             # Check if the file is already active. If so, we can skip polling.
@@ -406,13 +480,10 @@ class FilesAPIManager:
             )
             raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
         finally:
-            # Needs to stay blocking to prevent a race condition.
-            await emit_status(
-                "Upload complete",
-                self.event_emitter,
-                done=True,
-                hidden=True,
-            )
+            # Report completion (success or failure) to the status manager.
+            # This ensures the progress counter always advances.
+            if status_queue:
+                await status_queue.put(("COMPLETE_UPLOAD",))
 
     async def _poll_for_active_state(
         self,
@@ -483,8 +554,10 @@ class GeminiContentBuilder:
         )
 
     async def build_contents(self) -> list[types.Content]:
-        """The main public method to generate the contents list."""
-
+        """
+        The main public method to generate the contents list by processing all
+        message turns concurrently and using a self-configuring status manager.
+        """
         if not self.messages_db:
             warn_msg = (
                 "There was a problem retrieving the messages from the backend database. "
@@ -493,36 +566,34 @@ class GeminiContentBuilder:
             )
             await emit_toast(warn_msg, self.event_emitter, "warning")
 
-        # TODO: Asyncronously process messages.
-        contents = []
-        parts = []
-        for i, message in enumerate(self.messages_body):
-            role = message.get("role")
-            if role == "user":
-                message = cast("UserMessage", message)
-                files = []
-                if self.messages_db:
-                    message_db = self.messages_db[i]
-                    if self.upload_documents:
-                        files = message_db.get("files", [])
-                parts = await self._process_user_message(
-                    message, files, self.event_emitter
+        # 1. Set up and launch the status manager. It will activate itself if needed.
+        status_manager = UploadStatusManager(self.event_emitter)
+        manager_task = asyncio.create_task(status_manager.run())
+
+        # 2. Create and run concurrent processing tasks for each message turn.
+        tasks = [
+            self._process_message_turn(i, message, status_manager.queue)
+            for i, message in enumerate(self.messages_body)
+        ]
+        log.debug(f"Starting concurrent processing of {len(tasks)} message turns.")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 3. Signal to the manager that no more uploads will be registered.
+        await status_manager.queue.put(("FINALIZE",))
+
+        # 4. Wait for the manager to finish processing all reported uploads.
+        await manager_task
+
+        # 5. Filter and assemble the final contents list.
+        contents: list[types.Content] = []
+        for i, res in enumerate(results):
+            if isinstance(res, types.Content):
+                contents.append(res)
+            elif isinstance(res, Exception):
+                log.error(
+                    f"An error occurred while processing message {i} concurrently.",
+                    payload=res,
                 )
-            elif role == "assistant":
-                message = cast("AssistantMessage", message)
-                # Google API's assistant role is "model"
-                role = "model"
-                sources = None
-                if self.messages_db:
-                    message_db = self.messages_db[i]
-                    sources = message_db.get("sources")
-                parts = await self._process_assistant_message(message, sources)
-            else:
-                warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
-                log.warning(warn_msg)
-                await emit_toast(warn_msg, self.event_emitter, "warning")
-                continue
-            contents.append(types.Content(parts=parts, role=role))
         return contents
 
     @staticmethod
@@ -571,11 +642,54 @@ class GeminiContentBuilder:
 
         return messages_db
 
+    async def _process_message_turn(
+        self, i: int, message: "Message", status_queue: asyncio.Queue
+    ) -> types.Content | None:
+        """
+        Processes a single message turn, handling user and assistant roles,
+        and returns a complete `types.Content` object. Designed to be run concurrently.
+        """
+        role = message.get("role")
+        parts: list[types.Part] = []
+
+        if role == "user":
+            message = cast("UserMessage", message)
+            files = []
+            if self.messages_db:
+                message_db = self.messages_db[i]
+                if self.upload_documents:
+                    files = message_db.get("files", [])
+            parts = await self._process_user_message(
+                message, files, self.event_emitter, status_queue
+            )
+        elif role == "assistant":
+            message = cast("AssistantMessage", message)
+            # Google API's assistant role is "model"
+            role = "model"
+            sources = None
+            if self.messages_db:
+                message_db = self.messages_db[i]
+                sources = message_db.get("sources")
+            parts = await self._process_assistant_message(
+                message, sources, status_queue
+            )
+        else:
+            warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
+            log.warning(warn_msg)
+            await emit_toast(warn_msg, self.event_emitter, "warning")
+            return None
+
+        # Only create a Content object if there are parts to include.
+        if parts:
+            return types.Content(parts=parts, role=role)
+        return None
+
     async def _process_user_message(
         self,
         message: "UserMessage",
         files: list["FileAttachmentTD"],
         event_emitter: Callable[["Event"], Awaitable[None]],
+        status_queue: asyncio.Queue,
     ) -> list[types.Part]:
         user_parts: list[types.Part] = []
         db_files_processed = False
@@ -583,9 +697,11 @@ class GeminiContentBuilder:
         # PATH 1: Database is available (Normal Chat).
         if self.messages_db and files:
             db_files_processed = True
-            log.info(f"Processing {len(files)} files from the database.")
+            log.info(f"Processing {len(files)} files from the database concurrently.")
+
+            upload_tasks = []
             for file in files:
-                log.debug("Processing DB file:", payload=file)
+                log.debug("Preparing DB file for concurrent upload:", payload=file)
                 uri = ""
                 if file.get("type") == "image":
                     uri = file.get("url", "")
@@ -594,10 +710,16 @@ class GeminiContentBuilder:
                     uri = f"/api/v1/files/{file.get('id', '')}/content"
 
                 if uri:
-                    if part := await self._genai_part_from_uri(uri):
-                        user_parts.append(part)
+                    # Create a coroutine for each file upload and add it to a list.
+                    upload_tasks.append(self._genai_part_from_uri(uri, status_queue))
                 else:
                     log.warning("Could not determine URI for file in DB.", payload=file)
+
+            if upload_tasks:
+                # Run all upload tasks concurrently. asyncio.gather maintains the order of results.
+                results = await asyncio.gather(*upload_tasks)
+                # Filter out None results (from failed uploads) and add the successful parts to the list.
+                user_parts.extend(part for part in results if part)
 
         # Now, process the content from the message payload.
         user_content = message.get("content")
@@ -618,27 +740,34 @@ class GeminiContentBuilder:
             if c_type == "text":
                 c = cast("TextContent", c)
                 if c_text := c.get("text"):
-                    user_parts.extend(await self._genai_parts_from_text(c_text))
+                    user_parts.extend(
+                        await self._genai_parts_from_text(c_text, status_queue)
+                    )
 
             # PATH 2: Temporary Chat Image Handling.
             elif c_type == "image_url" and not db_files_processed:
                 log.info("Processing image from payload (temporary chat mode).")
                 c = cast("ImageContent", c)
                 if uri := c.get("image_url", {}).get("url"):
-                    if part := await self._genai_part_from_uri(uri):
+                    if part := await self._genai_part_from_uri(uri, status_queue):
                         user_parts.append(part)
 
         return user_parts
 
     async def _process_assistant_message(
-        self, message: "AssistantMessage", sources: list["Source"] | None
+        self,
+        message: "AssistantMessage",
+        sources: list["Source"] | None,
+        status_queue: asyncio.Queue,
     ) -> list[types.Part]:
         assistant_text = message.get("content")
         if sources:
             assistant_text = self._remove_citation_markers(assistant_text, sources)
-        return await self._genai_parts_from_text(assistant_text)
+        return await self._genai_parts_from_text(assistant_text, status_queue)
 
-    async def _genai_part_from_uri(self, uri: str) -> types.Part | None:
+    async def _genai_part_from_uri(
+        self, uri: str, status_queue: asyncio.Queue
+    ) -> types.Part | None:
         """
         Processes any resource URI and returns a genai.types.Part.
         This is the central dispatcher for all media processing, handling data URIs,
@@ -664,7 +793,9 @@ class GeminiContentBuilder:
 
                 log.info(f"Using Files API for data URI image (mime: {mime_type}).")
                 gemini_file = await self.files_api_manager.get_or_upload_file(
-                    file_bytes=image_bytes, mime_type=mime_type
+                    file_bytes=image_bytes,
+                    mime_type=mime_type,
+                    status_queue=status_queue,
                 )
                 return types.Part(
                     file_data=types.FileData(
@@ -691,6 +822,7 @@ class GeminiContentBuilder:
                         file_bytes=file_bytes,
                         mime_type=mime_type,
                         owui_file_id=file_id,
+                        status_queue=status_queue,
                     )
                     return types.Part(
                         file_data=types.FileData(
@@ -753,7 +885,9 @@ class GeminiContentBuilder:
 
         return restored_text
 
-    async def _genai_parts_from_text(self, text: str) -> list[types.Part]:
+    async def _genai_parts_from_text(
+        self, text: str, status_queue: asyncio.Queue
+    ) -> list[types.Part]:
         if not text:
             return []
 
@@ -782,7 +916,7 @@ class GeminiContentBuilder:
                 continue
 
             # Delegate all URI processing to the unified helper
-            if media_part := await self._genai_part_from_uri(uri):
+            if media_part := await self._genai_part_from_uri(uri, status_queue):
                 parts.append(media_part)
 
             last_pos = match.end()
