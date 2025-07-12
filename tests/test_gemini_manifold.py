@@ -782,6 +782,8 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
         "name": "Test User",
         "role": "user",
     }
+    # Create a mock for the new dependency
+    mock_files_api_manager = MagicMock()
 
     # The builder fetches chat history, mock it to return None for this test
     mock_chats_module.Chats.get_chat_by_id_and_user_id.return_value = None
@@ -790,10 +792,11 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
 
     builder = GeminiContentBuilder(
         messages_body=messages_body,  # type: ignore
-        metadata_body={"chat_id": "test_chat_id"},
+        metadata_body={"chat_id": "test_chat_id"},  # type: ignore
         user_data=mock_user_data,  # type: ignore
         event_emitter=mock_event_emitter,
         valves=pipe_instance.valves,
+        files_api_manager=mock_files_api_manager,  # Pass the new mock
     )
 
     with patch(
@@ -834,7 +837,7 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
     pipe_instance.valves.USE_VERTEX_AI = False
 
     # Arrange: Inputs
-    youtube_url = "https://www.youtube.com/watch?v=TLqL_68JPec"
+    youtube_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     text_before_raw = "Look at this: "
     text_after_raw = " it's great!"
     text_before_stripped = text_before_raw.strip()
@@ -848,6 +851,8 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
         "name": "Test User",
         "role": "user",
     }
+    # Create a mock for the new dependency
+    mock_files_api_manager = MagicMock()
 
     # Mock DB and system prompt extraction
     mock_chats_module.Chats.get_chat_by_id_and_user_id.return_value = None
@@ -855,10 +860,11 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
 
     builder = GeminiContentBuilder(
         messages_body=messages_body,  # type: ignore
-        metadata_body={"chat_id": "test_chat_id"},
+        metadata_body={"chat_id": "test_chat_id"},  # type: ignore
         user_data=mock_user_data,  # type: ignore
         event_emitter=mock_event_emitter,
         valves=pipe_instance.valves,
+        files_api_manager=mock_files_api_manager,  # Pass the new mock
     )
 
     # Mock part creation
@@ -947,7 +953,8 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
             {
                 "role": "user",
                 "content": user_text_content,
-                "files": [{"file": {"id": pdf_file_id}}],
+                # The new code path uses 'files' from the DB message with this structure
+                "files": [{"id": pdf_file_id, "type": "file"}],
             },
             {"role": "assistant", "content": ""},  # Placeholder for current response
         ]
@@ -957,32 +964,36 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
     mock_chats_module.Chats.get_chat_by_id_and_user_id.return_value = mock_chat_from_db
     mock_misc_module.pop_system_message.return_value = (None, messages_body)
 
+    # Create a mock for the new dependency and its methods
+    mock_files_api_manager = AsyncMock()
+    mock_gemini_file = MagicMock()
+    mock_gemini_file.uri = "gs://fake-bucket/fake-file.pdf"
+    mock_gemini_file.mime_type = pdf_mime_type
+    mock_files_api_manager.get_or_upload_file.return_value = mock_gemini_file
+
     builder = GeminiContentBuilder(
         messages_body=messages_body,  # type: ignore
         metadata_body={
             "chat_id": "test_chat_id",
-            "features": {"upload_documents": True},
+            "features": {"upload_documents": True},  # type: ignore
         },
         user_data=mock_user_data,  # type: ignore
         event_emitter=mock_event_emitter,
         valves=pipe_instance.valves,
+        files_api_manager=mock_files_api_manager,  # Pass the new mock
     )
 
-    mock_pdf_part_obj = MagicMock(spec=gemini_types.Part, name="PdfPart")
     mock_text_part_obj = MagicMock(spec=gemini_types.Part, name="TextPart")
 
-    with patch.object(
-        GeminiContentBuilder,
-        "_get_file_data",
+    # Patch _get_file_data to be async and patch from_text
+    with patch(
+        "plugins.pipes.gemini_manifold.GeminiContentBuilder._get_file_data",
+        new_callable=AsyncMock,
         return_value=(fake_pdf_bytes, pdf_mime_type),
     ) as mock_get_file_data, patch(
-        "plugins.pipes.gemini_manifold.types.Part.from_bytes",
-        return_value=mock_pdf_part_obj,
-    ) as mock_part_from_bytes, patch(
         "plugins.pipes.gemini_manifold.types.Part.from_text",
         return_value=mock_text_part_obj,
     ) as mock_part_from_text:
-
         # Act
         contents = await builder.build_contents()
 
@@ -990,18 +1001,38 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
         mock_chats_module.Chats.get_chat_by_id_and_user_id.assert_called_once_with(
             id="test_chat_id", user_id="test_user_id"
         )
-        mock_get_file_data.assert_called_once_with(pdf_file_id)
-        mock_part_from_bytes.assert_called_once_with(
-            data=fake_pdf_bytes, mime_type=pdf_mime_type
+        # The new logic calls _get_file_data from _genai_part_from_uri
+        mock_get_file_data.assert_awaited_once_with(pdf_file_id)
+
+        # Assert that the files_api_manager was used correctly
+        mock_files_api_manager.get_or_upload_file.assert_awaited_once_with(
+            file_bytes=fake_pdf_bytes,
+            mime_type=pdf_mime_type,
+            owui_file_id=pdf_file_id,
         )
+
+        # Assert that the text part was still processed
         mock_part_from_text.assert_called_once_with(text=user_text_content)
 
         assert len(contents) == 1
         user_content_obj = contents[0]
         assert user_content_obj.role == "user"
         assert user_content_obj.parts is not None
+        # The order is now file first, then text, based on the new implementation
         assert len(user_content_obj.parts) == 2
-        assert user_content_obj.parts[0] is mock_pdf_part_obj
+
+        # Assert the PDF part was created correctly via the new logic
+        pdf_part = user_content_obj.parts[0]
+        assert isinstance(pdf_part, gemini_types.Part)
+
+        # This assertion now helps the type checker understand that file_data is not None
+        assert pdf_part.file_data is not None
+
+        # Pylance will no longer complain about these lines
+        assert pdf_part.file_data.file_uri == mock_gemini_file.uri
+        assert pdf_part.file_data.mime_type == mock_gemini_file.mime_type
+
+        # Assert the text part is the second part
         assert user_content_obj.parts[1] is mock_text_part_obj
         mock_event_emitter.assert_not_called()
 
