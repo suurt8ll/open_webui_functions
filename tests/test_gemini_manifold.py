@@ -2,12 +2,7 @@ from typing import cast
 from aiocache.base import BaseCache
 import pytest
 import pytest_asyncio
-from unittest.mock import (
-    patch,
-    MagicMock,
-    AsyncMock,
-    call,
-)
+from unittest.mock import patch, MagicMock, AsyncMock, call, ANY
 import sys
 
 # --- Mock problematic Open WebUI modules BEFORE they are imported by your plugin ---
@@ -1009,6 +1004,7 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
             file_bytes=fake_pdf_bytes,
             mime_type=pdf_mime_type,
             owui_file_id=pdf_file_id,
+            status_queue=ANY,
         )
 
         # Assert that the text part was still processed
