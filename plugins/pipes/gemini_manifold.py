@@ -919,11 +919,6 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is True.""",
         )
-        USE_FILES_API: bool = Field(
-            default=True,
-            description="""Save the image files using Open WebUI's API for files. 
-            Default value is True.""",
-        )
         THINKING_MODEL_PATTERN: str = Field(
             default=r"gemini-2.5",
             description="""Regex pattern to identify thinking models. 
@@ -1019,11 +1014,6 @@ class Pipe:
             default=None,
             description="""Whether to show the thinking summary in the response.
             This is only applicable for Gemini 2.5 models.
-            Default value is None.""",
-        )
-        USE_FILES_API: bool | None | Literal[""] = Field(
-            default=None,
-            description="""Save the image files using Open WebUI's API for files.
             Default value is None.""",
         )
         THINKING_MODEL_PATTERN: str | None = Field(
@@ -1715,8 +1705,7 @@ class Pipe:
                             processed_text = self._process_image_part(
                                 data, gen_content_args, user_id, __request__
                             )
-                            if processed_text:
-                                payload = {"content": processed_text}
+                            payload = {"content": processed_text}
                         case types.Part(executable_code=code):
                             processed_text = self._process_executable_code_part(code)
                             # Code blocks are already formatted and safe.
@@ -1824,24 +1813,24 @@ class Pipe:
 
     def _process_image_part(
         self, inline_data, gen_content_args: dict, user_id: str, request: Request
-    ) -> str | None:
+    ) -> str:
         """Handles image data conversion to markdown."""
         mime_type = inline_data.mime_type
         image_data = inline_data.data
 
-        if self.valves.USE_FILES_API:
-            image_url = self._upload_image(
-                image_data,
-                mime_type,
-                gen_content_args.get("model", ""),
-                "Not implemented yet. TAKE IT FROM gen_content_args contents",
-                user_id,
-                request,
-            )
-            return f"![Generated Image]({image_url})" if image_url else None
-        else:
-            encoded = base64.b64encode(image_data).decode()
-            return f"![Generated Image](data:{mime_type};base64,{encoded})"
+        image_url = self._upload_image(
+            image_data,
+            mime_type,
+            gen_content_args.get("model", ""),
+            "Not implemented yet. TAKE IT FROM gen_content_args contents",
+            user_id,
+            request,
+        )
+        return (
+            f"![Generated Image]({image_url})"
+            if image_url
+            else "*An error occurred while trying to store this model generated image.*"
+        )
 
     def _upload_image(
         self,
