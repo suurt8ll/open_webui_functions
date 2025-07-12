@@ -1674,6 +1674,71 @@ class Pipe:
     # endregion 1.2 Model retrival from Google API
 
     # region 1.3 Model response streaming
+    async def _stream_response_generator(
+        self,
+        response_stream: AsyncIterator[types.GenerateContentResponse],
+        __request__: Request,
+        model: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        user_id: str,
+        chat_id: str,
+        message_id: str,
+    ) -> AsyncGenerator[dict, None]:
+        """
+        Yields structured dictionary chunks from the stream, counts tag substitutions
+        for a final toast notification, and handles post-processing.
+        """
+        final_response_chunk: types.GenerateContentResponse | None = None
+        error_occurred = False
+        total_substitutions = 0
+
+        try:
+            part_processor = self._process_parts_to_structured_stream(
+                response_stream, __request__, model, user_id, chat_id, message_id
+            )
+            async for structured_chunk, count, raw_chunk in part_processor:
+                if count > 0:
+                    total_substitutions += count
+                    log.debug(f"Disabled {count} special tag(s) in a chunk.")
+
+                if raw_chunk:
+                    final_response_chunk = raw_chunk
+                yield structured_chunk
+
+        except Exception as e:
+            error_occurred = True
+            error_msg = f"Stream ended with error: {e}"
+            # FIXME: raise the error instead?
+            await self._emit_error(error_msg, event_emitter)
+        finally:
+            if total_substitutions > 0 and not error_occurred:
+                plural_s = "s" if total_substitutions > 1 else ""
+                toast_msg = (
+                    f"For clarity, {total_substitutions} special tag{plural_s} "
+                    "were disabled in the response by injecting a zero-width space (ZWS)."
+                )
+                await emit_toast(toast_msg, event_emitter, "info")
+
+            if not error_occurred:
+                log.info("Stream finished successfully!")
+                log.debug("Last chunk:", payload=final_response_chunk)
+
+            try:
+                await self._do_post_processing(
+                    final_response_chunk,
+                    event_emitter,
+                    __request__,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    stream_error_happened=error_occurred,
+                )
+            except Exception as e:
+                error_msg = f"Post-processing failed with error:\n\n{e}"
+                await emit_toast(error_msg, event_emitter, "error")
+                log.exception(error_msg)
+
+            log.debug("AsyncGenerator finished.")
+
     async def _process_parts_to_structured_stream(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
@@ -1742,71 +1807,6 @@ class Pipe:
                         yield structured_chunk, count, chunk
         except Exception:
             raise
-
-    async def _stream_response_generator(
-        self,
-        response_stream: AsyncIterator[types.GenerateContentResponse],
-        __request__: Request,
-        model: str,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        user_id: str,
-        chat_id: str,
-        message_id: str,
-    ) -> AsyncGenerator[dict, None]:
-        """
-        Yields structured dictionary chunks from the stream, counts tag substitutions
-        for a final toast notification, and handles post-processing.
-        """
-        final_response_chunk: types.GenerateContentResponse | None = None
-        error_occurred = False
-        total_substitutions = 0
-
-        try:
-            part_processor = self._process_parts_to_structured_stream(
-                response_stream, __request__, model, user_id, chat_id, message_id
-            )
-            async for structured_chunk, count, raw_chunk in part_processor:
-                if count > 0:
-                    total_substitutions += count
-                    log.debug(f"Disabled {count} special tag(s) in a chunk.")
-
-                if raw_chunk:
-                    final_response_chunk = raw_chunk
-                yield structured_chunk
-
-        except Exception as e:
-            error_occurred = True
-            error_msg = f"Stream ended with error: {e}"
-            # FIXME: raise the error instead?
-            await self._emit_error(error_msg, event_emitter)
-        finally:
-            if total_substitutions > 0 and not error_occurred:
-                plural_s = "s" if total_substitutions > 1 else ""
-                toast_msg = (
-                    f"For clarity, {total_substitutions} special tag{plural_s} "
-                    "were disabled in the response by injecting a zero-width space (ZWS)."
-                )
-                await emit_toast(toast_msg, event_emitter, "info")
-
-            if not error_occurred:
-                log.info("Stream finished successfully!")
-                log.debug("Last chunk:", payload=final_response_chunk)
-
-            try:
-                await self._do_post_processing(
-                    final_response_chunk,
-                    event_emitter,
-                    __request__,
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    stream_error_happened=error_occurred,
-                )
-            except Exception as e:
-                error_msg = f"Post-processing failed with error:\n\n{e}"
-                await emit_toast(error_msg, event_emitter, "error")
-                log.exception(error_msg)
-
-            log.debug("AsyncGenerator finished.")
 
     @staticmethod
     def _disable_special_tags(text: str) -> tuple[str, int]:
