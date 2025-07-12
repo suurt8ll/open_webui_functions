@@ -417,7 +417,7 @@ class GeminiContentBuilder:
     def __init__(
         self,
         messages_body: list["Message"],
-        metadata_body: dict[str, Any],
+        metadata_body: "Metadata",
         user_data: "UserData",
         event_emitter: Callable[["Event"], Awaitable[None]],
         valves: "Pipe.Valves",
@@ -491,7 +491,7 @@ class GeminiContentBuilder:
         return system_prompt, remaining_messages  # type: ignore
 
     def _fetch_and_validate_chat_history(
-        self, metadata_body: dict[str, Any], user_data: "UserData"
+        self, metadata_body: "Metadata", user_data: "UserData"
     ) -> list["ChatMessageTD"] | None:
         """
         Fetches message history from the database and validates its length against the request body.
@@ -600,6 +600,12 @@ class GeminiContentBuilder:
         This is the central dispatcher for all media processing, handling data URIs,
         local API file paths, and YouTube URLs.
         """
+
+        # TODO: Implement a valve/toggle (e.g., self.valves.USE_FILES_API) to bypass
+        # this entire function and send raw bytes/data URIs directly in the prompt
+        # if a user needs to opt-out of the Files API for cost or privacy reasons.
+        # Deferring until a clear use case is requested.
+
         if not uri:
             log.warning("Received an empty URI, skipping.")
             return None
@@ -1073,7 +1079,7 @@ class Pipe:
         __user__: "UserData",
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]],
-        __metadata__: dict[str, Any],
+        __metadata__: "Metadata",
     ) -> AsyncGenerator[dict, None] | str:
         self._add_log_handler(self.valves.LOG_LEVEL)
 
@@ -1102,6 +1108,10 @@ class Pipe:
         if "error" in __metadata__["model"]["id"]:
             error_msg = f"There has been an error during model retrival phase: {str(__metadata__['model'])}"
             raise ValueError(error_msg)
+
+        # NOTE: will be "local" if Temporary Chat is enabled.
+        chat_id = __metadata__.get("chat_id", "not_provided")
+        message_id = __metadata__.get("message_id", "not_provided")
 
         features = __metadata__.get("features", {}) or {}
         log.info(
@@ -1254,10 +1264,11 @@ class Pipe:
             return self._stream_response_generator(
                 response_stream,
                 __request__,
-                gen_content_args,
+                model_name,
                 __event_emitter__,
-                __metadata__,
                 __user__["id"],
+                chat_id,
+                message_id,
             )
         else:
             # Non-streaming response.
@@ -1271,7 +1282,7 @@ class Pipe:
                 log.info("Non-streaming response finished successfully!")
                 log.debug("Non-streaming response:", payload=res)
                 await self._do_post_processing(
-                    res, __event_emitter__, __metadata__, __request__
+                    res, __event_emitter__, __request__, chat_id, message_id
                 )
                 log.info(
                     "Streaming disabled. Returning full response as str. "
@@ -1667,8 +1678,10 @@ class Pipe:
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
         __request__: Request,
-        gen_content_args: dict,
+        model: str,
         user_id: str,
+        chat_id: str,
+        message_id: str,
     ) -> AsyncGenerator[tuple[dict, int, types.GenerateContentResponse | None], None]:
         """
         Processes a stream of Gemini responses, yielding structured dictionaries,
@@ -1686,7 +1699,7 @@ class Pipe:
                 for part in parts:
                     # Initialize variables at the start of each loop to satisfy the linter
                     # and ensure they always have a defined state.
-                    payload: dict | None = None
+                    payload: dict[str, str] | None = None
                     count: int = 0
                     key: str = "content"
 
@@ -1701,9 +1714,14 @@ class Pipe:
                             sanitized_text, count = self._disable_special_tags(text)
                             payload = {key: sanitized_text}
                         case types.Part(inline_data=data):
+                            if not data:
+                                log.warning(
+                                    "Model response stream Part has an inline_data field but it is empty, skipping."
+                                )
+                                continue
                             # Image parts don't need tag disabling.
-                            processed_text = self._process_image_part(
-                                data, gen_content_args, user_id, __request__
+                            processed_text = await self._process_image_part(
+                                data, model, user_id, chat_id, message_id, __request__
                             )
                             payload = {"content": processed_text}
                         case types.Part(executable_code=code):
@@ -1729,10 +1747,11 @@ class Pipe:
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
         __request__: Request,
-        gen_content_args: dict,
+        model: str,
         event_emitter: Callable[["Event"], Awaitable[None]],
-        metadata: dict[str, Any],
         user_id: str,
+        chat_id: str,
+        message_id: str,
     ) -> AsyncGenerator[dict, None]:
         """
         Yields structured dictionary chunks from the stream, counts tag substitutions
@@ -1744,7 +1763,7 @@ class Pipe:
 
         try:
             part_processor = self._process_parts_to_structured_stream(
-                response_stream, __request__, gen_content_args, user_id
+                response_stream, __request__, model, user_id, chat_id, message_id
             )
             async for structured_chunk, count, raw_chunk in part_processor:
                 if count > 0:
@@ -1777,9 +1796,10 @@ class Pipe:
                 await self._do_post_processing(
                     final_response_chunk,
                     event_emitter,
-                    metadata,
                     __request__,
-                    error_occurred,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    stream_error_happened=error_occurred,
                 )
             except Exception as e:
                 error_msg = f"Post-processing failed with error:\n\n{e}"
@@ -1811,76 +1831,86 @@ class Pipe:
         modified_text, num_substitutions = TAG_REGEX.subn(rf"<{ZWS}\1", text)
         return modified_text, num_substitutions
 
-    def _process_image_part(
-        self, inline_data, gen_content_args: dict, user_id: str, request: Request
+    async def _process_image_part(
+        self,
+        inline_data: types.Blob,
+        model: str,
+        user_id: str,
+        chat_id: str,
+        message_id: str,
+        request: Request,
     ) -> str:
-        """Handles image data conversion to markdown."""
+        """
+        Handles image data by saving it to the Open WebUI backend and returning a markdown link.
+        """
         mime_type = inline_data.mime_type
         image_data = inline_data.data
 
-        image_url = self._upload_image(
-            image_data,
-            mime_type,
-            gen_content_args.get("model", ""),
-            "Not implemented yet. TAKE IT FROM gen_content_args contents",
-            user_id,
-            request,
-        )
+        if mime_type and image_data:
+            image_url = await self._upload_image(
+                image_data=image_data,
+                mime_type=mime_type,
+                model=model,
+                user_id=user_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                __request__=request,
+            )
+        else:
+            log.warning(
+                "Image part has no mime_type or data, cannot upload image. "
+                "Returning a placeholder message."
+            )
+            image_url = None
+
         return (
             f"![Generated Image]({image_url})"
             if image_url
             else "*An error occurred while trying to store this model generated image.*"
         )
 
-    def _upload_image(
+    async def _upload_image(
         self,
         image_data: bytes,
         mime_type: str,
         model: str,
-        prompt: str,
         user_id: str,
+        chat_id: str,
+        message_id: str,
         __request__: Request,
     ) -> str | None:
         """
-        Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
-        Returns the url to uploaded image.
+        Helper method that uploads a generated image to the configured Open WebUI storage provider.
+        Returns the url to the uploaded image.
         """
-        image_format = mimetypes.guess_extension(mime_type)
+        image_format = mimetypes.guess_extension(mime_type) or ".png"
         id = str(uuid.uuid4())
-        # TODO: Better filename? Prompt as the filename?
-        name = os.path.basename(f"generated-image{image_format}")
+        name = f"generated-image{image_format}"
+
+        # The final filename includes the unique ID to prevent collisions.
         imagename = f"{id}_{name}"
         image = io.BytesIO(image_data)
+
+        # Create a clean, precise metadata object linking to the generation context.
         image_metadata = {
             "model": model,
-            "prompt": prompt,
+            "chat_id": chat_id,
+            "message_id": message_id,
         }
 
-        # Upload the image to user configured storage provider.
-        log.info("Uploading the model generated image to Open WebUI backend.")
-        log.debug("Uploading to the configured storage provider.")
-        try:
-            # Dynamically check if 'tags' parameter exists
-            sig = inspect.signature(Storage.upload_file)
-            has_tags = "tags" in sig.parameters
-        except Exception as e:
-            log.error(f"Error checking Storage.upload_file signature: {e}")
-            has_tags = False  # Default to old behavior
+        log.info("Uploading the model-generated image to the Open WebUI backend.")
 
         try:
-            if has_tags:
-                # New version with tags support >=v0.6.6
-                contents, image_path = Storage.upload_file(image, imagename, tags={})
-            else:
-                # Old version without tags <v0.6.5
-                contents, image_path = Storage.upload_file(image, imagename)  # type: ignore
+            contents, image_path = await asyncio.to_thread(
+                Storage.upload_file, image, imagename, tags={}
+            )
         except Exception:
-            error_msg = "Error occurred during upload to the storage provider."
-            log.exception(error_msg)
+            log.exception("Error occurred during upload to the storage provider.")
             return None
-        # Add the image file to files database.
-        log.debug("Adding the image file to Open WebUI files database.")
-        file_item = Files.insert_new_file(
+
+        log.debug("Adding the image file to the Open WebUI files database.")
+        file_item = await asyncio.to_thread(
+            Files.insert_new_file,
             user_id,
             FileForm(
                 id=id,
@@ -1895,11 +1925,9 @@ class Pipe:
             ),
         )
         if not file_item:
-            log.warning(
-                "Files.insert_new_file did not return anything. Image upload to Open WebUI database likely failed."
-            )
+            log.warning("Image upload to Open WebUI database likely failed.")
             return None
-        # Get the image url.
+
         image_url: str = __request__.app.url_path_for(
             "get_file_content_by_id", id=file_item.id
         )
@@ -1953,8 +1981,10 @@ class Pipe:
         self,
         model_response: types.GenerateContentResponse | None,
         event_emitter: Callable[["Event"], Awaitable[None]],
-        metadata: dict[str, Any],
         request: Request,
+        chat_id: str,
+        message_id: str,
+        *,
         stream_error_happened: bool = False,
     ):
         """Handles emitting usage, grounding, and sources after the main response/stream is done."""
@@ -1994,19 +2024,18 @@ class Pipe:
             log.debug("Emitting usage data:", payload=usage_event)
             # TODO: catch potential errors?
             await event_emitter(usage_event)
-        self._add_grounding_data_to_state(model_response, metadata, request)
+        self._add_grounding_data_to_state(model_response, request, chat_id, message_id)
 
     def _add_grounding_data_to_state(
         self,
         response: types.GenerateContentResponse,
-        chat_metadata: dict[str, Any],
         request: Request,
+        chat_id: str,
+        message_id: str,
     ):
         candidate = self._get_first_candidate(response.candidates)
         grounding_metadata_obj = candidate.grounding_metadata if candidate else None
 
-        chat_id: str = chat_metadata.get("chat_id", "")
-        message_id: str = chat_metadata.get("message_id", "")
         storage_key = f"grounding_{chat_id}_{message_id}"
 
         if grounding_metadata_obj:
@@ -2022,8 +2051,8 @@ class Pipe:
         else:
             log.debug(f"Response {message_id} does not have grounding metadata.")
 
+    @staticmethod
     def _get_usage_data_event(
-        self,
         response: types.GenerateContentResponse,
     ) -> "ChatCompletionEvent | None":
         """
