@@ -371,10 +371,23 @@ class FilesAPIManager:
                 )
 
             log.debug(f"{uploaded_file.name} uploaded. Polling for ACTIVE state.")
-            active_file = await self._poll_for_active_state(
-                uploaded_file.name, owui_file_id
-            )
-            log.debug(f"File {active_file.name} is now ACTIVE.")
+            log.trace("Uploaded file details:", payload=uploaded_file)
+
+            # Check if the file is already active. If so, we can skip polling.
+            if uploaded_file.state == types.FileState.ACTIVE:
+                log.debug(
+                    f"File {uploaded_file.name} is already ACTIVE. Skipping poll."
+                )
+                active_file = uploaded_file
+            else:
+                # If not active, proceed with the original polling logic.
+                log.debug(
+                    f"{uploaded_file.name} uploaded with state {uploaded_file.state}. Polling for ACTIVE state."
+                )
+                active_file = await self._poll_for_active_state(
+                    uploaded_file.name, owui_file_id
+                )
+                log.debug(f"File {active_file.name} is now ACTIVE.")
 
             # Calculate TTL and set in the main file cache using the content hash as the key.
             ttl_seconds = self._calculate_ttl(active_file.expiration_time)
@@ -538,7 +551,7 @@ class GeminiContentBuilder:
             messages_db = chat_content.get("messages", [])[:-1]
         else:
             log.warning(
-                f"Chat with ID - {chat_id} - not found. Cannot process files or filter citations."
+                f"Chat {chat_id} not found. Cannot process files or filter citations."
             )
             return None
 
