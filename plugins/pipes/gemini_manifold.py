@@ -545,6 +545,7 @@ class GeminiContentBuilder:
         self.event_emitter = event_emitter
         self.valves = valves
         self.files_api_manager = files_api_manager
+        self.is_temp_chat = metadata_body.get("chat_id") == "local"
 
         self.system_prompt, self.messages_body = self._extract_system_prompt(
             self.messages_body
@@ -771,57 +772,76 @@ class GeminiContentBuilder:
         """
         Processes any resource URI and returns a genai.types.Part.
         This is the central dispatcher for all media processing, handling data URIs,
-        local API file paths, and YouTube URLs.
+        local API file paths, and YouTube URLs. It decides whether to use the
+        Files API or send raw bytes based on configuration and context.
         """
-
-        # TODO: Implement a valve/toggle (e.g., self.valves.USE_FILES_API) to bypass
-        # this entire function and send raw bytes/data URIs directly in the prompt
-        # if a user needs to opt-out of the Files API for cost or privacy reasons.
-        # Deferring until a clear use case is requested.
-
         if not uri:
             log.warning("Received an empty URI, skipping.")
             return None
+
         try:
+            file_bytes: bytes | None = None
+            mime_type: str | None = None
+            owui_file_id: str | None = None
+
+            # Step 1: Extract bytes and mime_type from the URI if applicable
             if uri.startswith("data:image"):
                 match = re.match(r"data:(image/\w+);base64,(.+)", uri)
                 if not match:
                     raise ValueError("Invalid data URI for image.")
-
                 mime_type, base64_data = match.group(1), match.group(2)
-                image_bytes = base64.b64decode(base64_data)
-
-                log.info(f"Using Files API for data URI image (mime: {mime_type}).")
-                gemini_file = await self.files_api_manager.get_or_upload_file(
-                    file_bytes=image_bytes,
-                    mime_type=mime_type,
-                    status_queue=status_queue,
-                )
-                return types.Part(
-                    file_data=types.FileData(
-                        file_uri=gemini_file.uri, mime_type=gemini_file.mime_type
-                    )
-                )
-
+                file_bytes = base64.b64decode(base64_data)
             elif uri.startswith("/api/v1/files/"):
                 log.info(f"Processing local API file URI: {uri}")
                 file_id = uri.split("/")[4]
+                owui_file_id = file_id
                 file_bytes, mime_type = await self._get_file_data(file_id)
+            elif "youtube.com/" in uri or "youtu.be/" in uri:
+                log.info(f"Found YouTube URL: {uri}")
+                # YouTube URLs are handled directly by the API as URIs.
+                if self.valves.USE_VERTEX_AI:
+                    return types.Part.from_uri(file_uri=uri, mime_type="video/mp4")
+                else:
+                    return types.Part(file_data=types.FileData(file_uri=uri))
+            # TODO: Google Cloud Storage bucket support.
+            # elif uri.startswith("gs://"): ...
+            else:
+                warn_msg = f"Unsupported URI: '{uri[:64]}...' Links must be to YouTube or a supported file type."
+                log.warning(warn_msg)
+                await emit_toast(warn_msg, self.event_emitter, "warning")
+                return None
 
-                if file_bytes and mime_type:
-                    # TODO: The Files API is strict about MIME types (e.g., text/plain,
-                    # application/pdf). In the future, inspect the content of files
-                    # with unsupported text-like MIME types (e.g., 'application/json',
-                    # 'text/markdown'). If the content is detected as plaintext,
-                    # override the `mime_type` variable to 'text/plain' to allow the upload.
+            # Step 2: If we have bytes, decide how to create the Part
+            if file_bytes and mime_type:
+                # TODO: The Files API is strict about MIME types (e.g., text/plain,
+                # application/pdf). In the future, inspect the content of files
+                # with unsupported text-like MIME types (e.g., 'application/json',
+                # 'text/markdown'). If the content is detected as plaintext,
+                # override the `mime_type` variable to 'text/plain' to allow the upload.
 
-                    log.info(
-                        f"Using Files API for local file: {file_id} (mime: {mime_type})"
-                    )
+                # Determine whether to use the Files API based on the specified conditions.
+                use_files_api = True
+                reason = ""
+
+                # Check the actual client configuration, not just the intended valve setting.
+                is_vertex_client = self.files_api_manager.client.vertexai
+
+                if not self.valves.USE_FILES_API:
+                    reason = "disabled by user setting (USE_FILES_API=False)"
+                    use_files_api = False
+                elif is_vertex_client:
+                    reason = "the active client is configured for Vertex AI, which does not support the Files API"
+                    use_files_api = False
+                elif self.is_temp_chat:
+                    reason = "temporary chat mode is active"
+                    use_files_api = False
+
+                if use_files_api:
+                    log.info(f"Using Files API for resource from URI: {uri[:64]}...")
                     gemini_file = await self.files_api_manager.get_or_upload_file(
                         file_bytes=file_bytes,
                         mime_type=mime_type,
-                        owui_file_id=file_id,
+                        owui_file_id=owui_file_id,
                         status_queue=status_queue,
                     )
                     return types.Part(
@@ -830,23 +850,13 @@ class GeminiContentBuilder:
                             mime_type=gemini_file.mime_type,
                         )
                     )
-                return None
-
-            # TODO: Google Cloud Storage bucket support.
-            # elif uri.startswith("gs://"): ...
-
-            elif "youtube.com/" in uri or "youtu.be/" in uri:
-                log.info(f"Found YouTube URL: {uri}")
-                if self.valves.USE_VERTEX_AI:
-                    return types.Part.from_uri(file_uri=uri, mime_type="video/mp4")
                 else:
-                    return types.Part(file_data=types.FileData(file_uri=uri))
+                    log.info(
+                        f"Sending raw bytes because {reason}. Resource from URI: {uri[:64]}..."
+                    )
+                    return types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
 
-            else:
-                warn_msg = f"Unsupported URI: '{uri[:70]}...' Links must be to YouTube or a supported file type."
-                log.warning(warn_msg)
-                await emit_toast(warn_msg, self.event_emitter, "warning")
-                return None
+            return None  # Return None if bytes/mime_type could not be determined
 
         except FilesAPIError as e:
             error_msg = f"Files API failed for URI '{uri[:64]}...': {e}"
@@ -1113,6 +1123,13 @@ class Pipe:
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs. 
             This tool is only compatible with specific models. Default value is False.""",
         )
+        USE_FILES_API: bool = Field(
+            default=True,
+            description="""Whether to use the Google Files API for uploading files.
+            This provides caching and performance benefits, but can be disabled for privacy, cost, or compatibility reasons.
+            If disabled, files are sent as raw bytes in the request.
+            Default value is True.""",
+        )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
@@ -1209,6 +1226,12 @@ class Pipe:
             default=None,
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs. 
             This tool is only compatible with specific models. Default value is None.""",
+        )
+        USE_FILES_API: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Override the default setting for using the Google Files API.
+            Set to True to force use, False to disable.
+            Default is None (use the admin's setting).""",
         )
 
         @field_validator("THINKING_BUDGET", mode="after")
@@ -1312,7 +1335,7 @@ class Pipe:
             metadata_body=__metadata__,
             user_data=__user__,
             event_emitter=__event_emitter__,
-            valves=self.valves,
+            valves=valves,
             files_api_manager=files_api_manager,
         )
         contents = await builder.build_contents()

@@ -961,6 +961,7 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
 
     # Create a mock for the new dependency and its methods
     mock_files_api_manager = AsyncMock()
+    mock_files_api_manager.client.vertexai = False
     mock_gemini_file = MagicMock()
     mock_gemini_file.uri = "gs://fake-bucket/fake-file.pdf"
     mock_gemini_file.mime_type = pdf_mime_type
