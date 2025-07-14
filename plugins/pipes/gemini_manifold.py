@@ -24,7 +24,7 @@ from google.genai import errors as genai_errors
 import time
 import copy
 import json
-import urllib.parse
+from urllib.parse import urlparse, parse_qs
 import xxhash
 import asyncio
 import aiofiles
@@ -780,6 +780,9 @@ class GeminiContentBuilder:
             log.warning("Received an empty URI, skipping.")
             return None
 
+        # Check the actual client configuration, not just the intended valve setting.
+        is_vertex_client = self.files_api_manager.client.vertexai
+
         try:
             file_bytes: bytes | None = None
             mime_type: str | None = None
@@ -799,11 +802,9 @@ class GeminiContentBuilder:
                 file_bytes, mime_type = await self._get_file_data(file_id)
             elif "youtube.com/" in uri or "youtu.be/" in uri:
                 log.info(f"Found YouTube URL: {uri}")
-                # YouTube URLs are handled directly by the API as URIs.
-                if self.valves.USE_VERTEX_AI:
-                    return types.Part.from_uri(file_uri=uri, mime_type="video/mp4")
-                else:
-                    return types.Part(file_data=types.FileData(file_uri=uri))
+                return self._genai_part_from_youtube_uri(
+                    uri, is_vertex_client=is_vertex_client
+                )
             # TODO: Google Cloud Storage bucket support.
             # elif uri.startswith("gs://"): ...
             else:
@@ -823,9 +824,6 @@ class GeminiContentBuilder:
                 # Determine whether to use the Files API based on the specified conditions.
                 use_files_api = True
                 reason = ""
-
-                # Check the actual client configuration, not just the intended valve setting.
-                is_vertex_client = self.files_api_manager.client.vertexai
 
                 if not self.valves.USE_FILES_API:
                     reason = "disabled by user setting (USE_FILES_API=False)"
@@ -867,6 +865,122 @@ class GeminiContentBuilder:
         except Exception:
             log.exception(f"Error processing URI: {uri[:64]}[...]")
             return None
+
+    def _genai_part_from_youtube_uri(
+        self, uri: str, *, is_vertex_client: bool
+    ) -> types.Part | None:
+        """Creates a Gemini Part from a YouTube URL, with optional video metadata.
+
+        Handles standard (`watch?v=`), short (`youtu.be/`), and mobile (`shorts/`)
+        URLs. Metadata is parsed for the Gemini Developer API but ignored for
+        Vertex AI, which receives a simple URI Part.
+
+        - **Start/End Time**: `?t=<value>` and `#end=<value>`. The value can be a
+          flexible duration (e.g., "1m30s", "90") and will be converted to seconds.
+        - **FPS**: `#fps=<value>` (e.g., `#fps=2.5`, valid range: (0, 24])
+
+        Args:
+            uri: The raw YouTube URL from the user.
+            is_vertex_client: If True, creates a simple Part for Vertex AI.
+
+        Returns:
+            A `types.Part` object, or `None` if the URI is not a valid YouTube link.
+        """
+        # Regex to capture the 11-character video ID from various YouTube URL formats.
+        video_id_pattern = re.compile(
+            r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([a-zA-Z0-9_-]{11})"
+        )
+
+        match = video_id_pattern.search(uri)
+        if not match:
+            # log.warning(f"Could not extract a valid YouTube video ID from URI: {uri}")
+            return None
+
+        video_id = match.group(1)
+        canonical_uri = f"https://www.youtube.com/watch?v={video_id}"
+
+        # --- Branching logic for Vertex AI vs. Gemini Developer API ---
+        if is_vertex_client:
+            return types.Part.from_uri(file_uri=canonical_uri, mime_type="video/mp4")
+        else:
+            parsed_uri = urlparse(uri)
+            query_params = parse_qs(parsed_uri.query)
+            fragment_params = parse_qs(parsed_uri.fragment)
+
+            start_offset: str | None = None
+            end_offset: str | None = None
+            fps: float | None = None
+
+            # Start time from query `t`. Convert flexible format to "Ns".
+            if "t" in query_params:
+                raw_start = query_params["t"][0]
+                if (
+                    total_seconds := self._parse_duration_to_seconds(raw_start)
+                ) is not None:
+                    start_offset = f"{total_seconds}s"
+
+            # End time from fragment `end`. Convert flexible format to "Ns".
+            if "end" in fragment_params:
+                raw_end = fragment_params["end"][0]
+                if (
+                    total_seconds := self._parse_duration_to_seconds(raw_end)
+                ) is not None:
+                    end_offset = f"{total_seconds}s"
+
+            # FPS from fragment `fps` (e.g., #fps=2)
+            if "fps" in fragment_params:
+                try:
+                    fps_val = float(fragment_params["fps"][0])
+                    if 0.0 < fps_val <= 24.0:
+                        fps = fps_val
+                    else:
+                        # log.warning(f"FPS value '{fps_val}' is outside the valid range (0.0, 24.0]. Ignoring.")
+                        pass
+                except (ValueError, IndexError):
+                    # log.warning(f"Invalid FPS value in fragment: {fragment_params.get('fps')}. Ignoring.")
+                    pass
+
+            video_metadata: types.VideoMetadata | None = None
+            if start_offset or end_offset or fps is not None:
+                video_metadata = types.VideoMetadata(
+                    start_offset=start_offset,
+                    end_offset=end_offset,
+                    fps=fps,
+                )
+
+            return types.Part(
+                file_data=types.FileData(file_uri=canonical_uri),
+                video_metadata=video_metadata,
+            )
+
+    def _parse_duration_to_seconds(self, duration_str: str) -> int | None:
+        """Converts a human-readable duration string to total seconds.
+
+        Supports formats like "1h30m15s", "90m", "3600s", or just "90".
+        Returns total seconds as an integer, or None if the string is invalid.
+        """
+        if duration_str.isdigit():
+            return int(duration_str)
+
+        total_seconds = 0
+        # Find all number-unit pairs (e.g., 1h, 30m, 15s)
+        parts = re.findall(r"(\d+)\s*(h|m|s)?", duration_str, re.IGNORECASE)
+
+        if not parts and not duration_str.isdigit():
+            # log.warning(f"Could not parse duration string: {duration_str}")
+            return None
+
+        for value, unit in parts:
+            val = int(value)
+            unit = (unit or "s").lower()  # Default to seconds if no unit
+            if unit == "h":
+                total_seconds += val * 3600
+            elif unit == "m":
+                total_seconds += val * 60
+            elif unit == "s":
+                total_seconds += val
+
+        return total_seconds
 
     @staticmethod
     def _enable_special_tags(text: str) -> str:
@@ -910,8 +1024,7 @@ class GeminiContentBuilder:
         # If YouTube parsing is disabled, the regex will only find markdown image links,
         # leaving YouTube URLs to be treated as plain text.
         markdown_part = r"!\[.*?\]\(([^)]+)\)"  # Group 1: Markdown URI
-        youtube_part = r"(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+)"  # Group 2: YouTube URL
-
+        youtube_part = r"(https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)[^\s)]+)"  # Group 2: YouTube URL
         if self.valves.PARSE_YOUTUBE_URLS:
             pattern = re.compile(f"{markdown_part}|{youtube_part}")
             process_youtube = True
