@@ -24,6 +24,7 @@ from google.genai import errors as genai_errors
 import time
 import copy
 import json
+import urllib.parse
 import xxhash
 import asyncio
 import aiofiles
@@ -905,20 +906,33 @@ class GeminiContentBuilder:
         parts: list[types.Part] = []
         last_pos = 0
 
-        # A more general regex to find any markdown link or a standalone YouTube URL.
-        # It captures the full URI found inside the parentheses of a markdown link, or the URL itself.
-        pattern = re.compile(
-            r"!\[.*?\]\(([^)]+)\)|"  # Group 1: Markdown URI
-            r"(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+)"  # Group 2: YouTube URL
-        )
+        # Conditionally build a regex to find media links.
+        # If YouTube parsing is disabled, the regex will only find markdown image links,
+        # leaving YouTube URLs to be treated as plain text.
+        markdown_part = r"!\[.*?\]\(([^)]+)\)"  # Group 1: Markdown URI
+        youtube_part = r"(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+)"  # Group 2: YouTube URL
+
+        if self.valves.PARSE_YOUTUBE_URLS:
+            pattern = re.compile(f"{markdown_part}|{youtube_part}")
+            process_youtube = True
+        else:
+            pattern = re.compile(markdown_part)
+            process_youtube = False
+            log.info(
+                "YouTube URL parsing is disabled. URLs will be treated as plain text."
+            )
 
         for match in pattern.finditer(text):
             # Add the text segment that precedes the media link
             if text_segment := text[last_pos : match.start()].strip():
                 parts.append(types.Part.from_text(text=text_segment))
 
-            # The URI is either in the first or second capture group
-            uri = match.group(1) or match.group(2)
+            # The URI is in group 1 for markdown, or group 2 for YouTube.
+            if process_youtube:
+                uri = match.group(1) or match.group(2)
+            else:
+                uri = match.group(1)
+
             if not uri:
                 log.warning(
                     f"Found unsupported URI format in text: {match.group(0)}. Skipping."
@@ -1130,6 +1144,13 @@ class Pipe:
             If disabled, files are sent as raw bytes in the request.
             Default value is True.""",
         )
+        PARSE_YOUTUBE_URLS: bool = Field(
+            default=True,
+            description="""Whether to parse YouTube URLs from user messages and provide them as context to the model.
+            If disabled, YouTube links are treated as plain text.
+            This is only applicable for models that support video.
+            Default value is True.""",
+        )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
@@ -1231,6 +1252,12 @@ class Pipe:
             default=None,
             description="""Override the default setting for using the Google Files API.
             Set to True to force use, False to disable.
+            Default is None (use the admin's setting).""",
+        )
+        PARSE_YOUTUBE_URLS: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Override the default setting for parsing YouTube URLs.
+            Set to True to enable, False to disable.
             Default is None (use the admin's setting).""",
         )
 
