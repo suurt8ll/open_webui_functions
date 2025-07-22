@@ -1053,7 +1053,7 @@ class Pipe:
         )
         GEMINI_API_BASE_URL: str | None = Field(
             default=None,
-            description="""The base URL for calling the Gemini API. 
+            description="""The base URL for calling the Gemini API.
             Default value is None.""",
         )
         USE_VERTEX_AI: bool = Field(
@@ -1087,7 +1087,7 @@ class Pipe:
         )
         CACHE_MODELS: bool = Field(
             default=True,
-            description="""Whether to request models only on first load and when white- or blacklist changes. 
+            description="""Whether to request models only on first load and when white- or blacklist changes.
             Default value is True.""",
         )
         THINKING_BUDGET: int = Field(
@@ -1115,12 +1115,12 @@ class Pipe:
         )
         THINKING_MODEL_PATTERN: str = Field(
             default=r"gemini-2.5",
-            description="""Regex pattern to identify thinking models. 
+            description="""Regex pattern to identify thinking models.
             Default value is r"gemini-2.5".""",
         )
         ENABLE_URL_CONTEXT_TOOL: bool = Field(
             default=False,
-            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs. 
+            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
             This tool is only compatible with specific models. Default value is False.""",
         )
         USE_FILES_API: bool = Field(
@@ -1224,7 +1224,7 @@ class Pipe:
         )
         ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
             default=None,
-            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs. 
+            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
             This tool is only compatible with specific models. Default value is None.""",
         )
         USE_FILES_API: bool | None | Literal[""] = Field(
@@ -1403,6 +1403,7 @@ class Pipe:
             compatible_models_for_url_context = [
                 "gemini-2.5-pro",
                 "gemini-2.5-flash",
+                "gemini-2.5-flash-lite",
                 "gemini-2.5-flash-lite-preview-06-17",
                 "gemini-2.5-pro-preview-06-05",
                 "gemini-2.5-pro-preview-05-06",
