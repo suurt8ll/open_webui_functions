@@ -877,7 +877,12 @@ class GeminiContentBuilder:
 
         - **Start/End Time**: `?t=<value>` and `#end=<value>`. The value can be a
           flexible duration (e.g., "1m30s", "90") and will be converted to seconds.
-        - **FPS**: `#fps=<value>` (e.g., `#fps=2.5`, valid range: (0, 24])
+        - **Frame Rate**: Can be specified in two ways (if both are present,
+          `interval` takes precedence):
+          - **Interval**: `#interval=<value>` (e.g., `#interval=10s`, `#interval=0.5s`).
+            The value is a flexible duration converted to seconds, then to FPS (1/interval).
+          - **FPS**: `#fps=<value>` (e.g., `#fps=2.5`).
+          The final FPS value must be in the range (0, 24].
 
         Args:
             uri: The raw YouTube URL from the user.
@@ -893,7 +898,7 @@ class GeminiContentBuilder:
 
         match = video_id_pattern.search(uri)
         if not match:
-            # log.warning(f"Could not extract a valid YouTube video ID from URI: {uri}")
+            log.warning(f"Could not extract a valid YouTube video ID from URI: {uri}")
             return None
 
         video_id = match.group(1)
@@ -927,18 +932,34 @@ class GeminiContentBuilder:
                 ) is not None:
                     end_offset = f"{total_seconds}s"
 
-            # FPS from fragment `fps` (e.g., #fps=2)
-            if "fps" in fragment_params:
+            # Frame rate from fragment `interval` or `fps`. `interval` takes precedence.
+            if "interval" in fragment_params:
+                raw_interval = fragment_params["interval"][0]
+                if (
+                    interval_seconds := self._parse_duration_to_seconds(raw_interval)
+                ) is not None and interval_seconds > 0:
+                    calculated_fps = 1.0 / interval_seconds
+                    if 0.0 < calculated_fps <= 24.0:
+                        fps = calculated_fps
+                    else:
+                        log.warning(
+                            f"Interval '{raw_interval}' results in FPS '{calculated_fps}' which is outside the valid range (0.0, 24.0]. Ignoring."
+                        )
+
+            # Fall back to `fps` param if not set by `interval`.
+            if fps is None and "fps" in fragment_params:
                 try:
                     fps_val = float(fragment_params["fps"][0])
                     if 0.0 < fps_val <= 24.0:
                         fps = fps_val
                     else:
-                        # log.warning(f"FPS value '{fps_val}' is outside the valid range (0.0, 24.0]. Ignoring.")
-                        pass
+                        log.warning(
+                            f"FPS value '{fps_val}' is outside the valid range (0.0, 24.0]. Ignoring."
+                        )
                 except (ValueError, IndexError):
-                    # log.warning(f"Invalid FPS value in fragment: {fragment_params.get('fps')}. Ignoring.")
-                    pass
+                    log.warning(
+                        f"Invalid FPS value in fragment: {fragment_params.get('fps')}. Ignoring."
+                    )
 
             video_metadata: types.VideoMetadata | None = None
             if start_offset or end_offset or fps is not None:
@@ -953,25 +974,30 @@ class GeminiContentBuilder:
                 video_metadata=video_metadata,
             )
 
-    def _parse_duration_to_seconds(self, duration_str: str) -> int | None:
+    def _parse_duration_to_seconds(self, duration_str: str) -> float | None:
         """Converts a human-readable duration string to total seconds.
 
         Supports formats like "1h30m15s", "90m", "3600s", or just "90".
-        Returns total seconds as an integer, or None if the string is invalid.
+        Also supports float values like "0.5s" or "90.5".
+        Returns total seconds as a float, or None if the string is invalid.
         """
-        if duration_str.isdigit():
-            return int(duration_str)
+        # First, try to convert the whole string as a plain number (e.g., "90", "90.5").
+        try:
+            return float(duration_str)
+        except ValueError:
+            # If it fails, it might be a composite duration like "1m30s", so we parse it below.
+            pass
 
-        total_seconds = 0
-        # Find all number-unit pairs (e.g., 1h, 30m, 15s)
-        parts = re.findall(r"(\d+)\s*(h|m|s)?", duration_str, re.IGNORECASE)
+        total_seconds = 0.0
+        # Regex to find number-unit pairs (e.g., 1h, 30.5m, 15s). Supports floats.
+        parts = re.findall(r"(\d+(?:\.\d+)?)\s*(h|m|s)?", duration_str, re.IGNORECASE)
 
-        if not parts and not duration_str.isdigit():
+        if not parts:
             # log.warning(f"Could not parse duration string: {duration_str}")
             return None
 
         for value, unit in parts:
-            val = int(value)
+            val = float(value)
             unit = (unit or "s").lower()  # Default to seconds if no unit
             if unit == "h":
                 total_seconds += val * 3600
