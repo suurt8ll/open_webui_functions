@@ -891,9 +891,14 @@ class GeminiContentBuilder:
         Returns:
             A `types.Part` object, or `None` if the URI is not a valid YouTube link.
         """
+        # Convert YouTube Music URLs to standard YouTube URLs for consistent parsing.
+        if "music.youtube.com" in uri:
+            uri = uri.replace("music.youtube.com", "www.youtube.com")
+            log.info(f"Converted YouTube Music URL to standard URL: {uri}")
+
         # Regex to capture the 11-character video ID from various YouTube URL formats.
         video_id_pattern = re.compile(
-            r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([a-zA-Z0-9_-]{11})"
+            r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu.be/)([a-zA-Z0-9_-]{11})"
         )
 
         match = video_id_pattern.search(uri)
@@ -1050,7 +1055,7 @@ class GeminiContentBuilder:
         # If YouTube parsing is disabled, the regex will only find markdown image links,
         # leaving YouTube URLs to be treated as plain text.
         markdown_part = r"!\[.*?\]\(([^)]+)\)"  # Group 1: Markdown URI
-        youtube_part = r"(https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)[^\s)]+)"  # Group 2: YouTube URL
+        youtube_part = r"(https?://(?:(?:www|music)\.)?youtube\.com/(?:watch\?v=|shorts/)[^\s)]+|https?://youtu\.be/[^\s)]+)"  # Group 2: YouTube URL
         if self.valves.PARSE_YOUTUBE_URLS:
             pattern = re.compile(f"{markdown_part}|{youtube_part}")
             process_youtube = True
