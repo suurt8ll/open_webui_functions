@@ -20,6 +20,8 @@ requirements: google-genai==1.24.0
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
+from google.cloud import storage
+from google.api_core import exceptions
 
 import time
 import copy
@@ -547,6 +549,7 @@ class GeminiContentBuilder:
         self.valves = valves
         self.files_api_manager = files_api_manager
         self.is_temp_chat = metadata_body.get("chat_id") == "local"
+        self.vertexai = self.files_api_manager.client.vertexai
 
         self.system_prompt, self.messages_body = self._extract_system_prompt(
             self.messages_body
@@ -664,6 +667,56 @@ class GeminiContentBuilder:
             parts = await self._process_user_message(
                 message, files, self.event_emitter, status_queue
             )
+            # Case 1: User content is completely empty (no text, no files).
+            if not parts:
+                log.info(
+                    f"User message at index {i} is completely empty. "
+                    "Injecting a prompt to ask for clarification."
+                )
+                # Inform the user via a toast notification.
+                toast_msg = f"Your message #{i + 1} was empty. The assistant will ask for clarification."
+                await emit_toast(toast_msg, self.event_emitter, "info")
+
+                clarification_prompt = (
+                    "The user sent an empty message. Please ask the user for "
+                    "clarification on what they would like to ask or discuss."
+                )
+                # This will become the only part for this user message.
+                parts = await self._genai_parts_from_text(
+                    clarification_prompt, status_queue
+                )
+            else:
+                # Case 2: User has sent content, check if it includes text.
+                has_text_component = any(p.text for p in parts if p.text)
+                if not has_text_component:
+                    # The user sent content (e.g., files) but no accompanying text.
+                    if self.vertexai:
+                        # Vertex AI requires a text part in multi-modal messages.
+                        log.info(
+                            f"User message at index {i} lacks a text component for Vertex AI. "
+                            "Adding default text prompt."
+                        )
+                        # Inform the user via a toast notification.
+                        toast_msg = (
+                            f"For your message #{i + 1}, a default prompt was added as text is required "
+                            "for requests with attachments when using Vertex AI."
+                        )
+                        await emit_toast(toast_msg, self.event_emitter, "info")
+
+                        default_prompt_text = (
+                            "The user did not send any text message with the additional context. "
+                            "Answer by summarizing the newly added context."
+                        )
+                        default_text_parts = await self._genai_parts_from_text(
+                            default_prompt_text, status_queue
+                        )
+                        parts.extend(default_text_parts)
+                    else:
+                        # Google Developer API allows no-text user content.
+                        log.info(
+                            f"User message at index {i} lacks a text component for Google Developer API. "
+                            "Proceeding with non-text parts only."
+                        )
         elif role == "assistant":
             message = cast("AssistantMessage", message)
             # Google API's assistant role is "model"
@@ -780,9 +833,6 @@ class GeminiContentBuilder:
             log.warning("Received an empty URI, skipping.")
             return None
 
-        # Check the actual client configuration, not just the intended valve setting.
-        is_vertex_client = self.files_api_manager.client.vertexai
-
         try:
             file_bytes: bytes | None = None
             mime_type: str | None = None
@@ -802,9 +852,7 @@ class GeminiContentBuilder:
                 file_bytes, mime_type = await self._get_file_data(file_id)
             elif "youtube.com/" in uri or "youtu.be/" in uri:
                 log.info(f"Found YouTube URL: {uri}")
-                return self._genai_part_from_youtube_uri(
-                    uri, is_vertex_client=is_vertex_client
-                )
+                return self._genai_part_from_youtube_uri(uri)
             # TODO: Google Cloud Storage bucket support.
             # elif uri.startswith("gs://"): ...
             else:
@@ -828,7 +876,7 @@ class GeminiContentBuilder:
                 if not self.valves.USE_FILES_API:
                     reason = "disabled by user setting (USE_FILES_API=False)"
                     use_files_api = False
-                elif is_vertex_client:
+                elif self.vertexai:
                     reason = "the active client is configured for Vertex AI, which does not support the Files API"
                     use_files_api = False
                 elif self.is_temp_chat:
@@ -866,9 +914,7 @@ class GeminiContentBuilder:
             log.exception(f"Error processing URI: {uri[:64]}[...]")
             return None
 
-    def _genai_part_from_youtube_uri(
-        self, uri: str, *, is_vertex_client: bool
-    ) -> types.Part | None:
+    def _genai_part_from_youtube_uri(self, uri: str) -> types.Part | None:
         """Creates a Gemini Part from a YouTube URL, with optional video metadata.
 
         Handles standard (`watch?v=`), short (`youtu.be/`), and mobile (`shorts/`)
@@ -910,7 +956,7 @@ class GeminiContentBuilder:
         canonical_uri = f"https://www.youtube.com/watch?v={video_id}"
 
         # --- Branching logic for Vertex AI vs. Gemini Developer API ---
-        if is_vertex_client:
+        if self.vertexai:
             return types.Part.from_uri(file_uri=canonical_uri, mime_type="video/mp4")
         else:
             parsed_uri = urlparse(uri)
@@ -1141,6 +1187,34 @@ class GeminiContentBuilder:
             )
             return None, None
 
+        if file_path.startswith("gs://"):
+            try:
+                # Initialize the GCS client
+                storage_client = storage.Client()
+
+                # Parse the GCS path
+                # The path should be in the format "gs://bucket-name/object-name"
+                if len(file_path.split("/", 3)) < 4:
+                    raise ValueError(
+                        f"Invalid GCS path: '{file_path}'. "
+                        "Path must be in the format 'gs://bucket-name/object-name'."
+                    )
+
+                bucket_name, blob_name = file_path.removeprefix("gs://").split("/", 1)
+
+                # Get the bucket and blob (file object)
+                bucket = storage_client.bucket(bucket_name)
+                blob = bucket.blob(blob_name)
+
+                # Download the file's content as bytes
+                print(f"Reading from GCS: {file_path}")
+                return blob.download_as_bytes(), content_type
+            except exceptions.NotFound:
+                print(f"Error: GCS object not found at {file_path}")
+                raise
+            except Exception as e:
+                print(f"An error occurred while reading from GCS: {e}")
+                raise
         try:
             async with aiofiles.open(file_path, "rb") as file:
                 file_data = await file.read()
@@ -1294,6 +1368,10 @@ class Pipe:
             If disabled, YouTube links are treated as plain text.
             This is only applicable for models that support video.
             Default value is True.""",
+        )
+        USE_ENTERPRISE_SEARCH: bool = Field(
+            default=False,
+            description="""Enable the Enterprise Search tool to allow the model to fetch and use content from provided URLs. """,
         )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
@@ -1569,42 +1647,17 @@ class Pipe:
                 )
         gen_content_conf.tools = []
 
-        # Add URL context tool if enabled and model is compatible
-        if valves.ENABLE_URL_CONTEXT_TOOL:
-            compatible_models_for_url_context = [
-                "gemini-2.5-pro",
-                "gemini-2.5-flash",
-                "gemini-2.5-flash-lite",
-                "gemini-2.5-flash-lite-preview-06-17",
-                "gemini-2.5-pro-preview-06-05",
-                "gemini-2.5-pro-preview-05-06",
-                "gemini-2.5-flash-preview-05-20",
-                "gemini-2.0-flash",
-                "gemini-2.0-flash-001",
-                "gemini-2.0-flash-live-001",
-            ]
-            if model_name in compatible_models_for_url_context:
-                if client.vertexai:
-                    log.warning(
-                        "URL context tool is enabled, but Vertex AI does not support it. Skipping."
-                    )
-                else:
-                    log.info(
-                        f"Model {model_name} is compatible with URL context tool. Enabling."
-                    )
-                    gen_content_conf.tools.append(
-                        types.Tool(url_context=types.UrlContext())
-                    )
-            else:
-                log.warning(
-                    f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
-                )
-
         if features.get("google_search_tool"):
             log.info("Using grounding with Google Search as a Tool.")
-            gen_content_conf.tools.append(
-                types.Tool(google_search=types.GoogleSearch())
-            )
+            if valves.USE_ENTERPRISE_SEARCH and client.vertexai:
+                log.info("Using Enterprise Web Search instead of Google Search.")
+                gen_content_conf.tools.append(
+                    types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
+                )
+            else:
+                gen_content_conf.tools.append(
+                    types.Tool(google_search=types.GoogleSearch())
+                )
         elif features.get("google_search_retrieval"):
             log.info("Using grounding with Google Search Retrieval.")
             gs = types.GoogleSearchRetrieval(
@@ -1627,6 +1680,36 @@ class Pipe:
         }
         log.debug("Passing these args to the Google API:", payload=gen_content_args)
 
+        # Add URL context tool if enabled and model is compatible
+        if valves.ENABLE_URL_CONTEXT_TOOL:
+            compatible_models_for_url_context = [
+                "gemini-2.5-pro",
+                "gemini-2.5-flash",
+                "gemini-2.5-flash-lite",
+                "gemini-2.5-flash-lite-preview-06-17",
+                "gemini-2.5-pro-preview-06-05",
+                "gemini-2.5-pro-preview-05-06",
+                "gemini-2.5-flash-preview-05-20",
+                "gemini-2.0-flash",
+                "gemini-2.0-flash-001",
+                "gemini-2.0-flash-live-001",
+            ]
+            if model_name in compatible_models_for_url_context:
+                if client.vertexai and (len(gen_content_conf.tools) > 0):
+                    log.warning(
+                        "URL context tool is enabled, but Vertex AI is used with multiple tools. Skipping."
+                    )
+                else:
+                    log.info(
+                        f"Model {model_name} is compatible with URL context tool. Enabling."
+                    )
+                    gen_content_conf.tools.append(
+                        types.Tool(url_context=types.UrlContext())
+                    )
+            else:
+                log.warning(
+                    f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
+                )
         if body.get("stream", False):
             # Streaming response
 

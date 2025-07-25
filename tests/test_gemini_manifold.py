@@ -797,7 +797,10 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
     with patch(
         "plugins.pipes.gemini_manifold.types.Part.from_text"
     ) as mock_part_from_text:
-        mock_part_from_text.return_value = MagicMock(spec=gemini_types.Part)
+        # The mock Part object needs a 'text' attribute for the new check in `build_contents`.
+        mock_text_part = MagicMock(spec=gemini_types.Part)
+        mock_text_part.text = "Hello!"
+        mock_part_from_text.return_value = mock_text_part
 
         contents = await builder.build_contents()
 
@@ -808,7 +811,7 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
         assert content_item.role == "user"
         assert content_item.parts is not None
         assert len(content_item.parts) == 1
-        assert content_item.parts[0] == mock_part_from_text.return_value
+        assert content_item.parts[0] == mock_text_part
         # A warning toast is emitted when messages_db is not found
         mock_event_emitter.assert_called_once()
         assert mock_event_emitter.call_args[0][0]["type"] == "notification"
@@ -862,9 +865,11 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
         files_api_manager=mock_files_api_manager,  # Pass the new mock
     )
 
-    # Mock part creation
+    # Mock part objects need 'text' attribute for new checks
     mock_text_part_before_obj = MagicMock(spec=gemini_types.Part, name="TextPartBefore")
+    mock_text_part_before_obj.text = text_before_stripped
     mock_text_part_after_obj = MagicMock(spec=gemini_types.Part, name="TextPartAfter")
+    mock_text_part_after_obj.text = text_after_stripped
 
     with patch(
         "plugins.pipes.gemini_manifold.types.Part.from_text"
@@ -875,9 +880,11 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
                 return mock_text_part_before_obj
             if text == text_after_stripped:
                 return mock_text_part_after_obj
-            return MagicMock(
+            generic_mock = MagicMock(
                 spec=gemini_types.Part, name=f"GenericTextPart_{text[:10]}"
             )
+            generic_mock.text = text
+            return generic_mock
 
         mock_part_from_text.side_effect = from_text_side_effect
 
@@ -908,6 +915,8 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
         assert hasattr(youtube_part, "file_data")
         assert youtube_part.file_data is not None
         assert youtube_part.file_data.file_uri == youtube_url
+        # A real file part should have a falsy .text attribute
+        assert not youtube_part.text
 
         # Part 3: Text after the YouTube link
         assert content_item.parts[2] is mock_text_part_after_obj
@@ -948,10 +957,9 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
             {
                 "role": "user",
                 "content": user_text_content,
-                # The new code path uses 'files' from the DB message with this structure
                 "files": [{"id": pdf_file_id, "type": "file"}],
             },
-            {"role": "assistant", "content": ""},  # Placeholder for current response
+            {"role": "assistant", "content": ""},
         ]
     }
 
@@ -976,20 +984,19 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
         user_data=mock_user_data,  # type: ignore
         event_emitter=mock_event_emitter,
         valves=pipe_instance.valves,
-        files_api_manager=mock_files_api_manager,  # Pass the new mock
+        files_api_manager=mock_files_api_manager,
     )
 
-    mock_text_part_obj = MagicMock(spec=gemini_types.Part, name="TextPart")
+    # REMOVED: No longer need to create a mock Part object for text.
+    # mock_text_part_obj = MagicMock(spec=gemini_types.Part, name="TextPart")
 
-    # Patch _get_file_data to be async and patch from_text
+    # Patch _get_file_data to be async.
+    # REMOVED: The patch for `types.Part.from_text` is removed to let the real method run.
     with patch(
         "plugins.pipes.gemini_manifold.GeminiContentBuilder._get_file_data",
         new_callable=AsyncMock,
         return_value=(fake_pdf_bytes, pdf_mime_type),
-    ) as mock_get_file_data, patch(
-        "plugins.pipes.gemini_manifold.types.Part.from_text",
-        return_value=mock_text_part_obj,
-    ) as mock_part_from_text:
+    ) as mock_get_file_data:
         # Act
         contents = await builder.build_contents()
 
@@ -997,10 +1004,8 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
         mock_chats_module.Chats.get_chat_by_id_and_user_id.assert_called_once_with(
             id="test_chat_id", user_id="test_user_id"
         )
-        # The new logic calls _get_file_data from _genai_part_from_uri
         mock_get_file_data.assert_awaited_once_with(pdf_file_id)
 
-        # Assert that the files_api_manager was used correctly
         mock_files_api_manager.get_or_upload_file.assert_awaited_once_with(
             file_bytes=fake_pdf_bytes,
             mime_type=pdf_mime_type,
@@ -1008,29 +1013,27 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
             status_queue=ANY,
         )
 
-        # Assert that the text part was still processed
-        mock_part_from_text.assert_called_once_with(text=user_text_content)
+        # This assertion is no longer needed as we are not mocking `from_text`
+        # mock_part_from_text.assert_called_once_with(text=user_text_content)
 
         assert len(contents) == 1
         user_content_obj = contents[0]
         assert user_content_obj.role == "user"
         assert user_content_obj.parts is not None
-        # The order is now file first, then text, based on the new implementation
         assert len(user_content_obj.parts) == 2
 
-        # Assert the PDF part was created correctly via the new logic
+        # Assert the PDF part was created correctly
         pdf_part = user_content_obj.parts[0]
         assert isinstance(pdf_part, gemini_types.Part)
-
-        # This assertion now helps the type checker understand that file_data is not None
         assert pdf_part.file_data is not None
-
-        # Pylance will no longer complain about these lines
         assert pdf_part.file_data.file_uri == mock_gemini_file.uri
         assert pdf_part.file_data.mime_type == mock_gemini_file.mime_type
 
-        # Assert the text part is the second part
-        assert user_content_obj.parts[1] is mock_text_part_obj
+        # CHANGED: Assert the text part by inspecting its properties, not its identity
+        text_part = user_content_obj.parts[1]
+        assert isinstance(text_part, gemini_types.Part)
+        assert text_part.text == user_text_content
+
         mock_event_emitter.assert_not_called()
 
 

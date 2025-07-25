@@ -10,3 +10,5 @@ aiofiles
 python-dotenv
 aiocache
 xxhash
+google-cloud-storage
+google-api-core
