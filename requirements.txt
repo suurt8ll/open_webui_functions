@@ -1,4 +1,4 @@
-google-genai==1.20.0
+google-genai==1.24.0
 fastapi==0.115.7
 loguru==0.7.3
 
@@ -9,5 +9,6 @@ aiohttp
 aiofiles
 python-dotenv
 aiocache
+xxhash
 google-cloud-storage
 google-api-core

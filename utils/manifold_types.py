@@ -1,4 +1,5 @@
 from typing import Any, NotRequired, Literal, TypedDict
+from google.genai import types
 
 
 # region `__files__` and `__metadata__.files`
@@ -170,6 +171,15 @@ class Features(TypedDict):
     code_interpreter: bool
     web_search: bool
 
+    # These are my own custom fields, not used by Open WebUI.
+    google_search_retrieval: NotRequired[bool]
+    google_search_retrieval_threshold: NotRequired[float | None]
+    google_search_tool: NotRequired[bool]
+    google_code_execution: NotRequired[bool]
+    upload_documents: NotRequired[bool]
+    reason: NotRequired[bool]
+    url_context: NotRequired[bool]
+
 
 class Metadata(TypedDict):
     """Represents the metadata object in the request body."""
@@ -183,10 +193,13 @@ class Metadata(TypedDict):
         dict[str, Any]
     ]  # Example is empty list, assuming list of objects
     files: list[FileAttachmentTD]  # List of files, using the same FileInfo structure
-    features: Features  # Using the specific Features TypedDict
+    features: Features | None  # Using the specific Features TypedDict
     variables: MetadataVariables  # Using the specific MetadataVariables TypedDict
     model: MetadataModel  # Using the specific MetadataModel TypedDict
     direct: bool
+
+    # This is my custom field, not used by Open WebUI.
+    safety_settings: list[types.SafetySetting]
 
 
 # endregion `__metadata__`
@@ -265,7 +278,7 @@ class Body(TypedDict):
     messages: list[Message]
     files: NotRequired[list[FileAttachmentTD]]  # Optional list of files
     features: NotRequired[Features]  # Optional features object
-    metadata: NotRequired[Metadata]  # Optional metadata object
+    metadata: Metadata
     options: NotRequired[Options]  # Optional options object
 
 

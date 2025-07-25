@@ -6,51 +6,39 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.21.0
-requirements: google-genai==1.20.0
+version: 1.22.0
+requirements: google-genai==1.24.0
 """
+
+# Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
+# They don't have any effect on the plugin's functionality.
+
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API and Vertex AI.
 # Be sure to check out my GitHub repository for more information! Contributions, questions and suggestions are very welcome.
 
-# Supported features:
-#   - Display thinking summary (Open WebUI >= 0.6.14 required)
-#   - Thinking budget
-#   - Gemini Reasoning Toggle (Reason filter required, see GitHub README)
-#   - Native image generation (image output), use "gemini-2.0-flash-preview-image-generation"
-#   - Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 filter required, see GitHub README)
-#   - Image input
-#   - YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
-#   - Grounding with Google Search (Gemini Manifold Companion >= 1.2.0 required)
-#   - Display citations in the front-end. (Gemini Manifold Companion >= 1.5.0 required)
-#   - Permissive safety settings (Gemini Manifold Companion >= 1.3.0 required)
-#   - Each user can decide to use their own API key.
-#   - Token usage data
-#   - Code execution tool. (Gemini Manifold Companion >= 1.1.0 required)
-#   - URL context tool (Gemini Manifold Companion >= 1.5.0 required if you want to see citations in the front-end).
-#   - Streaming and non-streaming responses.
-
-# Features that are supported by API but not yet implemented in the manifold:
-#   TODO Audio input support
-#   TODO Video input support (other than YouTube URLs)
-#   TODO Google Files API
-#   TODO Native tool calling
-
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
 from google.cloud import storage
 from google.api_core import exceptions
 
-import inspect
+import time
 import copy
 import json
-from functools import cache
+from urllib.parse import urlparse, parse_qs
+import xxhash
+import asyncio
+import aiofiles
 from aiocache import cached
 from aiocache.base import BaseCache
+from aiocache.serializers import NullSerializer
+from aiocache.backends.memory import SimpleMemoryCache
+from functools import cache
+from datetime import datetime, timezone
 from fastapi.datastructures import State
 import io
 import mimetypes
-import os
 import uuid
 import base64
 import re
@@ -68,6 +56,7 @@ from typing import (
     TYPE_CHECKING,
     cast,
 )
+
 from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
 from open_webui.storage.provider import Storage
@@ -105,18 +94,440 @@ async def emit_toast(
 ) -> None:
     """Emits a toast notification to the front-end."""
     # TODO: Use this method in more places, even for info toasts.
-    event: NotificationEvent = {
+    event: "NotificationEvent" = {
         "type": "notification",
         "data": {"type": toastType, "content": msg},
     }
     await event_emitter(event)
 
 
+async def emit_status(
+    message: str,
+    event_emitter: Callable[["Event"], Awaitable[None]],
+    done: bool = False,
+    hidden: bool = False,
+) -> None:
+    """Emit status updates asynchronously."""
+    try:
+        status_event: "StatusEvent" = {
+            "type": "status",
+            "data": {"description": message, "done": done, "hidden": hidden},
+        }
+        await event_emitter(status_event)
+        log.debug(f"Emitted status:", payload=status_event)
+    except Exception:
+        log.exception("Error emitting status")
+
+
 class GenaiApiError(Exception):
     """Custom exception for errors during Genai API interactions."""
 
-    def __init__(self, message):
-        super().__init__(message)
+    pass
+
+
+class FilesAPIError(Exception):
+    """Custom exception for errors during Files API operations."""
+
+    pass
+
+
+class UploadStatusManager:
+    """
+    Manages and centralizes status updates for concurrent file uploads.
+
+    This manager is self-configuring. It discovers the number of files that
+    require an actual upload at runtime, only showing a status message to the
+    user when network activity is necessary.
+
+    The communication protocol uses tuples sent via an asyncio.Queue:
+    - ('REGISTER_UPLOAD',): Sent by a worker when it determines an upload is needed.
+    - ('COMPLETE_UPLOAD',): Sent by a worker when its upload is finished.
+    - ('FINALIZE',): Sent by the orchestrator when all workers are done.
+    """
+
+    def __init__(self, event_emitter: Callable[["Event"], Awaitable[None]]):
+        self.event_emitter = event_emitter
+        self.queue = asyncio.Queue()
+        self.total_uploads_expected = 0
+        self.uploads_completed = 0
+        self.finalize_received = False
+        self.is_active = False
+
+    async def run(self) -> None:
+        """
+        Runs the manager loop, listening for updates and emitting status to the UI.
+        This should be started as a background task using asyncio.create_task().
+        """
+        while not (
+            self.finalize_received
+            and self.total_uploads_expected == self.uploads_completed
+        ):
+            msg = await self.queue.get()
+            msg_type = msg[0]
+
+            if msg_type == "REGISTER_UPLOAD":
+                self.is_active = True
+                self.total_uploads_expected += 1
+                await self._emit_progress_update()
+            elif msg_type == "COMPLETE_UPLOAD":
+                self.uploads_completed += 1
+                await self._emit_progress_update()
+            elif msg_type == "FINALIZE":
+                self.finalize_received = True
+
+            self.queue.task_done()
+
+        log.debug("UploadStatusManager finished its run.")
+
+    async def _emit_progress_update(self) -> None:
+        """Emits the current progress to the front-end if uploads are active."""
+        if not self.is_active:
+            return
+
+        is_done = (
+            self.total_uploads_expected > 0
+            and self.uploads_completed == self.total_uploads_expected
+        )
+        is_hidden = is_done
+
+        if is_done:
+            message = f"Upload complete. {self.uploads_completed} file(s) processed."
+        else:
+            # Show "Uploading 1 of N..."
+            message = f"Uploading file {self.uploads_completed + 1} of {self.total_uploads_expected}..."
+
+        await emit_status(
+            message,
+            self.event_emitter,
+            done=is_done,
+            hidden=is_hidden,
+        )
+
+
+class FilesAPIManager:
+    """
+    Manages uploading, caching, and retrieving files using the Google Gemini Files API.
+
+    This class provides a stateless and efficient way to handle files by using a fast,
+    non-cryptographic hash (xxHash) of the file's content as the primary identifier.
+    This enables content-addressable storage, preventing duplicate uploads of the
+    same file. It uses a multi-tiered approach:
+
+    1. Hot Path (In-Memory Caches): For instantly retrieving file objects and hashes
+       for recently used files.
+    2. Warm Path (Stateless GET): For quickly recovering file state after a server
+       restart by using a deterministic name (derived from the content hash) and a
+       single `get` API call.
+    3. Cold Path (Upload): As a last resort, for uploading new files or re-uploading
+       expired ones.
+    """
+
+    def __init__(
+        self,
+        client: genai.Client,
+        file_cache: SimpleMemoryCache,
+        id_hash_cache: SimpleMemoryCache,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+    ):
+        """
+        Initializes the FilesAPIManager.
+
+        Args:
+            client: An initialized `google.genai.Client` instance.
+            file_cache: An aiocache instance for mapping `content_hash -> types.File`.
+                        Must be configured with `aiocache.serializers.NullSerializer`.
+            id_hash_cache: An aiocache instance for mapping `owui_file_id -> content_hash`.
+                           This is an optimization to avoid re-hashing known files.
+            event_emitter: A callable for emitting events to the front-end.
+        """
+        self.client = client
+        self.file_cache = file_cache
+        self.id_hash_cache = id_hash_cache
+        self.event_emitter = event_emitter
+        # A dictionary to manage locks for concurrent uploads.
+        # The key is the content_hash, the value is an asyncio.Lock.
+        self.upload_locks: dict[str, asyncio.Lock] = {}
+
+    async def get_or_upload_file(
+        self,
+        file_bytes: bytes,
+        mime_type: str,
+        *,
+        owui_file_id: str | None = None,
+        status_queue: asyncio.Queue | None = None,
+    ) -> types.File:
+        """
+        The main public method to get a file, using caching, recovery, or uploading.
+
+        This method uses a fast content hash (xxHash) as the primary key for all
+        caching and remote API interactions to ensure deduplication and performance.
+        It is safe from race conditions during concurrent uploads.
+
+        Args:
+            file_bytes: The raw byte content of the file. Required.
+            mime_type: The MIME type of the file (e.g., 'image/png'). Required.
+            owui_file_id: The unique ID of the file from Open WebUI, if available.
+                          Used for logging and as a key for the hash cache optimization.
+            status_queue: An optional asyncio.Queue to report upload lifecycle events.
+
+        Returns:
+            An `ACTIVE` `google.genai.types.File` object.
+
+        Raises:
+            FilesAPIError: If the file fails to upload or process.
+        """
+        # Step 1: Get the fast content hash, using the ID cache as an optimization if possible.
+        content_hash = await self._get_content_hash(file_bytes, owui_file_id)
+
+        # Step 2: The Hot Path (Check Local File Cache)
+        # A cache hit means the file is valid and we can return immediately.
+        cached_file: types.File | None = await self.file_cache.get(content_hash)
+        if cached_file:
+            log_id = f"OWUI ID: {owui_file_id}" if owui_file_id else "anonymous file"
+            log.debug(
+                f"Cache HIT for file hash {content_hash} ({log_id}). Returning immediately."
+            )
+            return cached_file
+
+        # On cache miss, acquire a lock specific to this file's content to prevent race conditions.
+        # dict.setdefault is atomic, ensuring only one lock is created per hash.
+        lock = self.upload_locks.setdefault(content_hash, asyncio.Lock())
+        if lock.locked():
+            log.debug(
+                f"Lock for hash {content_hash} is held by another task. "
+                f"This call will now wait for the lock to be released."
+            )
+
+        async with lock:
+            # Step 2.5: Double-Checked Locking
+            # After acquiring the lock, check the cache again. Another task might have
+            # completed the upload while we were waiting for the lock.
+            cached_file = await self.file_cache.get(content_hash)
+            if cached_file:
+                log.debug(
+                    f"Cache HIT for file hash {content_hash} after acquiring lock. Returning."
+                )
+                return cached_file
+
+            # Step 3: The Warm/Cold Path (On Cache Miss)
+            deterministic_name = f"files/owui-v1-{content_hash}"
+            log.debug(
+                f"Cache MISS for hash {content_hash}. Attempting stateless recovery with GET: {deterministic_name}"
+            )
+
+            try:
+                # Attempt to get the file (Warm Path)
+                file = await self.client.aio.files.get(name=deterministic_name)
+                if not file.name:
+                    raise FilesAPIError(
+                        f"Stateless recovery for {deterministic_name} returned a file without a name."
+                    )
+
+                log.debug(
+                    f"Stateless recovery successful for {deterministic_name}. File exists on server."
+                )
+                active_file = await self._poll_for_active_state(file.name, owui_file_id)
+
+                ttl_seconds = self._calculate_ttl(active_file.expiration_time)
+                await self.file_cache.set(content_hash, active_file, ttl=ttl_seconds)
+
+                return active_file
+            except genai_errors.ClientError as e:
+                if e.code == 403:  # "Not found" signal from the API.
+                    log.info(
+                        f"File {deterministic_name} not found on server (received 403). Proceeding to upload."
+                    )
+                    # Proceed to upload (Cold Path)
+                    return await self._upload_and_process_file(
+                        content_hash,
+                        file_bytes,
+                        mime_type,
+                        deterministic_name,
+                        owui_file_id,
+                        status_queue,
+                    )
+                else:
+                    log.exception(
+                        f"A non-403 client error occurred during stateless recovery for {deterministic_name}."
+                    )
+                    await emit_toast(
+                        f"API error for file: {e.code}. Please check permissions.",
+                        self.event_emitter,
+                        "error",
+                    )
+                    raise FilesAPIError(
+                        f"Failed to check file status for {deterministic_name}: {e}"
+                    ) from e
+            except Exception as e:
+                log.exception(
+                    f"An unexpected error occurred during stateless recovery for {deterministic_name}."
+                )
+                await emit_toast(
+                    "Unexpected error retrieving a file. Please try again.",
+                    self.event_emitter,
+                    "error",
+                )
+                raise FilesAPIError(
+                    f"Failed to check file status for {deterministic_name}: {e}"
+                ) from e
+            finally:
+                # Clean up the lock from the dictionary once processing is complete
+                # for this hash, preventing memory growth over time.
+                # This is safe because any future request for this hash will hit the cache.
+                if content_hash in self.upload_locks:
+                    del self.upload_locks[content_hash]
+
+    async def _get_content_hash(
+        self, file_bytes: bytes, owui_file_id: str | None
+    ) -> str:
+        """
+        Retrieves the file's content hash, using a cache for known IDs or computing it.
+
+        This acts as a memoization layer for the hashing process, avoiding
+        re-computation for files with a known Open WebUI ID. For anonymous files
+        (owui_file_id=None), it will always compute the hash.
+        """
+        if owui_file_id:
+            # First, check the ID-to-Hash cache for known files.
+            cached_hash: str | None = await self.id_hash_cache.get(owui_file_id)
+            if cached_hash:
+                log.trace(f"Hash cache HIT for OWUI ID {owui_file_id}.")
+                return cached_hash
+
+        # If not in cache or if file is anonymous, compute the fast hash.
+        log.trace(
+            f"Hash cache MISS for OWUI ID {owui_file_id if owui_file_id else 'N/A'}. Computing hash."
+        )
+        content_hash = xxhash.xxh64(file_bytes).hexdigest()
+
+        # If there was an ID, store the newly computed hash for next time.
+        if owui_file_id:
+            await self.id_hash_cache.set(owui_file_id, content_hash)
+
+        return content_hash
+
+    def _calculate_ttl(self, expiration_time: datetime | None) -> float | None:
+        """Calculates the TTL in seconds from an expiration datetime."""
+        if not expiration_time:
+            return None
+
+        now_utc = datetime.now(timezone.utc)
+        if expiration_time <= now_utc:
+            return 0
+
+        return (expiration_time - now_utc).total_seconds()
+
+    async def _upload_and_process_file(
+        self,
+        content_hash: str,
+        file_bytes: bytes,
+        mime_type: str,
+        deterministic_name: str,
+        owui_file_id: str | None,
+        status_queue: asyncio.Queue | None = None,
+    ) -> types.File:
+        """Handles the full upload and post-upload processing workflow."""
+
+        # Register with the manager that an actual upload is starting.
+        if status_queue:
+            await status_queue.put(("REGISTER_UPLOAD",))
+
+        log.info(f"Starting upload for {deterministic_name}...")
+
+        try:
+            file_io = io.BytesIO(file_bytes)
+            upload_config = types.UploadFileConfig(
+                name=deterministic_name, mime_type=mime_type
+            )
+            uploaded_file = await self.client.aio.files.upload(
+                file=file_io, config=upload_config
+            )
+            if not uploaded_file.name:
+                raise FilesAPIError(
+                    f"File upload for {deterministic_name} did not return a file name."
+                )
+
+            log.debug(f"{uploaded_file.name} uploaded.")
+            log.trace("Uploaded file details:", payload=uploaded_file)
+
+            # Check if the file is already active. If so, we can skip polling.
+            if uploaded_file.state == types.FileState.ACTIVE:
+                log.debug(
+                    f"File {uploaded_file.name} is already ACTIVE. Skipping poll."
+                )
+                active_file = uploaded_file
+            else:
+                # If not active, proceed with the original polling logic.
+                log.debug(
+                    f"{uploaded_file.name} uploaded with state {uploaded_file.state}. Polling for ACTIVE state."
+                )
+                active_file = await self._poll_for_active_state(
+                    uploaded_file.name, owui_file_id
+                )
+                log.debug(f"File {active_file.name} is now ACTIVE.")
+
+            # Calculate TTL and set in the main file cache using the content hash as the key.
+            ttl_seconds = self._calculate_ttl(active_file.expiration_time)
+            await self.file_cache.set(content_hash, active_file, ttl=ttl_seconds)
+            log.debug(
+                f"Cached new file object for hash {content_hash} with TTL: {ttl_seconds}s."
+            )
+
+            return active_file
+        except Exception as e:
+            log.exception(f"File upload or processing failed for {deterministic_name}.")
+            await emit_toast(
+                "Upload failed for a file. Please check connection and try again.",
+                self.event_emitter,
+                "error",
+            )
+            raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
+        finally:
+            # Report completion (success or failure) to the status manager.
+            # This ensures the progress counter always advances.
+            if status_queue:
+                await status_queue.put(("COMPLETE_UPLOAD",))
+
+    async def _poll_for_active_state(
+        self,
+        file_name: str,
+        owui_file_id: str | None,
+        timeout: int = 60,
+        poll_interval: int = 1,
+    ) -> types.File:
+        """Polls the file's status until it is ACTIVE or fails."""
+        end_time = time.monotonic() + timeout
+        while time.monotonic() < end_time:
+            try:
+                file = await self.client.aio.files.get(name=file_name)
+            except Exception as e:
+                raise FilesAPIError(
+                    f"Polling failed: Could not get status for {file_name}. Reason: {e}"
+                ) from e
+
+            if file.state == types.FileState.ACTIVE:
+                return file
+            if file.state == types.FileState.FAILED:
+                log_id = f"'{owui_file_id}'" if owui_file_id else "an uploaded file"
+                error_message = f"File processing failed on server for {file_name}."
+                toast_message = f"Google could not process {log_id}."
+                if file.error:
+                    reason = f"Reason: {file.error.message} (Code: {file.error.code})"
+                    error_message += f" {reason}"
+                    toast_message += f" Reason: {file.error.message}"
+
+                await emit_toast(toast_message, self.event_emitter, "error")
+                raise FilesAPIError(error_message)
+
+            state_name = file.state.name if file.state else "UNKNOWN"
+            log.trace(
+                f"File {file_name} is still {state_name}. Waiting {poll_interval}s..."
+            )
+            await asyncio.sleep(poll_interval)
+
+        raise FilesAPIError(
+            f"File {file_name} did not become ACTIVE within {timeout} seconds."
+        )
 
 
 class GeminiContentBuilder:
@@ -124,11 +535,11 @@ class GeminiContentBuilder:
     def __init__(
         self,
         messages_body: list["Message"],
-        metadata_body: dict[str, Any],
+        metadata_body: "Metadata",
         user_data: "UserData",
         event_emitter: Callable[["Event"], Awaitable[None]],
         valves: "Pipe.Valves",
-        vertexai: bool = False,
+        files_api_manager: "FilesAPIManager",
     ):
         self.messages_body = messages_body
         self.upload_documents = (metadata_body.get("features", {}) or {}).get(
@@ -136,7 +547,9 @@ class GeminiContentBuilder:
         )
         self.event_emitter = event_emitter
         self.valves = valves
-        self.vertexai = vertexai
+        self.files_api_manager = files_api_manager
+        self.is_temp_chat = metadata_body.get("chat_id") == "local"
+        self.vertexai = self.files_api_manager.client.vertexai
 
         self.system_prompt, self.messages_body = self._extract_system_prompt(
             self.messages_body
@@ -146,8 +559,10 @@ class GeminiContentBuilder:
         )
 
     async def build_contents(self) -> list[types.Content]:
-        """The main public method to generate the contents list."""
-
+        """
+        The main public method to generate the contents list by processing all
+        message turns concurrently and using a self-configuring status manager.
+        """
         if not self.messages_db:
             warn_msg = (
                 "There was a problem retrieving the messages from the backend database. "
@@ -156,83 +571,34 @@ class GeminiContentBuilder:
             )
             await emit_toast(warn_msg, self.event_emitter, "warning")
 
-        contents = []
-        parts = []
-        for i, message in enumerate(self.messages_body):
-            role = message.get("role")
-            if role == "user":
-                message = cast("UserMessage", message)
-                files = []
-                if self.messages_db:
-                    message_db = self.messages_db[i]
-                    if self.upload_documents:
-                        files = message_db.get("files", [])
-                parts = await self._process_user_message(
-                    message, files, self.event_emitter
+        # 1. Set up and launch the status manager. It will activate itself if needed.
+        status_manager = UploadStatusManager(self.event_emitter)
+        manager_task = asyncio.create_task(status_manager.run())
+
+        # 2. Create and run concurrent processing tasks for each message turn.
+        tasks = [
+            self._process_message_turn(i, message, status_manager.queue)
+            for i, message in enumerate(self.messages_body)
+        ]
+        log.debug(f"Starting concurrent processing of {len(tasks)} message turns.")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 3. Signal to the manager that no more uploads will be registered.
+        await status_manager.queue.put(("FINALIZE",))
+
+        # 4. Wait for the manager to finish processing all reported uploads.
+        await manager_task
+
+        # 5. Filter and assemble the final contents list.
+        contents: list[types.Content] = []
+        for i, res in enumerate(results):
+            if isinstance(res, types.Content):
+                contents.append(res)
+            elif isinstance(res, Exception):
+                log.error(
+                    f"An error occurred while processing message {i} concurrently.",
+                    payload=res,
                 )
-                # Case 1: User content is completely empty (no text, no files).
-                if not parts:
-                    log.info(
-                        f"User message at index {i} is completely empty. "
-                        "Injecting a prompt to ask for clarification."
-                    )
-                    # Inform the user via a toast notification.
-                    toast_msg = f"Your message #{i + 1} was empty. The assistant will ask for clarification."
-                    await emit_toast(toast_msg, self.event_emitter, "info")
-
-                    clarification_prompt = (
-                        "The user sent an empty message. Please ask the user for "
-                        "clarification on what they would like to ask or discuss."
-                    )
-                    # This will become the only part for this user message.
-                    parts = self._genai_parts_from_text(clarification_prompt)
-                else:
-                    # Case 2: User has sent content, check if it includes text.
-                    has_text_component = any(p.text for p in parts if p.text)
-                    if not has_text_component:
-                        # The user sent content (e.g., files) but no accompanying text.
-                        if self.vertexai:
-                            # Vertex AI requires a text part in multi-modal messages.
-                            log.info(
-                                f"User message at index {i} lacks a text component for Vertex AI. "
-                                "Adding default text prompt."
-                            )
-                            # Inform the user via a toast notification.
-                            toast_msg = (
-                                f"For your message #{i + 1}, a default prompt was added as text is required "
-                                "for requests with attachments when using Vertex AI."
-                            )
-                            await emit_toast(toast_msg, self.event_emitter, "info")
-
-                            default_prompt_text = (
-                                "The user did not send any text message with the additional context. "
-                                "Answer by summarizing the newly added context."
-                            )
-                            default_text_parts = self._genai_parts_from_text(
-                                default_prompt_text
-                            )
-                            parts.extend(default_text_parts)
-                        else:
-                            # Google Developer API allows no-text user content.
-                            log.info(
-                                f"User message at index {i} lacks a text component for Google Developer API. "
-                                "Proceeding with non-text parts only."
-                            )
-            elif role == "assistant":
-                message = cast("AssistantMessage", message)
-                # Google API's assistant role is "model"
-                role = "model"
-                sources = None
-                if self.messages_db:
-                    message_db = self.messages_db[i]
-                    sources = message_db.get("sources")
-                parts = self._process_assistant_message(message, sources)
-            else:
-                warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
-                log.warning(warn_msg)
-                await emit_toast(warn_msg, self.event_emitter, "warning")
-                continue
-            contents.append(types.Content(role=role, parts=parts))
         return contents
 
     @staticmethod
@@ -245,7 +611,7 @@ class GeminiContentBuilder:
         return system_prompt, remaining_messages  # type: ignore
 
     def _fetch_and_validate_chat_history(
-        self, metadata_body: dict[str, Any], user_data: "UserData"
+        self, metadata_body: "Metadata", user_data: "UserData"
     ) -> list["ChatMessageTD"] | None:
         """
         Fetches message history from the database and validates its length against the request body.
@@ -261,7 +627,7 @@ class GeminiContentBuilder:
             messages_db = chat_content.get("messages", [])[:-1]
         else:
             log.warning(
-                f"Chat with ID - {chat_id} - not found. Cannot process files or filter citations."
+                f"Chat {chat_id} not found. Cannot process files or filter citations."
             )
             return None
 
@@ -273,42 +639,144 @@ class GeminiContentBuilder:
                 "This is likely due to a bug in Open WebUI. "
                 "Cannot process files or filter citations."
             )
+
+            # TODO: Emit a toast to the user in the front-end.
             log.warning(warn_msg)
             # Invalidate the db messages if they don't match
             return None
 
         return messages_db
 
+    async def _process_message_turn(
+        self, i: int, message: "Message", status_queue: asyncio.Queue
+    ) -> types.Content | None:
+        """
+        Processes a single message turn, handling user and assistant roles,
+        and returns a complete `types.Content` object. Designed to be run concurrently.
+        """
+        role = message.get("role")
+        parts: list[types.Part] = []
+
+        if role == "user":
+            message = cast("UserMessage", message)
+            files = []
+            if self.messages_db:
+                message_db = self.messages_db[i]
+                if self.upload_documents:
+                    files = message_db.get("files", [])
+            parts = await self._process_user_message(
+                message, files, self.event_emitter, status_queue
+            )
+            # Case 1: User content is completely empty (no text, no files).
+            if not parts:
+                log.info(
+                    f"User message at index {i} is completely empty. "
+                    "Injecting a prompt to ask for clarification."
+                )
+                # Inform the user via a toast notification.
+                toast_msg = f"Your message #{i + 1} was empty. The assistant will ask for clarification."
+                await emit_toast(toast_msg, self.event_emitter, "info")
+
+                clarification_prompt = (
+                    "The user sent an empty message. Please ask the user for "
+                    "clarification on what they would like to ask or discuss."
+                )
+                # This will become the only part for this user message.
+                parts = await self._genai_parts_from_text(
+                    clarification_prompt, status_queue
+                )
+            else:
+                # Case 2: User has sent content, check if it includes text.
+                has_text_component = any(p.text for p in parts if p.text)
+                if not has_text_component:
+                    # The user sent content (e.g., files) but no accompanying text.
+                    if self.vertexai:
+                        # Vertex AI requires a text part in multi-modal messages.
+                        log.info(
+                            f"User message at index {i} lacks a text component for Vertex AI. "
+                            "Adding default text prompt."
+                        )
+                        # Inform the user via a toast notification.
+                        toast_msg = (
+                            f"For your message #{i + 1}, a default prompt was added as text is required "
+                            "for requests with attachments when using Vertex AI."
+                        )
+                        await emit_toast(toast_msg, self.event_emitter, "info")
+
+                        default_prompt_text = (
+                            "The user did not send any text message with the additional context. "
+                            "Answer by summarizing the newly added context."
+                        )
+                        default_text_parts = await self._genai_parts_from_text(
+                            default_prompt_text, status_queue
+                        )
+                        parts.extend(default_text_parts)
+                    else:
+                        # Google Developer API allows no-text user content.
+                        log.info(
+                            f"User message at index {i} lacks a text component for Google Developer API. "
+                            "Proceeding with non-text parts only."
+                        )
+        elif role == "assistant":
+            message = cast("AssistantMessage", message)
+            # Google API's assistant role is "model"
+            role = "model"
+            sources = None
+            if self.messages_db:
+                message_db = self.messages_db[i]
+                sources = message_db.get("sources")
+            parts = await self._process_assistant_message(
+                message, sources, status_queue
+            )
+        else:
+            warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
+            log.warning(warn_msg)
+            await emit_toast(warn_msg, self.event_emitter, "warning")
+            return None
+
+        # Only create a Content object if there are parts to include.
+        if parts:
+            return types.Content(parts=parts, role=role)
+        return None
+
     async def _process_user_message(
         self,
         message: "UserMessage",
         files: list["FileAttachmentTD"],
         event_emitter: Callable[["Event"], Awaitable[None]],
+        status_queue: asyncio.Queue,
     ) -> list[types.Part]:
-        user_parts = []
+        user_parts: list[types.Part] = []
+        db_files_processed = False
 
-        if files:
-            log.info(f"Adding {len(files)} files to the user message.")
-        for file in files:
-            log.debug("Processing file:", payload=file)
-            file_id = file.get("file", {}).get("id")
-            document_bytes, mime_type = self._get_file_data(file_id)
-            if not document_bytes or not mime_type:
-                # Warnings are logged by the method above.
-                continue
+        # PATH 1: Database is available (Normal Chat).
+        if self.messages_db and files:
+            db_files_processed = True
+            log.info(f"Processing {len(files)} files from the database concurrently.")
 
-            if mime_type.startswith("text/") or mime_type == "application/pdf":
-                log.debug(
-                    f"{mime_type} is supported by Google API! Creating `types.Part` model for it."
-                )
-                user_parts.append(
-                    types.Part.from_bytes(data=document_bytes, mime_type=mime_type)
-                )
-            else:
-                warn_msg = f"{mime_type} is not supported by Google API! Skipping file {file_id}."
-                log.warning(warn_msg)
-                await emit_toast(warn_msg, event_emitter, "warning")
+            upload_tasks = []
+            for file in files:
+                log.debug("Preparing DB file for concurrent upload:", payload=file)
+                uri = ""
+                if file.get("type") == "image":
+                    uri = file.get("url", "")
+                elif file.get("type") == "file":
+                    # Reconstruct the local API URI to be handled by our unified function
+                    uri = f"/api/v1/files/{file.get('id', '')}/content"
 
+                if uri:
+                    # Create a coroutine for each file upload and add it to a list.
+                    upload_tasks.append(self._genai_part_from_uri(uri, status_queue))
+                else:
+                    log.warning("Could not determine URI for file in DB.", payload=file)
+
+            if upload_tasks:
+                # Run all upload tasks concurrently. asyncio.gather maintains the order of results.
+                results = await asyncio.gather(*upload_tasks)
+                # Filter out None results (from failed uploads) and add the successful parts to the list.
+                user_parts.extend(part for part in results if part)
+
+        # Now, process the content from the message payload.
         user_content = message.get("content")
         if isinstance(user_content, str):
             user_content_list: list["Content"] = [
@@ -317,7 +785,7 @@ class GeminiContentBuilder:
         elif isinstance(user_content, list):
             user_content_list = user_content
         else:
-            warn_msg = f"User message content is not a string or list, skipping to the next message."
+            warn_msg = "User message content is not a string or list, skipping."
             log.warning(warn_msg)
             await emit_toast(warn_msg, event_emitter, "warning")
             return user_parts
@@ -326,61 +794,270 @@ class GeminiContentBuilder:
             c_type = c.get("type")
             if c_type == "text":
                 c = cast("TextContent", c)
-                # Don't process empty strings.
                 if c_text := c.get("text"):
-                    # YouTube URL extraction is now handled by _genai_parts_from_text
-                    user_parts.extend(self._genai_parts_from_text(c_text))
-            elif c_type == "image_url":
+                    user_parts.extend(
+                        await self._genai_parts_from_text(c_text, status_queue)
+                    )
+
+            # PATH 2: Temporary Chat Image Handling.
+            elif c_type == "image_url" and not db_files_processed:
+                log.info("Processing image from payload (temporary chat mode).")
                 c = cast("ImageContent", c)
-                if img_part := self._genai_part_from_image_url(
-                    c.get("image_url").get("url")
-                ):
-                    user_parts.append(img_part)
-            else:
-                warn_msg = f"User message content type {c_type} is not supported, skipping to the next message."
-                log.warning(warn_msg)
-                await emit_toast(warn_msg, event_emitter, "warning")
-                continue
+                if uri := c.get("image_url", {}).get("url"):
+                    if part := await self._genai_part_from_uri(uri, status_queue):
+                        user_parts.append(part)
 
         return user_parts
 
-    def _process_assistant_message(
-        self, message: "AssistantMessage", sources: list["Source"] | None
+    async def _process_assistant_message(
+        self,
+        message: "AssistantMessage",
+        sources: list["Source"] | None,
+        status_queue: asyncio.Queue,
     ) -> list[types.Part]:
         assistant_text = message.get("content")
         if sources:
             assistant_text = self._remove_citation_markers(assistant_text, sources)
-        return self._genai_parts_from_text(assistant_text)
+        return await self._genai_parts_from_text(assistant_text, status_queue)
 
-    def _genai_part_from_image_url(self, image_url: str) -> types.Part | None:
+    async def _genai_part_from_uri(
+        self, uri: str, status_queue: asyncio.Queue
+    ) -> types.Part | None:
         """
-        Processes an image URL and returns a genai.types.Part object from it
-        Handles GCS, data URIs, and standard URLs.
+        Processes any resource URI and returns a genai.types.Part.
+        This is the central dispatcher for all media processing, handling data URIs,
+        local API file paths, and YouTube URLs. It decides whether to use the
+        Files API or send raw bytes based on configuration and context.
         """
+        if not uri:
+            log.warning("Received an empty URI, skipping.")
+            return None
+
         try:
-            if image_url.startswith("gs://"):
-                # FIXME: mime type helper would error out here, it only handles filenames.
-                return types.Part.from_uri(
-                    file_uri=image_url, mime_type=self._get_mime_type(image_url)
-                )
-            elif image_url.startswith("data:image"):
-                match = re.match(r"data:(image/\w+);base64,(.+)", image_url)
-                if match:
-                    return types.Part.from_bytes(
-                        data=base64.b64decode(match.group(2)),
-                        mime_type=match.group(1),
+            file_bytes: bytes | None = None
+            mime_type: str | None = None
+            owui_file_id: str | None = None
+
+            # Step 1: Extract bytes and mime_type from the URI if applicable
+            if uri.startswith("data:image"):
+                match = re.match(r"data:(image/\w+);base64,(.+)", uri)
+                if not match:
+                    raise ValueError("Invalid data URI for image.")
+                mime_type, base64_data = match.group(1), match.group(2)
+                file_bytes = base64.b64decode(base64_data)
+            elif uri.startswith("/api/v1/files/"):
+                log.info(f"Processing local API file URI: {uri}")
+                file_id = uri.split("/")[4]
+                owui_file_id = file_id
+                file_bytes, mime_type = await self._get_file_data(file_id)
+            elif "youtube.com/" in uri or "youtu.be/" in uri:
+                log.info(f"Found YouTube URL: {uri}")
+                return self._genai_part_from_youtube_uri(uri)
+            # TODO: Google Cloud Storage bucket support.
+            # elif uri.startswith("gs://"): ...
+            else:
+                warn_msg = f"Unsupported URI: '{uri[:64]}...' Links must be to YouTube or a supported file type."
+                log.warning(warn_msg)
+                await emit_toast(warn_msg, self.event_emitter, "warning")
+                return None
+
+            # Step 2: If we have bytes, decide how to create the Part
+            if file_bytes and mime_type:
+                # TODO: The Files API is strict about MIME types (e.g., text/plain,
+                # application/pdf). In the future, inspect the content of files
+                # with unsupported text-like MIME types (e.g., 'application/json',
+                # 'text/markdown'). If the content is detected as plaintext,
+                # override the `mime_type` variable to 'text/plain' to allow the upload.
+
+                # Determine whether to use the Files API based on the specified conditions.
+                use_files_api = True
+                reason = ""
+
+                if not self.valves.USE_FILES_API:
+                    reason = "disabled by user setting (USE_FILES_API=False)"
+                    use_files_api = False
+                elif self.vertexai:
+                    reason = "the active client is configured for Vertex AI, which does not support the Files API"
+                    use_files_api = False
+                elif self.is_temp_chat:
+                    reason = "temporary chat mode is active"
+                    use_files_api = False
+
+                if use_files_api:
+                    log.info(f"Using Files API for resource from URI: {uri[:64]}...")
+                    gemini_file = await self.files_api_manager.get_or_upload_file(
+                        file_bytes=file_bytes,
+                        mime_type=mime_type,
+                        owui_file_id=owui_file_id,
+                        status_queue=status_queue,
+                    )
+                    return types.Part(
+                        file_data=types.FileData(
+                            file_uri=gemini_file.uri,
+                            mime_type=gemini_file.mime_type,
+                        )
                     )
                 else:
-                    raise ValueError("Invalid data URI for image.")
-            else:  # Assume standard URL
-                # FIXME: mime type helper would error out here too, it only handles filenames.
-                return types.Part.from_uri(
-                    file_uri=image_url, mime_type=self._get_mime_type(image_url)
-                )
-        except Exception:
-            # TODO: Send warnin toast to user in front-end.
-            log.exception(f"Error processing image URL: {image_url[:64]}[...]")
+                    log.info(
+                        f"Sending raw bytes because {reason}. Resource from URI: {uri[:64]}..."
+                    )
+                    return types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+
+            return None  # Return None if bytes/mime_type could not be determined
+
+        except FilesAPIError as e:
+            error_msg = f"Files API failed for URI '{uri[:64]}...': {e}"
+            log.error(error_msg)
+            await emit_toast(error_msg, self.event_emitter, "error")
             return None
+        except Exception:
+            log.exception(f"Error processing URI: {uri[:64]}[...]")
+            return None
+
+    def _genai_part_from_youtube_uri(self, uri: str) -> types.Part | None:
+        """Creates a Gemini Part from a YouTube URL, with optional video metadata.
+
+        Handles standard (`watch?v=`), short (`youtu.be/`), and mobile (`shorts/`)
+        URLs. Metadata is parsed for the Gemini Developer API but ignored for
+        Vertex AI, which receives a simple URI Part.
+
+        - **Start/End Time**: `?t=<value>` and `#end=<value>`. The value can be a
+          flexible duration (e.g., "1m30s", "90") and will be converted to seconds.
+        - **Frame Rate**: Can be specified in two ways (if both are present,
+          `interval` takes precedence):
+          - **Interval**: `#interval=<value>` (e.g., `#interval=10s`, `#interval=0.5s`).
+            The value is a flexible duration converted to seconds, then to FPS (1/interval).
+          - **FPS**: `#fps=<value>` (e.g., `#fps=2.5`).
+          The final FPS value must be in the range (0, 24].
+
+        Args:
+            uri: The raw YouTube URL from the user.
+            is_vertex_client: If True, creates a simple Part for Vertex AI.
+
+        Returns:
+            A `types.Part` object, or `None` if the URI is not a valid YouTube link.
+        """
+        # Convert YouTube Music URLs to standard YouTube URLs for consistent parsing.
+        if "music.youtube.com" in uri:
+            uri = uri.replace("music.youtube.com", "www.youtube.com")
+            log.info(f"Converted YouTube Music URL to standard URL: {uri}")
+
+        # Regex to capture the 11-character video ID from various YouTube URL formats.
+        video_id_pattern = re.compile(
+            r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu.be/)([a-zA-Z0-9_-]{11})"
+        )
+
+        match = video_id_pattern.search(uri)
+        if not match:
+            log.warning(f"Could not extract a valid YouTube video ID from URI: {uri}")
+            return None
+
+        video_id = match.group(1)
+        canonical_uri = f"https://www.youtube.com/watch?v={video_id}"
+
+        # --- Branching logic for Vertex AI vs. Gemini Developer API ---
+        if self.vertexai:
+            return types.Part.from_uri(file_uri=canonical_uri, mime_type="video/mp4")
+        else:
+            parsed_uri = urlparse(uri)
+            query_params = parse_qs(parsed_uri.query)
+            fragment_params = parse_qs(parsed_uri.fragment)
+
+            start_offset: str | None = None
+            end_offset: str | None = None
+            fps: float | None = None
+
+            # Start time from query `t`. Convert flexible format to "Ns".
+            if "t" in query_params:
+                raw_start = query_params["t"][0]
+                if (
+                    total_seconds := self._parse_duration_to_seconds(raw_start)
+                ) is not None:
+                    start_offset = f"{total_seconds}s"
+
+            # End time from fragment `end`. Convert flexible format to "Ns".
+            if "end" in fragment_params:
+                raw_end = fragment_params["end"][0]
+                if (
+                    total_seconds := self._parse_duration_to_seconds(raw_end)
+                ) is not None:
+                    end_offset = f"{total_seconds}s"
+
+            # Frame rate from fragment `interval` or `fps`. `interval` takes precedence.
+            if "interval" in fragment_params:
+                raw_interval = fragment_params["interval"][0]
+                if (
+                    interval_seconds := self._parse_duration_to_seconds(raw_interval)
+                ) is not None and interval_seconds > 0:
+                    calculated_fps = 1.0 / interval_seconds
+                    if 0.0 < calculated_fps <= 24.0:
+                        fps = calculated_fps
+                    else:
+                        log.warning(
+                            f"Interval '{raw_interval}' results in FPS '{calculated_fps}' which is outside the valid range (0.0, 24.0]. Ignoring."
+                        )
+
+            # Fall back to `fps` param if not set by `interval`.
+            if fps is None and "fps" in fragment_params:
+                try:
+                    fps_val = float(fragment_params["fps"][0])
+                    if 0.0 < fps_val <= 24.0:
+                        fps = fps_val
+                    else:
+                        log.warning(
+                            f"FPS value '{fps_val}' is outside the valid range (0.0, 24.0]. Ignoring."
+                        )
+                except (ValueError, IndexError):
+                    log.warning(
+                        f"Invalid FPS value in fragment: {fragment_params.get('fps')}. Ignoring."
+                    )
+
+            video_metadata: types.VideoMetadata | None = None
+            if start_offset or end_offset or fps is not None:
+                video_metadata = types.VideoMetadata(
+                    start_offset=start_offset,
+                    end_offset=end_offset,
+                    fps=fps,
+                )
+
+            return types.Part(
+                file_data=types.FileData(file_uri=canonical_uri),
+                video_metadata=video_metadata,
+            )
+
+    def _parse_duration_to_seconds(self, duration_str: str) -> float | None:
+        """Converts a human-readable duration string to total seconds.
+
+        Supports formats like "1h30m15s", "90m", "3600s", or just "90".
+        Also supports float values like "0.5s" or "90.5".
+        Returns total seconds as a float, or None if the string is invalid.
+        """
+        # First, try to convert the whole string as a plain number (e.g., "90", "90.5").
+        try:
+            return float(duration_str)
+        except ValueError:
+            # If it fails, it might be a composite duration like "1m30s", so we parse it below.
+            pass
+
+        total_seconds = 0.0
+        # Regex to find number-unit pairs (e.g., 1h, 30.5m, 15s). Supports floats.
+        parts = re.findall(r"(\d+(?:\.\d+)?)\s*(h|m|s)?", duration_str, re.IGNORECASE)
+
+        if not parts:
+            # log.warning(f"Could not parse duration string: {duration_str}")
+            return None
+
+        for value, unit in parts:
+            val = float(value)
+            unit = (unit or "s").lower()  # Default to seconds if no unit
+            if unit == "h":
+                total_seconds += val * 3600
+            elif unit == "m":
+                total_seconds += val * 60
+            elif unit == "s":
+                total_seconds += val
+
+        return total_seconds
 
     @staticmethod
     def _enable_special_tags(text: str) -> str:
@@ -410,137 +1087,106 @@ class GeminiContentBuilder:
 
         return restored_text
 
-    def _genai_parts_from_text(self, text: str) -> list[types.Part]:
+    async def _genai_parts_from_text(
+        self, text: str, status_queue: asyncio.Queue
+    ) -> list[types.Part]:
         if not text:
             return []
 
-        # Restore special tags that were disabled for front-end safety.
-        # This ensures the model receives the original, intended text.
         text = self._enable_special_tags(text)
-
         parts: list[types.Part] = []
         last_pos = 0
 
-        # Regex to find markdown images or YouTube URLs
-        # Markdown image: !\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)
-        # YouTube URL: (https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+)
-        pattern = re.compile(
-            r"!\[.*?\]\((data:(image/[^;]+);base64,([^)]+)|/api/v1/files/([a-f0-9\-]+)/content)\)|"
-            r"(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[^&\s]+)"
-        )
+        # Conditionally build a regex to find media links.
+        # If YouTube parsing is disabled, the regex will only find markdown image links,
+        # leaving YouTube URLs to be treated as plain text.
+        markdown_part = r"!\[.*?\]\(([^)]+)\)"  # Group 1: Markdown URI
+        youtube_part = r"(https?://(?:(?:www|music)\.)?youtube\.com/(?:watch\?v=|shorts/)[^\s)]+|https?://youtu\.be/[^\s)]+)"  # Group 2: YouTube URL
+        if self.valves.PARSE_YOUTUBE_URLS:
+            pattern = re.compile(f"{markdown_part}|{youtube_part}")
+            process_youtube = True
+        else:
+            pattern = re.compile(markdown_part)
+            process_youtube = False
+            log.info(
+                "YouTube URL parsing is disabled. URLs will be treated as plain text."
+            )
 
         for match in pattern.finditer(text):
-            # Add text before the current match
-            text_segment = text[last_pos : match.start()]
-            if text_segment.strip():  # Ensure non-empty, stripped text
-                parts.append(types.Part.from_text(text=text_segment.strip()))
+            # Add the text segment that precedes the media link
+            if text_segment := text[last_pos : match.start()].strip():
+                parts.append(types.Part.from_text(text=text_segment))
 
-            # Determine if it's an image or a YouTube URL
-            if match.group(1):  # It's a markdown image
-                if match.group(2):  # Base64 encoded image
-                    try:
-                        mime_type = match.group(2)
-                        base64_data = match.group(3)
-                        image_part = types.Part.from_bytes(
-                            data=base64.b64decode(base64_data),
-                            mime_type=mime_type,
-                        )
-                        parts.append(image_part)
-                    except Exception:
-                        log.exception("Error decoding base64 image:")
-                elif match.group(4):  # File URL for image
-                    file_id = match.group(4)
-                    image_bytes, mime_type = self._get_file_data(file_id)
-                    if image_bytes and mime_type:
-                        image_part = types.Part.from_bytes(
-                            data=image_bytes, mime_type=mime_type
-                        )
-                        parts.append(image_part)
-            elif match.group(5):  # It's a YouTube URL
-                youtube_url = match.group(5)
-                log.info(f"Found YouTube URL: {youtube_url}")
-                if (
-                    self.valves.USE_VERTEX_AI
-                ):  # Vertex AI expects from_uri part instead of files
-                    parts.append(
-                        types.Part.from_uri(file_uri=youtube_url, mime_type="video/mp4")
-                    )
-                else:
-                    parts.append(
-                        types.Part(file_data=types.FileData(file_uri=youtube_url))
-                    )
+            # The URI is in group 1 for markdown, or group 2 for YouTube.
+            if process_youtube:
+                uri = match.group(1) or match.group(2)
+            else:
+                uri = match.group(1)
+
+            if not uri:
+                log.warning(
+                    f"Found unsupported URI format in text: {match.group(0)}. Skipping."
+                )
+                continue
+
+            # Delegate all URI processing to the unified helper
+            if media_part := await self._genai_part_from_uri(uri, status_queue):
+                parts.append(media_part)
 
             last_pos = match.end()
 
-        # Add remaining text after the last match
-        remaining_text = text[last_pos:]
-        if remaining_text.strip():  # Ensure non-empty, stripped text
-            parts.append(types.Part.from_text(text=remaining_text.strip()))
+        # Add any remaining text after the last media link
+        if remaining_text := text[last_pos:].strip():
+            parts.append(types.Part.from_text(text=remaining_text))
 
-        # If no matches were found at all (e.g. plain text), the original text (stripped) is added as a single part.
+        # If no media links were found, the whole text is a single part
         if not parts and text.strip():
             parts.append(types.Part.from_text(text=text.strip()))
-
-        # If parts list is empty and original text was only whitespace, return empty list.
-        # Otherwise, if parts were added, or if it was plain text, it's handled above.
-        # This check ensures that if text was "   ", we don't add a Part for "   ".
-        # The .strip() in the conditions above should handle this, but as a safeguard:
-        if not parts and not text.strip():
-            return []
 
         return parts
 
     @staticmethod
-    def _extract_youtube_urls(text: str) -> list[str]:
+    async def _get_file_data(file_id: str) -> tuple[bytes | None, str | None]:
         """
-        Extracts YouTube URLs from a given text.
-        Supports standard youtube.com/watch?v= URLs and shortened youtu.be URLs
+        Asynchronously retrieves file metadata from the database and its content from disk.
         """
-        youtube_urls = []
-        # Match standard YouTube URLs
-        for match in re.finditer(
-            r"https?://(?:www\.)?youtube\.com/watch\?v=[^&\s]+", text
-        ):
-            youtube_urls.append(match.group(0))
-        # Match shortened YouTube URLs
-        for match in re.finditer(r"https?://(?:www\.)?youtu\.be/[^&\s]+", text):
-            youtube_urls.append(match.group(0))
-
-        if youtube_urls:
-            # TODO: toast
-            log.info(f"Extracted YouTube URLs: {youtube_urls}")
-
-        return youtube_urls
-
-    @staticmethod
-    def _get_file_data(file_id: str) -> tuple[bytes | None, str | None]:
+        # TODO: Emit toasts on unexpected conditions.
         if not file_id:
-            # TODO: Emit toast
-            log.warning(f"file_id is empty. Cannot continue.")
+            log.warning("file_id is empty. Cannot continue.")
             return None, None
-        file_model = Files.get_file_by_id(file_id)
+
+        # Run the synchronous, blocking database call in a separate thread
+        # to avoid blocking the main asyncio event loop.
+        try:
+            file_model = await asyncio.to_thread(Files.get_file_by_id, file_id)
+        except Exception as e:
+            log.exception(
+                f"An unexpected error occurred during database call for file_id {file_id}: {e}"
+            )
+            return None, None
+
         if file_model is None:
-            # TODO: Emit toast
+            # The get_file_by_id method already handles and logs the specific exception,
+            # so we just need to handle the None return value.
             log.warning(f"File {file_id} not found in the backend's database.")
             return None, None
+
         if not (file_path := file_model.path):
-            # TODO: Emit toast
             log.warning(
                 f"File {file_id} was found in the database but it lacks `path` field. Cannot Continue."
             )
             return None, None
         if file_model.meta is None:
-            # TODO: Emit toast
             log.warning(
                 f"File {file_path} was found in the database but it lacks `meta` field. Cannot continue."
             )
             return None, None
         if not (content_type := file_model.meta.get("content_type")):
-            # TODO: Emit toast
             log.warning(
                 f"File {file_path} was found in the database but it lacks `meta.content_type` field. Cannot continue."
             )
             return None, None
+
         if file_path.startswith("gs://"):
             try:
                 # Initialize the GCS client
@@ -570,27 +1216,15 @@ class GeminiContentBuilder:
                 print(f"An error occurred while reading from GCS: {e}")
                 raise
         try:
-            with open(file_path, "rb") as file:
-                image_data = file.read()
-            return image_data, content_type
+            async with aiofiles.open(file_path, "rb") as file:
+                file_data = await file.read()
+            return file_data, content_type
         except FileNotFoundError:
-            # TODO: Emit toast
             log.exception(f"File {file_path} not found on disk.")
             return None, content_type
         except Exception:
-            # TODO: Emit toast
             log.exception(f"Error processing file {file_path}")
             return None, content_type
-
-    @staticmethod
-    def _get_mime_type(file_uri: str) -> str:
-        """
-        Determines MIME type based on file extension using the mimetypes module.
-        """
-        mime_type, encoding = mimetypes.guess_type(file_uri)
-        if mime_type is None:
-            return "application/octet-stream"  # Default MIME type if unknown
-        return mime_type
 
     @staticmethod
     def _remove_citation_markers(text: str, sources: list["Source"]) -> str:
@@ -651,7 +1285,7 @@ class Pipe:
         )
         GEMINI_API_BASE_URL: str | None = Field(
             default=None,
-            description="""The base URL for calling the Gemini API. 
+            description="""The base URL for calling the Gemini API.
             Default value is None.""",
         )
         USE_VERTEX_AI: bool = Field(
@@ -685,7 +1319,7 @@ class Pipe:
         )
         CACHE_MODELS: bool = Field(
             default=True,
-            description="""Whether to request models only on first load and when white- or blacklist changes. 
+            description="""Whether to request models only on first load and when white- or blacklist changes.
             Default value is True.""",
         )
         THINKING_BUDGET: int = Field(
@@ -711,20 +1345,29 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is True.""",
         )
-        USE_FILES_API: bool = Field(
-            default=True,
-            description="""Save the image files using Open WebUI's API for files. 
-            Default value is True.""",
-        )
         THINKING_MODEL_PATTERN: str = Field(
             default=r"gemini-2.5",
-            description="""Regex pattern to identify thinking models. 
+            description="""Regex pattern to identify thinking models.
             Default value is r"gemini-2.5".""",
         )
         ENABLE_URL_CONTEXT_TOOL: bool = Field(
             default=False,
-            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs. 
+            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
             This tool is only compatible with specific models. Default value is False.""",
+        )
+        USE_FILES_API: bool = Field(
+            default=True,
+            description="""Whether to use the Google Files API for uploading files.
+            This provides caching and performance benefits, but can be disabled for privacy, cost, or compatibility reasons.
+            If disabled, files are sent as raw bytes in the request.
+            Default value is True.""",
+        )
+        PARSE_YOUTUBE_URLS: bool = Field(
+            default=True,
+            description="""Whether to parse YouTube URLs from user messages and provide them as context to the model.
+            If disabled, YouTube links are treated as plain text.
+            This is only applicable for models that support video.
+            Default value is True.""",
         )
         USE_ENTERPRISE_SEARCH: bool = Field(
             default=False,
@@ -817,11 +1460,6 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is None.""",
         )
-        USE_FILES_API: bool | None | Literal[""] = Field(
-            default=None,
-            description="""Save the image files using Open WebUI's API for files.
-            Default value is None.""",
-        )
         THINKING_MODEL_PATTERN: str | None = Field(
             default=None,
             description="""Regex pattern to identify thinking models.
@@ -829,8 +1467,20 @@ class Pipe:
         )
         ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
             default=None,
-            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs. 
+            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
             This tool is only compatible with specific models. Default value is None.""",
+        )
+        USE_FILES_API: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Override the default setting for using the Google Files API.
+            Set to True to force use, False to disable.
+            Default is None (use the admin's setting).""",
+        )
+        PARSE_YOUTUBE_URLS: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Override the default setting for parsing YouTube URLs.
+            Set to True to enable, False to disable.
+            Default is None (use the admin's setting).""",
         )
 
         @field_validator("THINKING_BUDGET", mode="after")
@@ -845,6 +1495,8 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
+        self.file_content_cache = SimpleMemoryCache(serializer=NullSerializer())
+        self.file_id_to_hash_cache = SimpleMemoryCache(serializer=NullSerializer())
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
@@ -877,7 +1529,7 @@ class Pipe:
         __user__: "UserData",
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]],
-        __metadata__: dict[str, Any],
+        __metadata__: "Metadata",
     ) -> AsyncGenerator[dict, None] | str:
         self._add_log_handler(self.valves.LOG_LEVEL)
 
@@ -894,24 +1546,46 @@ class Pipe:
         )
         client = self._get_user_client(valves, __user__["email"])
 
-        log.trace("__metadata__:", payload=__metadata__)
+        files_api_manager = FilesAPIManager(
+            client=client,
+            file_cache=self.file_content_cache,
+            id_hash_cache=self.file_id_to_hash_cache,
+            event_emitter=__event_emitter__,
+        )
+
         # Check if user is chatting with an error model for some reason.
         if "error" in __metadata__["model"]["id"]:
             error_msg = f"There has been an error during model retrival phase: {str(__metadata__['model'])}"
             raise ValueError(error_msg)
 
+        # NOTE: will be "local" if Temporary Chat is enabled.
+        chat_id = __metadata__.get("chat_id", "not_provided")
+        message_id = __metadata__.get("message_id", "not_provided")
+
         features = __metadata__.get("features", {}) or {}
         log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
         )
+        # URL context front-end button takes precedence over valves setting if it is enabled.
+        if self._is_function_active("gemini_url_context_toggle"):
+            valves.ENABLE_URL_CONTEXT_TOOL = features.get("url_context", False)
+            log.info(
+                "URL context toggle filter is active. "
+                f"Setting valves.ENABLE_URL_CONTEXT_TOOL to {valves.ENABLE_URL_CONTEXT_TOOL}."
+            )
+        else:
+            log.warning(
+                "Gemini URL Context Toggle filter is not active. "
+                "Install or enable it if you want to toggle URL context tool on/off through a front-end button."
+            )
 
         builder = GeminiContentBuilder(
             messages_body=body.get("messages"),
             metadata_body=__metadata__,
             user_data=__user__,
             event_emitter=__event_emitter__,
-            valves=self.valves,
-            vertexai=client.vertexai,
+            valves=valves,
+            files_api_manager=files_api_manager,
         )
         contents = await builder.build_contents()
 
@@ -929,12 +1603,11 @@ class Pipe:
                 include_thoughts=valves.SHOW_THINKING_SUMMARY,
             )
 
-        # TODO: Check availability of companion filter too with this method.
         if self._is_function_active("gemini_reasoning_toggle"):
             # NOTE: Gemini 2.5 Pro supports reasoning budget but not toggling reasoning on/off.
             if re.search(
                 r"gemini-2.5-(flash|lite)", model_name, re.IGNORECASE
-            ) and not body.get("reason", False):
+            ) and not features.get("reason"):
                 log.info(
                     f"Model ID '{model_name}' allows turning off the reasoning feature. "
                     "Reasoning is currently toggled off in the UI. Setting thinking budget to 0."
@@ -946,7 +1619,7 @@ class Pipe:
         else:
             log.warning(
                 "Gemini Reasoning Toggle filter is not active. "
-                "Install or enable it if you want to toggle Gemini 2.5 Flash or Lite reasoning on/off."
+                "Install or enable it if you want to toggle Gemini 2.5 Flash or Lite reasoning on/off through a front-end button."
             )
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
@@ -1012,6 +1685,7 @@ class Pipe:
             compatible_models_for_url_context = [
                 "gemini-2.5-pro",
                 "gemini-2.5-flash",
+                "gemini-2.5-flash-lite",
                 "gemini-2.5-flash-lite-preview-06-17",
                 "gemini-2.5-pro-preview-06-05",
                 "gemini-2.5-pro-preview-05-06",
@@ -1038,17 +1712,27 @@ class Pipe:
                 )
         if body.get("stream", False):
             # Streaming response
+
+            asyncio.create_task(
+                emit_status(
+                    "Waiting for first token from Google...",
+                    __event_emitter__,
+                    done=False,
+                )
+            )
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
                 await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
             )
+
             log.info("Streaming enabled. Returning AsyncGenerator.")
             return self._stream_response_generator(
                 response_stream,
                 __request__,
-                gen_content_args,
+                model_name,
                 __event_emitter__,
-                __metadata__,
                 __user__["id"],
+                chat_id,
+                message_id,
             )
         else:
             # Non-streaming response.
@@ -1057,12 +1741,31 @@ class Pipe:
                 raise NotImplementedError(warn_msg)
             # TODO: Support native image gen here too.
             # TODO: Support code execution here too.
-            res = await client.aio.models.generate_content(**gen_content_args)
+            asyncio.create_task(
+                emit_status(
+                    "Waiting for response from Google...",
+                    __event_emitter__,
+                    done=False,
+                )
+            )
+            try:
+                # TODO: Support native image gen here too.
+                # TODO: Support code execution here too.
+                res = await client.aio.models.generate_content(**gen_content_args)
+            finally:
+                asyncio.create_task(
+                    emit_status(
+                        "Response received",
+                        __event_emitter__,
+                        done=True,
+                        hidden=True,
+                    )
+                )
             if raw_text := res.text:
                 log.info("Non-streaming response finished successfully!")
                 log.debug("Non-streaming response:", payload=res)
                 await self._do_post_processing(
-                    res, __event_emitter__, __metadata__, __request__
+                    res, __event_emitter__, __request__, chat_id, message_id
                 )
                 log.info(
                     "Streaming disabled. Returning full response as str. "
@@ -1454,77 +2157,15 @@ class Pipe:
     # endregion 1.2 Model retrival from Google API
 
     # region 1.3 Model response streaming
-    async def _process_parts_to_structured_stream(
-        self,
-        response_stream: AsyncIterator[types.GenerateContentResponse],
-        __request__: Request,
-        gen_content_args: dict,
-        user_id: str,
-    ) -> AsyncGenerator[tuple[dict, int, types.GenerateContentResponse | None], None]:
-        """
-        Processes a stream of Gemini responses, yielding structured dictionaries,
-        a substitution count for the ZWS safeguard, and the raw chunk.
-        """
-        try:
-            async for chunk in response_stream:
-                if not (candidate := self._get_first_candidate(chunk.candidates)):
-                    log.warning("Stream chunk has no candidates, skipping.")
-                    continue
-                if not (parts := candidate.content and candidate.content.parts):
-                    log.warning("Candidate has no content parts, skipping.")
-                    continue
-
-                for part in parts:
-                    # Initialize variables at the start of each loop to satisfy the linter
-                    # and ensure they always have a defined state.
-                    payload: dict | None = None
-                    count: int = 0
-                    key: str = "content"
-
-                    match part:
-                        case types.Part(text=str(text), thought=True):
-                            # It's a thought, so we'll use the "reasoning" key.
-                            key = "reasoning"
-                            sanitized_text, count = self._disable_special_tags(text)
-                            payload = {key: sanitized_text}
-                        case types.Part(text=str(text)):
-                            # It's regular content, using the default "content" key.
-                            sanitized_text, count = self._disable_special_tags(text)
-                            payload = {key: sanitized_text}
-                        case types.Part(inline_data=data):
-                            # Image parts don't need tag disabling.
-                            processed_text = self._process_image_part(
-                                data, gen_content_args, user_id, __request__
-                            )
-                            if processed_text:
-                                payload = {"content": processed_text}
-                        case types.Part(executable_code=code):
-                            processed_text = self._process_executable_code_part(code)
-                            # Code blocks are already formatted and safe.
-                            if processed_text:
-                                payload = {"content": processed_text}
-                        case types.Part(code_execution_result=result):
-                            processed_text = self._process_code_execution_result_part(
-                                result
-                            )
-                            # Code results are also safe.
-                            if processed_text:
-                                payload = {"content": processed_text}
-
-                    if payload:
-                        structured_chunk = {"choices": [{"delta": payload}]}
-                        yield structured_chunk, count, chunk
-        except Exception:
-            raise
-
     async def _stream_response_generator(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
         __request__: Request,
-        gen_content_args: dict,
+        model: str,
         event_emitter: Callable[["Event"], Awaitable[None]],
-        metadata: dict[str, Any],
         user_id: str,
+        chat_id: str,
+        message_id: str,
     ) -> AsyncGenerator[dict, None]:
         """
         Yields structured dictionary chunks from the stream, counts tag substitutions
@@ -1536,7 +2177,13 @@ class Pipe:
 
         try:
             part_processor = self._process_parts_to_structured_stream(
-                response_stream, __request__, gen_content_args, user_id
+                response_stream,
+                __request__,
+                model,
+                user_id,
+                chat_id,
+                message_id,
+                event_emitter,
             )
             async for structured_chunk, count, raw_chunk in part_processor:
                 if count > 0:
@@ -1569,9 +2216,10 @@ class Pipe:
                 await self._do_post_processing(
                     final_response_chunk,
                     event_emitter,
-                    metadata,
                     __request__,
-                    error_occurred,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    stream_error_happened=error_occurred,
                 )
             except Exception as e:
                 error_msg = f"Post-processing failed with error:\n\n{e}"
@@ -1579,6 +2227,98 @@ class Pipe:
                 log.exception(error_msg)
 
             log.debug("AsyncGenerator finished.")
+
+    async def _process_parts_to_structured_stream(
+        self,
+        response_stream: AsyncIterator[types.GenerateContentResponse],
+        __request__: Request,
+        model: str,
+        user_id: str,
+        chat_id: str,
+        message_id: str,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+    ) -> AsyncGenerator[tuple[dict, int, types.GenerateContentResponse | None], None]:
+        """
+        Processes a stream of Gemini responses, yielding structured dictionaries,
+        a substitution count for the ZWS safeguard, and the raw chunk.
+        """
+        first_chunk_received = False
+        try:
+            async for chunk in response_stream:
+                if not first_chunk_received:
+                    # This is the first chunk. End the waiting status.
+                    asyncio.create_task(
+                        emit_status(
+                            "First token received",
+                            event_emitter,
+                            done=True,
+                            hidden=True,
+                        )
+                    )
+                    first_chunk_received = True
+
+                if not (candidate := self._get_first_candidate(chunk.candidates)):
+                    log.warning("Stream chunk has no candidates, skipping.")
+                    continue
+                if not (parts := candidate.content and candidate.content.parts):
+                    log.warning("Candidate has no content parts, skipping.")
+                    continue
+
+                for part in parts:
+                    # Initialize variables at the start of each loop to satisfy the linter
+                    # and ensure they always have a defined state.
+                    payload: dict[str, str] | None = None
+                    count: int = 0
+                    key: str = "content"
+
+                    match part:
+                        case types.Part(text=str(text), thought=True):
+                            # It's a thought, so we'll use the "reasoning" key.
+                            key = "reasoning"
+                            sanitized_text, count = self._disable_special_tags(text)
+                            payload = {key: sanitized_text}
+                        case types.Part(text=str(text)):
+                            # It's regular content, using the default "content" key.
+                            sanitized_text, count = self._disable_special_tags(text)
+                            payload = {key: sanitized_text}
+                        case types.Part(inline_data=data):
+                            if not data:
+                                log.warning(
+                                    "Model response stream Part has an inline_data field but it is empty, skipping."
+                                )
+                                continue
+                            # Image parts don't need tag disabling.
+                            processed_text = await self._process_image_part(
+                                data, model, user_id, chat_id, message_id, __request__
+                            )
+                            payload = {"content": processed_text}
+                        case types.Part(executable_code=code):
+                            processed_text = self._process_executable_code_part(code)
+                            # Code blocks are already formatted and safe.
+                            if processed_text:
+                                payload = {"content": processed_text}
+                        case types.Part(code_execution_result=result):
+                            processed_text = self._process_code_execution_result_part(
+                                result
+                            )
+                            # Code results are also safe.
+                            if processed_text:
+                                payload = {"content": processed_text}
+
+                    if payload:
+                        structured_chunk = {"choices": [{"delta": payload}]}
+                        yield structured_chunk, count, chunk
+        except Exception:
+            raise
+        finally:
+            if not first_chunk_received:
+                # Emit done status if error occurs before the first chunk.
+                await emit_status(
+                    "Error occurred before receiving the first token from Google.",
+                    event_emitter,
+                    done=True,
+                    hidden=True,
+                )
 
     @staticmethod
     def _disable_special_tags(text: str) -> tuple[str, int]:
@@ -1603,76 +2343,86 @@ class Pipe:
         modified_text, num_substitutions = TAG_REGEX.subn(rf"<{ZWS}\1", text)
         return modified_text, num_substitutions
 
-    def _process_image_part(
-        self, inline_data, gen_content_args: dict, user_id: str, request: Request
-    ) -> str | None:
-        """Handles image data conversion to markdown."""
+    async def _process_image_part(
+        self,
+        inline_data: types.Blob,
+        model: str,
+        user_id: str,
+        chat_id: str,
+        message_id: str,
+        request: Request,
+    ) -> str:
+        """
+        Handles image data by saving it to the Open WebUI backend and returning a markdown link.
+        """
         mime_type = inline_data.mime_type
         image_data = inline_data.data
 
-        if self.valves.USE_FILES_API:
-            image_url = self._upload_image(
-                image_data,
-                mime_type,
-                gen_content_args.get("model", ""),
-                "Not implemented yet. TAKE IT FROM gen_content_args contents",
-                user_id,
-                request,
+        if mime_type and image_data:
+            image_url = await self._upload_image(
+                image_data=image_data,
+                mime_type=mime_type,
+                model=model,
+                user_id=user_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                __request__=request,
             )
-            return f"![Generated Image]({image_url})" if image_url else None
         else:
-            encoded = base64.b64encode(image_data).decode()
-            return f"![Generated Image](data:{mime_type};base64,{encoded})"
+            log.warning(
+                "Image part has no mime_type or data, cannot upload image. "
+                "Returning a placeholder message."
+            )
+            image_url = None
 
-    def _upload_image(
+        return (
+            f"![Generated Image]({image_url})"
+            if image_url
+            else "*An error occurred while trying to store this model generated image.*"
+        )
+
+    async def _upload_image(
         self,
         image_data: bytes,
         mime_type: str,
         model: str,
-        prompt: str,
         user_id: str,
+        chat_id: str,
+        message_id: str,
         __request__: Request,
     ) -> str | None:
         """
-        Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
-        Returns the url to uploaded image.
+        Helper method that uploads a generated image to the configured Open WebUI storage provider.
+        Returns the url to the uploaded image.
         """
-        image_format = mimetypes.guess_extension(mime_type)
+        image_format = mimetypes.guess_extension(mime_type) or ".png"
         id = str(uuid.uuid4())
-        # TODO: Better filename? Prompt as the filename?
-        name = os.path.basename(f"generated-image{image_format}")
+        name = f"generated-image{image_format}"
+
+        # The final filename includes the unique ID to prevent collisions.
         imagename = f"{id}_{name}"
         image = io.BytesIO(image_data)
+
+        # Create a clean, precise metadata object linking to the generation context.
         image_metadata = {
             "model": model,
-            "prompt": prompt,
+            "chat_id": chat_id,
+            "message_id": message_id,
         }
 
-        # Upload the image to user configured storage provider.
-        log.info("Uploading the model generated image to Open WebUI backend.")
-        log.debug("Uploading to the configured storage provider.")
-        try:
-            # Dynamically check if 'tags' parameter exists
-            sig = inspect.signature(Storage.upload_file)
-            has_tags = "tags" in sig.parameters
-        except Exception as e:
-            log.error(f"Error checking Storage.upload_file signature: {e}")
-            has_tags = False  # Default to old behavior
+        log.info("Uploading the model-generated image to the Open WebUI backend.")
 
         try:
-            if has_tags:
-                # New version with tags support >=v0.6.6
-                contents, image_path = Storage.upload_file(image, imagename, tags={})
-            else:
-                # Old version without tags <v0.6.5
-                contents, image_path = Storage.upload_file(image, imagename)  # type: ignore
+            contents, image_path = await asyncio.to_thread(
+                Storage.upload_file, image, imagename, tags={}
+            )
         except Exception:
-            error_msg = "Error occurred during upload to the storage provider."
-            log.exception(error_msg)
+            log.exception("Error occurred during upload to the storage provider.")
             return None
-        # Add the image file to files database.
-        log.debug("Adding the image file to Open WebUI files database.")
-        file_item = Files.insert_new_file(
+
+        log.debug("Adding the image file to the Open WebUI files database.")
+        file_item = await asyncio.to_thread(
+            Files.insert_new_file,
             user_id,
             FileForm(
                 id=id,
@@ -1687,11 +2437,9 @@ class Pipe:
             ),
         )
         if not file_item:
-            log.warning(
-                "Files.insert_new_file did not return anything. Image upload to Open WebUI database likely failed."
-            )
+            log.warning("Image upload to Open WebUI database likely failed.")
             return None
-        # Get the image url.
+
         image_url: str = __request__.app.url_path_for(
             "get_file_content_by_id", id=file_item.id
         )
@@ -1745,8 +2493,10 @@ class Pipe:
         self,
         model_response: types.GenerateContentResponse | None,
         event_emitter: Callable[["Event"], Awaitable[None]],
-        metadata: dict[str, Any],
         request: Request,
+        chat_id: str,
+        message_id: str,
+        *,
         stream_error_happened: bool = False,
     ):
         """Handles emitting usage, grounding, and sources after the main response/stream is done."""
@@ -1786,19 +2536,18 @@ class Pipe:
             log.debug("Emitting usage data:", payload=usage_event)
             # TODO: catch potential errors?
             await event_emitter(usage_event)
-        self._add_grounding_data_to_state(model_response, metadata, request)
+        self._add_grounding_data_to_state(model_response, request, chat_id, message_id)
 
     def _add_grounding_data_to_state(
         self,
         response: types.GenerateContentResponse,
-        chat_metadata: dict[str, Any],
         request: Request,
+        chat_id: str,
+        message_id: str,
     ):
         candidate = self._get_first_candidate(response.candidates)
         grounding_metadata_obj = candidate.grounding_metadata if candidate else None
 
-        chat_id: str = chat_metadata.get("chat_id", "")
-        message_id: str = chat_metadata.get("message_id", "")
         storage_key = f"grounding_{chat_id}_{message_id}"
 
         if grounding_metadata_obj:
@@ -1814,8 +2563,8 @@ class Pipe:
         else:
             log.debug(f"Response {message_id} does not have grounding metadata.")
 
+    @staticmethod
     def _get_usage_data_event(
-        self,
         response: types.GenerateContentResponse,
     ) -> "ChatCompletionEvent | None":
         """
@@ -1877,24 +2626,6 @@ class Pipe:
         if sources:
             emission["data"]["sources"] = sources
         await event_emitter(emission)
-
-    async def _emit_status(
-        self,
-        message: str,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        done: bool = False,
-        hidden: bool = False,
-    ) -> None:
-        """Emit status updates asynchronously."""
-        try:
-            status_event: "StatusEvent" = {
-                "type": "status",
-                "data": {"description": message, "done": done, "hidden": hidden},
-            }
-            await event_emitter(status_event)
-            log.debug(f"Emitted status:", payload=status_event)
-        except Exception:
-            log.exception("Error emitting status")
 
     async def _emit_error(
         self,
@@ -2148,6 +2879,7 @@ class Pipe:
 
     # region 1.7 Utility helpers
 
+    # TODO: Check availability of companion filter too with this method.
     @staticmethod
     def _is_function_active(id: str) -> bool:
         # Get the filter's data from the database.

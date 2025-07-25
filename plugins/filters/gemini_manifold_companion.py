@@ -6,8 +6,8 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.5.1
-requirements: google-genai==1.20.0
+version: 1.5.2
+requirements: google-genai==1.24.0
 """
 
 # This filter can detect that a feature like web search or code execution is enabled in the front-end,
@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 ALLOWED_GROUNDING_MODELS = {
     "gemini-2.5-pro",
     "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
     "gemini-2.5-flash-lite-preview-06-17",
     "gemini-2.5-pro-preview-06-05",
     "gemini-2.5-flash-preview-05-20",
@@ -60,6 +61,7 @@ ALLOWED_GROUNDING_MODELS = {
 ALLOWED_CODE_EXECUTION_MODELS = {
     "gemini-2.5-pro",
     "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
     "gemini-2.5-flash-lite-preview-06-17",
     "gemini-2.5-pro-preview-06-05",
     "gemini-2.5-flash-preview-05-20",
@@ -155,9 +157,12 @@ class Filter:
         features = body.get("features", {})
         log.debug(f"body.features:", payload=features)
 
-        # Ensure metadata structure exists and add new feature
-        metadata = body.setdefault("metadata", {})  # type: ignore
-        metadata_features = metadata.setdefault("features", {})
+        # Ensure features field exists
+        metadata = body.get("metadata")
+        metadata_features = metadata.get("features")
+        if metadata_features is None:
+            metadata_features = cast(Features, {})
+            metadata["features"] = metadata_features
 
         if is_grounding_model:
             web_search_enabled = (
