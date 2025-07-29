@@ -917,9 +917,9 @@ class GeminiContentBuilder:
     def _genai_part_from_youtube_uri(self, uri: str) -> types.Part | None:
         """Creates a Gemini Part from a YouTube URL, with optional video metadata.
 
-        Handles standard (`watch?v=`), short (`youtu.be/`), and mobile (`shorts/`)
-        URLs. Metadata is parsed for the Gemini Developer API but ignored for
-        Vertex AI, which receives a simple URI Part.
+        Handles standard (`watch?v=`), short (`youtu.be/`), mobile (`shorts/`),
+        and live (`live/`) URLs. Metadata is parsed for the Gemini Developer API
+        but ignored for Vertex AI, which receives a simple URI Part.
 
         - **Start/End Time**: `?t=<value>` and `#end=<value>`. The value can be a
           flexible duration (e.g., "1m30s", "90") and will be converted to seconds.
@@ -944,7 +944,7 @@ class GeminiContentBuilder:
 
         # Regex to capture the 11-character video ID from various YouTube URL formats.
         video_id_pattern = re.compile(
-            r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu.be/)([a-zA-Z0-9_-]{11})"
+            r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/|live/)|youtu.be/)([a-zA-Z0-9_-]{11})"
         )
 
         match = video_id_pattern.search(uri)
@@ -1101,7 +1101,7 @@ class GeminiContentBuilder:
         # If YouTube parsing is disabled, the regex will only find markdown image links,
         # leaving YouTube URLs to be treated as plain text.
         markdown_part = r"!\[.*?\]\(([^)]+)\)"  # Group 1: Markdown URI
-        youtube_part = r"(https?://(?:(?:www|music)\.)?youtube\.com/(?:watch\?v=|shorts/)[^\s)]+|https?://youtu\.be/[^\s)]+)"  # Group 2: YouTube URL
+        youtube_part = r"(https?://(?:(?:www|music)\.)?youtube\.com/(?:watch\?v=|shorts/|live/)[^\s)]+|https?://youtu\.be/[^\s)]+)"  # Group 2: YouTube URL
         if self.valves.PARSE_YOUTUBE_URLS:
             pattern = re.compile(f"{markdown_part}|{youtube_part}")
             process_youtube = True
