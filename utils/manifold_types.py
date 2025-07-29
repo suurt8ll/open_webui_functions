@@ -197,6 +197,8 @@ class Metadata(TypedDict):
     variables: MetadataVariables  # Using the specific MetadataVariables TypedDict
     model: MetadataModel  # Using the specific MetadataModel TypedDict
     direct: bool
+    task: str | None
+    task_body: dict[str, Any] | None
 
     # This is my custom field, not used by Open WebUI.
     safety_settings: list[types.SafetySetting]
