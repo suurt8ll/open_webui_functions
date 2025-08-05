@@ -1324,13 +1324,14 @@ class Pipe:
         )
         THINKING_BUDGET: int = Field(
             default=8192,
-            ge=0,
+            ge=-1,
             # The widest possible range is 0 (for Lite/Flash) to 32768 (for Pro).
+            # -1 is used for dynamic thinking budget.
             # Model-specific constraints are detailed in the description.
             le=32768,
             description="""Specifies the token budget for the model's internal thinking process,
             used for complex tasks like tool use. Applicable to Gemini 2.5 models.
-            Default value is 8192.
+            Default value is 8192. If you want the model to control the thinking budget when using the API, set the thinking budget to -1.
 
             The valid token range depends on the specific model tier:
             - **Pro models**: Must be a value between 128 and 32,768.
@@ -1445,7 +1446,7 @@ class Pipe:
             default=None,
             description="""Specifies the token budget for the model's internal thinking process,
             used for complex tasks like tool use. Applicable to Gemini 2.5 models.
-            Default value is None.
+            Default value is None. If you want the model to control the thinking budget when using the API, set the thinking budget to -1.
 
             The valid token range depends on the specific model tier:
             - **Pro models**: Must be a value between 128 and 32,768.
@@ -1487,9 +1488,9 @@ class Pipe:
         @classmethod
         def validate_thinking_budget_range(cls, v):
             if v is not None and v != "":
-                if not (0 <= v <= 32768):
+                if not (-1 <= v <= 32768):
                     raise ValueError(
-                        "THINKING_BUDGET must be between 0 and 32768, inclusive."
+                        "THINKING_BUDGET must be between -1 and 32768, inclusive."
                     )
             return v
 
