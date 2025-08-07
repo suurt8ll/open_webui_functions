@@ -86,37 +86,96 @@ SPECIAL_TAGS_TO_DISABLE = [
 ]
 ZWS = "\u200b"
 
+# region 1. Helper functions
+
 
 async def emit_toast(
     msg: str,
-    event_emitter: Callable[["Event"], Awaitable[None]],
+    event_emitter: Callable[["Event"], Awaitable[None]] | None,
     toastType: Literal["info", "success", "warning", "error"] = "info",
 ) -> None:
     """Emits a toast notification to the front-end."""
-    # TODO: Use this method in more places, even for info toasts.
+
+    if not event_emitter:
+        return
+
     event: "NotificationEvent" = {
         "type": "notification",
         "data": {"type": toastType, "content": msg},
     }
-    await event_emitter(event)
+
+    try:
+        await event_emitter(event)
+    except Exception:
+        log.exception("Error emitting toast notification.")
 
 
 async def emit_status(
     message: str,
-    event_emitter: Callable[["Event"], Awaitable[None]],
+    event_emitter: Callable[["Event"], Awaitable[None]] | None,
     done: bool = False,
     hidden: bool = False,
 ) -> None:
     """Emit status updates asynchronously."""
+
+    if not event_emitter:
+        return
+
+    status_event: "StatusEvent" = {
+        "type": "status",
+        "data": {"description": message, "done": done, "hidden": hidden},
+    }
+
     try:
-        status_event: "StatusEvent" = {
-            "type": "status",
-            "data": {"description": message, "done": done, "hidden": hidden},
-        }
         await event_emitter(status_event)
         log.debug(f"Emitted status:", payload=status_event)
     except Exception:
-        log.exception("Error emitting status")
+        log.exception("Error emitting status.")
+
+
+async def emit_completion(
+    event_emitter: Callable[["Event"], Awaitable[None]] | None,
+    content: str | None = None,
+    done: bool = False,
+    error: str | None = None,
+    sources: list["Source"] | None = None,
+):
+    """Constructs and emits completion event."""
+
+    if not event_emitter:
+        return
+
+    emission: "ChatCompletionEvent" = {
+        "type": "chat:completion",
+        "data": {"done": done},
+    }
+    if content:
+        emission["data"]["content"] = content
+    if error:
+        emission["data"]["error"] = {"detail": error}
+    if sources:
+        emission["data"]["sources"] = sources
+    await event_emitter(emission)
+
+
+async def emit_error(
+    error_msg: str,
+    event_emitter: Callable[["Event"], Awaitable[None]] | None,
+    warning: bool = False,
+    exception: bool = True,
+) -> None:
+    """Emits an event to the front-end that causes it to display a nice red error message."""
+
+    if warning:
+        log.opt(depth=1, exception=False).warning(error_msg)
+    else:
+        log.opt(depth=1, exception=exception).error(error_msg)
+    await emit_completion(
+        error=f"\n{error_msg}", event_emitter=event_emitter, done=True
+    )
+
+
+# endregion 1. Helper functions
 
 
 class GenaiApiError(Exception):
@@ -145,7 +204,7 @@ class UploadStatusManager:
     - ('FINALIZE',): Sent by the orchestrator when all workers are done.
     """
 
-    def __init__(self, event_emitter: Callable[["Event"], Awaitable[None]]):
+    def __init__(self, event_emitter: Callable[["Event"], Awaitable[None]] | None):
         self.event_emitter = event_emitter
         self.queue = asyncio.Queue()
         self.total_uploads_expected = 0
@@ -227,7 +286,7 @@ class FilesAPIManager:
         client: genai.Client,
         file_cache: SimpleMemoryCache,
         id_hash_cache: SimpleMemoryCache,
-        event_emitter: Callable[["Event"], Awaitable[None]],
+        event_emitter: Callable[["Event"], Awaitable[None]] | None,
     ):
         """
         Initializes the FilesAPIManager.
@@ -537,7 +596,7 @@ class GeminiContentBuilder:
         messages_body: list["Message"],
         metadata_body: "Metadata",
         user_data: "UserData",
-        event_emitter: Callable[["Event"], Awaitable[None]],
+        event_emitter: Callable[["Event"], Awaitable[None]] | None,
         valves: "Pipe.Valves",
         files_api_manager: "FilesAPIManager",
     ):
@@ -743,7 +802,7 @@ class GeminiContentBuilder:
         self,
         message: "UserMessage",
         files: list["FileAttachmentTD"],
-        event_emitter: Callable[["Event"], Awaitable[None]],
+        event_emitter: Callable[["Event"], Awaitable[None]] | None,
         status_queue: asyncio.Queue,
     ) -> list[types.Part]:
         user_parts: list[types.Part] = []
@@ -1498,6 +1557,7 @@ class Pipe:
         self.valves = self.Valves()
         self.file_content_cache = SimpleMemoryCache(serializer=NullSerializer())
         self.file_id_to_hash_cache = SimpleMemoryCache(serializer=NullSerializer())
+        log.success("Function has been initialized.")
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
@@ -1529,7 +1589,7 @@ class Pipe:
         body: "Body",
         __user__: "UserData",
         __request__: Request,
-        __event_emitter__: Callable[["Event"], Awaitable[None]],
+        __event_emitter__: Callable[["Event"], Awaitable[None]] | None,
         __metadata__: "Metadata",
     ) -> AsyncGenerator[dict, None] | str:
         self._add_log_handler(self.valves.LOG_LEVEL)
@@ -1546,6 +1606,11 @@ class Pipe:
             f"Getting genai client (potentially cached) for user {__user__['email']}."
         )
         client = self._get_user_client(valves, __user__["email"])
+
+        if __metadata__.get("task"):
+            log.info(f'{__metadata__["task"]=}, disabling event emissions.')
+            # Task model is not user facing, so we should not emit any events.
+            __event_emitter__ = None
 
         files_api_manager = FilesAPIManager(
             client=client,
@@ -1777,9 +1842,9 @@ class Pipe:
                 warn_msg = "Non-streaming response did not have any text inside it."
                 raise ValueError(warn_msg)
 
-    # region 1. Helper methods inside the Pipe class
+    # region 2. Helper methods inside the Pipe class
 
-    # region 1.1 Client initialization
+    # region 2.1 Client initialization
     @staticmethod
     @cache
     def _get_or_create_genai_client(
@@ -1865,9 +1930,9 @@ class Pipe:
         ]
         return [getattr(source_valves, attr) for attr in ATTRS]
 
-    # endregion 1.1 Client initialization
+    # endregion 2.1 Client initialization
 
-    # region 1.2 Model retrival from Google API
+    # region 2.2 Model retrival from Google API
     @cached()  # aiocache.cached for async method
     async def _get_genai_models(
         self,
@@ -2155,15 +2220,15 @@ class Pipe:
         stripped = re.sub(r"^(?:.*/|[^.]*\.)", "", model_name)
         return stripped
 
-    # endregion 1.2 Model retrival from Google API
+    # endregion 2.2 Model retrival from Google API
 
-    # region 1.3 Model response streaming
+    # region 2.3 Model response streaming
     async def _stream_response_generator(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
         __request__: Request,
         model: str,
-        event_emitter: Callable[["Event"], Awaitable[None]],
+        event_emitter: Callable[["Event"], Awaitable[None]] | None,
         user_id: str,
         chat_id: str,
         message_id: str,
@@ -2198,8 +2263,9 @@ class Pipe:
         except Exception as e:
             error_occurred = True
             error_msg = f"Stream ended with error: {e}"
-            # FIXME: raise the error instead?
-            await self._emit_error(error_msg, event_emitter)
+            # Using just raise does not work correctly for some reason, so we use a custom reverse engineered emit_error function for that.
+            await emit_error(error_msg, event_emitter)
+            # FIXME: Ensure last emitted status message gets hidden.
         finally:
             if total_substitutions > 0 and not error_occurred:
                 plural_s = "s" if total_substitutions > 1 else ""
@@ -2237,7 +2303,7 @@ class Pipe:
         user_id: str,
         chat_id: str,
         message_id: str,
-        event_emitter: Callable[["Event"], Awaitable[None]],
+        event_emitter: Callable[["Event"], Awaitable[None]] | None,
     ) -> AsyncGenerator[tuple[dict, int, types.GenerateContentResponse | None], None]:
         """
         Processes a stream of Gemini responses, yielding structured dictionaries,
@@ -2487,13 +2553,13 @@ class Pipe:
         else:
             return None
 
-    # endregion 1.3 Model response streaming
+    # endregion 2.3 Model response streaming
 
-    # region 1.4 Post-processing
+    # region 2.4 Post-processing
     async def _do_post_processing(
         self,
         model_response: types.GenerateContentResponse | None,
-        event_emitter: Callable[["Event"], Awaitable[None]],
+        event_emitter: Callable[["Event"], Awaitable[None]] | None,
         request: Request,
         chat_id: str,
         message_id: str,
@@ -2522,6 +2588,7 @@ class Pipe:
             types.FinishReason.STOP,
             types.FinishReason.MAX_TOKENS,
         ):
+            # FIXME: What if it's None?
             # MAX_TOKENS is often acceptable, but others might indicate issues.
             error_msg = f"Stream finished with sus reason:\n\n{finish_reason}."
             await emit_toast(error_msg, event_emitter, "error")
@@ -2534,9 +2601,10 @@ class Pipe:
 
         # Emit token usage data.
         if usage_event := self._get_usage_data_event(model_response):
-            log.debug("Emitting usage data:", payload=usage_event)
             # TODO: catch potential errors?
-            await event_emitter(usage_event)
+            if event_emitter:
+                log.debug("Emitting usage data:", payload=usage_event)
+                await event_emitter(usage_event)
         self._add_grounding_data_to_state(model_response, request, chat_id, message_id)
 
     def _add_grounding_data_to_state(
@@ -2604,50 +2672,9 @@ class Pipe:
         }
         return completion_event
 
-    # endregion 1.4 Post-processing
+    # endregion 2.4 Post-processing
 
-    # region 1.5 Event emissions
-    async def _emit_completion(
-        self,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        content: str | None = None,
-        done: bool = False,
-        error: str | None = None,
-        sources: list["Source"] | None = None,
-    ):
-        """Constructs and emits completion event."""
-        emission: "ChatCompletionEvent" = {
-            "type": "chat:completion",
-            "data": {"done": done},
-        }
-        if content:
-            emission["data"]["content"] = content
-        if error:
-            emission["data"]["error"] = {"detail": error}
-        if sources:
-            emission["data"]["sources"] = sources
-        await event_emitter(emission)
-
-    async def _emit_error(
-        self,
-        error_msg: str,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        warning: bool = False,
-        exception: bool = True,
-    ) -> None:
-        """Emits an event to the front-end that causes it to display a nice red error message."""
-
-        if warning:
-            log.opt(depth=1, exception=False).warning(error_msg)
-        else:
-            log.opt(depth=1, exception=exception).error(error_msg)
-        await self._emit_completion(
-            error=f"\n{error_msg}", event_emitter=event_emitter, done=True
-        )
-
-    # endregion 1.5 Event emissions
-
-    # region 1.6 Logging
+    # region 2.5 Logging
     # TODO: Move to a separate plugin that does not have any Open WebUI funcitonlity and is only imported by this plugin.
 
     def _is_flat_dict(self, data: Any) -> bool:
@@ -2876,9 +2903,9 @@ class Pipe:
                 f"Added new handler to loguru for {__name__} with level {desired_level_name}."
             )
 
-    # endregion 1.6 Logging
+    # endregion 2.5 Logging
 
-    # region 1.7 Utility helpers
+    # region 2.6 Utility helpers
 
     # TODO: Check availability of companion filter too with this method.
     @staticmethod
@@ -2965,6 +2992,6 @@ class Pipe:
             log.warning("Multiple candidates found, defaulting to first candidate.")
         return candidates[0]
 
-    # endregion 1.7 Utility helpers
+    # endregion 2.6 Utility helpers
 
-    # endregion 1. Helper methods inside the Pipe class
+    # endregion 2. Helper methods inside the Pipe class
