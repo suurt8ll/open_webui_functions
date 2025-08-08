@@ -2572,7 +2572,8 @@ class Pipe:
             log.warning(
                 "An error occured during the stream, cannot do post-processing."
             )
-            # All the needed metadata is always in the last chunk, so if error happened then we cannot do anything.
+            # All the needed metadata is always in the last chunk, so if an error happened
+            # during the stream, we likely don't have the final response object.
             return
         if not model_response:
             log.warning("model_response is empty, cannot do post-processing.")
@@ -2584,27 +2585,40 @@ class Pipe:
             return
 
         finish_reason = candidate.finish_reason
-        if finish_reason not in (
-            types.FinishReason.STOP,
-            types.FinishReason.MAX_TOKENS,
-        ):
-            # FIXME: What if it's None?
-            # MAX_TOKENS is often acceptable, but others might indicate issues.
-            error_msg = f"Stream finished with sus reason:\n\n{finish_reason}."
-            await emit_toast(error_msg, event_emitter, "error")
-            log.error(error_msg)
-            return
-        else:
-            log.debug(f"Response has correct finish reason: {finish_reason}.")
+        finish_message = candidate.finish_message
+
+        # Bucketize finish reasons to determine logging and notification levels.
+        NORMAL_REASONS = {types.FinishReason.STOP, types.FinishReason.MAX_TOKENS}
+        WARNING_REASONS = {types.FinishReason.RECITATION, types.FinishReason.OTHER}
+
+        if finish_reason in NORMAL_REASONS:
+            log.debug(f"Stream finished normally with reason: {finish_reason.name}.")  # type: ignore
+        elif finish_reason is None or finish_reason in WARNING_REASONS:
+            reason_str = (
+                "an unknown reason" if finish_reason is None else finish_reason.name
+            )
+            msg = f"Stream finished with a warning: {reason_str}."
+            if finish_message:
+                msg += f"\n\nDetails: {finish_message}"
+            log.warning(msg)
+            await emit_toast(msg, event_emitter, "warning")
+        else:  # All other reasons are treated as errors.
+            reason_str = finish_reason.name
+            msg = f"Stream finished with an error: {reason_str}."
+            if finish_message:
+                msg += f"\n\nDetails: {finish_message}"
+            log.error(msg)
+            await emit_toast(msg, event_emitter, "error")
 
         # TODO: Emit a toast message if url context retrieval was not successful.
 
-        # Emit token usage data.
+        # Attempt to emit token usage data even if the finish reason was problematic,
+        # as usage data might still be available.
         if usage_event := self._get_usage_data_event(model_response):
-            # TODO: catch potential errors?
             if event_emitter:
                 log.debug("Emitting usage data:", payload=usage_event)
                 await event_emitter(usage_event)
+
         self._add_grounding_data_to_state(model_response, request, chat_id, message_id)
 
     def _add_grounding_data_to_state(
