@@ -147,12 +147,12 @@ if [[ -n "$AUTHORS_SOURCE_COMMIT_LOG" ]]; then # If there's any log (merge or no
     if [[ ${#FIRST_TIME_CONTRIBUTORS_ARRAY[@]} -gt 0 || ${#RETURNING_CONTRIBUTORS_ARRAY[@]} -gt 0 ]]; then
         CONTRIBUTOR_SHOUTOUT_LINES+=("## 💖 Contributors")
         CONTRIBUTOR_SHOUTOUT_LINES+=("")
-        CONTRIBUTOR_SHOUTOUT_LINES+=("A big thank you to everyone who contributed to **${PLUGIN_NAME} v${CURRENT_VERSION_PART}**!")
+        CONTRIBUTOR_SHOUTOUT_LINES+=("A big thank you to everyone who contributed to **${PLUGIN_NAME} ${CURRENT_VERSION_PART}**!")
         CONTRIBUTOR_SHOUTOUT_LINES+=("")
 
         if [[ ${#FIRST_TIME_CONTRIBUTORS_ARRAY[@]} -gt 0 ]]; then
             CONTRIBUTOR_SHOUTOUT_LINES+=("### 🎉 New Contributors")
-            CONTRIBUTOR_SHOUTOUT_LINES+=("Welcome and thank you to our first-time contributors to this plugin:")
+            CONTRIBUTOR_SHOUTOUT_LINES+=("Welcome and thank you to the first-time contributors to this plugin:")
             mapfile -t SORTED_FIRST_TIME_CONTRIBUTORS < <(printf "%s\n" "${FIRST_TIME_CONTRIBUTORS_ARRAY[@]}" | sort -u)
             for contributor in "${SORTED_FIRST_TIME_CONTRIBUTORS[@]}"; do
                 CONTRIBUTOR_SHOUTOUT_LINES+=("* @${contributor}") # Using @ for mention style
@@ -163,7 +163,7 @@ if [[ -n "$AUTHORS_SOURCE_COMMIT_LOG" ]]; then # If there's any log (merge or no
         if [[ ${#RETURNING_CONTRIBUTORS_ARRAY[@]} -gt 0 ]]; then
             if [[ ${#FIRST_TIME_CONTRIBUTORS_ARRAY[@]} -gt 0 ]]; then
                 CONTRIBUTOR_SHOUTOUT_LINES+=("### 🚀 Returning Contributors")
-                CONTRIBUTOR_SHOUTOUT_LINES+=("And a huge thanks to our returning contributors:")
+                CONTRIBUTOR_SHOUTOUT_LINES+=("And a huge thanks to the returning contributors:")
             else # Only returning contributors
                 CONTRIBUTOR_SHOUTOUT_LINES+=("### 🚀 Contributors")
             fi
@@ -173,7 +173,7 @@ if [[ -n "$AUTHORS_SOURCE_COMMIT_LOG" ]]; then # If there's any log (merge or no
             done
             CONTRIBUTOR_SHOUTOUT_LINES+=("")
         fi
-        CONTRIBUTOR_SHOUTOUT_LINES+=("*We appreciate all your hard work!*")
+        CONTRIBUTOR_SHOUTOUT_LINES+=("*I appreciate all your hard work!*")
     fi
 
     if [[ ${#CONTRIBUTOR_SHOUTOUT_LINES[@]} -gt 0 ]]; then
