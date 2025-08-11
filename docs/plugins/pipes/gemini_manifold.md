@@ -19,6 +19,9 @@ Here's a breakdown of implemented and planned features for the Gemini Manifold p
 -   [x] Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 filter required, see [it's doc](../filters/gemini_manifold_companion.md))
 -   [x] Image input
 -   [x] YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
+-   [x] Video input support (other than YouTube URLs)
+-   [x] Audio input support
+-   [x] Google Files API
 -   [x] Grounding with Google Search (Gemini Manifold Companion >= 1.2.0 required)
 -   [x] Display citations in the front-end. (Gemini Manifold Companion >= 1.5.0 required)
 -   [x] Permissive safety settings (Gemini Manifold Companion >= 1.3.0 required)
@@ -30,9 +33,6 @@ Here's a breakdown of implemented and planned features for the Gemini Manifold p
 
 **Planned Features:**
 
--   [ ] Audio input support
--   [ ] Video input support (other than YouTube URLs)
--   [ ] Google Files API
 -   [ ] Native tool calling
 
 ## Installation
