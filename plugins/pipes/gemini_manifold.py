@@ -1406,9 +1406,9 @@ class Pipe:
             Default value is True.""",
         )
         THINKING_MODEL_PATTERN: str = Field(
-            default=r"gemini-2.5",
+            default=r"^(?=.*gemini-2.5)(?!.*live)(?!.*image)",
             description="""Regex pattern to identify thinking models.
-            Default value is r"gemini-2.5".""",
+            Default value is r"^(?=.*gemini-2.5)(?!.*live)(?!.*image)".""",
         )
         ENABLE_URL_CONTEXT_TOOL: bool = Field(
             default=False,
@@ -1662,31 +1662,38 @@ class Pipe:
         model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
 
         thinking_conf = None
-        if re.search(self.valves.THINKING_MODEL_PATTERN, model_name, re.IGNORECASE):
-            log.info(f"Model ID '{model_name}' allows adjusting the thinking settings.")
+        # Use the user-configurable regex to determine if this is a thinking model.
+        is_thinking_model = re.search(
+            valves.THINKING_MODEL_PATTERN, model_name, re.IGNORECASE
+        )
+
+        if is_thinking_model:
+            log.debug(f"Model ID '{model_name}' is a thinking model.")
+            # Start with the default thinking configuration from valves.
             thinking_conf = types.ThinkingConfig(
                 thinking_budget=valves.THINKING_BUDGET,
                 include_thoughts=valves.SHOW_THINKING_SUMMARY,
             )
 
-        if self._is_function_active("gemini_reasoning_toggle"):
-            # NOTE: Gemini 2.5 Pro supports reasoning budget but not toggling reasoning on/off.
-            if re.search(
-                r"gemini-2.5-(flash|lite)", model_name, re.IGNORECASE
-            ) and not features.get("reason"):
-                log.info(
-                    f"Model ID '{model_name}' allows turning off the reasoning feature. "
-                    "Reasoning is currently toggled off in the UI. Setting thinking budget to 0."
+            # Now, check if the reasoning toggle feature is active and should be applied.
+            if self._is_function_active("gemini_reasoning_toggle"):
+                # This toggle is only applicable to flash/lite models, which support a budget of 0.
+                is_reasoning_toggleable = "flash" in model_name or "lite" in model_name
+                reasoning_is_off = not features.get("reason")
+
+                if is_reasoning_toggleable and reasoning_is_off:
+                    log.info(
+                        f"Model '{model_name}' supports disabling reasoning, and it is toggled OFF in the UI. "
+                        "Setting thinking budget to 0."
+                    )
+                    # Override the budget to 0 to disable the feature.
+                    thinking_conf.thinking_budget = 0
+            else:
+                log.warning(
+                    "Gemini Reasoning Toggle filter is not active. "
+                    "Install or enable it if you want to toggle Gemini 2.5 Flash or Lite reasoning on/off through a front-end button."
                 )
-                thinking_conf = types.ThinkingConfig(
-                    thinking_budget=0,
-                    include_thoughts=valves.SHOW_THINKING_SUMMARY,
-                )
-        else:
-            log.warning(
-                "Gemini Reasoning Toggle filter is not active. "
-                "Install or enable it if you want to toggle Gemini 2.5 Flash or Lite reasoning on/off through a front-end button."
-            )
+
         # TODO: Take defaults from the general front-end config.
         gen_content_conf = types.GenerateContentConfig(
             system_instruction=builder.system_prompt,
@@ -2310,8 +2317,11 @@ class Pipe:
         a substitution count for the ZWS safeguard, and the raw chunk.
         """
         first_chunk_received = False
+        chunk_counter = 0
         try:
             async for chunk in response_stream:
+                log.trace(f"Received stream chunk #{chunk_counter}:", payload=chunk)
+                chunk_counter += 1
                 if not first_chunk_received:
                     # This is the first chunk. End the waiting status.
                     asyncio.create_task(
