@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.24.0
+version: 1.23.0
 requirements: google-genai==1.32.0
 """
 
@@ -2303,11 +2303,8 @@ class Pipe:
                     )
                     first_chunk_received = True
 
-                if not (candidate := self._get_first_candidate(chunk.candidates)):
-                    log.warning("Stream chunk has no candidates, skipping.")
-                    continue
-                if not (parts := candidate.content and candidate.content.parts):
-                    log.warning("Candidate has no content parts, skipping.")
+                if not (parts := chunk.parts):
+                    log.warning("Chunk has no candidates and/or parts, skipping.")
                     continue
 
                 for part in parts:
