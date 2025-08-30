@@ -1815,11 +1815,6 @@ class Pipe:
             )
         else:
             # Non-streaming response.
-            if "gemini-2.0-flash-preview-image-generation" in model_name:
-                warn_msg = "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
-                raise NotImplementedError(warn_msg)
-            # TODO: Support native image gen here too.
-            # TODO: Support code execution here too.
             asyncio.create_task(
                 emit_status(
                     "Waiting for response from Google...",
@@ -1838,7 +1833,43 @@ class Pipe:
                         hidden=True,
                     )
                 )
-            if raw_text := res.text:
+
+            processed_parts: list[str] = []
+            total_substitutions = 0
+
+            if res.parts:
+                for part in res.parts:
+                    payload, count = await self._process_part(
+                        part,
+                        __request__,
+                        model_name,
+                        __user__["id"],
+                        chat_id,
+                        message_id,
+                        is_stream=False,
+                    )
+                    if count > 0:
+                        total_substitutions += count
+
+                    if payload:
+                        # Payload is a dict like {'content': '...'} or {'reasoning': '...'}
+                        # We just need the value to build the final string.
+                        if "content" in payload:
+                            processed_parts.append(payload["content"])
+                        elif "reasoning" in payload:
+                            processed_parts.append(payload["reasoning"])
+
+            if total_substitutions > 0:
+                plural_s = "s" if total_substitutions > 1 else ""
+                toast_msg = (
+                    f"For clarity, {total_substitutions} special tag{plural_s} "
+                    "were disabled in the response by injecting a zero-width space (ZWS)."
+                )
+                asyncio.create_task(emit_toast(toast_msg, __event_emitter__, "info"))
+
+            full_response_text = "".join(processed_parts)
+
+            if full_response_text:
                 log.info("Non-streaming response finished successfully!")
                 log.debug("Non-streaming response:", payload=res)
                 await self._do_post_processing(
@@ -1848,9 +1879,10 @@ class Pipe:
                     "Streaming disabled. Returning full response as str. "
                     "With that Pipe.pipe method has finished it's run!"
                 )
-                return raw_text
+                return full_response_text
             else:
-                warn_msg = "Non-streaming response did not have any text inside it."
+                # TODO: Check if there's a reason for no text (e.g., safety block) to provide a better error message.
+                warn_msg = "Non-streaming response did not have any processable content inside it."
                 raise ValueError(warn_msg)
 
     # region 2. Helper methods inside the Pipe class
@@ -2286,6 +2318,7 @@ class Pipe:
                         user_id,
                         chat_id,
                         message_id,
+                        is_stream=True,
                     )
 
                     if payload:
@@ -2348,6 +2381,7 @@ class Pipe:
         user_id: str,
         chat_id: str,
         message_id: str,
+        is_stream: bool,
     ) -> tuple[dict | None, int]:
         """
         Processes a single `types.Part` object and returns a payload dictionary
@@ -2363,6 +2397,12 @@ class Pipe:
                 # It's a thought, so we'll use the "reasoning" key.
                 key = "reasoning"
                 sanitized_text, count = self._disable_special_tags(text)
+
+                # For non-streaming responses, wrap the thought/reasoning block
+                # in details block manually for nice front-end rendering.
+                if not is_stream:
+                    sanitized_text = f'\n<details type="reasoning" done="true">\n<summary>Thinking...</summary>\n{sanitized_text}\n</details>\n'
+
                 payload = {key: sanitized_text}
             case types.Part(text=str(text)):
                 # It's regular content, using the default "content" key.
