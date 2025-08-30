@@ -2322,6 +2322,7 @@ class Pipe:
             async for chunk in response_stream:
                 log.trace(f"Received stream chunk #{chunk_counter}:", payload=chunk)
                 chunk_counter += 1
+
                 if not first_chunk_received:
                     # This is the first chunk. End the waiting status.
                     asyncio.create_task(
@@ -2334,13 +2335,9 @@ class Pipe:
                     )
                     first_chunk_received = True
 
-                if not (candidate := self._get_first_candidate(chunk.candidates)):
-                    log.warning("Stream chunk has no candidates, skipping.")
+                if not (parts := chunk.parts):
+                    log.warning("Chunk has no candidates and/or parts, skipping.")
                     continue
-                if not (parts := candidate.content and candidate.content.parts):
-                    log.warning("Candidate has no content parts, skipping.")
-                    continue
-
                 for part in parts:
                     # Initialize variables at the start of each loop to satisfy the linter
                     # and ensure they always have a defined state.
