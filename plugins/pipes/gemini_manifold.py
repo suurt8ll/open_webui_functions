@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 1.23.0
-requirements: google-genai==1.31.0
+requirements: google-genai==1.32.0
 """
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
