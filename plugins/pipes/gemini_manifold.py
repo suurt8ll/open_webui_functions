@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.23.0
+version: 1.24.0
 requirements: google-genai==1.32.0
 """
 
@@ -1705,13 +1705,17 @@ class Pipe:
             safety_settings=safety_settings,
             thinking_config=thinking_conf,
         )
-        gen_content_conf.response_modalities = ["Text"]
+        gen_content_conf.response_modalities = ["TEXT"]
         if (
             "gemini-2.0-flash-preview-image-generation" in model_name
+            or "gemini-2.5-flash-image-preview" in model_name
             or "gemma" in model_name
         ):
-            if "gemini-2.0-flash-preview-image-generation" in model_name:
-                gen_content_conf.response_modalities.append("Image")
+            if (
+                "gemini-2.0-flash-preview-image-generation" in model_name
+                or "gemini-2.5-flash-image-preview" in model_name
+            ):
+                gen_content_conf.response_modalities.append("IMAGE")
             # TODO: append to user message instead.
             if gen_content_conf.system_instruction:
                 gen_content_conf.system_instruction = None
@@ -2335,8 +2339,11 @@ class Pipe:
                     )
                     first_chunk_received = True
 
-                if not (parts := chunk.parts):
-                    log.warning("Chunk has no candidates and/or parts, skipping.")
+                if not (candidate := self._get_first_candidate(chunk.candidates)):
+                    log.warning("Stream chunk has no candidates, skipping.")
+                    continue
+                if not (parts := candidate.content and candidate.content.parts):
+                    log.warning("Candidate has no content parts, skipping.")
                     continue
                 for part in parts:
                     # Initialize variables at the start of each loop to satisfy the linter
