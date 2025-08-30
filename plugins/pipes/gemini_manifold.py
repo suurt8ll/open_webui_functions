@@ -590,6 +590,7 @@ class FilesAPIManager:
 
 
 class GeminiContentBuilder:
+    """Builds a list of `google.genai.types.Content` objects from the OWUI's body payload."""
 
     def __init__(
         self,
@@ -2362,23 +2363,18 @@ class Pipe:
                             # It's regular content, using the default "content" key.
                             sanitized_text, count = self._disable_special_tags(text)
                             payload = {key: sanitized_text}
-                        case types.Part(inline_data=data):
-                            if not data:
-                                log.warning(
-                                    "Model response stream Part has an inline_data field but it is empty, skipping."
-                                )
-                                continue
+                        case types.Part(inline_data=data) if data:
                             # Image parts don't need tag disabling.
                             processed_text = await self._process_image_part(
                                 data, model, user_id, chat_id, message_id, __request__
                             )
                             payload = {"content": processed_text}
-                        case types.Part(executable_code=code):
+                        case types.Part(executable_code=code) if code:
                             processed_text = self._process_executable_code_part(code)
                             # Code blocks are already formatted and safe.
                             if processed_text:
                                 payload = {"content": processed_text}
-                        case types.Part(code_execution_result=result):
+                        case types.Part(code_execution_result=result) if result:
                             processed_text = self._process_code_execution_result_part(
                                 result
                             )
