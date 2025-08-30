@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.24.0
+version: 1.23.0
 requirements: google-genai==1.32.0
 """
 
@@ -590,6 +590,7 @@ class FilesAPIManager:
 
 
 class GeminiContentBuilder:
+    """Builds a list of `google.genai.types.Content` objects from the OWUI's body payload."""
 
     def __init__(
         self,
@@ -1787,6 +1788,7 @@ class Pipe:
                 log.warning(
                     f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
                 )
+
         if body.get("stream", False):
             # Streaming response
 
@@ -1813,11 +1815,6 @@ class Pipe:
             )
         else:
             # Non-streaming response.
-            if "gemini-2.0-flash-preview-image-generation" in model_name:
-                warn_msg = "Non-streaming responses with native image gen are not currently supported! Stay tuned! Please enable streaming."
-                raise NotImplementedError(warn_msg)
-            # TODO: Support native image gen here too.
-            # TODO: Support code execution here too.
             asyncio.create_task(
                 emit_status(
                     "Waiting for response from Google...",
@@ -1826,8 +1823,6 @@ class Pipe:
                 )
             )
             try:
-                # TODO: Support native image gen here too.
-                # TODO: Support code execution here too.
                 res = await client.aio.models.generate_content(**gen_content_args)
             finally:
                 asyncio.create_task(
@@ -1838,7 +1833,43 @@ class Pipe:
                         hidden=True,
                     )
                 )
-            if raw_text := res.text:
+
+            processed_parts: list[str] = []
+            total_substitutions = 0
+
+            if res.parts:
+                for part in res.parts:
+                    payload, count = await self._process_part(
+                        part,
+                        __request__,
+                        model_name,
+                        __user__["id"],
+                        chat_id,
+                        message_id,
+                        is_stream=False,
+                    )
+                    if count > 0:
+                        total_substitutions += count
+
+                    if payload:
+                        # Payload is a dict like {'content': '...'} or {'reasoning': '...'}
+                        # We just need the value to build the final string.
+                        if "content" in payload:
+                            processed_parts.append(payload["content"])
+                        elif "reasoning" in payload:
+                            processed_parts.append(payload["reasoning"])
+
+            if total_substitutions > 0:
+                plural_s = "s" if total_substitutions > 1 else ""
+                toast_msg = (
+                    f"For clarity, {total_substitutions} special tag{plural_s} "
+                    "were disabled in the response by injecting a zero-width space (ZWS)."
+                )
+                asyncio.create_task(emit_toast(toast_msg, __event_emitter__, "info"))
+
+            full_response_text = "".join(processed_parts)
+
+            if full_response_text:
                 log.info("Non-streaming response finished successfully!")
                 log.debug("Non-streaming response:", payload=res)
                 await self._do_post_processing(
@@ -1848,9 +1879,10 @@ class Pipe:
                     "Streaming disabled. Returning full response as str. "
                     "With that Pipe.pipe method has finished it's run!"
                 )
-                return raw_text
+                return full_response_text
             else:
-                warn_msg = "Non-streaming response did not have any text inside it."
+                # TODO: Check if there's a reason for no text (e.g., safety block) to provide a better error message.
+                warn_msg = "Non-streaming response did not have any processable content inside it."
                 raise ValueError(warn_msg)
 
     # region 2. Helper methods inside the Pipe class
@@ -2251,77 +2283,9 @@ class Pipe:
         final_response_chunk: types.GenerateContentResponse | None = None
         error_occurred = False
         total_substitutions = 0
-
-        try:
-            part_processor = self._process_parts_to_structured_stream(
-                response_stream,
-                __request__,
-                model,
-                user_id,
-                chat_id,
-                message_id,
-                event_emitter,
-            )
-            async for structured_chunk, count, raw_chunk in part_processor:
-                if count > 0:
-                    total_substitutions += count
-                    log.debug(f"Disabled {count} special tag(s) in a chunk.")
-
-                if raw_chunk:
-                    final_response_chunk = raw_chunk
-                yield structured_chunk
-
-        except Exception as e:
-            error_occurred = True
-            error_msg = f"Stream ended with error: {e}"
-            # Using just raise does not work correctly for some reason, so we use a custom reverse engineered emit_error function for that.
-            await emit_error(error_msg, event_emitter)
-            # FIXME: Ensure last emitted status message gets hidden.
-        finally:
-            if total_substitutions > 0 and not error_occurred:
-                plural_s = "s" if total_substitutions > 1 else ""
-                toast_msg = (
-                    f"For clarity, {total_substitutions} special tag{plural_s} "
-                    "were disabled in the response by injecting a zero-width space (ZWS)."
-                )
-                await emit_toast(toast_msg, event_emitter, "info")
-
-            if not error_occurred:
-                log.info("Stream finished successfully!")
-                log.debug("Last chunk:", payload=final_response_chunk)
-
-            try:
-                await self._do_post_processing(
-                    final_response_chunk,
-                    event_emitter,
-                    __request__,
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    stream_error_happened=error_occurred,
-                )
-            except Exception as e:
-                error_msg = f"Post-processing failed with error:\n\n{e}"
-                await emit_toast(error_msg, event_emitter, "error")
-                log.exception(error_msg)
-
-            log.debug("AsyncGenerator finished.")
-
-    async def _process_parts_to_structured_stream(
-        self,
-        response_stream: AsyncIterator[types.GenerateContentResponse],
-        __request__: Request,
-        model: str,
-        user_id: str,
-        chat_id: str,
-        message_id: str,
-        event_emitter: Callable[["Event"], Awaitable[None]] | None,
-    ) -> AsyncGenerator[tuple[dict, int, types.GenerateContentResponse | None], None]:
-        """
-        Processes a stream of Gemini responses, yielding structured dictionaries,
-        a substitution count for the ZWS safeguard, and the raw chunk.
-        """
         first_chunk_received = False
         chunk_counter = 0
+
         try:
             async for chunk in response_stream:
                 log.trace(f"Received stream chunk #{chunk_counter}:", payload=chunk)
@@ -2339,67 +2303,124 @@ class Pipe:
                     )
                     first_chunk_received = True
 
-                if not (candidate := self._get_first_candidate(chunk.candidates)):
-                    log.warning("Stream chunk has no candidates, skipping.")
+                if not (parts := chunk.parts):
+                    log.warning("Chunk has no candidates and/or parts, skipping.")
                     continue
-                if not (parts := candidate.content and candidate.content.parts):
-                    log.warning("Candidate has no content parts, skipping.")
-                    continue
-                for part in parts:
-                    # Initialize variables at the start of each loop to satisfy the linter
-                    # and ensure they always have a defined state.
-                    payload: dict[str, str] | None = None
-                    count: int = 0
-                    key: str = "content"
 
-                    match part:
-                        case types.Part(text=str(text), thought=True):
-                            # It's a thought, so we'll use the "reasoning" key.
-                            key = "reasoning"
-                            sanitized_text, count = self._disable_special_tags(text)
-                            payload = {key: sanitized_text}
-                        case types.Part(text=str(text)):
-                            # It's regular content, using the default "content" key.
-                            sanitized_text, count = self._disable_special_tags(text)
-                            payload = {key: sanitized_text}
-                        case types.Part(inline_data=data):
-                            if not data:
-                                log.warning(
-                                    "Model response stream Part has an inline_data field but it is empty, skipping."
-                                )
-                                continue
-                            # Image parts don't need tag disabling.
-                            processed_text = await self._process_image_part(
-                                data, model, user_id, chat_id, message_id, __request__
-                            )
-                            payload = {"content": processed_text}
-                        case types.Part(executable_code=code):
-                            processed_text = self._process_executable_code_part(code)
-                            # Code blocks are already formatted and safe.
-                            if processed_text:
-                                payload = {"content": processed_text}
-                        case types.Part(code_execution_result=result):
-                            processed_text = self._process_code_execution_result_part(
-                                result
-                            )
-                            # Code results are also safe.
-                            if processed_text:
-                                payload = {"content": processed_text}
+                for part in parts:
+                    payload, count = await self._process_part(
+                        part,
+                        __request__,
+                        model,
+                        user_id,
+                        chat_id,
+                        message_id,
+                        is_stream=True,
+                    )
 
                     if payload:
+                        if count > 0:
+                            total_substitutions += count
+                            log.debug(f"Disabled {count} special tag(s) in a chunk.")
+
                         structured_chunk = {"choices": [{"delta": payload}]}
-                        yield structured_chunk, count, chunk
-        except Exception:
-            raise
+                        yield structured_chunk
+
+                final_response_chunk = chunk
+
+        except Exception as e:
+            error_occurred = True
+            error_msg = f"Stream ended with error: {e}"
+            # Using just raise does not work correctly for some reason, so we use a custom reverse engineered emit_error function for that.
+            await emit_error(error_msg, event_emitter)
+
         finally:
-            if not first_chunk_received:
-                # Emit done status if error occurs before the first chunk.
-                await emit_status(
-                    "Error occurred before receiving the first token from Google.",
-                    event_emitter,
-                    done=True,
-                    hidden=True,
+            # This will hide any lingering status messages, just in case.
+            await emit_status(
+                "Stream ended",
+                event_emitter,
+                done=True,
+                hidden=True,
+            )
+
+            if total_substitutions > 0 and not error_occurred:
+                plural_s = "s" if total_substitutions > 1 else ""
+                toast_msg = (
+                    f"For clarity, {total_substitutions} special tag{plural_s} "
+                    "were disabled in the response by injecting a zero-width space (ZWS)."
                 )
+                await emit_toast(toast_msg, event_emitter, "info")
+
+            if not error_occurred:
+                log.info("Stream finished successfully!")
+
+            try:
+                await self._do_post_processing(
+                    final_response_chunk,
+                    event_emitter,
+                    __request__,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    stream_error_happened=error_occurred,
+                )
+            except Exception as e:
+                error_msg = f"Post-processing failed with error:\n\n{e}"
+                await emit_toast(error_msg, event_emitter, "error")
+                log.exception(error_msg)
+
+            log.debug("AsyncGenerator finished.")
+
+    async def _process_part(
+        self,
+        part: types.Part,
+        __request__: Request,
+        model: str,
+        user_id: str,
+        chat_id: str,
+        message_id: str,
+        is_stream: bool,
+    ) -> tuple[dict | None, int]:
+        """
+        Processes a single `types.Part` object and returns a payload dictionary
+        for the Open WebUI stream, along with a count of tag substitutions.
+        """
+        # Initialize variables to ensure they always have a defined state.
+        payload: dict[str, str] | None = None
+        count: int = 0
+        key: str = "content"
+
+        match part:
+            case types.Part(text=str(text), thought=True):
+                # It's a thought, so we'll use the "reasoning" key.
+                key = "reasoning"
+                sanitized_text, count = self._disable_special_tags(text)
+
+                # For non-streaming responses, wrap the thought/reasoning block
+                # in details block manually for nice front-end rendering.
+                if not is_stream:
+                    sanitized_text = f'\n<details type="reasoning" done="true">\n<summary>Thinking...</summary>\n{sanitized_text}\n</details>\n'
+
+                payload = {key: sanitized_text}
+            case types.Part(text=str(text)):
+                # It's regular content, using the default "content" key.
+                sanitized_text, count = self._disable_special_tags(text)
+                payload = {key: sanitized_text}
+            case types.Part(inline_data=data) if data:
+                # Image parts don't need tag disabling.
+                processed_text = await self._process_image_part(
+                    data, model, user_id, chat_id, message_id, __request__
+                )
+                payload = {"content": processed_text}
+            case types.Part(executable_code=code) if code:
+                # Code blocks are already formatted and safe.
+                if processed_text := self._process_executable_code_part(code):
+                    payload = {"content": processed_text}
+            case types.Part(code_execution_result=result) if result:
+                # Code results are also safe.
+                if processed_text := self._process_code_execution_result_part(result):
+                    payload = {"content": processed_text}
+
+        return payload, count
 
     @staticmethod
     def _disable_special_tags(text: str) -> tuple[str, int]:
