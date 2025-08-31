@@ -225,6 +225,15 @@ class Filter:
         else:
             metadata_features["upload_documents"] = False
 
+        # Force the backend down the streaming path, manifold pipe requires it to work.
+        # User's original intent is preserved into __metadata__.
+        # TODO: Image generation models can be set to non-streaming here.
+        log.info(
+            f'Storing original stream value ({body["stream"]}) into __metadata__. Backend will be forced down the streaming path.'
+        )
+        metadata_features["stream"] = body.get("stream", True)
+        body["stream"] = True
+
         # TODO: Filter out the citation markers here.
 
         return body

@@ -179,6 +179,7 @@ class Features(TypedDict):
     upload_documents: NotRequired[bool]
     reason: NotRequired[bool]
     url_context: NotRequired[bool]
+    stream: NotRequired[bool]
 
 
 class Metadata(TypedDict):
