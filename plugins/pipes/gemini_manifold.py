@@ -1789,9 +1789,12 @@ class Pipe:
                     f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
                 )
 
-        if body.get("stream", False):
-            # Streaming response
+        # Both streaming and non-streaming responses are now handled by the same
+        # unified processor, which returns an AsyncGenerator. For non-streaming,
+        # we adapt the single response object into a one-item async generator.
 
+        if features.get("stream", True):
+            # Streaming response
             asyncio.create_task(
                 emit_status(
                     "Waiting for first token from Google...",
@@ -1803,8 +1806,10 @@ class Pipe:
                 await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
             )
 
-            log.info("Streaming enabled. Returning AsyncGenerator.")
-            return self._stream_response_generator(
+            log.info(
+                "Streaming enabled. Returning AsyncGenerator from unified processor."
+            )
+            return self._unified_response_processor(
                 response_stream,
                 __request__,
                 model_name,
@@ -1825,6 +1830,7 @@ class Pipe:
             try:
                 res = await client.aio.models.generate_content(**gen_content_args)
             finally:
+                # This status is emitted immediately after the full response is received.
                 asyncio.create_task(
                     emit_status(
                         "Response received",
@@ -1834,56 +1840,26 @@ class Pipe:
                     )
                 )
 
-            processed_parts: list[str] = []
-            total_substitutions = 0
+            # Adapter: Create a simple, one-shot async generator that yields the
+            # single response object, making it behave like a stream.
+            async def single_item_stream(
+                response: types.GenerateContentResponse,
+            ) -> AsyncGenerator[types.GenerateContentResponse, None]:
+                yield response
 
-            if res.parts:
-                for part in res.parts:
-                    payload, count = await self._process_part(
-                        part,
-                        __request__,
-                        model_name,
-                        __user__["id"],
-                        chat_id,
-                        message_id,
-                        is_stream=False,
-                    )
-                    if count > 0:
-                        total_substitutions += count
-
-                    if payload:
-                        # Payload is a dict like {'content': '...'} or {'reasoning': '...'}
-                        # We just need the value to build the final string.
-                        if "content" in payload:
-                            processed_parts.append(payload["content"])
-                        elif "reasoning" in payload:
-                            processed_parts.append(payload["reasoning"])
-
-            if total_substitutions > 0:
-                plural_s = "s" if total_substitutions > 1 else ""
-                toast_msg = (
-                    f"For clarity, {total_substitutions} special tag{plural_s} "
-                    "were disabled in the response by injecting a zero-width space (ZWS)."
-                )
-                asyncio.create_task(emit_toast(toast_msg, __event_emitter__, "info"))
-
-            full_response_text = "".join(processed_parts)
-
-            if full_response_text:
-                log.info("Non-streaming response finished successfully!")
-                log.debug("Non-streaming response:", payload=res)
-                await self._do_post_processing(
-                    res, __event_emitter__, __request__, chat_id, message_id
-                )
-                log.info(
-                    "Streaming disabled. Returning full response as str. "
-                    "With that Pipe.pipe method has finished it's run!"
-                )
-                return full_response_text
-            else:
-                # TODO: Check if there's a reason for no text (e.g., safety block) to provide a better error message.
-                warn_msg = "Non-streaming response did not have any processable content inside it."
-                raise ValueError(warn_msg)
+            log.info(
+                "Streaming disabled. Adapting full response and returning "
+                "AsyncGenerator from unified processor."
+            )
+            return self._unified_response_processor(
+                single_item_stream(res),
+                __request__,
+                model_name,
+                __event_emitter__,
+                __user__["id"],
+                chat_id,
+                message_id,
+            )
 
     # region 2. Helper methods inside the Pipe class
 
@@ -2265,8 +2241,8 @@ class Pipe:
 
     # endregion 2.2 Model retrival from Google API
 
-    # region 2.3 Model response streaming
-    async def _stream_response_generator(
+    # region 2.3 Model response processing
+    async def _unified_response_processor(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
         __request__: Request,
@@ -2277,8 +2253,13 @@ class Pipe:
         message_id: str,
     ) -> AsyncGenerator[dict, None]:
         """
-        Yields structured dictionary chunks from the stream, counts tag substitutions
-        for a final toast notification, and handles post-processing.
+        Processes an async iterator of GenerateContentResponse objects, yielding
+        structured dictionary chunks for the Open WebUI frontend.
+
+        This single method handles both streaming and non-streaming (via an adapter)
+        responses, eliminating code duplication. It processes all parts within each
+        response chunk, counts tag substitutions for a final toast notification,
+        and handles post-processing in a finally block.
         """
         final_response_chunk: types.GenerateContentResponse | None = None
         error_occurred = False
@@ -2288,11 +2269,12 @@ class Pipe:
 
         try:
             async for chunk in response_stream:
-                log.trace(f"Received stream chunk #{chunk_counter}:", payload=chunk)
+                log.trace(f"Processing response chunk #{chunk_counter}:", payload=chunk)
                 chunk_counter += 1
+                final_response_chunk = chunk  # Keep the latest chunk for metadata
 
                 if not first_chunk_received:
-                    # This is the first chunk. End the waiting status.
+                    # This is the first (and possibly only) chunk. End the waiting status.
                     asyncio.create_task(
                         emit_status(
                             "First token received",
@@ -2304,9 +2286,11 @@ class Pipe:
                     first_chunk_received = True
 
                 if not (parts := chunk.parts):
-                    log.warning("Chunk has no candidates and/or parts, skipping.")
+                    log.warning("Chunk has no parts, skipping.")
                     continue
 
+                # This inner loop makes the method robust. It handles a single chunk
+                # with many parts (non-streaming) or many chunks with one part (streaming).
                 for part in parts:
                     payload, count = await self._process_part(
                         part,
@@ -2315,29 +2299,27 @@ class Pipe:
                         user_id,
                         chat_id,
                         message_id,
-                        is_stream=True,
+                        is_stream=True,  # We always yield chunks, so this is effectively true
                     )
 
                     if payload:
                         if count > 0:
                             total_substitutions += count
-                            log.debug(f"Disabled {count} special tag(s) in a chunk.")
+                            log.debug(f"Disabled {count} special tag(s) in a part.")
 
                         structured_chunk = {"choices": [{"delta": payload}]}
                         yield structured_chunk
 
-                final_response_chunk = chunk
-
         except Exception as e:
             error_occurred = True
-            error_msg = f"Stream ended with error: {e}"
-            # Using just raise does not work correctly for some reason, so we use a custom reverse engineered emit_error function for that.
+            error_msg = f"Response processing ended with error: {e}"
+            log.exception(error_msg)
             await emit_error(error_msg, event_emitter)
 
         finally:
-            # This will hide any lingering status messages, just in case.
+            # This will hide any lingering status messages.
             await emit_status(
-                "Stream ended",
+                "Response processing finished",
                 event_emitter,
                 done=True,
                 hidden=True,
@@ -2352,7 +2334,7 @@ class Pipe:
                 await emit_toast(toast_msg, event_emitter, "info")
 
             if not error_occurred:
-                log.info("Stream finished successfully!")
+                log.info("Response processing finished successfully!")
 
             try:
                 await self._do_post_processing(
@@ -2368,7 +2350,7 @@ class Pipe:
                 await emit_toast(error_msg, event_emitter, "error")
                 log.exception(error_msg)
 
-            log.debug("AsyncGenerator finished.")
+            log.debug("Unified response processor finished.")
 
     async def _process_part(
         self,
@@ -2588,7 +2570,7 @@ class Pipe:
         else:
             return None
 
-    # endregion 2.3 Model response streaming
+    # endregion 2.3 Model response processing
 
     # region 2.4 Post-processing
     async def _do_post_processing(
