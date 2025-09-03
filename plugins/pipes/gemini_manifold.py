@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.24.0
+version: 1.25.0
 requirements: google-genai==1.32.0
 """
 
@@ -1332,6 +1332,12 @@ class GeminiContentBuilder:
 class Pipe:
     class Valves(BaseModel):
         GEMINI_API_KEY: str | None = Field(default=None)
+        IMAGE_GEN_GEMINI_API_KEY: str | None = Field(
+            default=None,
+            description="""Optional separate API key for image generation models.
+            If not provided, the main GEMINI_API_KEY will be used.
+            An image generation model is identified by the Image Model Pattern regex below.""",
+        )
         USER_MUST_PROVIDE_AUTH_CONFIG: bool = Field(
             default=False,
             description="""Whether to require users (including admins) to provide their own authentication configuration.
@@ -1411,6 +1417,11 @@ class Pipe:
             description="""Regex pattern to identify thinking models.
             Default value is r"^(?=.*gemini-2.5)(?!.*live)(?!.*image)".""",
         )
+        IMAGE_MODEL_PATTERN: str = Field(
+            default=r"image",
+            description="""Regex pattern to identify image generation models.
+            Default value is r"image".""",
+        )
         ENABLE_URL_CONTEXT_TOOL: bool = Field(
             default=False,
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
@@ -1481,6 +1492,11 @@ class Pipe:
             default=None,
             description="""Gemini Developer API key.
             Default value is None (uses the default from Valves, same goes for other options below).""",
+        )
+        IMAGE_GEN_GEMINI_API_KEY: str | None = Field(
+            default=None,
+            description="""Optional separate API key for image generation models.
+            If not provided, the main GEMINI_API_KEY will be used.""",
         )
         GEMINI_API_BASE_URL: str | None = Field(
             default=None,
@@ -1585,6 +1601,9 @@ class Pipe:
 
         return filtered_models
 
+    def _is_image_model(self, model_name: str, pattern: str) -> bool:
+        return bool(re.search(pattern, model_name, re.IGNORECASE))
+
     async def pipe(
         self,
         body: "Body",
@@ -1599,6 +1618,19 @@ class Pipe:
         valves: Pipe.Valves = self._get_merged_valves(
             self.valves, __user__.get("valves"), __user__.get("email")
         )
+
+        model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
+        is_image_model = self._is_image_model(model_name, valves.IMAGE_MODEL_PATTERN)
+
+        if is_image_model and valves.IMAGE_GEN_GEMINI_API_KEY:
+            log.info("Using separate API key for image generation model.")
+            valves.GEMINI_API_KEY = valves.IMAGE_GEN_GEMINI_API_KEY
+
+            # When using a separate key, assume it's for Gemini API, not Vertex AI
+            # TODO: check if it would work for Vertex AI as well
+            valves.USE_VERTEX_AI = False
+            valves.VERTEX_PROJECT = None
+
         log.debug(
             f"USE_VERTEX_AI: {valves.USE_VERTEX_AI}, VERTEX_PROJECT set: {bool(valves.VERTEX_PROJECT)}, API_KEY set: {bool(valves.GEMINI_API_KEY)}"
         )
@@ -1660,8 +1692,7 @@ class Pipe:
         safety_settings: list[types.SafetySetting] | None = __metadata__.get(
             "safety_settings"
         )
-        model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
-
+        
         thinking_conf = None
         # Use the user-configurable regex to determine if this is a thinking model.
         is_thinking_model = re.search(
