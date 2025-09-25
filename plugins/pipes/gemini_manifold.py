@@ -1793,7 +1793,11 @@ class Pipe:
         if valves.ENABLE_URL_CONTEXT_TOOL:
             compatible_models_for_url_context = [
                 "gemini-2.5-pro",
+                "gemini-flash-latest",
+                "gemini-2.5-flash-preview-09-2025",
                 "gemini-2.5-flash",
+                "gemini-flash-lite-latest",
+                "gemini-2.5-flash-lite-preview-09-2025",
                 "gemini-2.5-flash-lite",
                 "gemini-2.5-flash-lite-preview-06-17",
                 "gemini-2.5-pro-preview-06-05",
