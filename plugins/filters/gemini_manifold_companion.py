@@ -38,7 +38,11 @@ if TYPE_CHECKING:
 # According to https://ai.google.dev/gemini-api/docs/models
 ALLOWED_GROUNDING_MODELS = {
     "gemini-2.5-pro",
+    "gemini-flash-latest",
+    "gemini-2.5-flash-preview-09-2025",
     "gemini-2.5-flash",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash-lite-preview-09-2025",
     "gemini-2.5-flash-lite",
     "gemini-2.5-flash-lite-preview-06-17",
     "gemini-2.5-pro-preview-06-05",
@@ -59,7 +63,11 @@ ALLOWED_GROUNDING_MODELS = {
 }
 ALLOWED_CODE_EXECUTION_MODELS = {
     "gemini-2.5-pro",
+    "gemini-flash-latest",
+    "gemini-2.5-flash-preview-09-2025",
     "gemini-2.5-flash",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash-lite-preview-09-2025",
     "gemini-2.5-flash-lite",
     "gemini-2.5-flash-lite-preview-06-17",
     "gemini-2.5-pro-preview-06-05",
