@@ -247,6 +247,7 @@ class Filter:
         image_generation_models = {
             "gemini-2.0-flash-preview-image-generation",
             "gemini-2.5-flash-image-preview",
+            "gemini-2.5-flash-image",
         }
 
         # Check if the current model is an image generation model and if the

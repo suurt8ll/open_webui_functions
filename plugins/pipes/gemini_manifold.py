@@ -1692,7 +1692,7 @@ class Pipe:
         safety_settings: list[types.SafetySetting] | None = __metadata__.get(
             "safety_settings"
         )
-        
+
         thinking_conf = None
         # Use the user-configurable regex to determine if this is a thinking model.
         is_thinking_model = re.search(
@@ -1738,15 +1738,18 @@ class Pipe:
             thinking_config=thinking_conf,
         )
         gen_content_conf.response_modalities = ["TEXT"]
-        if (
-            "gemini-2.0-flash-preview-image-generation" in model_name
-            or "gemini-2.5-flash-image-preview" in model_name
-            or "gemma" in model_name
-        ):
-            if (
-                "gemini-2.0-flash-preview-image-generation" in model_name
-                or "gemini-2.5-flash-image-preview" in model_name
-            ):
+        # Use maintainable lists for capability checks
+        image_generation_model_codes = [
+            "gemini-2.0-flash-preview-image-generation",
+            "gemini-2.5-flash-image-preview",
+            "gemini-2.5-flash-image",
+        ]
+        system_prompt_unsupported_model_substrings = (
+            image_generation_model_codes + ["gemma"]
+        )
+
+        if any(s in model_name for s in system_prompt_unsupported_model_substrings):
+            if any(s in model_name for s in image_generation_model_codes):
                 gen_content_conf.response_modalities.append("IMAGE")
             # TODO: append to user message instead.
             if gen_content_conf.system_instruction:
