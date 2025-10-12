@@ -51,6 +51,7 @@ from pydantic import BaseModel, Field, field_validator
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import (
     Any,
+    Final,
     AsyncGenerator,
     Literal,
     TYPE_CHECKING,
@@ -70,6 +71,27 @@ if TYPE_CHECKING:
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
+
+# Finish reasons are bucketized to determine logging and notification levels.
+NORMAL_REASONS: Final = {types.FinishReason.STOP, types.FinishReason.MAX_TOKENS}
+WARNING_REASONS: Final = {
+    types.FinishReason.RECITATION,
+    types.FinishReason.OTHER,
+    types.FinishReason.FINISH_REASON_UNSPECIFIED,
+}
+ERROR_REASONS: Final = {
+    types.FinishReason.SAFETY,
+    types.FinishReason.LANGUAGE,
+    types.FinishReason.BLOCKLIST,
+    types.FinishReason.PROHIBITED_CONTENT,
+    types.FinishReason.SPII,
+    types.FinishReason.MALFORMED_FUNCTION_CALL,
+    types.FinishReason.IMAGE_SAFETY,
+    types.FinishReason.UNEXPECTED_TOOL_CALL,
+    # FIXME: These cause "open_webui.utils.plugin:load_function_module_by_id:159 - Error loading module ..." errors for some reason
+    # types.FinishReason.IMAGE_PROHIBITED_CONTENT,
+    # types.FinishReason.NO_IMAGE,
+}
 
 # These tags will be "disabled" in the response, meaning that they will not be parsed by the backend.
 SPECIAL_TAGS_TO_DISABLE = [
@@ -2623,47 +2645,65 @@ class Pipe:
     ):
         """Handles emitting usage, grounding, and sources after the main response/stream is done."""
         log.info("Post-processing the model response.")
+
         if stream_error_happened:
             log.warning(
-                "An error occured during the stream, cannot do post-processing."
+                "An error occurred during the stream, skipping post-processing."
             )
             # All the needed metadata is always in the last chunk, so if an error happened
             # during the stream, we likely don't have the final response object.
             return
         if not model_response:
-            log.warning("model_response is empty, cannot do post-processing.")
+            log.warning("model_response is empty, skipping post-processing.")
             return
         if not (candidate := self._get_first_candidate(model_response.candidates)):
-            log.warning(
-                "Response does not contain any canditates. Cannot do post-processing."
-            )
+            log.warning("Response contains no candidates, skipping post-processing.")
             return
 
         finish_reason = candidate.finish_reason
         finish_message = candidate.finish_message
 
-        # Bucketize finish reasons to determine logging and notification levels.
-        NORMAL_REASONS = {types.FinishReason.STOP, types.FinishReason.MAX_TOKENS}
-        WARNING_REASONS = {types.FinishReason.RECITATION, types.FinishReason.OTHER}
+        reason_name = finish_reason.name if finish_reason else "UNSPECIFIED"
+        full_finish_details = f"[{reason_name}]"
+        if finish_message:
+            full_finish_details += f": {finish_message}"
 
-        if finish_reason in NORMAL_REASONS:
-            log.debug(f"Stream finished normally with reason: {finish_reason.name}.")  # type: ignore
-        elif finish_reason is None or finish_reason in WARNING_REASONS:
-            reason_str = (
-                "an unknown reason" if finish_reason is None else finish_reason.name
-            )
-            msg = f"Stream finished with a warning: {reason_str}."
-            if finish_message:
-                msg += f"\n\nDetails: {finish_message}"
-            log.warning(msg)
-            await emit_toast(msg, event_emitter, "warning")
-        else:  # All other reasons are treated as errors.
-            reason_str = finish_reason.name
-            msg = f"Stream finished with an error: {reason_str}."
-            if finish_message:
-                msg += f"\n\nDetails: {finish_message}"
-            log.error(msg)
-            await emit_toast(msg, event_emitter, "error")
+        match finish_reason:
+            case r if r in NORMAL_REASONS:
+                log.debug(f"Stream finished normally. {full_finish_details}")
+            case r if r in WARNING_REASONS:
+                log.warning(f"Stream finished with a warning. {full_finish_details}")
+                await emit_toast(
+                    f"Finished with a warning. {full_finish_details}",
+                    event_emitter,
+                    "warning",
+                )
+            case r if r in ERROR_REASONS:
+                log.error(f"Stream finished with an error. {full_finish_details}")
+                await emit_toast(
+                    f"An error occurred. {full_finish_details}",
+                    event_emitter,
+                    "error",
+                )
+            case None:
+                log.warning(
+                    f"Stream finished for an unknown reason. {full_finish_details}"
+                )
+                await emit_toast(
+                    f"Finished with a warning. {full_finish_details}",
+                    event_emitter,
+                    "warning",
+                )
+            case _:
+                log.error(
+                    f"Stream finished with an unhandled reason: {reason_name}. "
+                    f"{full_finish_details}"
+                )
+                await emit_toast(
+                    f"An unexpected error occurred. {full_finish_details}",
+                    event_emitter,
+                    "error",
+                )
 
         # TODO: Emit a toast message if url context retrieval was not successful.
 
@@ -2690,7 +2730,7 @@ class Pipe:
 
         if grounding_metadata_obj:
             log.debug(
-                f"Found grounding metadata. Storing in in request's app state using key {storage_key}."
+                f"Found grounding metadata. Storing in request's app state using key {storage_key}."
             )
             # Using shared `request.app.state` to pass grounding metadata to Filter.outlet.
             # This is necessary because the Pipe finishes during the initial `/api/completion` request,
