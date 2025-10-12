@@ -247,7 +247,6 @@ class UploadStatusManager:
             self.total_uploads_expected > 0
             and self.uploads_completed == self.total_uploads_expected
         )
-        is_hidden = is_done
 
         if is_done:
             message = f"Upload complete. {self.uploads_completed} file(s) processed."
@@ -259,7 +258,6 @@ class UploadStatusManager:
             message,
             self.event_emitter,
             done=is_done,
-            hidden=is_hidden,
         )
 
 
@@ -1831,15 +1829,21 @@ class Pipe:
         # unified processor, which returns an AsyncGenerator. For non-streaming,
         # we adapt the single response object into a one-item async generator.
 
-        if features.get("stream", True):
-            # Streaming response
-            asyncio.create_task(
-                emit_status(
-                    "Waiting for first token from Google...",
-                    __event_emitter__,
-                    done=False,
-                )
+        # Determine the request type to provide a more informative status message.
+        is_streaming = features.get("stream", True)
+        request_type_str = "streaming" if is_streaming else "non-streaming"
+
+        # Emit a single status update before making the actual API call.
+        asyncio.create_task(
+            emit_status(
+                f"Sending {request_type_str} request to Google API...",
+                __event_emitter__,
+                done=False,
             )
+        )
+
+        if is_streaming:
+            # Streaming response
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
                 await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
             )
@@ -1858,25 +1862,7 @@ class Pipe:
             )
         else:
             # Non-streaming response.
-            asyncio.create_task(
-                emit_status(
-                    "Waiting for response from Google...",
-                    __event_emitter__,
-                    done=False,
-                )
-            )
-            try:
-                res = await client.aio.models.generate_content(**gen_content_args)
-            finally:
-                # This status is emitted immediately after the full response is received.
-                asyncio.create_task(
-                    emit_status(
-                        "Response received",
-                        __event_emitter__,
-                        done=True,
-                        hidden=True,
-                    )
-                )
+            res = await client.aio.models.generate_content(**gen_content_args)
 
             # Adapter: Create a simple, one-shot async generator that yields the
             # single response object, making it behave like a stream.
@@ -2312,13 +2298,12 @@ class Pipe:
                 final_response_chunk = chunk  # Keep the latest chunk for metadata
 
                 if not first_chunk_received:
-                    # This is the first (and possibly only) chunk. End the waiting status.
+                    # This is the first (and possibly only) chunk.
                     asyncio.create_task(
                         emit_status(
-                            "First token received",
+                            "Response received",
                             event_emitter,
                             done=True,
-                            hidden=True,
                         )
                     )
                     first_chunk_received = True
@@ -2355,12 +2340,12 @@ class Pipe:
             await emit_error(error_msg, event_emitter)
 
         finally:
-            # This will hide any lingering status messages.
+            # The async for loop has completed, meaning we have received all data
+            # from the API. Now, we perform final internal processing.
             await emit_status(
-                "Response processing finished",
+                "Full response received",
                 event_emitter,
                 done=True,
-                hidden=True,
             )
 
             if total_substitutions > 0 and not error_occurred:
