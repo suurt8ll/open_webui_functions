@@ -2747,32 +2747,32 @@ class Pipe:
     ) -> "ChatCompletionEvent | None":
         """
         Extracts usage data from a GenerateContentResponse object.
-        Returns None if any of the core metrics (prompt_tokens, completion_tokens, total_tokens)
-        cannot be reliably determined.
-
-        Args:
-            response: The GenerateContentResponse object.
-
-        Returns:
-            A dictionary containing the usage data, formatted as a ResponseUsage type,
-            or None if any core metrics are missing.
+        Returns None if usage metadata is not present.
         """
-
         if not response.usage_metadata:
             log.warning(
-                "Usage_metadata is missing from the response. Cannot reliably determine usage."
+                "Usage metadata is missing from the response. Cannot determine usage."
             )
             return None
 
         usage_data = response.usage_metadata.model_dump()
+
+        # 1. Rename the three core required fields.
         usage_data["prompt_tokens"] = usage_data.pop("prompt_token_count")
         usage_data["completion_tokens"] = usage_data.pop("candidates_token_count")
         usage_data["total_tokens"] = usage_data.pop("total_token_count")
-        # Remove null values and turn ModalityTokenCount into dict.
-        for k, v in usage_data.copy().items():
-            if k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+
+        CORE_KEYS = {"prompt_tokens", "completion_tokens", "total_tokens"}
+
+        # 2. Remove auxiliary keys that have falsy values (None, empty list, etc.).
+        # We must iterate over a copy of keys to safely delete items from the dict.
+        for k in list(usage_data.keys()):
+            if k in CORE_KEYS:
                 continue
-            if not v:
+
+            # If the value is falsy (None, 0, empty list), remove the key.
+            # This retains non-core data (like modality counts) if it exists.
+            if not usage_data[k]:
                 del usage_data[k]
 
         completion_event: "ChatCompletionEvent" = {
