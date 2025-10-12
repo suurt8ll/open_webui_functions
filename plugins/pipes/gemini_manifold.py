@@ -204,8 +204,13 @@ class UploadStatusManager:
     - ('FINALIZE',): Sent by the orchestrator when all workers are done.
     """
 
-    def __init__(self, event_emitter: Callable[["Event"], Awaitable[None]] | None):
+    def __init__(
+        self,
+        event_emitter: Callable[["Event"], Awaitable[None]] | None,
+        start_time: float,
+    ):
         self.event_emitter = event_emitter
+        self.start_time = start_time
         self.queue = asyncio.Queue()
         self.total_uploads_expected = 0
         self.uploads_completed = 0
@@ -243,16 +248,19 @@ class UploadStatusManager:
         if not self.is_active:
             return
 
+        elapsed_time = time.monotonic() - self.start_time
+        time_str = f"(+{elapsed_time:.2f}s)"
+
         is_done = (
             self.total_uploads_expected > 0
             and self.uploads_completed == self.total_uploads_expected
         )
 
         if is_done:
-            message = f"Upload complete. {self.uploads_completed} file(s) processed."
+            message = f"- Upload complete. {self.uploads_completed} file(s) processed. {time_str}"
         else:
             # Show "Uploading 1 of N..."
-            message = f"Uploading file {self.uploads_completed + 1} of {self.total_uploads_expected}..."
+            message = f"- Uploading file {self.uploads_completed + 1} of {self.total_uploads_expected}... {time_str}"
 
         await emit_status(
             message,
@@ -616,7 +624,7 @@ class GeminiContentBuilder:
             metadata_body, user_data
         )
 
-    async def build_contents(self) -> list[types.Content]:
+    async def build_contents(self, start_time: float) -> list[types.Content]:
         """
         The main public method to generate the contents list by processing all
         message turns concurrently and using a self-configuring status manager.
@@ -630,7 +638,7 @@ class GeminiContentBuilder:
             await emit_toast(warn_msg, self.event_emitter, "warning")
 
         # 1. Set up and launch the status manager. It will activate itself if needed.
-        status_manager = UploadStatusManager(self.event_emitter)
+        status_manager = UploadStatusManager(self.event_emitter, start_time=start_time)
         manager_task = asyncio.create_task(status_manager.run())
 
         # 2. Create and run concurrent processing tasks for each message turn.
@@ -1610,6 +1618,8 @@ class Pipe:
         __event_emitter__: Callable[["Event"], Awaitable[None]] | None,
         __metadata__: "Metadata",
     ) -> AsyncGenerator[dict, None] | str:
+
+        start_time = time.monotonic()
         self._add_log_handler(self.valves.LOG_LEVEL)
 
         # Apply settings from the user
@@ -1684,7 +1694,15 @@ class Pipe:
             valves=valves,
             files_api_manager=files_api_manager,
         )
-        contents = await builder.build_contents()
+        # This is our first timed event, marking the start of payload preparation.
+        asyncio.create_task(
+            emit_status(
+                "Preparing request...",
+                __event_emitter__,
+                done=False,
+            )
+        )
+        contents = await builder.build_contents(start_time=start_time)
 
         # Assemble GenerateContentConfig
         safety_settings: list[types.SafetySetting] | None = __metadata__.get(
@@ -1829,14 +1847,17 @@ class Pipe:
         # unified processor, which returns an AsyncGenerator. For non-streaming,
         # we adapt the single response object into a one-item async generator.
 
+        elapsed_time = time.monotonic() - start_time
+        time_str = f"(+{elapsed_time:.2f}s)"
+
         # Determine the request type to provide a more informative status message.
         is_streaming = features.get("stream", True)
         request_type_str = "streaming" if is_streaming else "non-streaming"
 
-        # Emit a single status update before making the actual API call.
+        # Emit a status update with timing before making the actual API call.
         asyncio.create_task(
             emit_status(
-                f"Sending {request_type_str} request to Google API...",
+                f"Sending {request_type_str} request to Google API... {time_str}",
                 __event_emitter__,
                 done=False,
             )
@@ -1859,6 +1880,7 @@ class Pipe:
                 __user__["id"],
                 chat_id,
                 message_id,
+                start_time=start_time,
             )
         else:
             # Non-streaming response.
@@ -1883,6 +1905,7 @@ class Pipe:
                 __user__["id"],
                 chat_id,
                 message_id,
+                start_time=start_time,
             )
 
     # region 2. Helper methods inside the Pipe class
@@ -2275,6 +2298,7 @@ class Pipe:
         user_id: str,
         chat_id: str,
         message_id: str,
+        start_time: float,
     ) -> AsyncGenerator[dict, None]:
         """
         Processes an async iterator of GenerateContentResponse objects, yielding
@@ -2299,9 +2323,11 @@ class Pipe:
 
                 if not first_chunk_received:
                     # This is the first (and possibly only) chunk.
+                    elapsed_time = time.monotonic() - start_time
+                    time_str = f"(+{elapsed_time:.2f}s)"
                     asyncio.create_task(
                         emit_status(
-                            "Response received",
+                            f"Response received {time_str}",
                             event_emitter,
                             done=True,
                         )
@@ -2342,8 +2368,10 @@ class Pipe:
         finally:
             # The async for loop has completed, meaning we have received all data
             # from the API. Now, we perform final internal processing.
+            elapsed_time = time.monotonic() - start_time
+            time_str = f"(+{elapsed_time:.2f}s)"
             await emit_status(
-                "Full response received",
+                f"Full response received {time_str}",
                 event_emitter,
                 done=True,
             )
