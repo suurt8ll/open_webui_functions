@@ -5,7 +5,7 @@ id: system_prompt_injector
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
-version: 0.7.0
+version: 0.8.0
 """
 
 # The injection must follow this format (without triple quotes).
@@ -15,8 +15,8 @@ version: 0.7.0
 <summary>{{prompt_title}}</summary>
 ```json
 {
-    system: "{{system_prompt}}",
-    temperature: {{temperature}}
+    "system": "{{system_prompt}}",
+    "temperature": {{temperature}}
 }
 ```
 </details>
@@ -26,6 +26,8 @@ version: 0.7.0
 # IMPORTANT: Disable "Rich Text Input for Chat" in Open WebUI settings for this plugin to work correctly.
 # See https://github.com/open-webui/open-webui/issues/9759 for more.
 
+import datetime
+import inspect
 import json
 import re
 from pydantic import BaseModel
@@ -59,25 +61,26 @@ class Filter:
         self.valves = self.Valves(**(valves if valves else {}))
         # Store the prompt title extracted during inlet for use in outlet
         self.prompt_title: str | None = None
-        print("Function has been initialized.")
+        self._log("Initialized.")
+
+    def _log(self, message: str):
+        """Helper method for standardized logging."""
+        timestamp = datetime.datetime.now().isoformat()
+        caller_name = inspect.stack()[1].function
+        print(f"[{timestamp}] [{__name__}.{caller_name}] {message}")
 
     def inlet(self, body: "Body") -> "Body":
-        print(f"\n--- Inlet Filter ---")
-        print("Original Request Body:")
-        # Use json.dumps for potentially large/complex body structure
-        try:
-            print(json.dumps(body, indent=2, default=str))
-        except Exception:
-            print(body)  # Fallback if json serialization fails
+        self._log("Inlet execution started.")
 
         messages: list["Message"] = body.get("messages", [])
         if not messages:
-            print("Warning: No messages found in the body.")
+            self._log("Warning: No messages found in the body.")
             return body
 
         latest_system_prompt, latest_options, prompt_title = None, None, None
 
-        # Process each user message to extract parameters
+        # Process each user message to find and extract prompt parameters.
+        # If multiple prompts are found, only the last one will be applied.
         for idx, message in enumerate(messages):
             if message.get("role") == "user":
                 message = cast("UserMessage", message)
@@ -86,52 +89,49 @@ class Filter:
                 )
                 messages[idx] = processed_message  # Update message in-place
 
-                # Track parameters only when title is found
+                # Track the parameters from the latest found prompt injection
                 if title is not None:
                     latest_system_prompt = sp
                     latest_options = opt
                     prompt_title = title
-        print(f"\n{latest_system_prompt=}\n{latest_options=}\n{prompt_title=}\n")
 
-        # Apply extracted parameters
-        self._handle_system_prompt(body, latest_system_prompt)
-        if latest_options:
-            self._handle_options(body, latest_options)  # type: ignore
-        # Display title only when params where changed.
-        if latest_options or latest_system_prompt:
-            self.prompt_title = prompt_title  # Store title for later use
+        # A prompt was detected in one of the user messages.
+        if prompt_title:
+            self._log(f"Detected prompt '{prompt_title}'. Applying settings.")
+            # Apply extracted parameters to the request body
+            self._handle_system_prompt(body, latest_system_prompt)
+            if latest_options:
+                self._handle_options(body, latest_options)  # type: ignore
+
+        # Store title for the outlet function only if parameters were changed.
+        # `is not None` is used because an empty string for system_prompt is a valid
+        # instruction (to remove it) but would be falsy in a boolean check.
+        if latest_options is not None or latest_system_prompt is not None:
+            self.prompt_title = prompt_title
         else:
             self.prompt_title = None
 
-        print("Modified Request Body (before sending to LLM):")
-        try:
-            print(json.dumps(body, indent=2, default=str))
-        except Exception:
-            print(body)  # Fallback
+        self._log("Inlet execution finished.")
         return body
 
     async def outlet(
         self, body: "Body", __event_emitter__: Callable[["Event"], Awaitable[None]]
     ) -> "Body":
+        self._log("Outlet execution started.")
 
-        print(f"\n--- Outlet Filter ---")
-        print("Response Body:")
-        try:
-            print(json.dumps(body, indent=2, default=str))
-        except Exception:
-            print(body)  # Fallback
-
-        # Only add header if a prompt title was set during inlet
+        # Only add a status header if a prompt title was set during inlet
         if self.prompt_title:
+            self._log(f"Emitting status event for prompt title: '{self.prompt_title}'")
             status_event: "StatusEvent" = {
                 "type": "status",
                 "data": {"description": self.prompt_title},
             }
             await __event_emitter__(status_event)
 
+        self._log("Outlet execution finished.")
         return body
 
-    # region ----- Helper methods inside the Pipe class -----
+    # region ----- Helper methods inside the Filter class -----
 
     def _process_user_message(
         self, user_message: "UserMessage"
@@ -151,6 +151,7 @@ class Filter:
             for ts in text_segments:
                 sp, ti, mod_ts, opt = self._extract_injection_params(ts)
                 new_text_segments.append(mod_ts)
+                # Keep the parameters from the last injection block found
                 if ti is not None:
                     system_prompt = sp
                     options = opt
@@ -158,7 +159,7 @@ class Filter:
 
             # Rebuild content structure
             combined_text = "".join(new_text_segments) if new_text_segments else None
-            new_content = non_text_content.copy()
+            new_content: list[Content] = non_text_content.copy()
             if combined_text:
                 new_content.append({"type": "text", "text": combined_text})
             user_message["content"] = new_content
@@ -179,7 +180,6 @@ class Filter:
         prompt_title = None
         modified_content = user_message_content
         json_data: dict[str, Any] | None = None
-        injection_block = None
 
         match = DETAILS_BLOCK_REGEX.search(user_message_content)
         if match:
@@ -197,19 +197,17 @@ class Filter:
                 try:
                     json_data = json.loads(json_str)
                 except json.JSONDecodeError as e:
-                    print(f"JSON Parse Error: {e}")  # Print exception directly
+                    self._log(f"JSON Parse Error: {e}")
                 if not json_data:
                     return (None, prompt_title, modified_content, None)
 
                 system_prompt = json_data.pop("system", None)
             else:
-                print("Warning: No JSON block found in parameters section")
+                self._log("Warning: No JSON block found in parameters section")
 
-        # Remove keys that have value None.
+        # Remove keys that have a value of None.
         if json_data:
-            for k, v in json_data.copy().items():
-                if v is None:
-                    json_data.pop(k)
+            json_data = {k: v for k, v in json_data.items() if v is not None}
 
         return (system_prompt, prompt_title, modified_content, json_data)
 
@@ -229,19 +227,19 @@ class Filter:
         body_options: dict[str, Any] | None = None
 
         if is_ollama:
-            body_options = body.setdefault("options", {})
+            body_options = body.setdefault("options", {})  # type: ignore
 
         for key, value in options.items():
             if value:
                 body[key] = value
                 if is_ollama and body_options is not None:
                     body_options[key] = value
-                print(f"Set option '{key}' to: {value}")
+                self._log(f"Set option '{key}' to: {value}")
             else:
                 body.pop(key, None)
                 if is_ollama and body_options is not None:
                     body_options.pop(key, None)
-                print(f"Removed option '{key}' due to falsy value.")
+                self._log(f"Removed option '{key}' due to falsy value.")
 
     def _handle_system_prompt(self, body: "Body", system_prompt: str | None) -> None:
         """
@@ -265,36 +263,39 @@ class Filter:
 
         body_options: dict[str, Any] | None = None
         if is_ollama:
-            if system_prompt is not None:
-                body_options = body.setdefault("options", {})
+            body_options = body.setdefault("options", {})  # type: ignore
 
         if system_prompt is None:
-            print("No system prompt provided; leaving existing messages unchanged.")
+            # No action needed if no system prompt was provided in the injection block.
+            return
 
         elif system_prompt == "":
-            print("Empty system prompt provided; removing existing system message.")
+            self._log("Empty system prompt provided; removing existing system message.")
             if system_message_index != -1:
                 messages.pop(system_message_index)
-                print("Removed system message from 'messages' list.")
+                self._log("Removed system message from 'messages' list.")
             if is_ollama and body_options is not None:
                 body_options.pop("system", None)
-                print("Removed 'system' key from Ollama options.")
+                self._log("Removed 'system' key from Ollama options.")
 
         else:
-            print(f"Applying system prompt: '{system_prompt[:50]}...'")
-            system_message: Message = {"role": "system", "content": system_prompt}
+            self._log(f"Applying system prompt: '{system_prompt[:70]}...'")
+            system_message: "SystemMessage" = {
+                "role": "system",
+                "content": system_prompt,
+            }
 
             if system_message_index != -1:
                 messages[system_message_index] = system_message
-                print("Updated existing system message in 'messages' list.")
+                self._log("Updated existing system message in 'messages' list.")
             else:
                 messages.insert(0, system_message)
-                print(
+                self._log(
                     "Inserted new system message at the beginning of 'messages' list."
                 )
 
             if is_ollama and body_options is not None:
                 body_options["system"] = system_prompt
-                print("Set 'system' key in Ollama options.")
+                self._log("Set 'system' key in Ollama options.")
 
     # endregion
