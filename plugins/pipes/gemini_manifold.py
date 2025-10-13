@@ -10,6 +10,13 @@ version: 1.25.0
 requirements: google-genai==1.41.0
 """
 
+VERSION = "1.25.0"
+# This is the recommended version for the companion filter.
+# Older versions might still work, but backward compatibility is not guaranteed
+# during the development of this personal use plugin.
+RECOMMENDED_COMPANION_VERSION = "1.6.0"
+
+
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
 # They don't have any effect on the plugin's functionality.
 
@@ -1637,9 +1644,14 @@ class Pipe:
         __metadata__: "Metadata",
     ) -> AsyncGenerator[dict, None] | str:
         self._add_log_handler(self.valves.LOG_LEVEL)
+
         log.debug(
-            "pipe method has been called. Gemini Manifold google_genai version is 1.25.0"
+            f"pipe method has been called. Gemini Manifold google_genai version is {VERSION}"
         )
+        features = __metadata__.get("features", {}) or {}
+
+        # Check the version of the companion filter
+        self._check_companion_filter_version(features)
 
         # Apply settings from the user
         valves: Pipe.Valves = self._get_merged_valves(
@@ -1688,7 +1700,6 @@ class Pipe:
         chat_id = __metadata__.get("chat_id", "not_provided")
         message_id = __metadata__.get("message_id", "not_provided")
 
-        features = __metadata__.get("features", {}) or {}
         log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
         )
@@ -3107,6 +3118,44 @@ class Pipe:
         if len(candidates) > 1:
             log.warning("Multiple candidates found, defaulting to first candidate.")
         return candidates[0]
+
+    def _check_companion_filter_version(self, features: "Features | dict") -> None:
+        """
+        Checks for the presence and version compatibility of the Gemini Manifold Companion filter.
+        Logs warnings if the filter is missing or outdated.
+        """
+        companion_version = features.get("gemini_manifold_companion_version")
+
+        if companion_version is None:
+            log.warning(
+                "Gemini Manifold Companion filter not detected. "
+                "While this pipe can function without it, you are missing out on key features like native Google Search, "
+                "Code Execution, and direct document uploads. Please install the companion filter or ensure it is active "
+                "for this model to unlock the full functionality."
+            )
+        else:
+            # Comparing tuples of integers is a robust way to handle versions like '1.10.0' vs '1.2.0'.
+            try:
+                companion_v_tuple = tuple(map(int, companion_version.split(".")))
+                recommended_v_tuple = tuple(
+                    map(int, RECOMMENDED_COMPANION_VERSION.split("."))
+                )
+
+                if companion_v_tuple < recommended_v_tuple:
+                    log.warning(
+                        f"The installed Gemini Manifold Companion filter version ({companion_version}) is older than "
+                        f"the recommended version ({RECOMMENDED_COMPANION_VERSION}). "
+                        "Some features may not work as expected. Please update the filter."
+                    )
+                else:
+                    log.debug(
+                        f"Gemini Manifold Companion filter detected with version: {companion_version}"
+                    )
+            except (ValueError, TypeError):
+                # This handles cases where the version string is malformed (e.g., '1.a.0').
+                log.error(
+                    f"Could not parse companion version string: '{companion_version}'. Version check skipped."
+                )
 
     # endregion 2.6 Utility helpers
 
