@@ -152,7 +152,9 @@ class Filter:
             )
             self._add_log_handler()
 
-        log.debug("inlet method has been triggered.")
+        log.debug(
+            "inlet method has been called. Gemini Manifold Companion version is 1.6.0"
+        )
 
         canonical_model_name, is_manifold = self._get_model_name(body)
         # Exit early if we are filtering an unsupported model.
@@ -272,6 +274,7 @@ class Filter:
 
         # TODO: Filter out the citation markers here.
 
+        log.debug("inlet method has finished.")
         return body
 
     def stream(self, event: dict) -> dict:
@@ -287,7 +290,7 @@ class Filter:
     ) -> "Body":
         """Modifies the complete response payload after it's received from the LLM. Operates on the final `body` dictionary."""
 
-        log.debug("outlet method has been triggered.")
+        log.debug("outlet method has been called.")
 
         chat_id: str = __metadata__.get("chat_id", "")
         message_id: str = __metadata__.get("message_id", "")
@@ -350,6 +353,7 @@ class Filter:
         else:
             log.info("No grounding metadata found in request state.")
 
+        log.debug("output method has finished.")
         return body
 
     # region 1. Helper methods inside the Filter class

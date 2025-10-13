@@ -1601,6 +1601,7 @@ class Pipe:
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
         self._add_log_handler(self.valves.LOG_LEVEL)
+        log.debug("pipes method has been called.")
 
         # Clear cache if caching is disabled
         if not self.valves.CACHE_MODELS:
@@ -1620,6 +1621,7 @@ class Pipe:
 
         log.info(f"Returning {len(filtered_models)} models to Open WebUI.")
         log.debug("Model list:", payload=filtered_models, _log_truncation_enabled=False)
+        log.debug("pipes method has finished.")
 
         return filtered_models
 
@@ -1635,6 +1637,9 @@ class Pipe:
         __metadata__: "Metadata",
     ) -> AsyncGenerator[dict, None] | str:
         self._add_log_handler(self.valves.LOG_LEVEL)
+        log.debug(
+            "pipe method has been called. Gemini Manifold google_genai version is 1.25.0"
+        )
 
         # Apply settings from the user
         valves: Pipe.Valves = self._get_merged_valves(
@@ -1869,6 +1874,7 @@ class Pipe:
             log.info(
                 "Streaming enabled. Returning AsyncGenerator from unified processor."
             )
+            log.debug("pipe method has finished.")
             return self._unified_response_processor(
                 response_stream,
                 __request__,
@@ -1911,6 +1917,7 @@ class Pipe:
                 "Streaming disabled. Adapting full response and returning "
                 "AsyncGenerator from unified processor."
             )
+            log.debug("pipe method has finished.")
             return self._unified_response_processor(
                 single_item_stream(res),
                 __request__,
@@ -2410,7 +2417,7 @@ class Pipe:
                 await emit_toast(error_msg, event_emitter, "error")
                 log.exception(error_msg)
 
-            log.debug("Unified response processor finished.")
+            log.debug("Unified response processor has finished.")
 
     async def _process_part(
         self,
