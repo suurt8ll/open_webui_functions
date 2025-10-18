@@ -180,6 +180,7 @@ class Features(TypedDict):
     reason: NotRequired[bool]
     url_context: NotRequired[bool]
     stream: NotRequired[bool]
+    gemini_manifold_companion_version: NotRequired[str]
 
 
 class Metadata(TypedDict):
