@@ -2414,13 +2414,6 @@ class Pipe:
         finally:
             # The async for loop has completed, meaning we have received all data
             # from the API. Now, we perform final internal processing.
-            elapsed_time = time.monotonic() - start_time
-            time_str = f"(+{elapsed_time:.2f}s)"
-            await emit_status(
-                f"Full response received {time_str}",
-                event_emitter,
-                done=True,
-            )
 
             if total_substitutions > 0 and not error_occurred:
                 plural_s = "s" if total_substitutions > 1 else ""
@@ -2441,6 +2434,7 @@ class Pipe:
                     chat_id=chat_id,
                     message_id=message_id,
                     stream_error_happened=error_occurred,
+                    start_time=start_time,
                 )
             except Exception as e:
                 error_msg = f"Post-processing failed with error:\n\n{e}"
@@ -2679,61 +2673,76 @@ class Pipe:
         message_id: str,
         *,
         stream_error_happened: bool = False,
+        start_time: float,
     ):
         """Handles emitting usage, grounding, and sources after the main response/stream is done."""
         log.info("Post-processing the model response.")
 
+        time_str = f"(+{(time.monotonic() - start_time):.2f}s)"
+
         if stream_error_happened:
-            log.warning(
-                "An error occurred during the stream, skipping post-processing."
+            log.warning("Response processing failed due to stream error.")
+            await emit_status(
+                f"Response failed [Stream Error] {time_str}", event_emitter, done=True
             )
-            # All the needed metadata is always in the last chunk, so if an error happened
-            # during the stream, we likely don't have the final response object.
             return
+
         if not model_response:
-            log.warning("model_response is empty, skipping post-processing.")
+            log.warning("Response processing skipped: Model response was empty.")
+            await emit_status(
+                f"Response failed [Empty Response] {time_str}", event_emitter, done=True
+            )
             return
+
         if not (candidate := self._get_first_candidate(model_response.candidates)):
-            log.warning("Response contains no candidates, skipping post-processing.")
+            log.warning("Response processing skipped: No candidates found.")
+            await emit_status(
+                f"Response failed [No Candidates] {time_str}", event_emitter, done=True
+            )
             return
 
-        finish_reason = candidate.finish_reason
-        finish_message = candidate.finish_message
-
-        # Handle cases where finish_reason might be None or a dynamic, unknown enum member.
-        reason_name = finish_reason.name if finish_reason else "UNSPECIFIED"
+        # --- Construct detailed finish reason message ---
+        reason_name = getattr(candidate.finish_reason, "name", "UNSPECIFIED")
         reason_description = FINISH_REASON_DESCRIPTIONS.get(reason_name)
+        finish_message = (
+            candidate.finish_message.strip() if candidate.finish_message else None
+        )
 
-        details_parts = []
-        if reason_description:
-            details_parts.append(reason_description)
-        if finish_message:
-            details_parts.append(finish_message.strip())
+        details_parts = [part for part in (reason_description, finish_message) if part]
+        details_str = f": {' '.join(details_parts)}" if details_parts else ""
+        full_finish_details = f"[{reason_name}]{details_str}"
 
-        full_finish_details = f"[{reason_name}]"
-        if details_parts:
-            full_finish_details += f": {' '.join(details_parts)}"
+        # --- Determine final status and emit toast for errors ---
+        is_normal_finish = candidate.finish_reason in NORMAL_REASONS
 
-        # If finish_reason is None, it will not be in NORMAL_REASONS and will be treated as an error.
-        if finish_reason in NORMAL_REASONS:
-            log.debug(f"Stream finished normally. {full_finish_details}")
+        if is_normal_finish:
+            log.debug(f"Response finished normally. {full_finish_details}")
+            status_prefix = "Response finished"
         else:
-            # All other reasons are treated as errors that should be shown to the user.
-            log.error(f"Stream finished with an error. {full_finish_details}")
+            log.error(f"Response finished with an error. {full_finish_details}")
+            status_prefix = "Response failed"
             await emit_toast(
                 f"An error occurred. {full_finish_details}",
                 event_emitter,
                 "error",
             )
 
+        await emit_status(
+            f"{status_prefix} [{reason_name}] {time_str}",
+            event_emitter,
+            done=True,
+        )
+
         # TODO: Emit a toast message if url context retrieval was not successful.
 
+        # --- Emit usage and grounding data ---
         # Attempt to emit token usage data even if the finish reason was problematic,
         # as usage data might still be available.
-        if usage_event := self._get_usage_data_event(model_response):
-            if event_emitter:
-                log.debug("Emitting usage data:", payload=usage_event)
-                await event_emitter(usage_event)
+        if event_emitter and (
+            usage_event := self._get_usage_data_event(model_response)
+        ):
+            log.debug("Emitting usage data:", payload=usage_event)
+            await event_emitter(usage_event)
 
         self._add_grounding_data_to_state(model_response, request, chat_id, message_id)
 
