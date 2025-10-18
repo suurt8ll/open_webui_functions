@@ -10,6 +10,13 @@ version: 1.25.0
 requirements: google-genai==1.41.0
 """
 
+VERSION = "1.25.0"
+# This is the recommended version for the companion filter.
+# Older versions might still work, but backward compatibility is not guaranteed
+# during the development of this personal use plugin.
+RECOMMENDED_COMPANION_VERSION = "1.6.0"
+
+
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
 # They don't have any effect on the plugin's functionality.
 
@@ -51,6 +58,7 @@ from pydantic import BaseModel, Field, field_validator
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import (
     Any,
+    Final,
     AsyncGenerator,
     Literal,
     TYPE_CHECKING,
@@ -70,6 +78,33 @@ if TYPE_CHECKING:
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
+
+# A mapping of finish reason names (str) to human-readable descriptions.
+# This allows handling of reasons that may not be defined in the current SDK version.
+FINISH_REASON_DESCRIPTIONS: Final = {
+    "FINISH_REASON_UNSPECIFIED": "The reason for finishing is not specified.",
+    "STOP": "Natural stopping point or stop sequence reached.",
+    "MAX_TOKENS": "The maximum number of tokens was reached.",
+    "SAFETY": "The response was blocked due to safety concerns.",
+    "RECITATION": "The response was blocked due to potential recitation of copyrighted material.",
+    "LANGUAGE": "The response was stopped because of an unsupported language.",
+    "OTHER": "The response was stopped for an unspecified reason.",
+    "BLOCKLIST": "The response was blocked due to a word on a blocklist.",
+    "PROHIBITED_CONTENT": "The response was blocked for containing prohibited content.",
+    "SPII": "The response was blocked for containing sensitive personally identifiable information.",
+    "MALFORMED_FUNCTION_CALL": "The model generated an invalid function call.",
+    "IMAGE_SAFETY": "Generated image was blocked due to safety concerns.",
+    "UNEXPECTED_TOOL_CALL": "The model generated an invalid tool call.",
+    "IMAGE_PROHIBITED_CONTENT": "Generated image was blocked for containing prohibited content.",
+    "NO_IMAGE": "The model was expected to generate an image, but it did not.",
+    "IMAGE_OTHER": (
+        "Image generation stopped for other reasons, possibly related to safety or quality. "
+        "Try a different image or prompt."
+    ),
+}
+
+# Finish reasons that are considered normal and do not require user notification.
+NORMAL_REASONS: Final = {types.FinishReason.STOP, types.FinishReason.MAX_TOKENS}
 
 # These tags will be "disabled" in the response, meaning that they will not be parsed by the backend.
 SPECIAL_TAGS_TO_DISABLE = [
@@ -1585,6 +1620,7 @@ class Pipe:
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
         self._add_log_handler(self.valves.LOG_LEVEL)
+        log.debug("pipes method has been called.")
 
         # Clear cache if caching is disabled
         if not self.valves.CACHE_MODELS:
@@ -1604,6 +1640,7 @@ class Pipe:
 
         log.info(f"Returning {len(filtered_models)} models to Open WebUI.")
         log.debug("Model list:", payload=filtered_models, _log_truncation_enabled=False)
+        log.debug("pipes method has finished.")
 
         return filtered_models
 
@@ -1621,6 +1658,14 @@ class Pipe:
 
         start_time = time.monotonic()
         self._add_log_handler(self.valves.LOG_LEVEL)
+
+        log.debug(
+            f"pipe method has been called. Gemini Manifold google_genai version is {VERSION}"
+        )
+        features = __metadata__.get("features", {}) or {}
+
+        # Check the version of the companion filter
+        self._check_companion_filter_version(features)
 
         # Apply settings from the user
         valves: Pipe.Valves = self._get_merged_valves(
@@ -1669,7 +1714,6 @@ class Pipe:
         chat_id = __metadata__.get("chat_id", "not_provided")
         message_id = __metadata__.get("message_id", "not_provided")
 
-        features = __metadata__.get("features", {}) or {}
         log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
         )
@@ -1872,6 +1916,7 @@ class Pipe:
             log.info(
                 "Streaming enabled. Returning AsyncGenerator from unified processor."
             )
+            log.debug("pipe method has finished.")
             return self._unified_response_processor(
                 response_stream,
                 __request__,
@@ -1897,6 +1942,7 @@ class Pipe:
                 "Streaming disabled. Adapting full response and returning "
                 "AsyncGenerator from unified processor."
             )
+            log.debug("pipe method has finished.")
             return self._unified_response_processor(
                 single_item_stream(res),
                 __request__,
@@ -2401,7 +2447,7 @@ class Pipe:
                 await emit_toast(error_msg, event_emitter, "error")
                 log.exception(error_msg)
 
-            log.debug("Unified response processor finished.")
+            log.debug("Unified response processor has finished.")
 
     async def _process_part(
         self,
@@ -2636,47 +2682,49 @@ class Pipe:
     ):
         """Handles emitting usage, grounding, and sources after the main response/stream is done."""
         log.info("Post-processing the model response.")
+
         if stream_error_happened:
             log.warning(
-                "An error occured during the stream, cannot do post-processing."
+                "An error occurred during the stream, skipping post-processing."
             )
             # All the needed metadata is always in the last chunk, so if an error happened
             # during the stream, we likely don't have the final response object.
             return
         if not model_response:
-            log.warning("model_response is empty, cannot do post-processing.")
+            log.warning("model_response is empty, skipping post-processing.")
             return
         if not (candidate := self._get_first_candidate(model_response.candidates)):
-            log.warning(
-                "Response does not contain any canditates. Cannot do post-processing."
-            )
+            log.warning("Response contains no candidates, skipping post-processing.")
             return
 
         finish_reason = candidate.finish_reason
         finish_message = candidate.finish_message
 
-        # Bucketize finish reasons to determine logging and notification levels.
-        NORMAL_REASONS = {types.FinishReason.STOP, types.FinishReason.MAX_TOKENS}
-        WARNING_REASONS = {types.FinishReason.RECITATION, types.FinishReason.OTHER}
+        # Handle cases where finish_reason might be None or a dynamic, unknown enum member.
+        reason_name = finish_reason.name if finish_reason else "UNSPECIFIED"
+        reason_description = FINISH_REASON_DESCRIPTIONS.get(reason_name)
 
+        details_parts = []
+        if reason_description:
+            details_parts.append(reason_description)
+        if finish_message:
+            details_parts.append(finish_message.strip())
+
+        full_finish_details = f"[{reason_name}]"
+        if details_parts:
+            full_finish_details += f": {' '.join(details_parts)}"
+
+        # If finish_reason is None, it will not be in NORMAL_REASONS and will be treated as an error.
         if finish_reason in NORMAL_REASONS:
-            log.debug(f"Stream finished normally with reason: {finish_reason.name}.")  # type: ignore
-        elif finish_reason is None or finish_reason in WARNING_REASONS:
-            reason_str = (
-                "an unknown reason" if finish_reason is None else finish_reason.name
+            log.debug(f"Stream finished normally. {full_finish_details}")
+        else:
+            # All other reasons are treated as errors that should be shown to the user.
+            log.error(f"Stream finished with an error. {full_finish_details}")
+            await emit_toast(
+                f"An error occurred. {full_finish_details}",
+                event_emitter,
+                "error",
             )
-            msg = f"Stream finished with a warning: {reason_str}."
-            if finish_message:
-                msg += f"\n\nDetails: {finish_message}"
-            log.warning(msg)
-            await emit_toast(msg, event_emitter, "warning")
-        else:  # All other reasons are treated as errors.
-            reason_str = finish_reason.name
-            msg = f"Stream finished with an error: {reason_str}."
-            if finish_message:
-                msg += f"\n\nDetails: {finish_message}"
-            log.error(msg)
-            await emit_toast(msg, event_emitter, "error")
 
         # TODO: Emit a toast message if url context retrieval was not successful.
 
@@ -2703,7 +2751,7 @@ class Pipe:
 
         if grounding_metadata_obj:
             log.debug(
-                f"Found grounding metadata. Storing in in request's app state using key {storage_key}."
+                f"Found grounding metadata. Storing in request's app state using key {storage_key}."
             )
             # Using shared `request.app.state` to pass grounding metadata to Filter.outlet.
             # This is necessary because the Pipe finishes during the initial `/api/completion` request,
@@ -2720,32 +2768,32 @@ class Pipe:
     ) -> "ChatCompletionEvent | None":
         """
         Extracts usage data from a GenerateContentResponse object.
-        Returns None if any of the core metrics (prompt_tokens, completion_tokens, total_tokens)
-        cannot be reliably determined.
-
-        Args:
-            response: The GenerateContentResponse object.
-
-        Returns:
-            A dictionary containing the usage data, formatted as a ResponseUsage type,
-            or None if any core metrics are missing.
+        Returns None if usage metadata is not present.
         """
-
         if not response.usage_metadata:
             log.warning(
-                "Usage_metadata is missing from the response. Cannot reliably determine usage."
+                "Usage metadata is missing from the response. Cannot determine usage."
             )
             return None
 
         usage_data = response.usage_metadata.model_dump()
+
+        # 1. Rename the three core required fields.
         usage_data["prompt_tokens"] = usage_data.pop("prompt_token_count")
         usage_data["completion_tokens"] = usage_data.pop("candidates_token_count")
         usage_data["total_tokens"] = usage_data.pop("total_token_count")
-        # Remove null values and turn ModalityTokenCount into dict.
-        for k, v in usage_data.copy().items():
-            if k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+
+        CORE_KEYS = {"prompt_tokens", "completion_tokens", "total_tokens"}
+
+        # 2. Remove auxiliary keys that have falsy values (None, empty list, etc.).
+        # We must iterate over a copy of keys to safely delete items from the dict.
+        for k in list(usage_data.keys()):
+            if k in CORE_KEYS:
                 continue
-            if not v:
+
+            # If the value is falsy (None, 0, empty list), remove the key.
+            # This retains non-core data (like modality counts) if it exists.
+            if not usage_data[k]:
                 del usage_data[k]
 
         completion_event: "ChatCompletionEvent" = {
@@ -3073,6 +3121,44 @@ class Pipe:
         if len(candidates) > 1:
             log.warning("Multiple candidates found, defaulting to first candidate.")
         return candidates[0]
+
+    def _check_companion_filter_version(self, features: "Features | dict") -> None:
+        """
+        Checks for the presence and version compatibility of the Gemini Manifold Companion filter.
+        Logs warnings if the filter is missing or outdated.
+        """
+        companion_version = features.get("gemini_manifold_companion_version")
+
+        if companion_version is None:
+            log.warning(
+                "Gemini Manifold Companion filter not detected. "
+                "While this pipe can function without it, you are missing out on key features like native Google Search, "
+                "Code Execution, and direct document uploads. Please install the companion filter or ensure it is active "
+                "for this model to unlock the full functionality."
+            )
+        else:
+            # Comparing tuples of integers is a robust way to handle versions like '1.10.0' vs '1.2.0'.
+            try:
+                companion_v_tuple = tuple(map(int, companion_version.split(".")))
+                recommended_v_tuple = tuple(
+                    map(int, RECOMMENDED_COMPANION_VERSION.split("."))
+                )
+
+                if companion_v_tuple < recommended_v_tuple:
+                    log.warning(
+                        f"The installed Gemini Manifold Companion filter version ({companion_version}) is older than "
+                        f"the recommended version ({RECOMMENDED_COMPANION_VERSION}). "
+                        "Some features may not work as expected. Please update the filter."
+                    )
+                else:
+                    log.debug(
+                        f"Gemini Manifold Companion filter detected with version: {companion_version}"
+                    )
+            except (ValueError, TypeError):
+                # This handles cases where the version string is malformed (e.g., '1.a.0').
+                log.error(
+                    f"Could not parse companion version string: '{companion_version}'. Version check skipped."
+                )
 
     # endregion 2.6 Utility helpers
 

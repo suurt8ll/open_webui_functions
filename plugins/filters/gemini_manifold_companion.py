@@ -9,6 +9,8 @@ license: MIT
 version: 1.6.0
 """
 
+VERSION = "1.6.0"
+
 # This filter can detect that a feature like web search or code execution is enabled in the front-end,
 # set the feature back to False so Open WebUI does not run it's own logic and then
 # pass custom values to "Gemini Manifold google_genai" that signal which feature was enabled and intercepted.
@@ -152,7 +154,9 @@ class Filter:
             )
             self._add_log_handler()
 
-        log.debug("inlet method has been triggered.")
+        log.debug(
+            f"inlet method has been called. Gemini Manifold Companion version is {VERSION}"
+        )
 
         canonical_model_name, is_manifold = self._get_model_name(body)
         # Exit early if we are filtering an unsupported model.
@@ -176,6 +180,9 @@ class Filter:
         if metadata_features is None:
             metadata_features = cast(Features, {})
             metadata["features"] = metadata_features
+
+        # Add the companion version to the payload for the pipe to consume.
+        metadata_features["gemini_manifold_companion_version"] = VERSION
 
         if is_grounding_model:
             web_search_enabled = (
@@ -272,6 +279,7 @@ class Filter:
 
         # TODO: Filter out the citation markers here.
 
+        log.debug("inlet method has finished.")
         return body
 
     def stream(self, event: dict) -> dict:
@@ -287,7 +295,7 @@ class Filter:
     ) -> "Body":
         """Modifies the complete response payload after it's received from the LLM. Operates on the final `body` dictionary."""
 
-        log.debug("outlet method has been triggered.")
+        log.debug("outlet method has been called.")
 
         chat_id: str = __metadata__.get("chat_id", "")
         message_id: str = __metadata__.get("message_id", "")
@@ -350,6 +358,7 @@ class Filter:
         else:
             log.info("No grounding metadata found in request state.")
 
+        log.debug("output method has finished.")
         return body
 
     # region 1. Helper methods inside the Filter class
