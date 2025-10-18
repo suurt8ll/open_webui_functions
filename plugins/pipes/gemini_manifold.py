@@ -2745,7 +2745,7 @@ class Pipe:
             log.debug("Emitting usage data:", payload=usage_event)
             await event_emitter(usage_event)
 
-        self._add_grounding_data_to_state(model_response, request, chat_id, message_id)
+        self._add_grounding_data_to_state(model_response, request, chat_id, message_id, start_time)
 
     def _add_grounding_data_to_state(
         self,
@@ -2753,22 +2753,23 @@ class Pipe:
         request: Request,
         chat_id: str,
         message_id: str,
+        pipe_start_time: float,
     ):
         candidate = self._get_first_candidate(response.candidates)
         grounding_metadata_obj = candidate.grounding_metadata if candidate else None
 
-        storage_key = f"grounding_{chat_id}_{message_id}"
+        app_state: State = request.app.state
+        grounding_key = f"grounding_{chat_id}_{message_id}"
+        time_key = f"pipe_start_time_{chat_id}_{message_id}"
 
         if grounding_metadata_obj:
             log.debug(
-                f"Found grounding metadata. Storing in request's app state using key {storage_key}."
+                f"Found grounding metadata. Storing in request's app state using key {grounding_key}."
             )
-            # Using shared `request.app.state` to pass grounding metadata to Filter.outlet.
-            # This is necessary because the Pipe finishes during the initial `/api/completion` request,
-            # while Filter.outlet is invoked by a separate, later `/api/chat/completed` request.
-            # `request.state` does not persist across these distinct request lifecycles.
-            app_state: State = request.app.state
-            app_state._state[storage_key] = grounding_metadata_obj
+            # Using shared `request.app.state` to pass data to Filter.outlet.
+            # This is necessary because the Pipe and Filter operate on different requests.
+            app_state._state[grounding_key] = grounding_metadata_obj
+            app_state._state[time_key] = pipe_start_time
         else:
             log.debug(f"Response {message_id} does not have grounding metadata.")
 
