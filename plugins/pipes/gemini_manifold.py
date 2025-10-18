@@ -2678,7 +2678,8 @@ class Pipe:
         """Handles emitting usage, grounding, and sources after the main response/stream is done."""
         log.info("Post-processing the model response.")
 
-        time_str = f"(+{(time.monotonic() - start_time):.2f}s)"
+        elapsed_time = time.monotonic() - start_time
+        time_str = f"(+{elapsed_time:.2f}s)"
 
         if stream_error_happened:
             log.warning("Response processing failed due to stream error.")
@@ -2738,9 +2739,9 @@ class Pipe:
         # --- Emit usage and grounding data ---
         # Attempt to emit token usage data even if the finish reason was problematic,
         # as usage data might still be available.
-        if event_emitter and (
-            usage_event := self._get_usage_data_event(model_response)
-        ):
+        if event_emitter and (usage_event := self._get_usage_data_event(model_response)):
+            # Inject the total processing time into the usage payload.
+            usage_event["data"]["usage"]["completion_time"] = round(elapsed_time, 2) # type: ignore
             log.debug("Emitting usage data:", payload=usage_event)
             await event_emitter(usage_event)
 
