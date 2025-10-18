@@ -1,50 +1,102 @@
+import asyncio
 import hashlib
 import os
-import asyncio
 import signal
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Any
 
-import aiohttp
 import aiofiles
+import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
 
+# --- Configuration & State Management ---
 
-async def file_hash(filename: str) -> str:
-    """Calculate SHA256 hash of a file asynchronously."""
+
+class ApiState(Enum):
+    """Represents the perceived state of the remote API."""
+
+    UNKNOWN = auto()
+    AVAILABLE = auto()
+    UNAVAILABLE = auto()
+
+
+@dataclass(frozen=True)
+class Config:
+    """Typed configuration loaded from environment variables."""
+
+    api_endpoint: str
+    api_key: str
+    filepaths: list[str]
+    polling_interval: int
+
+
+def load_config() -> Config:
+    """Loads and validates required environment variables into a Config object."""
+    load_dotenv()
+    required_vars = ["API_ENDPOINT", "API_KEY", "FILEPATHS"]
+    env_vars: dict[str, Any] = {}
+
+    for var in required_vars:
+        value = os.getenv(var)
+        if not value:
+            logger.critical(f"Missing required environment variable: {var}")
+            raise ValueError(f"Missing environment variable: {var}")
+
+        env_vars[var] = value
+
+    return Config(
+        api_endpoint=env_vars["API_ENDPOINT"],
+        api_key=env_vars["API_KEY"],
+        filepaths=[path.strip() for path in env_vars["FILEPATHS"].split(",")],
+        polling_interval=int(os.getenv("POLLING_INTERVAL", "5")),
+    )
+
+
+# --- File Utilities ---
+
+
+async def file_hash(filename: str) -> str | None:
+    """
+    Calculate the SHA256 hash of a file asynchronously.
+    Returns None if the file cannot be read.
+    """
     hasher = hashlib.sha256()
     try:
         async with aiofiles.open(filename, "rb") as file:
-            while True:
-                chunk = await file.read(4096)
-                if not chunk:
-                    break
+            while chunk := await file.read(4096):
                 hasher.update(chunk)
     except FileNotFoundError:
-        logger.error(f"File not found: {filename}")
-        return ""  # Return empty string if file not found
+        # This is handled separately in the main loop, so no need to log here.
+        return None
     except Exception as e:
-        logger.exception(
-            f"Error reading file {filename}: {e}"
-        )  # Use exception for full traceback
-        return ""
+        logger.exception(f"Error reading file {filename}: {e}")
+        return None
     return hasher.hexdigest()
 
 
 async def extract_metadata_from_file(filepath: str) -> dict[str, str]:
-    """Extract metadata from the first docstring in a Python file asynchronously."""
+    """
+    Extracts metadata from the first docstring in a Python file.
+
+    NOTE: This is a simple parser. For more complex scenarios, using `ast.get_docstring`
+          might be more robust, but this is sufficient for this utility's purpose.
+    """
     metadata = {}
     try:
-        async with aiofiles.open(filepath, "r") as file:
+        async with aiofiles.open(filepath, "r", encoding="utf-8") as file:
             content = await file.read()
 
-        # Find first docstring
-        doc_start = content.find('"""')
-        if doc_start == -1:
-            return metadata
+        # A simple way to find the first module-level docstring
+        if not content.strip().startswith('"""'):
+            return {}
 
+        doc_start = content.find('"""')
         doc_end = content.find('"""', doc_start + 3)
+
         if doc_end == -1:
-            return metadata
+            return {}
 
         docstring = content[doc_start + 3 : doc_end]
         for line in docstring.splitlines():
@@ -54,281 +106,267 @@ async def extract_metadata_from_file(filepath: str) -> dict[str, str]:
                 metadata[key.strip()] = value.strip()
 
     except FileNotFoundError:
-        logger.error(f"File not found: {filepath}")
+        # This is handled by the caller, no need to log here.
+        pass
     except Exception as e:
-        logger.warning(f"Metadata extraction error: {e}")
+        logger.warning(f"Metadata extraction error for {filepath}: {e}")
 
     return metadata
 
 
-async def check_api_availability(
-    api_endpoint: str, session: aiohttp.ClientSession
-) -> bool:
-    """Check if the API endpoint is available, asynchronously."""
-    try:
-        async with session.get(f"{api_endpoint}/health") as response:
-            response.raise_for_status()
-            return True
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        return False
-    except Exception as e:
-        logger.exception(f"Unexpected error checking API: {e}")
-        return False
+# --- API Client ---
 
 
-async def function_exists(
-    api_endpoint: str, function_id: str, api_key: str, session: aiohttp.ClientSession
-) -> bool:
-    """Check if a function with the given ID exists, asynchronously."""
-    try:
-        async with session.get(
-            f"{api_endpoint}/functions/", headers={"Authorization": f"Bearer {api_key}"}
-        ) as response:
-            response.raise_for_status()
-            functions = await response.json()
-            for function in functions:
-                if function["id"] == function_id:
-                    return True
+class OwuiApiClient:
+    """A client to interact with the OWUI functions API."""
+
+    def __init__(self, session: aiohttp.ClientSession, root_url: str, api_key: str):
+        self._session = session
+        self._root_url = root_url
+        self._base_api_url = f"{root_url}/api/v1"
+        self._api_key = api_key
+        self._headers = {"Authorization": f"Bearer {self._api_key}"}
+
+    async def check_availability(self) -> bool:
+        """Checks if the API is healthy and responsive."""
+        try:
+            # The health endpoint is at the root, not under /api/v1
+            async with self._session.get(
+                f"{self._root_url}/health", timeout=aiohttp.ClientTimeout(total=3)
+            ) as response:
+                return response.status == 200
+        except (aiohttp.ClientError, asyncio.TimeoutError):
             return False
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logger.error(f"Error checking function existence: {e}")
-        return False
-    except Exception as e:
-        logger.exception(f"Unexpected error checking function: {e}")
-        return False
+        except Exception as e:
+            logger.exception(f"Unexpected error checking API: {e}")
+            return False
 
+    async def function_exists(self, function_id: str) -> bool:
+        """Checks if a function with the given ID exists."""
+        try:
+            async with self._session.get(
+                f"{self._base_api_url}/functions/", headers=self._headers
+            ) as response:
+                response.raise_for_status()
+                functions = await response.json()
+                return any(f["id"] == function_id for f in functions)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.error(f"Error checking function existence: {e}")
+            return False
+        except Exception as e:
+            logger.exception(f"Unexpected error checking function: {e}")
+            return False
 
-async def create_function(
-    filepath: str,
-    api_endpoint: str,
-    function_id: str,
-    function_name: str,
-    function_description: str,
-    api_key: str,
-    session: aiohttp.ClientSession,
-) -> None:
-    """Create a new remote function via API, asynchronously."""
-    try:
-        async with aiofiles.open(filepath, "r") as file:
-            code_content = await file.read()
-
+    async def _create_function(
+        self,
+        filepath: str,
+        function_id: str,
+        function_name: str,
+        description: str,
+        code_content: str,
+    ) -> None:
+        """Helper to create a new remote function."""
         payload = {
             "id": function_id,
             "name": function_name,
             "content": code_content,
-            "meta": {"description": function_description, "manifest": {}},
+            "meta": {"description": description, "manifest": {}},
         }
-        async with session.post(
-            f"{api_endpoint}/functions/create",
-            headers={"Authorization": f"Bearer {api_key}"},
+        async with self._session.post(
+            f"{self._base_api_url}/functions/create",
+            headers=self._headers,
             json=payload,
         ) as response:
             response.raise_for_status()
-            logger.info(f"Created new function {function_id} from {filepath}")
+            logger.info(f"✅ Created new function '{function_id}' from {filepath}")
 
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logger.error(
-            f"Creation failed for {filepath}: {type(e).__name__}: {e}. Check network/API status."
-        )
-    except Exception as e:
-        logger.exception(f"Unexpected error creating function: {e}")
+    async def update_or_create_function(
+        self,
+        filepath: str,
+        function_id: str,
+        function_name: str,
+        description: str,
+    ) -> None:
+        """Updates a remote function, or creates it if it doesn't exist."""
+        try:
+            async with aiofiles.open(filepath, "r", encoding="utf-8") as file:
+                code_content = await file.read()
+        except (IOError, OSError) as e:
+            logger.error(f"Failed to read file {filepath} before update: {e}")
+            return
 
+        try:
+            payload = {
+                "id": function_id,
+                "name": function_name,
+                "content": code_content,
+                "meta": {"description": description, "manifest": {}},
+            }
 
-async def update_function(
-    filepath: str,
-    api_endpoint: str,
-    function_id: str,
-    function_name: str,
-    function_description: str,
-    api_key: str,
-    session: aiohttp.ClientSession,
-) -> None:
-    """Update remote function, or create if it doesn't exist, asynchronously."""
-    try:
-        async with aiofiles.open(filepath, "r") as file:
-            code_content = await file.read()
+            async with self._session.post(
+                f"{self._base_api_url}/functions/id/{function_id}/update",
+                headers=self._headers,
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                logger.info(f"🔄 Updated function '{function_id}' from {filepath}")
 
-        payload = {
-            "id": function_id,
-            "name": function_name,
-            "content": code_content,
-            "meta": {"description": function_description, "manifest": {}},
-        }
-
-        async with session.post(
-            f"{api_endpoint}/functions/id/{function_id}/update",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json=payload,
-        ) as response:
-            response.raise_for_status()
-            logger.info(f"Updated {function_id} from {filepath}")
-
-    except aiohttp.ClientResponseError as e:
-        if e.status == 400:
-            if await function_exists(api_endpoint, function_id, api_key, session):
-                logger.error(
-                    f"Update failed for {filepath}: Function exists, but update failed. Check function and re-enable."
-                )
-            else:
+        except aiohttp.ClientResponseError as e:
+            if e.status in {400, 404}:  # Handle both 'Bad Request' and 'Not Found'
                 logger.warning(
-                    f"Function {function_id} not found (400). Creating new function."
+                    f"Function '{function_id}' not found or failed to update (Status: {e.status}). Attempting to create it."
                 )
-                await create_function(
-                    filepath,
-                    api_endpoint,
-                    function_id,
-                    function_name,
-                    function_description,
-                    api_key,
-                    session,
-                )
-        else:
-            logger.error(
-                f"Update failed for {filepath}: {type(e).__name__}: {e}. Check function and re-enable."
-            )
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logger.error(
-            f"Update failed for {filepath}: {type(e).__name__}: {e}. Check network/API status."
-        )
-    except Exception as e:
-        logger.exception(f"Unexpected error updating function: {e}")
-
-
-def validate_env_vars() -> dict[str, str]:
-    """Validate required environment variables."""
-    required_vars = ["API_ENDPOINT", "API_KEY", "FILEPATHS"]
-    env_vars = {}
-
-    for var in required_vars:
-        value = os.getenv(var)
-        if not value:
-            logger.critical(f"Missing required environment variable: {var}")
-            exit(1)  # Exit with a non-zero code to indicate failure
-        env_vars[var] = value
-
-    env_vars["FILEPATHS"] = [path.strip() for path in env_vars["FILEPATHS"].split(",")]
-    env_vars["POLLING_INTERVAL"] = int(os.getenv("POLLING_INTERVAL", "5"))
-
-    return env_vars
-
-
-async def process_file(
-    path: str,
-    api_endpoint: str,
-    api_key: str,
-    file_states: dict[str, str | None],
-    session: aiohttp.ClientSession,
-    missing_file_logged: set[str],
-):
-    """Process a single file, checking for changes and updating/creating."""
-    if not os.path.exists(path):
-        if path not in missing_file_logged:
-            logger.warning(f"Missing file: {path}")
-            missing_file_logged.add(path)
-        return
-
-    # If the file exists, ensure it's removed from the missing_file_logged set
-    if path in missing_file_logged:
-        missing_file_logged.remove(path)
-
-    current_hash = await file_hash(path)
-    if not current_hash:
-        return
-    metadata = await extract_metadata_from_file(path)
-
-    function_id = metadata.get("id", "")
-    function_name = metadata.get("title", "")
-    description = metadata.get("description", "")
-
-    if not all([function_id, function_name, description]):
-        logger.warning(f"Missing metadata for {path}")
-        return
-
-    if current_hash != file_states[path]:
-        if file_states[path] is not None:
-            await update_function(
-                path,
-                api_endpoint,
-                function_id,
-                function_name,
-                description,
-                api_key,
-                session,
-            )
-        file_states[path] = current_hash
-
-
-async def main() -> None:
-    """Main monitoring loop."""
-    load_dotenv()
-    env_vars = validate_env_vars()
-
-    filepaths = env_vars["FILEPATHS"]
-    api_endpoint = env_vars["API_ENDPOINT"]
-    api_key = env_vars["API_KEY"]
-    polling_interval = int(env_vars["POLLING_INTERVAL"])
-
-    file_states: dict[str, str | None] = {path: None for path in filepaths}
-    missing_file_logged: set[str] = set()  # Keep track of files we've warned about
-
-    api_available = True  # Assume API is available at startup
-    api_unavailable_logged = False  # Flag to track if "API unavailable" has been logged
-
-    async with aiohttp.ClientSession() as session:
-        while True:
-            if shutdown_event.is_set():  # Check for shutdown signal
-                logger.info("Exiting main loop due to shutdown signal.")
-                break
-
-            if not await check_api_availability(api_endpoint, session):
-                if api_available:  # Only log if API was previously available
-                    logger.info(f"API unavailable. Waiting...")
-                    api_available = False
-                    api_unavailable_logged = (
-                        True  # Mark that unavailable log has been made
+                try:
+                    await self._create_function(
+                        filepath,
+                        function_id,
+                        function_name,
+                        description,
+                        code_content,
+                    )
+                except (aiohttp.ClientError, asyncio.TimeoutError) as create_err:
+                    logger.error(f"Creation failed for {filepath}: {create_err}")
+                except Exception as create_exc:
+                    logger.exception(
+                        f"Unexpected error creating function {function_id}"
                     )
             else:
-                if (
-                    not api_available and api_unavailable_logged
-                ):  # Log reconnection only if it was previously unavailable and log was made
-                    logger.info("API reconnected.")
-                    api_available = True
-                    api_unavailable_logged = False  # Reset the unavailable log flag
+                logger.error(f"Update failed for {filepath}: {e}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.error(
+                f"Update failed for {filepath}: {type(e).__name__}: {e}. Check network/API status."
+            )
+        except Exception as e:
+            logger.exception(f"Unexpected error updating function: {e}")
 
-            if api_available:  # Only process files if API is available
-                tasks = [
-                    process_file(
-                        path,
-                        api_endpoint + "/api/v1",
-                        api_key,
-                        file_states,
-                        session,
-                        missing_file_logged,
+
+# --- Main Application ---
+
+
+class FunctionUpdater:
+    """The main application class that orchestrates file monitoring and updates."""
+
+    def __init__(self, config: Config, shutdown_event: asyncio.Event):
+        self.config = config
+        self.shutdown_event = shutdown_event
+        self.api_state = ApiState.UNKNOWN
+        self.file_hashes: dict[str, str | None] = {
+            path: None for path in config.filepaths
+        }
+        self.missing_file_logged: set[str] = set()
+
+    async def _check_api_status(self, client: OwuiApiClient) -> None:
+        """Checks API availability and updates the state, logging changes."""
+        is_available = await client.check_availability()
+        if is_available:
+            if self.api_state != ApiState.AVAILABLE:
+                logger.info("API is available. Starting to process files...")
+                self.api_state = ApiState.AVAILABLE
+        else:
+            if self.api_state != ApiState.UNAVAILABLE:
+                logger.warning("API is unavailable. Will keep retrying...")
+                self.api_state = ApiState.UNAVAILABLE
+
+    async def _process_file(self, path: str, client: OwuiApiClient) -> None:
+        """Processes a single file, checking for changes and updating if necessary."""
+        if not os.path.exists(path):
+            if path not in self.missing_file_logged:
+                logger.warning(f"File not found: {path}")
+                self.missing_file_logged.add(path)
+            return
+
+        if path in self.missing_file_logged:
+            self.missing_file_logged.remove(path)
+
+        current_hash = await file_hash(path)
+        if not current_hash:
+            return
+
+        if current_hash == self.file_hashes.get(path):
+            return  # No change, skip processing
+
+        logger.debug(f"File change detected for {path}")
+        metadata = await extract_metadata_from_file(path)
+        function_id = metadata.get("id")
+        function_name = metadata.get("title")
+        description = metadata.get("description")
+
+        if not all([function_id, function_name, description]):
+            logger.warning(
+                f"Skipping {path}: Missing required metadata ('id', 'title', 'description')."
+            )
+            return
+
+        # Assertions to satisfy the type checker after the 'all' check.
+        assert function_id is not None
+        assert function_name is not None
+        assert description is not None
+
+        # A file has changed, so we trigger an update.
+        await client.update_or_create_function(
+            path, function_id, function_name, description
+        )
+        # Only update the hash on successful processing to ensure retry on failure.
+        self.file_hashes[path] = current_hash
+
+    async def run(self) -> None:
+        """The main execution loop."""
+        async with aiohttp.ClientSession() as session:
+            api_client = OwuiApiClient(
+                session, self.config.api_endpoint, self.config.api_key
+            )
+            while not self.shutdown_event.is_set():
+                await self._check_api_status(api_client)
+
+                if self.api_state == ApiState.AVAILABLE:
+                    # Use a TaskGroup for robust concurrent execution (Python 3.11+)
+                    try:
+                        async with asyncio.TaskGroup() as tg:
+                            for path in self.config.filepaths:
+                                tg.create_task(self._process_file(path, api_client))
+                    except Exception as e:
+                        logger.exception(
+                            f"An error occurred during file processing: {e}"
+                        )
+
+                try:
+                    # Use the shutdown event for a more responsive sleep
+                    await asyncio.wait_for(
+                        self.shutdown_event.wait(), timeout=self.config.polling_interval
                     )
-                    for path in filepaths
-                ]
-                await asyncio.gather(*tasks)
+                except asyncio.TimeoutError:
+                    continue  # This is the normal polling loop
+                except asyncio.CancelledError:
+                    break
 
-            await asyncio.sleep(polling_interval)
 
-
-if __name__ == "__main__":
+async def main_wrapper() -> None:
+    """Sets up signal handling and runs the main application."""
     shutdown_event = asyncio.Event()
 
     def signal_handler(signum, frame):
-        logger.warning(f"Received signal {signum}. Shutting down...")
+        logger.warning(f"Received signal {signum}. Initiating shutdown...")
         shutdown_event.set()
 
-    async def main_wrapper():
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, signal_handler, sig, None)
-
-        await main()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, signal_handler, sig, None)
 
     try:
-        asyncio.run(main_wrapper())
+        config = load_config()
+        updater = FunctionUpdater(config, shutdown_event)
+        await updater.run()
+    except ValueError as e:
+        # This catches configuration errors from load_config
+        logger.critical(e)
+    except asyncio.CancelledError:
+        logger.info("Main task cancelled.")
     except Exception:
-        logger.exception(f"An error occurred:")
+        logger.exception("An unexpected error occurred in the main application:")
     finally:
-        logger.info("Shutting down...")
+        logger.info("Shutdown complete.")
+
+
+if __name__ == "__main__":
+    logger.info("Starting function updater utility...")
+    asyncio.run(main_wrapper())
