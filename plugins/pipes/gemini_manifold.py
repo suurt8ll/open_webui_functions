@@ -79,25 +79,32 @@ if TYPE_CHECKING:
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
 
-# Finish reasons are bucketized to determine logging and notification levels.
+# A mapping of finish reason names (str) to human-readable descriptions.
+# This allows handling of reasons that may not be defined in the current SDK version.
+FINISH_REASON_DESCRIPTIONS: Final = {
+    "FINISH_REASON_UNSPECIFIED": "The reason for finishing is not specified.",
+    "STOP": "Natural stopping point or stop sequence reached.",
+    "MAX_TOKENS": "The maximum number of tokens was reached.",
+    "SAFETY": "The response was blocked due to safety concerns.",
+    "RECITATION": "The response was blocked due to potential recitation of copyrighted material.",
+    "LANGUAGE": "The response was stopped because of an unsupported language.",
+    "OTHER": "The response was stopped for an unspecified reason.",
+    "BLOCKLIST": "The response was blocked due to a word on a blocklist.",
+    "PROHIBITED_CONTENT": "The response was blocked for containing prohibited content.",
+    "SPII": "The response was blocked for containing sensitive personally identifiable information.",
+    "MALFORMED_FUNCTION_CALL": "The model generated an invalid function call.",
+    "IMAGE_SAFETY": "Generated image was blocked due to safety concerns.",
+    "UNEXPECTED_TOOL_CALL": "The model generated an invalid tool call.",
+    "IMAGE_PROHIBITED_CONTENT": "Generated image was blocked for containing prohibited content.",
+    "NO_IMAGE": "The model was expected to generate an image, but it did not.",
+    "IMAGE_OTHER": (
+        "Image generation stopped for other reasons, possibly related to safety or quality. "
+        "Try a different image or prompt."
+    ),
+}
+
+# Finish reasons that are considered normal and do not require user notification.
 NORMAL_REASONS: Final = {types.FinishReason.STOP, types.FinishReason.MAX_TOKENS}
-WARNING_REASONS: Final = {
-    types.FinishReason.RECITATION,
-    types.FinishReason.OTHER,
-    types.FinishReason.FINISH_REASON_UNSPECIFIED,
-}
-ERROR_REASONS: Final = {
-    types.FinishReason.SAFETY,
-    types.FinishReason.LANGUAGE,
-    types.FinishReason.BLOCKLIST,
-    types.FinishReason.PROHIBITED_CONTENT,
-    types.FinishReason.SPII,
-    types.FinishReason.MALFORMED_FUNCTION_CALL,
-    types.FinishReason.IMAGE_SAFETY,
-    types.FinishReason.UNEXPECTED_TOOL_CALL,
-    types.FinishReason.IMAGE_PROHIBITED_CONTENT,
-    types.FinishReason.NO_IMAGE,
-}
 
 # These tags will be "disabled" in the response, meaning that they will not be parsed by the backend.
 SPECIAL_TAGS_TO_DISABLE = [
@@ -2680,47 +2687,31 @@ class Pipe:
         finish_reason = candidate.finish_reason
         finish_message = candidate.finish_message
 
+        # Handle cases where finish_reason might be None or a dynamic, unknown enum member.
         reason_name = finish_reason.name if finish_reason else "UNSPECIFIED"
-        full_finish_details = f"[{reason_name}]"
-        if finish_message:
-            full_finish_details += f": {finish_message}"
+        reason_description = FINISH_REASON_DESCRIPTIONS.get(reason_name)
 
-        match finish_reason:
-            case r if r in NORMAL_REASONS:
-                log.debug(f"Stream finished normally. {full_finish_details}")
-            case r if r in WARNING_REASONS:
-                log.warning(f"Stream finished with a warning. {full_finish_details}")
-                await emit_toast(
-                    f"Finished with a warning. {full_finish_details}",
-                    event_emitter,
-                    "warning",
-                )
-            case r if r in ERROR_REASONS:
-                log.error(f"Stream finished with an error. {full_finish_details}")
-                await emit_toast(
-                    f"An error occurred. {full_finish_details}",
-                    event_emitter,
-                    "error",
-                )
-            case None:
-                log.warning(
-                    f"Stream finished for an unknown reason. {full_finish_details}"
-                )
-                await emit_toast(
-                    f"Finished with a warning. {full_finish_details}",
-                    event_emitter,
-                    "warning",
-                )
-            case _:
-                log.error(
-                    f"Stream finished with an unhandled reason: {reason_name}. "
-                    f"{full_finish_details}"
-                )
-                await emit_toast(
-                    f"An unexpected error occurred. {full_finish_details}",
-                    event_emitter,
-                    "error",
-                )
+        details_parts = []
+        if reason_description:
+            details_parts.append(reason_description)
+        if finish_message:
+            details_parts.append(finish_message.strip())
+
+        full_finish_details = f"[{reason_name}]"
+        if details_parts:
+            full_finish_details += f": {' '.join(details_parts)}"
+
+        # If finish_reason is None, it will not be in NORMAL_REASONS and will be treated as an error.
+        if finish_reason in NORMAL_REASONS:
+            log.debug(f"Stream finished normally. {full_finish_details}")
+        else:
+            # All other reasons are treated as errors that should be shown to the user.
+            log.error(f"Stream finished with an error. {full_finish_details}")
+            await emit_toast(
+                f"An error occurred. {full_finish_details}",
+                event_emitter,
+                "error",
+            )
 
         # TODO: Emit a toast message if url context retrieval was not successful.
 
