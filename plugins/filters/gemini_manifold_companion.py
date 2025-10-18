@@ -224,19 +224,25 @@ class Filter:
             if __metadata__["chat_id"] == "local":
                 # TODO toast notification
                 log.warning(
-                    "Temporary chats don't have support for native PDF upload currently"
-                    "This chat will likely use Open WebUI's RAG."
+                    "Bypassing Open WebUI's RAG is not possible for temporary chats. "
+                    "The Manifold pipe requires a database entry to access uploaded files, "
+                    "which temporary chats do not have. Falling back to Open WebUI's RAG."
                 )
                 metadata_features["upload_documents"] = False
-                return body
-            log.info(
-                "BYPASS_BACKEND_RAG is enabled, bypassing Open WebUI RAG and allowing gemini_manifold pipe to handle the rest."
-            )
-            if files := body.get("files"):
-                log.info(f"Removing {len(files)} from backend's RAG pipeline.")
-                body["files"] = []
-            metadata_features["upload_documents"] = True
+            else:
+                log.info(
+                    "BYPASS_BACKEND_RAG is enabled, bypassing Open WebUI RAG to let the Manifold pipe handle documents."
+                )
+                if files := body.get("files"):
+                    log.info(
+                        f"Removing {len(files)} files from the Open WebUI RAG pipeline."
+                    )
+                    body["files"] = []
+                metadata_features["upload_documents"] = True
         else:
+            log.info(
+                "BYPASS_BACKEND_RAG is disabled. Open WebUI's RAG will be used if applicable."
+            )
             metadata_features["upload_documents"] = False
 
         # The manifold pipe requires the backend to be in streaming mode to correctly
