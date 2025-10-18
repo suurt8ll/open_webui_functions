@@ -95,9 +95,8 @@ ERROR_REASONS: Final = {
     types.FinishReason.MALFORMED_FUNCTION_CALL,
     types.FinishReason.IMAGE_SAFETY,
     types.FinishReason.UNEXPECTED_TOOL_CALL,
-    # FIXME: These cause "open_webui.utils.plugin:load_function_module_by_id:159 - Error loading module ..." errors for some reason
-    # types.FinishReason.IMAGE_PROHIBITED_CONTENT,
-    # types.FinishReason.NO_IMAGE,
+    types.FinishReason.IMAGE_PROHIBITED_CONTENT,
+    types.FinishReason.NO_IMAGE,
 }
 
 # These tags will be "disabled" in the response, meaning that they will not be parsed by the backend.
