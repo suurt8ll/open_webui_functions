@@ -802,7 +802,7 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
         mock_text_part.text = "Hello!"
         mock_part_from_text.return_value = mock_text_part
 
-        contents = await builder.build_contents()
+        contents = await builder.build_contents(start_time=0.0)
 
         mock_misc_module.pop_system_message.assert_called_once_with(messages_body)
         mock_part_from_text.assert_called_once_with(text="Hello!")
@@ -889,7 +889,7 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
         mock_part_from_text.side_effect = from_text_side_effect
 
         # Act
-        contents = await builder.build_contents()
+        contents = await builder.build_contents(start_time=0.0)
 
         # Assert
         assert len(contents) == 1
@@ -998,7 +998,7 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
         return_value=(fake_pdf_bytes, pdf_mime_type),
     ) as mock_get_file_data:
         # Act
-        contents = await builder.build_contents()
+        contents = await builder.build_contents(start_time=0.0)
 
         # Assert
         mock_chats_module.Chats.get_chat_by_id_and_user_id.assert_called_once_with(
