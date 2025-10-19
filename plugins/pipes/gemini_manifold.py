@@ -128,7 +128,6 @@ class GenaiApiError(Exception):
     pass
 
 
-
 class FilesAPIError(Exception):
     """Custom exception for errors during Files API operations."""
 
@@ -155,6 +154,9 @@ class EventEmitter:
             "data": {"type": toastType, "content": msg},
         }
 
+        log.debug(f"Emitting toast: '{msg}'")
+        log.trace("Toast payload:", payload=event)
+
         async def send_toast():
             try:
                 # Re-check in case the event loop runs this later and state has changed.
@@ -180,9 +182,11 @@ class EventEmitter:
             "data": {"description": message, "done": done, "hidden": hidden},
         }
 
+        log.debug(f"Emitting status: '{message}'")
+        log.trace("Status payload:", payload=status_event)
+
         try:
             await self.event_emitter(status_event)
-            log.debug(f"Emitted status:", payload=status_event)
         except Exception:
             log.exception("Error emitting status.")
 
@@ -207,6 +211,9 @@ class EventEmitter:
             emission["data"]["error"] = {"detail": error}
         if sources:
             emission["data"]["sources"] = sources
+
+        log.debug(f"Emitting completion: {content=}, {error=}, {sources=}, {done=}")
+        log.trace("Completion payload:", payload=emission)
 
         try:
             await self.event_emitter(emission)
