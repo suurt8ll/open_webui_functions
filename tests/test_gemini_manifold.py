@@ -30,6 +30,7 @@ sys.modules["open_webui.utils.misc"] = mock_misc_module
 # --- Now, the import of your plugin should use the mocks ---
 from plugins.pipes.gemini_manifold import (
     Pipe,
+    EventEmitter,
     GeminiContentBuilder,
     types as gemini_types,
 )  # gemini_types is google.genai.types
@@ -770,7 +771,7 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
 
     pipe_instance, _ = pipe_instance_fixture
     messages_body = [{"role": "user", "content": "Hello!"}]
-    mock_event_emitter = AsyncMock()
+    mock_event_emitter = MagicMock(spec=EventEmitter)
     mock_user_data = {
         "id": "test_user_id",
         "email": "test@example.com",
@@ -813,9 +814,8 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
         assert len(content_item.parts) == 1
         assert content_item.parts[0] == mock_text_part
         # A warning toast is emitted when messages_db is not found
-        mock_event_emitter.assert_called_once()
-        assert mock_event_emitter.call_args[0][0]["type"] == "notification"
-        assert mock_event_emitter.call_args[0][0]["data"]["type"] == "warning"
+        # The call uses positional arguments (msg, toastType), so we match that here.
+        mock_event_emitter.emit_toast.assert_called_once_with(ANY, "warning")
 
 
 @pytest.mark.asyncio
@@ -842,7 +842,7 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
     text_after_stripped = text_after_raw.strip()
     user_content_string = f"{text_before_raw}{youtube_url}{text_after_raw}"
     messages_body = [{"role": "user", "content": user_content_string}]
-    mock_event_emitter = AsyncMock()
+    mock_event_emitter = MagicMock(spec=EventEmitter)
     mock_user_data = {
         "id": "test_user_id",
         "email": "test@example.com",
@@ -922,7 +922,8 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
         assert content_item.parts[2] is mock_text_part_after_obj
 
         # A warning toast is emitted when messages_db is not found
-        mock_event_emitter.assert_called_once()
+        # The call uses positional arguments (msg, toastType), so we match that here.
+        mock_event_emitter.emit_toast.assert_called_once_with(ANY, "warning")
 
 
 @pytest.mark.asyncio
@@ -942,7 +943,7 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
     fake_pdf_bytes = b"%PDF-1.4 fake content..."
     pdf_mime_type = "application/pdf"
     messages_body = [{"role": "user", "content": user_text_content}]
-    mock_event_emitter = AsyncMock()
+    mock_event_emitter = MagicMock(spec=EventEmitter)
     mock_user_data = {
         "id": "test_user_id",
         "email": "test@example.com",
