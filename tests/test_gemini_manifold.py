@@ -835,7 +835,7 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
     pipe_instance.valves.USE_VERTEX_AI = False
 
     # Arrange: Inputs
-    youtube_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    youtube_url = "https://www.youtube.com/watch?v=kpwNjdEPz7E"
     text_before_raw = "Look at this: "
     text_after_raw = " it's great!"
     text_before_stripped = text_before_raw.strip()
