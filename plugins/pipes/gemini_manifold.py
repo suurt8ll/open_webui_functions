@@ -137,8 +137,14 @@ class FilesAPIError(Exception):
 class EventEmitter:
     """A helper class to abstract web-socket event emissions to the front-end."""
 
-    def __init__(self, event_emitter: Callable[["Event"], Awaitable[None]] | None):
+    def __init__(
+        self,
+        event_emitter: Callable[["Event"], Awaitable[None]] | None,
+        *,
+        hide_successful_status: bool = False,
+    ):
         self.event_emitter = event_emitter
+        self.hide_successful_status = hide_successful_status
 
     def emit_toast(
         self,
@@ -172,10 +178,17 @@ class EventEmitter:
         message: str,
         done: bool = False,
         hidden: bool = False,
+        *,
+        is_successful_finish: bool = False,
     ) -> None:
         """Emit status updates asynchronously."""
         if not self.event_emitter:
             return
+
+        # If this is a successful finish status and the user wants to hide it,
+        # we override the hidden flag.
+        if is_successful_finish and self.hide_successful_status:
+            hidden = True
 
         status_event: "StatusEvent" = {
             "type": "status",
@@ -1498,6 +1511,12 @@ class Pipe:
             default=False,
             description="""Enable the Enterprise Search tool to allow the model to fetch and use content from provided URLs. """,
         )
+        HIDE_SUCCESSFUL_STATUS_MESSAGE: bool = Field(
+            default=False,
+            description="""Whether to hide the final 'Response finished' status message on success.
+            Error messages will always be shown.
+            Default value is False.""",
+        )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
@@ -1612,6 +1631,12 @@ class Pipe:
             Set to True to enable, False to disable.
             Default is None (use the admin's setting).""",
         )
+        HIDE_SUCCESSFUL_STATUS_MESSAGE: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Override the default setting for hiding the successful status message.
+            Set to True to hide, False to show.
+            Default is None (use the admin's setting).""",
+        )
 
         @field_validator("THINKING_BUDGET", mode="after")
         @classmethod
@@ -1710,7 +1735,10 @@ class Pipe:
             # Task model is not user facing, so we should not emit any events.
             __event_emitter__ = None
 
-        event_emitter = EventEmitter(__event_emitter__)
+        event_emitter = EventEmitter(
+            __event_emitter__,
+            hide_successful_status=valves.HIDE_SUCCESSFUL_STATUS_MESSAGE,
+        )
 
         files_api_manager = FilesAPIManager(
             client=client,
@@ -2731,6 +2759,7 @@ class Pipe:
         await event_emitter.emit_status(
             f"{status_prefix} [{reason_name}] {time_str}",
             done=True,
+            is_successful_finish=is_normal_finish,
         )
 
         # TODO: Emit a toast message if url context retrieval was not successful.
