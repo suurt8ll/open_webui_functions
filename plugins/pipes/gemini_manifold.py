@@ -196,6 +196,7 @@ class EventEmitter:
         done: bool = False,
         error: str | None = None,
         sources: list["Source"] | None = None,
+        usage: dict[str, Any] | None = None,
     ) -> None:
         """Constructs and emits completion event."""
         if not self.event_emitter:
@@ -205,20 +206,32 @@ class EventEmitter:
             "type": "chat:completion",
             "data": {"done": done},
         }
-        if content:
+        parts = []
+        if content is not None:
             emission["data"]["content"] = content
-        if error:
+            parts.append("content")
+        if error is not None:
             emission["data"]["error"] = {"detail": error}
-        if sources:
+            parts.append("error")
+        if sources is not None:
             emission["data"]["sources"] = sources
+            parts.append("sources")
+        if usage is not None:
+            emission["data"]["usage"] = usage
+            parts.append("usage")
 
-        log.debug(f"Emitting completion: {content=}, {error=}, {sources=}, {done=}")
+        desc = f" with {', '.join(parts)}" if parts else ""
+        log.debug(f"Emitting completion: done={done}{desc}")
         log.trace("Completion payload:", payload=emission)
 
         try:
             await self.event_emitter(emission)
         except Exception:
             log.exception("Error emitting completion.")
+
+    async def emit_usage(self, usage_data: dict[str, Any]) -> None:
+        """A wrapper around emit_completion to specifically emit usage data."""
+        await self.emit_completion(usage=usage_data)
 
     async def emit_error(
         self,
@@ -1698,7 +1711,7 @@ class Pipe:
             __event_emitter__ = None
 
         event_emitter = EventEmitter(__event_emitter__)
-        
+
         files_api_manager = FilesAPIManager(
             client=client,
             file_cache=self.file_content_cache,
@@ -2725,11 +2738,10 @@ class Pipe:
         # --- Emit usage and grounding data ---
         # Attempt to emit token usage data even if the finish reason was problematic,
         # as usage data might still be available.
-        if event_emitter.event_emitter and (usage_event := self._get_usage_data_event(model_response)):
+        if usage_data := self._get_usage_data(model_response):
             # Inject the total processing time into the usage payload.
-            usage_event["data"]["usage"]["completion_time"] = round(elapsed_time, 2) # type: ignore
-            log.debug("Emitting usage data:", payload=usage_event)
-            await event_emitter.event_emitter(usage_event)
+            usage_data["completion_time"] = round(elapsed_time, 2)
+            await event_emitter.emit_usage(usage_data)
 
         self._add_grounding_data_to_state(model_response, request, chat_id, message_id, start_time)
 
@@ -2760,11 +2772,11 @@ class Pipe:
             log.debug(f"Response {message_id} does not have grounding metadata.")
 
     @staticmethod
-    def _get_usage_data_event(
+    def _get_usage_data(
         response: types.GenerateContentResponse,
-    ) -> "ChatCompletionEvent | None":
+    ) -> dict[str, Any] | None:
         """
-        Extracts usage data from a GenerateContentResponse object.
+        Extracts and cleans usage data from a GenerateContentResponse object.
         Returns None if usage metadata is not present.
         """
         if not response.usage_metadata:
@@ -2793,11 +2805,7 @@ class Pipe:
             if not usage_data[k]:
                 del usage_data[k]
 
-        completion_event: "ChatCompletionEvent" = {
-            "type": "chat:completion",
-            "data": {"usage": usage_data},
-        }
-        return completion_event
+        return usage_data
 
     # endregion 2.4 Post-processing
 
