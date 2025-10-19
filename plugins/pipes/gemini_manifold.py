@@ -141,12 +141,12 @@ class EventEmitter:
     def __init__(self, event_emitter: Callable[["Event"], Awaitable[None]] | None):
         self.event_emitter = event_emitter
 
-    async def emit_toast(
+    def emit_toast(
         self,
         msg: str,
         toastType: Literal["info", "success", "warning", "error"] = "info",
     ) -> None:
-        """Emits a toast notification to the front-end."""
+        """Emits a toast notification to the front-end. This is a fire-and-forget operation."""
         if not self.event_emitter:
             return
 
@@ -155,10 +155,15 @@ class EventEmitter:
             "data": {"type": toastType, "content": msg},
         }
 
-        try:
-            await self.event_emitter(event)
-        except Exception:
-            log.exception("Error emitting toast notification.")
+        async def send_toast():
+            try:
+                # Re-check in case the event loop runs this later and state has changed.
+                if self.event_emitter:
+                    await self.event_emitter(event)
+            except Exception:
+                log.exception("Error emitting toast notification.")
+
+        asyncio.create_task(send_toast())
 
     async def emit_status(
         self,
@@ -443,7 +448,7 @@ class FilesAPIManager:
                     log.exception(
                         f"A non-403 client error occurred during stateless recovery for {deterministic_name}."
                     )
-                    await self.event_emitter.emit_toast(
+                    self.event_emitter.emit_toast(
                         f"API error for file: {e.code}. Please check permissions.",
                         "error",
                     )
@@ -454,7 +459,7 @@ class FilesAPIManager:
                 log.exception(
                     f"An unexpected error occurred during stateless recovery for {deterministic_name}."
                 )
-                await self.event_emitter.emit_toast(
+                self.event_emitter.emit_toast(
                     "Unexpected error retrieving a file. Please try again.",
                     "error",
                 )
@@ -567,7 +572,7 @@ class FilesAPIManager:
             return active_file
         except Exception as e:
             log.exception(f"File upload or processing failed for {deterministic_name}.")
-            await self.event_emitter.emit_toast(
+            self.event_emitter.emit_toast(
                 "Upload failed for a file. Please check connection and try again.",
                 "error",
             )
@@ -606,7 +611,7 @@ class FilesAPIManager:
                     error_message += f" {reason}"
                     toast_message += f" Reason: {file.error.message}"
 
-                await self.event_emitter.emit_toast(toast_message, "error")
+                self.event_emitter.emit_toast(toast_message, "error")
                 raise FilesAPIError(error_message)
 
             state_name = file.state.name if file.state else "UNKNOWN"
@@ -660,7 +665,7 @@ class GeminiContentBuilder:
                 "Check the console for more details. "
                 "Citation filtering and file uploads will not be available."
             )
-            await self.event_emitter.emit_toast(warn_msg, "warning")
+            self.event_emitter.emit_toast(warn_msg, "warning")
 
         # 1. Set up and launch the status manager. It will activate itself if needed.
         status_manager = UploadStatusManager(self.event_emitter, start_time=start_time)
@@ -764,7 +769,7 @@ class GeminiContentBuilder:
                 )
                 # Inform the user via a toast notification.
                 toast_msg = f"Your message #{i + 1} was empty. The assistant will ask for clarification."
-                await self.event_emitter.emit_toast(toast_msg, "info")
+                self.event_emitter.emit_toast(toast_msg, "info")
 
                 clarification_prompt = (
                     "The user sent an empty message. Please ask the user for "
@@ -790,7 +795,7 @@ class GeminiContentBuilder:
                             f"For your message #{i + 1}, a default prompt was added as text is required "
                             "for requests with attachments when using Vertex AI."
                         )
-                        await self.event_emitter.emit_toast(toast_msg, "info")
+                        self.event_emitter.emit_toast(toast_msg, "info")
 
                         default_prompt_text = (
                             "The user did not send any text message with the additional context. "
@@ -820,7 +825,7 @@ class GeminiContentBuilder:
         else:
             warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
             log.warning(warn_msg)
-            await self.event_emitter.emit_toast(warn_msg, "warning")
+            self.event_emitter.emit_toast(warn_msg, "warning")
             return None
 
         # Only create a Content object if there are parts to include.
@@ -875,7 +880,7 @@ class GeminiContentBuilder:
         else:
             warn_msg = "User message content is not a string or list, skipping."
             log.warning(warn_msg)
-            await self.event_emitter.emit_toast(warn_msg, "warning")
+            self.event_emitter.emit_toast(warn_msg, "warning")
             return user_parts
 
         for c in user_content_list:
@@ -946,7 +951,7 @@ class GeminiContentBuilder:
             else:
                 warn_msg = f"Unsupported URI: '{uri[:64]}...' Links must be to YouTube or a supported file type."
                 log.warning(warn_msg)
-                await self.event_emitter.emit_toast(warn_msg, "warning")
+                self.event_emitter.emit_toast(warn_msg, "warning")
                 return None
 
             # Step 2: If we have bytes, decide how to create the Part
@@ -996,7 +1001,7 @@ class GeminiContentBuilder:
         except FilesAPIError as e:
             error_msg = f"Files API failed for URI '{uri[:64]}...': {e}"
             log.error(error_msg)
-            await self.event_emitter.emit_toast(error_msg, "error")
+            self.event_emitter.emit_toast(error_msg, "error")
             return None
         except Exception:
             log.exception(f"Error processing URI: {uri[:64]}[...]")
@@ -2397,7 +2402,7 @@ class Pipe:
                     f"For clarity, {total_substitutions} special tag{plural_s} "
                     "were disabled in the response by injecting a zero-width space (ZWS)."
                 )
-                await event_emitter.emit_toast(toast_msg, "info")
+                event_emitter.emit_toast(toast_msg, "info")
 
             if not error_occurred:
                 log.info("Response processing finished successfully!")
@@ -2414,7 +2419,7 @@ class Pipe:
                 )
             except Exception as e:
                 error_msg = f"Post-processing failed with error:\n\n{e}"
-                await event_emitter.emit_toast(error_msg, "error")
+                event_emitter.emit_toast(error_msg, "error")
                 log.exception(error_msg)
 
             log.debug("Unified response processor has finished.")
@@ -2698,7 +2703,7 @@ class Pipe:
         else:
             log.error(f"Response finished with an error. {full_finish_details}")
             status_prefix = "Response failed"
-            await event_emitter.emit_toast(
+            event_emitter.emit_toast(
                 f"An error occurred. {full_finish_details}",
                 "error",
             )
