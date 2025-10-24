@@ -20,6 +20,7 @@ import json
 from google.genai import types
 
 import sys
+import time
 import asyncio
 import aiohttp
 from fastapi import Request
@@ -299,13 +300,16 @@ class Filter:
 
         chat_id: str = __metadata__.get("chat_id", "")
         message_id: str = __metadata__.get("message_id", "")
-        storage_key = f"grounding_{chat_id}_{message_id}"
+        grounding_key = f"grounding_{chat_id}_{message_id}"
+        time_key = f"pipe_start_time_{chat_id}_{message_id}"
 
         app_state: State = __request__.app.state
-        log.debug(f"Seeing if there is attribute {storage_key} in request state.")
+        log.debug(f"Checking for attributes for message {message_id} in request state.")
         stored_metadata: types.GroundingMetadata | None = getattr(
-            app_state, storage_key, None
+            app_state, grounding_key, None
         )
+        pipe_start_time: float | None = getattr(app_state, time_key, None)
+
         if stored_metadata:
             log.info("Found grounding metadata, processing citations.")
 
@@ -345,6 +349,7 @@ class Filter:
                     grounding_chunks=gs_chunks,
                     supports=gs_supports,
                     event_emitter=__event_emitter__,
+                    pipe_start_time=pipe_start_time,
                 )
             else:
                 log.info(
@@ -354,11 +359,15 @@ class Filter:
 
             # Emit status event with search queries
             await self._emit_status_event_w_queries(stored_metadata, __event_emitter__)
-            delattr(app_state, storage_key)
+
+            # Clean up state
+            delattr(app_state, grounding_key)
+            if hasattr(app_state, time_key):
+                delattr(app_state, time_key)
         else:
             log.info("No grounding metadata found in request state.")
 
-        log.debug("output method has finished.")
+        log.debug("outlet method has finished.")
         return body
 
     # region 1. Helper methods inside the Filter class
@@ -472,10 +481,13 @@ class Filter:
         timeout: aiohttp.ClientTimeout = DEFAULT_URL_TIMEOUT,
         max_retries: int = 3,
         base_delay: float = 0.5,
-    ) -> str:
-        """Resolves a given URL using the provided aiohttp session, with multiple retries on failure."""
+    ) -> tuple[str, bool]:
+        """
+        Resolves a given URL using the provided aiohttp session, with multiple retries on failure.
+        Returns the final URL and a boolean indicating success.
+        """
         if not url:
-            return ""
+            return "", False
         for attempt in range(max_retries + 1):
             try:
                 async with session.get(
@@ -487,13 +499,13 @@ class Filter:
                     log.debug(
                         f"Resolved URL '{url}' to '{final_url}' after {attempt} retries"
                     )
-                    return final_url
+                    return final_url, True
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
                 if attempt == max_retries:
                     log.error(
                         f"Failed to resolve URL '{url}' after {max_retries + 1} attempts: {e}"
                     )
-                    return url
+                    return url, False
                 else:
                     delay = min(base_delay * (2**attempt), 10.0)
                     log.warning(
@@ -502,59 +514,72 @@ class Filter:
                     await asyncio.sleep(delay)
             except Exception as e:
                 log.error(f"Unexpected error resolving URL '{url}': {e}")
-                return url
-        return url
+                return url, False
+        return url, False
 
     async def _resolve_and_emit_sources(
         self,
         grounding_chunks: list[types.GroundingChunk],
         supports: list[types.GroundingSupport],
         event_emitter: Callable[["Event"], Awaitable[None]],
+        pipe_start_time: float | None,
     ):
         """
         Resolves URLs in the background and emits a chat completion event
-        containing only the source information.
+        containing only the source information, along with status updates.
         """
-        # Create initial_metadatas from grounding_chunks
         initial_metadatas: list[tuple[int, str]] = []
         for i, g_c in enumerate(grounding_chunks):
-            web_info = g_c.web
-            if web_info and web_info.uri:
+            if (web_info := g_c.web) and web_info.uri:
                 initial_metadatas.append((i, web_info.uri))
 
         if not initial_metadatas:
-            log.info(
-                "No source URIs found in grounding_chunks (checked in _resolve_and_emit_sources), "
-                "skipping background URL resolution task."
-            )
+            log.info("No source URIs found, skipping URL resolution.")
             return
 
-        # Create source_metadatas_template based on grounding_chunks length
+        num_urls = len(initial_metadatas)
+        self._emit_status_update(
+            event_emitter,
+            f"Resolving {num_urls} source URLs...",
+            pipe_start_time,
+        )
+
         source_metadatas_template: list["SourceMetadata"] = [
-            {
-                "source": None,
-                "original_url": None,
-                "supports": [],
-            }
+            {"source": None, "original_url": None, "supports": []}
             for _ in grounding_chunks
         ]
-
         resolved_uris_map = {}
+
         try:
             urls_to_resolve = [url for _, url in initial_metadatas]
-            resolved_uris: list[str] = []
-
             log.info(f"Resolving {len(urls_to_resolve)} source URLs...")
             async with aiohttp.ClientSession() as session:
                 tasks = [self._resolve_url(session, url) for url in urls_to_resolve]
-                resolved_uris = await asyncio.gather(*tasks)
+                results = await asyncio.gather(*tasks)
             log.info("URL resolution completed.")
 
+            resolved_uris = [res[0] for res in results]
             resolved_uris_map = dict(zip(urls_to_resolve, resolved_uris))
+
+            # Emit final status based on resolution results.
+            success_count = sum(1 for _, success in results if success)
+            final_status_msg = (
+                "URL resolution complete"
+                if success_count == num_urls
+                else f"Resolved {success_count}/{num_urls} URLs"
+            )
+            self._emit_status_update(
+                event_emitter, final_status_msg, pipe_start_time, done=True
+            )
 
         except Exception as e:
             log.error(f"Error during URL resolution: {e}")
             resolved_uris_map = {url: url for _, url in initial_metadatas}
+
+            # Emit failure status.
+            self._emit_status_update(
+                event_emitter, "URL resolution failed", pipe_start_time, done=True
+            )
 
         populated_metadatas = [m.copy() for m in source_metadatas_template]
 
@@ -696,6 +721,38 @@ class Filter:
     # endregion 1.3 Get permissive safety settings
 
     # region 1.4 Utility helpers
+
+    def _emit_status_update(
+        self,
+        event_emitter: Callable[["Event"], Awaitable[None]],
+        description: str,
+        pipe_start_time: float | None,
+        *,
+        done: bool = False,
+    ):
+        """Constructs and emits a status event in a non-blocking task."""
+
+        async def emit_task():
+            time_str = (
+                f" (+{(time.monotonic() - pipe_start_time):.2f}s)"
+                if pipe_start_time is not None
+                else ""
+            )
+            full_description = f"{description}{time_str}"
+
+            status_event: "StatusEvent" = {
+                "type": "status",
+                "data": {"description": full_description, "done": done},
+            }
+
+            try:
+                await event_emitter(status_event)
+                log.debug(f"Emitted status:", payload=status_event)
+            except Exception:
+                log.exception("Error emitting status.")
+
+        # Fire-and-forget the emission task.
+        asyncio.create_task(emit_task())
 
     def _get_first_candidate(
         self, candidates: list[types.Candidate] | None

@@ -30,6 +30,7 @@ sys.modules["open_webui.utils.misc"] = mock_misc_module
 # --- Now, the import of your plugin should use the mocks ---
 from plugins.pipes.gemini_manifold import (
     Pipe,
+    EventEmitter,
     GeminiContentBuilder,
     types as gemini_types,
 )  # gemini_types is google.genai.types
@@ -770,7 +771,7 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
 
     pipe_instance, _ = pipe_instance_fixture
     messages_body = [{"role": "user", "content": "Hello!"}]
-    mock_event_emitter = AsyncMock()
+    mock_event_emitter = MagicMock(spec=EventEmitter)
     mock_user_data = {
         "id": "test_user_id",
         "email": "test@example.com",
@@ -802,7 +803,7 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
         mock_text_part.text = "Hello!"
         mock_part_from_text.return_value = mock_text_part
 
-        contents = await builder.build_contents()
+        contents = await builder.build_contents(start_time=0.0)
 
         mock_misc_module.pop_system_message.assert_called_once_with(messages_body)
         mock_part_from_text.assert_called_once_with(text="Hello!")
@@ -813,9 +814,8 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
         assert len(content_item.parts) == 1
         assert content_item.parts[0] == mock_text_part
         # A warning toast is emitted when messages_db is not found
-        mock_event_emitter.assert_called_once()
-        assert mock_event_emitter.call_args[0][0]["type"] == "notification"
-        assert mock_event_emitter.call_args[0][0]["data"]["type"] == "warning"
+        # The call uses positional arguments (msg, toastType), so we match that here.
+        mock_event_emitter.emit_toast.assert_called_once_with(ANY, "warning")
 
 
 @pytest.mark.asyncio
@@ -835,14 +835,14 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
     pipe_instance.valves.USE_VERTEX_AI = False
 
     # Arrange: Inputs
-    youtube_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    youtube_url = "https://www.youtube.com/watch?v=kpwNjdEPz7E"
     text_before_raw = "Look at this: "
     text_after_raw = " it's great!"
     text_before_stripped = text_before_raw.strip()
     text_after_stripped = text_after_raw.strip()
     user_content_string = f"{text_before_raw}{youtube_url}{text_after_raw}"
     messages_body = [{"role": "user", "content": user_content_string}]
-    mock_event_emitter = AsyncMock()
+    mock_event_emitter = MagicMock(spec=EventEmitter)
     mock_user_data = {
         "id": "test_user_id",
         "email": "test@example.com",
@@ -889,7 +889,7 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
         mock_part_from_text.side_effect = from_text_side_effect
 
         # Act
-        contents = await builder.build_contents()
+        contents = await builder.build_contents(start_time=0.0)
 
         # Assert
         assert len(contents) == 1
@@ -922,7 +922,8 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
         assert content_item.parts[2] is mock_text_part_after_obj
 
         # A warning toast is emitted when messages_db is not found
-        mock_event_emitter.assert_called_once()
+        # The call uses positional arguments (msg, toastType), so we match that here.
+        mock_event_emitter.emit_toast.assert_called_once_with(ANY, "warning")
 
 
 @pytest.mark.asyncio
@@ -942,7 +943,7 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
     fake_pdf_bytes = b"%PDF-1.4 fake content..."
     pdf_mime_type = "application/pdf"
     messages_body = [{"role": "user", "content": user_text_content}]
-    mock_event_emitter = AsyncMock()
+    mock_event_emitter = MagicMock(spec=EventEmitter)
     mock_user_data = {
         "id": "test_user_id",
         "email": "test@example.com",
@@ -998,7 +999,7 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
         return_value=(fake_pdf_bytes, pdf_mime_type),
     ) as mock_get_file_data:
         # Act
-        contents = await builder.build_contents()
+        contents = await builder.build_contents(start_time=0.0)
 
         # Assert
         mock_chats_module.Chats.get_chat_by_id_and_user_id.assert_called_once_with(

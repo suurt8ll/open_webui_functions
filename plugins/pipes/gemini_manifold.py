@@ -121,97 +121,6 @@ SPECIAL_TAGS_TO_DISABLE = [
 ]
 ZWS = "\u200b"
 
-# region 1. Helper functions
-
-
-async def emit_toast(
-    msg: str,
-    event_emitter: Callable[["Event"], Awaitable[None]] | None,
-    toastType: Literal["info", "success", "warning", "error"] = "info",
-) -> None:
-    """Emits a toast notification to the front-end."""
-
-    if not event_emitter:
-        return
-
-    event: "NotificationEvent" = {
-        "type": "notification",
-        "data": {"type": toastType, "content": msg},
-    }
-
-    try:
-        await event_emitter(event)
-    except Exception:
-        log.exception("Error emitting toast notification.")
-
-
-async def emit_status(
-    message: str,
-    event_emitter: Callable[["Event"], Awaitable[None]] | None,
-    done: bool = False,
-    hidden: bool = False,
-) -> None:
-    """Emit status updates asynchronously."""
-
-    if not event_emitter:
-        return
-
-    status_event: "StatusEvent" = {
-        "type": "status",
-        "data": {"description": message, "done": done, "hidden": hidden},
-    }
-
-    try:
-        await event_emitter(status_event)
-        log.debug(f"Emitted status:", payload=status_event)
-    except Exception:
-        log.exception("Error emitting status.")
-
-
-async def emit_completion(
-    event_emitter: Callable[["Event"], Awaitable[None]] | None,
-    content: str | None = None,
-    done: bool = False,
-    error: str | None = None,
-    sources: list["Source"] | None = None,
-):
-    """Constructs and emits completion event."""
-
-    if not event_emitter:
-        return
-
-    emission: "ChatCompletionEvent" = {
-        "type": "chat:completion",
-        "data": {"done": done},
-    }
-    if content:
-        emission["data"]["content"] = content
-    if error:
-        emission["data"]["error"] = {"detail": error}
-    if sources:
-        emission["data"]["sources"] = sources
-    await event_emitter(emission)
-
-
-async def emit_error(
-    error_msg: str,
-    event_emitter: Callable[["Event"], Awaitable[None]] | None,
-    warning: bool = False,
-    exception: bool = True,
-) -> None:
-    """Emits an event to the front-end that causes it to display a nice red error message."""
-
-    if warning:
-        log.opt(depth=1, exception=False).warning(error_msg)
-    else:
-        log.opt(depth=1, exception=exception).error(error_msg)
-    await emit_completion(
-        error=f"\n{error_msg}", event_emitter=event_emitter, done=True
-    )
-
-
-# endregion 1. Helper functions
-
 
 class GenaiApiError(Exception):
     """Custom exception for errors during Genai API interactions."""
@@ -223,6 +132,132 @@ class FilesAPIError(Exception):
     """Custom exception for errors during Files API operations."""
 
     pass
+
+
+class EventEmitter:
+    """A helper class to abstract web-socket event emissions to the front-end."""
+
+    def __init__(
+        self,
+        event_emitter: Callable[["Event"], Awaitable[None]] | None,
+        *,
+        hide_successful_status: bool = False,
+    ):
+        self.event_emitter = event_emitter
+        self.hide_successful_status = hide_successful_status
+
+    def emit_toast(
+        self,
+        msg: str,
+        toastType: Literal["info", "success", "warning", "error"] = "info",
+    ) -> None:
+        """Emits a toast notification to the front-end. This is a fire-and-forget operation."""
+        if not self.event_emitter:
+            return
+
+        event: "NotificationEvent" = {
+            "type": "notification",
+            "data": {"type": toastType, "content": msg},
+        }
+
+        log.debug(f"Emitting toast: '{msg}'")
+        log.trace("Toast payload:", payload=event)
+
+        async def send_toast():
+            try:
+                # Re-check in case the event loop runs this later and state has changed.
+                if self.event_emitter:
+                    await self.event_emitter(event)
+            except Exception:
+                log.exception("Error emitting toast notification.")
+
+        asyncio.create_task(send_toast())
+
+    async def emit_status(
+        self,
+        message: str,
+        done: bool = False,
+        hidden: bool = False,
+        *,
+        is_successful_finish: bool = False,
+    ) -> None:
+        """Emit status updates asynchronously."""
+        if not self.event_emitter:
+            return
+
+        # If this is a successful finish status and the user wants to hide it,
+        # we override the hidden flag.
+        if is_successful_finish and self.hide_successful_status:
+            hidden = True
+
+        status_event: "StatusEvent" = {
+            "type": "status",
+            "data": {"description": message, "done": done, "hidden": hidden},
+        }
+
+        log.debug(f"Emitting status: '{message}'")
+        log.trace("Status payload:", payload=status_event)
+
+        try:
+            await self.event_emitter(status_event)
+        except Exception:
+            log.exception("Error emitting status.")
+
+    async def emit_completion(
+        self,
+        content: str | None = None,
+        done: bool = False,
+        error: str | None = None,
+        sources: list["Source"] | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> None:
+        """Constructs and emits completion event."""
+        if not self.event_emitter:
+            return
+
+        emission: "ChatCompletionEvent" = {
+            "type": "chat:completion",
+            "data": {"done": done},
+        }
+        parts = []
+        if content is not None:
+            emission["data"]["content"] = content
+            parts.append("content")
+        if error is not None:
+            emission["data"]["error"] = {"detail": error}
+            parts.append("error")
+        if sources is not None:
+            emission["data"]["sources"] = sources
+            parts.append("sources")
+        if usage is not None:
+            emission["data"]["usage"] = usage
+            parts.append("usage")
+
+        desc = f" with {', '.join(parts)}" if parts else ""
+        log.debug(f"Emitting completion: done={done}{desc}")
+        log.trace("Completion payload:", payload=emission)
+
+        try:
+            await self.event_emitter(emission)
+        except Exception:
+            log.exception("Error emitting completion.")
+
+    async def emit_usage(self, usage_data: dict[str, Any]) -> None:
+        """A wrapper around emit_completion to specifically emit usage data."""
+        await self.emit_completion(usage=usage_data)
+
+    async def emit_error(
+        self,
+        error_msg: str,
+        warning: bool = False,
+        exception: bool = True,
+    ) -> None:
+        """Emits an event to the front-end that causes it to display a nice red error message."""
+        if warning:
+            log.opt(depth=1, exception=False).warning(error_msg)
+        else:
+            log.opt(depth=1, exception=exception).error(error_msg)
+        await self.emit_completion(error=f"\n{error_msg}", done=True)
 
 
 class UploadStatusManager:
@@ -239,8 +274,13 @@ class UploadStatusManager:
     - ('FINALIZE',): Sent by the orchestrator when all workers are done.
     """
 
-    def __init__(self, event_emitter: Callable[["Event"], Awaitable[None]] | None):
+    def __init__(
+        self,
+        event_emitter: EventEmitter,
+        start_time: float,
+    ):
         self.event_emitter = event_emitter
+        self.start_time = start_time
         self.queue = asyncio.Queue()
         self.total_uploads_expected = 0
         self.uploads_completed = 0
@@ -278,24 +318,21 @@ class UploadStatusManager:
         if not self.is_active:
             return
 
+        elapsed_time = time.monotonic() - self.start_time
+        time_str = f"(+{elapsed_time:.2f}s)"
+
         is_done = (
             self.total_uploads_expected > 0
             and self.uploads_completed == self.total_uploads_expected
         )
-        is_hidden = is_done
 
         if is_done:
-            message = f"Upload complete. {self.uploads_completed} file(s) processed."
+            message = f"- Upload complete. {self.uploads_completed} file(s) processed. {time_str}"
         else:
             # Show "Uploading 1 of N..."
-            message = f"Uploading file {self.uploads_completed + 1} of {self.total_uploads_expected}..."
+            message = f"- Uploading file {self.uploads_completed + 1} of {self.total_uploads_expected}... {time_str}"
 
-        await emit_status(
-            message,
-            self.event_emitter,
-            done=is_done,
-            hidden=is_hidden,
-        )
+        await self.event_emitter.emit_status(message, done=is_done)
 
 
 class FilesAPIManager:
@@ -321,7 +358,7 @@ class FilesAPIManager:
         client: genai.Client,
         file_cache: SimpleMemoryCache,
         id_hash_cache: SimpleMemoryCache,
-        event_emitter: Callable[["Event"], Awaitable[None]] | None,
+        event_emitter: EventEmitter,
     ):
         """
         Initializes the FilesAPIManager.
@@ -332,7 +369,7 @@ class FilesAPIManager:
                         Must be configured with `aiocache.serializers.NullSerializer`.
             id_hash_cache: An aiocache instance for mapping `owui_file_id -> content_hash`.
                            This is an optimization to avoid re-hashing known files.
-            event_emitter: A callable for emitting events to the front-end.
+            event_emitter: An abstract class for emitting events to the front-end.
         """
         self.client = client
         self.file_cache = file_cache
@@ -444,9 +481,8 @@ class FilesAPIManager:
                     log.exception(
                         f"A non-403 client error occurred during stateless recovery for {deterministic_name}."
                     )
-                    await emit_toast(
+                    self.event_emitter.emit_toast(
                         f"API error for file: {e.code}. Please check permissions.",
-                        self.event_emitter,
                         "error",
                     )
                     raise FilesAPIError(
@@ -456,9 +492,8 @@ class FilesAPIManager:
                 log.exception(
                     f"An unexpected error occurred during stateless recovery for {deterministic_name}."
                 )
-                await emit_toast(
+                self.event_emitter.emit_toast(
                     "Unexpected error retrieving a file. Please try again.",
-                    self.event_emitter,
                     "error",
                 )
                 raise FilesAPIError(
@@ -570,9 +605,8 @@ class FilesAPIManager:
             return active_file
         except Exception as e:
             log.exception(f"File upload or processing failed for {deterministic_name}.")
-            await emit_toast(
+            self.event_emitter.emit_toast(
                 "Upload failed for a file. Please check connection and try again.",
-                self.event_emitter,
                 "error",
             )
             raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
@@ -610,7 +644,7 @@ class FilesAPIManager:
                     error_message += f" {reason}"
                     toast_message += f" Reason: {file.error.message}"
 
-                await emit_toast(toast_message, self.event_emitter, "error")
+                self.event_emitter.emit_toast(toast_message, "error")
                 raise FilesAPIError(error_message)
 
             state_name = file.state.name if file.state else "UNKNOWN"
@@ -632,7 +666,7 @@ class GeminiContentBuilder:
         messages_body: list["Message"],
         metadata_body: "Metadata",
         user_data: "UserData",
-        event_emitter: Callable[["Event"], Awaitable[None]] | None,
+        event_emitter: EventEmitter,
         valves: "Pipe.Valves",
         files_api_manager: "FilesAPIManager",
     ):
@@ -653,7 +687,7 @@ class GeminiContentBuilder:
             metadata_body, user_data
         )
 
-    async def build_contents(self) -> list[types.Content]:
+    async def build_contents(self, start_time: float) -> list[types.Content]:
         """
         The main public method to generate the contents list by processing all
         message turns concurrently and using a self-configuring status manager.
@@ -664,10 +698,10 @@ class GeminiContentBuilder:
                 "Check the console for more details. "
                 "Citation filtering and file uploads will not be available."
             )
-            await emit_toast(warn_msg, self.event_emitter, "warning")
+            self.event_emitter.emit_toast(warn_msg, "warning")
 
         # 1. Set up and launch the status manager. It will activate itself if needed.
-        status_manager = UploadStatusManager(self.event_emitter)
+        status_manager = UploadStatusManager(self.event_emitter, start_time=start_time)
         manager_task = asyncio.create_task(status_manager.run())
 
         # 2. Create and run concurrent processing tasks for each message turn.
@@ -759,9 +793,7 @@ class GeminiContentBuilder:
                 message_db = self.messages_db[i]
                 if self.upload_documents:
                     files = message_db.get("files", [])
-            parts = await self._process_user_message(
-                message, files, self.event_emitter, status_queue
-            )
+            parts = await self._process_user_message(message, files, status_queue)
             # Case 1: User content is completely empty (no text, no files).
             if not parts:
                 log.info(
@@ -770,7 +802,7 @@ class GeminiContentBuilder:
                 )
                 # Inform the user via a toast notification.
                 toast_msg = f"Your message #{i + 1} was empty. The assistant will ask for clarification."
-                await emit_toast(toast_msg, self.event_emitter, "info")
+                self.event_emitter.emit_toast(toast_msg, "info")
 
                 clarification_prompt = (
                     "The user sent an empty message. Please ask the user for "
@@ -796,7 +828,7 @@ class GeminiContentBuilder:
                             f"For your message #{i + 1}, a default prompt was added as text is required "
                             "for requests with attachments when using Vertex AI."
                         )
-                        await emit_toast(toast_msg, self.event_emitter, "info")
+                        self.event_emitter.emit_toast(toast_msg, "info")
 
                         default_prompt_text = (
                             "The user did not send any text message with the additional context. "
@@ -826,7 +858,7 @@ class GeminiContentBuilder:
         else:
             warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
             log.warning(warn_msg)
-            await emit_toast(warn_msg, self.event_emitter, "warning")
+            self.event_emitter.emit_toast(warn_msg, "warning")
             return None
 
         # Only create a Content object if there are parts to include.
@@ -838,7 +870,6 @@ class GeminiContentBuilder:
         self,
         message: "UserMessage",
         files: list["FileAttachmentTD"],
-        event_emitter: Callable[["Event"], Awaitable[None]] | None,
         status_queue: asyncio.Queue,
     ) -> list[types.Part]:
         user_parts: list[types.Part] = []
@@ -882,7 +913,7 @@ class GeminiContentBuilder:
         else:
             warn_msg = "User message content is not a string or list, skipping."
             log.warning(warn_msg)
-            await emit_toast(warn_msg, event_emitter, "warning")
+            self.event_emitter.emit_toast(warn_msg, "warning")
             return user_parts
 
         for c in user_content_list:
@@ -953,7 +984,7 @@ class GeminiContentBuilder:
             else:
                 warn_msg = f"Unsupported URI: '{uri[:64]}...' Links must be to YouTube or a supported file type."
                 log.warning(warn_msg)
-                await emit_toast(warn_msg, self.event_emitter, "warning")
+                self.event_emitter.emit_toast(warn_msg, "warning")
                 return None
 
             # Step 2: If we have bytes, decide how to create the Part
@@ -1003,7 +1034,7 @@ class GeminiContentBuilder:
         except FilesAPIError as e:
             error_msg = f"Files API failed for URI '{uri[:64]}...': {e}"
             log.error(error_msg)
-            await emit_toast(error_msg, self.event_emitter, "error")
+            self.event_emitter.emit_toast(error_msg, "error")
             return None
         except Exception:
             log.exception(f"Error processing URI: {uri[:64]}[...]")
@@ -1480,6 +1511,12 @@ class Pipe:
             default=False,
             description="""Enable the Enterprise Search tool to allow the model to fetch and use content from provided URLs. """,
         )
+        HIDE_SUCCESSFUL_STATUS_MESSAGE: bool = Field(
+            default=False,
+            description="""Whether to hide the final 'Response finished' status message on success.
+            Error messages will always be shown.
+            Default value is False.""",
+        )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
@@ -1594,6 +1631,12 @@ class Pipe:
             Set to True to enable, False to disable.
             Default is None (use the admin's setting).""",
         )
+        HIDE_SUCCESSFUL_STATUS_MESSAGE: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Override the default setting for hiding the successful status message.
+            Set to True to hide, False to show.
+            Default is None (use the admin's setting).""",
+        )
 
         @field_validator("THINKING_BUDGET", mode="after")
         @classmethod
@@ -1649,6 +1692,8 @@ class Pipe:
         __event_emitter__: Callable[["Event"], Awaitable[None]] | None,
         __metadata__: "Metadata",
     ) -> AsyncGenerator[dict, None] | str:
+
+        start_time = time.monotonic()
         self._add_log_handler(self.valves.LOG_LEVEL)
 
         log.debug(
@@ -1690,11 +1735,16 @@ class Pipe:
             # Task model is not user facing, so we should not emit any events.
             __event_emitter__ = None
 
+        event_emitter = EventEmitter(
+            __event_emitter__,
+            hide_successful_status=valves.HIDE_SUCCESSFUL_STATUS_MESSAGE,
+        )
+
         files_api_manager = FilesAPIManager(
             client=client,
             file_cache=self.file_content_cache,
             id_hash_cache=self.file_id_to_hash_cache,
-            event_emitter=__event_emitter__,
+            event_emitter=event_emitter,
         )
 
         # Check if user is chatting with an error model for some reason.
@@ -1726,11 +1776,13 @@ class Pipe:
             messages_body=body.get("messages"),
             metadata_body=__metadata__,
             user_data=__user__,
-            event_emitter=__event_emitter__,
+            event_emitter=event_emitter,
             valves=valves,
             files_api_manager=files_api_manager,
         )
-        contents = await builder.build_contents()
+        # This is our first timed event, marking the start of payload preparation.
+        asyncio.create_task(event_emitter.emit_status("Preparing request..."))
+        contents = await builder.build_contents(start_time=start_time)
 
         # Assemble GenerateContentConfig
         safety_settings: list[types.SafetySetting] | None = __metadata__.get(
@@ -1875,15 +1927,18 @@ class Pipe:
         # unified processor, which returns an AsyncGenerator. For non-streaming,
         # we adapt the single response object into a one-item async generator.
 
-        if features.get("stream", True):
+        elapsed_time = time.monotonic() - start_time
+        time_str = f"(+{elapsed_time:.2f}s)"
+
+        # Determine the request type to provide a more informative status message.
+        is_streaming = features.get("stream", True)
+        request_type_str = "streaming" if is_streaming else "non-streaming"
+
+        # Emit a status update with timing before making the actual API call.
+        asyncio.create_task(event_emitter.emit_status(f"Sending {request_type_str} request to Google API... {time_str}"))
+
+        if is_streaming:
             # Streaming response
-            asyncio.create_task(
-                emit_status(
-                    "Waiting for first token from Google...",
-                    __event_emitter__,
-                    done=False,
-                )
-            )
             response_stream: AsyncIterator[types.GenerateContentResponse] = (
                 await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
             )
@@ -1896,32 +1951,15 @@ class Pipe:
                 response_stream,
                 __request__,
                 model_name,
-                __event_emitter__,
+                event_emitter,
                 __user__["id"],
                 chat_id,
                 message_id,
+                start_time=start_time,
             )
         else:
             # Non-streaming response.
-            asyncio.create_task(
-                emit_status(
-                    "Waiting for response from Google...",
-                    __event_emitter__,
-                    done=False,
-                )
-            )
-            try:
-                res = await client.aio.models.generate_content(**gen_content_args)
-            finally:
-                # This status is emitted immediately after the full response is received.
-                asyncio.create_task(
-                    emit_status(
-                        "Response received",
-                        __event_emitter__,
-                        done=True,
-                        hidden=True,
-                    )
-                )
+            res = await client.aio.models.generate_content(**gen_content_args)
 
             # Adapter: Create a simple, one-shot async generator that yields the
             # single response object, making it behave like a stream.
@@ -1939,10 +1977,11 @@ class Pipe:
                 single_item_stream(res),
                 __request__,
                 model_name,
-                __event_emitter__,
+                event_emitter,
                 __user__["id"],
                 chat_id,
                 message_id,
+                start_time=start_time,
             )
 
     # region 2. Helper methods inside the Pipe class
@@ -2331,10 +2370,11 @@ class Pipe:
         response_stream: AsyncIterator[types.GenerateContentResponse],
         __request__: Request,
         model: str,
-        event_emitter: Callable[["Event"], Awaitable[None]] | None,
+        event_emitter: EventEmitter,
         user_id: str,
         chat_id: str,
         message_id: str,
+        start_time: float,
     ) -> AsyncGenerator[dict, None]:
         """
         Processes an async iterator of GenerateContentResponse objects, yielding
@@ -2358,13 +2398,13 @@ class Pipe:
                 final_response_chunk = chunk  # Keep the latest chunk for metadata
 
                 if not first_chunk_received:
-                    # This is the first (and possibly only) chunk. End the waiting status.
+                    # This is the first (and possibly only) chunk.
+                    elapsed_time = time.monotonic() - start_time
+                    time_str = f"(+{elapsed_time:.2f}s)"
                     asyncio.create_task(
-                        emit_status(
-                            "First token received",
-                            event_emitter,
+                        event_emitter.emit_status(
+                            f"Response received {time_str}",
                             done=True,
-                            hidden=True,
                         )
                     )
                     first_chunk_received = True
@@ -2398,16 +2438,11 @@ class Pipe:
             error_occurred = True
             error_msg = f"Response processing ended with error: {e}"
             log.exception(error_msg)
-            await emit_error(error_msg, event_emitter)
+            await event_emitter.emit_error(error_msg)
 
         finally:
-            # This will hide any lingering status messages.
-            await emit_status(
-                "Response processing finished",
-                event_emitter,
-                done=True,
-                hidden=True,
-            )
+            # The async for loop has completed, meaning we have received all data
+            # from the API. Now, we perform final internal processing.
 
             if total_substitutions > 0 and not error_occurred:
                 plural_s = "s" if total_substitutions > 1 else ""
@@ -2415,7 +2450,7 @@ class Pipe:
                     f"For clarity, {total_substitutions} special tag{plural_s} "
                     "were disabled in the response by injecting a zero-width space (ZWS)."
                 )
-                await emit_toast(toast_msg, event_emitter, "info")
+                event_emitter.emit_toast(toast_msg, "info")
 
             if not error_occurred:
                 log.info("Response processing finished successfully!")
@@ -2428,10 +2463,11 @@ class Pipe:
                     chat_id=chat_id,
                     message_id=message_id,
                     stream_error_happened=error_occurred,
+                    start_time=start_time,
                 )
             except Exception as e:
                 error_msg = f"Post-processing failed with error:\n\n{e}"
-                await emit_toast(error_msg, event_emitter, "error")
+                event_emitter.emit_toast(error_msg, "error")
                 log.exception(error_msg)
 
             log.debug("Unified response processor has finished.")
@@ -2660,69 +2696,83 @@ class Pipe:
     async def _do_post_processing(
         self,
         model_response: types.GenerateContentResponse | None,
-        event_emitter: Callable[["Event"], Awaitable[None]] | None,
+        event_emitter: EventEmitter,
         request: Request,
         chat_id: str,
         message_id: str,
         *,
         stream_error_happened: bool = False,
+        start_time: float,
     ):
         """Handles emitting usage, grounding, and sources after the main response/stream is done."""
         log.info("Post-processing the model response.")
 
+        elapsed_time = time.monotonic() - start_time
+        time_str = f"(+{elapsed_time:.2f}s)"
+
         if stream_error_happened:
-            log.warning(
-                "An error occurred during the stream, skipping post-processing."
+            log.warning("Response processing failed due to stream error.")
+            await event_emitter.emit_status(
+                f"Response failed [Stream Error] {time_str}", done=True
             )
-            # All the needed metadata is always in the last chunk, so if an error happened
-            # during the stream, we likely don't have the final response object.
             return
+
         if not model_response:
-            log.warning("model_response is empty, skipping post-processing.")
+            log.warning("Response processing skipped: Model response was empty.")
+            await event_emitter.emit_status(
+                f"Response failed [Empty Response] {time_str}", done=True
+            )
             return
+
         if not (candidate := self._get_first_candidate(model_response.candidates)):
-            log.warning("Response contains no candidates, skipping post-processing.")
+            log.warning("Response processing skipped: No candidates found.")
+            await event_emitter.emit_status(
+                f"Response failed [No Candidates] {time_str}", done=True
+            )
             return
 
-        finish_reason = candidate.finish_reason
-        finish_message = candidate.finish_message
-
-        # Handle cases where finish_reason might be None or a dynamic, unknown enum member.
-        reason_name = finish_reason.name if finish_reason else "UNSPECIFIED"
+        # --- Construct detailed finish reason message ---
+        reason_name = getattr(candidate.finish_reason, "name", "UNSPECIFIED")
         reason_description = FINISH_REASON_DESCRIPTIONS.get(reason_name)
+        finish_message = (
+            candidate.finish_message.strip() if candidate.finish_message else None
+        )
 
-        details_parts = []
-        if reason_description:
-            details_parts.append(reason_description)
-        if finish_message:
-            details_parts.append(finish_message.strip())
+        details_parts = [part for part in (reason_description, finish_message) if part]
+        details_str = f": {' '.join(details_parts)}" if details_parts else ""
+        full_finish_details = f"[{reason_name}]{details_str}"
 
-        full_finish_details = f"[{reason_name}]"
-        if details_parts:
-            full_finish_details += f": {' '.join(details_parts)}"
+        # --- Determine final status and emit toast for errors ---
+        is_normal_finish = candidate.finish_reason in NORMAL_REASONS
 
-        # If finish_reason is None, it will not be in NORMAL_REASONS and will be treated as an error.
-        if finish_reason in NORMAL_REASONS:
-            log.debug(f"Stream finished normally. {full_finish_details}")
+        if is_normal_finish:
+            log.debug(f"Response finished normally. {full_finish_details}")
+            status_prefix = "Response finished"
         else:
-            # All other reasons are treated as errors that should be shown to the user.
-            log.error(f"Stream finished with an error. {full_finish_details}")
-            await emit_toast(
+            log.error(f"Response finished with an error. {full_finish_details}")
+            status_prefix = "Response failed"
+            event_emitter.emit_toast(
                 f"An error occurred. {full_finish_details}",
-                event_emitter,
                 "error",
             )
 
+        await event_emitter.emit_status(
+            f"{status_prefix} [{reason_name}] {time_str}",
+            done=True,
+            is_successful_finish=is_normal_finish,
+        )
+
         # TODO: Emit a toast message if url context retrieval was not successful.
 
+        # --- Emit usage and grounding data ---
         # Attempt to emit token usage data even if the finish reason was problematic,
         # as usage data might still be available.
-        if usage_event := self._get_usage_data_event(model_response):
-            if event_emitter:
-                log.debug("Emitting usage data:", payload=usage_event)
-                await event_emitter(usage_event)
+        if usage_data := self._get_usage_data(model_response):
+            # Inject the total processing time into the usage payload.
+            usage_data["completion_time"] = round(elapsed_time, 2)
+            await event_emitter.emit_usage(usage_data)
 
-        self._add_grounding_data_to_state(model_response, request, chat_id, message_id)
+        self._add_grounding_data_to_state(model_response, request, chat_id, message_id, start_time)
 
     def _add_grounding_data_to_state(
         self,
@@ -2730,31 +2780,32 @@ class Pipe:
         request: Request,
         chat_id: str,
         message_id: str,
+        pipe_start_time: float,
     ):
         candidate = self._get_first_candidate(response.candidates)
         grounding_metadata_obj = candidate.grounding_metadata if candidate else None
 
-        storage_key = f"grounding_{chat_id}_{message_id}"
+        app_state: State = request.app.state
+        grounding_key = f"grounding_{chat_id}_{message_id}"
+        time_key = f"pipe_start_time_{chat_id}_{message_id}"
 
         if grounding_metadata_obj:
             log.debug(
-                f"Found grounding metadata. Storing in request's app state using key {storage_key}."
+                f"Found grounding metadata. Storing in request's app state using key {grounding_key}."
             )
-            # Using shared `request.app.state` to pass grounding metadata to Filter.outlet.
-            # This is necessary because the Pipe finishes during the initial `/api/completion` request,
-            # while Filter.outlet is invoked by a separate, later `/api/chat/completed` request.
-            # `request.state` does not persist across these distinct request lifecycles.
-            app_state: State = request.app.state
-            app_state._state[storage_key] = grounding_metadata_obj
+            # Using shared `request.app.state` to pass data to Filter.outlet.
+            # This is necessary because the Pipe and Filter operate on different requests.
+            app_state._state[grounding_key] = grounding_metadata_obj
+            app_state._state[time_key] = pipe_start_time
         else:
             log.debug(f"Response {message_id} does not have grounding metadata.")
 
     @staticmethod
-    def _get_usage_data_event(
+    def _get_usage_data(
         response: types.GenerateContentResponse,
-    ) -> "ChatCompletionEvent | None":
+    ) -> dict[str, Any] | None:
         """
-        Extracts usage data from a GenerateContentResponse object.
+        Extracts and cleans usage data from a GenerateContentResponse object.
         Returns None if usage metadata is not present.
         """
         if not response.usage_metadata:
@@ -2783,11 +2834,7 @@ class Pipe:
             if not usage_data[k]:
                 del usage_data[k]
 
-        completion_event: "ChatCompletionEvent" = {
-            "type": "chat:completion",
-            "data": {"usage": usage_data},
-        }
-        return completion_event
+        return usage_data
 
     # endregion 2.4 Post-processing
 
