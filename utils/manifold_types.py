@@ -202,8 +202,9 @@ class Metadata(TypedDict):
     task: str | None
     task_body: dict[str, Any] | None
 
-    # This is my custom field, not used by Open WebUI.
+    # These are my own added custom keys, not used by Open WebUI.
     safety_settings: list[types.SafetySetting]
+    is_vertex_ai: NotRequired[bool]
 
 
 # endregion `__metadata__`

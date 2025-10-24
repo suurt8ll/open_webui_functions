@@ -79,6 +79,23 @@ if TYPE_CHECKING:
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
 
+COMPATIBLE_MODELS_FOR_URL_CONTEXT: Final = [
+    "gemini-2.5-pro",
+    "gemini-flash-latest",
+    "gemini-2.5-flash-preview-09-2025",
+    "gemini-2.5-flash",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash-lite-preview-09-2025",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash-lite-preview-06-17",
+    "gemini-2.5-pro-preview-06-05",
+    "gemini-2.5-pro-preview-05-06",
+    "gemini-2.5-flash-preview-05-20",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-001",
+    "gemini-2.0-flash-live-001",
+]
+
 # A mapping of finish reason names (str) to human-readable descriptions.
 # This allows handling of reasons that may not be defined in the current SDK version.
 FINISH_REASON_DESCRIPTIONS: Final = {
@@ -1729,6 +1746,7 @@ class Pipe:
             f"Getting genai client (potentially cached) for user {__user__['email']}."
         )
         client = self._get_user_client(valves, __user__["email"])
+        __metadata__["is_vertex_ai"] = client.vertexai
 
         if __metadata__.get("task"):
             log.info(f'{__metadata__["task"]=}, disabling event emissions.')
@@ -1784,144 +1802,25 @@ class Pipe:
         asyncio.create_task(event_emitter.emit_status("Preparing request..."))
         contents = await builder.build_contents(start_time=start_time)
 
-        # Assemble GenerateContentConfig
-        safety_settings: list[types.SafetySetting] | None = __metadata__.get(
-            "safety_settings"
-        )
+        gen_content_conf = self._build_gen_content_config(body, __metadata__, valves)
+        gen_content_conf.system_instruction = builder.system_prompt
 
-        thinking_conf = None
-        # Use the user-configurable regex to determine if this is a thinking model.
-        is_thinking_model = re.search(
-            valves.THINKING_MODEL_PATTERN, model_name, re.IGNORECASE
-        )
-
-        if is_thinking_model:
-            log.debug(f"Model ID '{model_name}' is a thinking model.")
-            # Start with the default thinking configuration from valves.
-            thinking_conf = types.ThinkingConfig(
-                thinking_budget=valves.THINKING_BUDGET,
-                include_thoughts=valves.SHOW_THINKING_SUMMARY,
-            )
-
-            # Now, check if the reasoning toggle feature is active and should be applied.
-            if self._is_function_active("gemini_reasoning_toggle"):
-                # This toggle is only applicable to flash/lite models, which support a budget of 0.
-                is_reasoning_toggleable = "flash" in model_name or "lite" in model_name
-                reasoning_is_off = not features.get("reason")
-
-                if is_reasoning_toggleable and reasoning_is_off:
-                    log.info(
-                        f"Model '{model_name}' supports disabling reasoning, and it is toggled OFF in the UI. "
-                        "Setting thinking budget to 0."
-                    )
-                    # Override the budget to 0 to disable the feature.
-                    thinking_conf.thinking_budget = 0
-            else:
-                log.warning(
-                    "Gemini Reasoning Toggle filter is not active. "
-                    "Install or enable it if you want to toggle Gemini 2.5 Flash or Lite reasoning on/off through a front-end button."
-                )
-
-        # TODO: Take defaults from the general front-end config.
-        gen_content_conf = types.GenerateContentConfig(
-            system_instruction=builder.system_prompt,
-            temperature=body.get("temperature"),
-            top_p=body.get("top_p"),
-            top_k=body.get("top_k"),
-            max_output_tokens=body.get("max_tokens"),
-            stop_sequences=body.get("stop"),
-            safety_settings=safety_settings,
-            thinking_config=thinking_conf,
-        )
-        gen_content_conf.response_modalities = ["TEXT"]
-        # Use maintainable lists for capability checks
-        image_generation_model_codes = [
-            "gemini-2.0-flash-preview-image-generation",
-            "gemini-2.5-flash-image-preview",
-            "gemini-2.5-flash-image",
-        ]
-        system_prompt_unsupported_model_substrings = (
-            image_generation_model_codes + ["gemma"]
-        )
-
-        if any(s in model_name for s in system_prompt_unsupported_model_substrings):
-            if any(s in model_name for s in image_generation_model_codes):
-                gen_content_conf.response_modalities.append("IMAGE")
+        # Some models (e.g., image generation, Gemma) do not support the system prompt message.
+        system_prompt_unsupported = is_image_model or "gemma" in model_name
+        if system_prompt_unsupported:
             # TODO: append to user message instead.
             if gen_content_conf.system_instruction:
                 gen_content_conf.system_instruction = None
                 log.warning(
-                    "Image Generation model does not support the system prompt message! Removing the system prompt."
+                    f"Model '{model_name}' does not support the system prompt message! Removing the system prompt."
                 )
-        gen_content_conf.tools = []
 
-        if features.get("google_search_tool"):
-            log.info("Using grounding with Google Search as a Tool.")
-            if valves.USE_ENTERPRISE_SEARCH and client.vertexai:
-                log.info("Using Enterprise Web Search instead of Google Search.")
-                gen_content_conf.tools.append(
-                    types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
-                )
-            else:
-                gen_content_conf.tools.append(
-                    types.Tool(google_search=types.GoogleSearch())
-                )
-        elif features.get("google_search_retrieval"):
-            log.info("Using grounding with Google Search Retrieval.")
-            gs = types.GoogleSearchRetrieval(
-                dynamic_retrieval_config=types.DynamicRetrievalConfig(
-                    dynamic_threshold=features.get("google_search_retrieval_threshold")
-                )
-            )
-            gen_content_conf.tools.append(types.Tool(google_search_retrieval=gs))
-        # NB: It is not possible to use both Search and Code execution at the same time,
-        # however, it can be changed later, so let's just handle it as a common error
-        if features.get("google_code_execution"):
-            log.info("Using code execution on Google side.")
-            gen_content_conf.tools.append(
-                types.Tool(code_execution=types.ToolCodeExecution())
-            )
         gen_content_args = {
             "model": model_name,
             "contents": contents,
             "config": gen_content_conf,
         }
         log.debug("Passing these args to the Google API:", payload=gen_content_args)
-
-        # Add URL context tool if enabled and model is compatible
-        if valves.ENABLE_URL_CONTEXT_TOOL:
-            compatible_models_for_url_context = [
-                "gemini-2.5-pro",
-                "gemini-flash-latest",
-                "gemini-2.5-flash-preview-09-2025",
-                "gemini-2.5-flash",
-                "gemini-flash-lite-latest",
-                "gemini-2.5-flash-lite-preview-09-2025",
-                "gemini-2.5-flash-lite",
-                "gemini-2.5-flash-lite-preview-06-17",
-                "gemini-2.5-pro-preview-06-05",
-                "gemini-2.5-pro-preview-05-06",
-                "gemini-2.5-flash-preview-05-20",
-                "gemini-2.0-flash",
-                "gemini-2.0-flash-001",
-                "gemini-2.0-flash-live-001",
-            ]
-            if model_name in compatible_models_for_url_context:
-                if client.vertexai and (len(gen_content_conf.tools) > 0):
-                    log.warning(
-                        "URL context tool is enabled, but Vertex AI is used with multiple tools. Skipping."
-                    )
-                else:
-                    log.info(
-                        f"Model {model_name} is compatible with URL context tool. Enabling."
-                    )
-                    gen_content_conf.tools.append(
-                        types.Tool(url_context=types.UrlContext())
-                    )
-            else:
-                log.warning(
-                    f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
-                )
 
         # Both streaming and non-streaming responses are now handled by the same
         # unified processor, which returns an AsyncGenerator. For non-streaming,
@@ -2364,7 +2263,139 @@ class Pipe:
 
     # endregion 2.2 Model retrival from Google API
 
-    # region 2.3 Model response processing
+    # region 2.3 GenerateContentConfig assembly
+
+    def _build_gen_content_config(
+        self,
+        body: "Body",
+        __metadata__: "Metadata",
+        valves: "Valves",
+    ) -> types.GenerateContentConfig:
+        """Assembles the GenerateContentConfig for a Gemini API request."""
+        model_name = body["model"]
+        features = __metadata__.get("features", {}) or {}
+        is_vertex_ai = __metadata__.get("is_vertex_ai", False)
+
+        safety_settings: list[types.SafetySetting] | None = __metadata__.get(
+            "safety_settings"
+        )
+
+        thinking_conf = None
+        # Use the user-configurable regex to determine if this is a thinking model.
+        is_thinking_model = re.search(
+            valves.THINKING_MODEL_PATTERN, model_name, re.IGNORECASE
+        )
+
+        if is_thinking_model:
+            log.debug(f"Model ID '{model_name}' is a thinking model.")
+            # Start with the default thinking configuration from valves.
+            thinking_conf = types.ThinkingConfig(
+                thinking_budget=valves.THINKING_BUDGET,
+                include_thoughts=valves.SHOW_THINKING_SUMMARY,
+            )
+
+            # Now, check if the reasoning toggle feature is active and should be applied.
+            if self._is_function_active("gemini_reasoning_toggle"):
+                # This toggle is only applicable to flash/lite models, which support a budget of 0.
+                is_reasoning_toggleable = "flash" in model_name or "lite" in model_name
+                reasoning_is_off = not features.get("reason")
+
+                if is_reasoning_toggleable and reasoning_is_off:
+                    log.info(
+                        f"Model '{model_name}' supports disabling reasoning, and it is toggled OFF in the UI. "
+                        "Setting thinking budget to 0."
+                    )
+                    # Override the budget to 0 to disable the feature.
+                    thinking_conf.thinking_budget = 0
+            else:
+                log.warning(
+                    "Gemini Reasoning Toggle filter is not active. "
+                    "Install or enable it if you want to toggle Gemini 2.5 Flash or Lite reasoning on/off through a front-end button."
+                )
+
+        # TODO: Take defaults from the general front-end config.
+        # system_instruction is intentionally left unset here. It will be set by the caller.
+        gen_content_conf = types.GenerateContentConfig(
+            temperature=body.get("temperature"),
+            top_p=body.get("top_p"),
+            top_k=body.get("top_k"),
+            max_output_tokens=body.get("max_tokens"),
+            stop_sequences=body.get("stop"),
+            safety_settings=safety_settings,
+            thinking_config=thinking_conf,
+        )
+
+        gen_content_conf.response_modalities = ["TEXT"]
+        if self._is_image_model(model_name, valves.IMAGE_MODEL_PATTERN):
+            gen_content_conf.response_modalities.append("IMAGE")
+
+        gen_content_conf.tools = []
+
+        if features.get("google_search_tool"):
+            log.info("Using grounding with Google Search as a Tool.")
+            if valves.USE_ENTERPRISE_SEARCH and is_vertex_ai:
+                log.info("Using Enterprise Web Search instead of Google Search.")
+                gen_content_conf.tools.append(
+                    types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
+                )
+            else:
+                gen_content_conf.tools.append(
+                    types.Tool(google_search=types.GoogleSearch())
+                )
+        elif features.get("google_search_retrieval"):
+            log.info("Using grounding with Google Search Retrieval.")
+            gs = types.GoogleSearchRetrieval(
+                dynamic_retrieval_config=types.DynamicRetrievalConfig(
+                    dynamic_threshold=features.get("google_search_retrieval_threshold")
+                )
+            )
+            gen_content_conf.tools.append(types.Tool(google_search_retrieval=gs))
+
+        # NB: It is not possible to use both Search and Code execution at the same time,
+        # however, it can be changed later, so let's just handle it as a common error
+        if features.get("google_code_execution"):
+            log.info("Using code execution on Google side.")
+            gen_content_conf.tools.append(
+                types.Tool(code_execution=types.ToolCodeExecution())
+            )
+
+        # Determine if URL context tool should be enabled, prioritizing the front-end toggle.
+        enable_url_context = valves.ENABLE_URL_CONTEXT_TOOL
+        if self._is_function_active("gemini_url_context_toggle"):
+            enable_url_context = features.get("url_context", False)
+            log.info(
+                "URL context toggle filter is active. URL context tool is "
+                f"{'enabled' if enable_url_context else 'disabled'} by front-end button."
+            )
+        elif valves.ENABLE_URL_CONTEXT_TOOL:
+            log.warning(
+                "Gemini URL Context Toggle filter is not active. "
+                "Install or enable it if you want to toggle URL context tool on/off through a front-end button."
+            )
+
+        if enable_url_context:
+            if model_name in COMPATIBLE_MODELS_FOR_URL_CONTEXT:
+                if is_vertex_ai and (len(gen_content_conf.tools) > 0):
+                    log.warning(
+                        "URL context tool is enabled, but Vertex AI is used with other tools. Skipping."
+                    )
+                else:
+                    log.info(
+                        f"Model {model_name} is compatible with URL context tool. Enabling."
+                    )
+                    gen_content_conf.tools.append(
+                        types.Tool(url_context=types.UrlContext())
+                    )
+            else:
+                log.warning(
+                    f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
+                )
+
+        return gen_content_conf
+
+    # endregion 2.3 GenerateContentConfig assembly
+
+    # region 2.4 Model response processing
     async def _unified_response_processor(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
@@ -2690,9 +2721,9 @@ class Pipe:
         else:
             return None
 
-    # endregion 2.3 Model response processing
+    # endregion 2.4 Model response processing
 
-    # region 2.4 Post-processing
+    # region 2.5 Post-processing
     async def _do_post_processing(
         self,
         model_response: types.GenerateContentResponse | None,
@@ -2836,9 +2867,9 @@ class Pipe:
 
         return usage_data
 
-    # endregion 2.4 Post-processing
+    # endregion 2.5 Post-processing
 
-    # region 2.5 Logging
+    # region 2.6 Logging
     # TODO: Move to a separate plugin that does not have any Open WebUI funcitonlity and is only imported by this plugin.
 
     def _is_flat_dict(self, data: Any) -> bool:
@@ -3067,9 +3098,9 @@ class Pipe:
                 f"Added new handler to loguru for {__name__} with level {desired_level_name}."
             )
 
-    # endregion 2.5 Logging
+    # endregion 2.6 Logging
 
-    # region 2.6 Utility helpers
+    # region 2.7 Utility helpers
 
     # TODO: Check availability of companion filter too with this method.
     @staticmethod
@@ -3194,6 +3225,6 @@ class Pipe:
                     f"Could not parse companion version string: '{companion_version}'. Version check skipped."
                 )
 
-    # endregion 2.6 Utility helpers
+    # endregion 2.7 Utility helpers
 
     # endregion 2. Helper methods inside the Pipe class
