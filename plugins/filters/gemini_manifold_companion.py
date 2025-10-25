@@ -542,60 +542,71 @@ class Filter:
                 initial_metadatas.append((i, uri))
 
         if not initial_metadatas:
-            log.info("No source URIs found, skipping URL resolution.")
+            log.info("No source URIs found, skipping source emission.")
             return
 
-        num_urls = len(initial_metadatas)
-        self._emit_status_update(
-            event_emitter,
-            f"Resolving {num_urls} source URLs...",
-            pipe_start_time,
-        )
+        # Filter out URLs that require resolution (Vertex AI search redirects).
+        # Other URIs (e.g., from Google Maps) are used directly.
+        urls_to_resolve = [
+            uri
+            for _, uri in initial_metadatas
+            if uri.startswith(
+                "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+            )
+        ]
+        resolved_uris_map = {}
 
+        if urls_to_resolve:
+            num_urls = len(urls_to_resolve)
+            self._emit_status_update(
+                event_emitter,
+                f"Resolving {num_urls} source URLs...",
+                pipe_start_time,
+            )
+
+            try:
+                log.info(f"Resolving {num_urls} source URLs...")
+                async with aiohttp.ClientSession() as session:
+                    tasks = [self._resolve_url(session, url) for url in urls_to_resolve]
+                    results = await asyncio.gather(*tasks)
+                log.info("URL resolution completed.")
+
+                resolved_uris = [res[0] for res in results]
+                resolved_uris_map = dict(zip(urls_to_resolve, resolved_uris))
+
+                # Emit final status based on resolution results.
+                success_count = sum(1 for _, success in results if success)
+                final_status_msg = (
+                    "URL resolution complete"
+                    if success_count == num_urls
+                    else f"Resolved {success_count}/{num_urls} URLs"
+                )
+                self._emit_status_update(
+                    event_emitter, final_status_msg, pipe_start_time, done=True
+                )
+
+            except Exception as e:
+                log.error(f"Error during URL resolution: {e}")
+                # On failure, map original URLs to themselves to avoid losing them.
+                resolved_uris_map = {url: url for url in urls_to_resolve}
+                self._emit_status_update(
+                    event_emitter, "URL resolution failed", pipe_start_time, done=True
+                )
+
+        # TODO: Check if Open WebUI can utilize a 'title' key in the source metadata.
+        # The grounding chunks from Gemini API provide a title for both web and maps sources.
         source_metadatas_template: list["SourceMetadata"] = [
             {"source": None, "original_url": None, "supports": []}
             for _ in grounding_chunks
         ]
-        resolved_uris_map = {}
-
-        try:
-            urls_to_resolve = [url for _, url in initial_metadatas]
-            log.info(f"Resolving {len(urls_to_resolve)} source URLs...")
-            async with aiohttp.ClientSession() as session:
-                tasks = [self._resolve_url(session, url) for url in urls_to_resolve]
-                results = await asyncio.gather(*tasks)
-            log.info("URL resolution completed.")
-
-            resolved_uris = [res[0] for res in results]
-            resolved_uris_map = dict(zip(urls_to_resolve, resolved_uris))
-
-            # Emit final status based on resolution results.
-            success_count = sum(1 for _, success in results if success)
-            final_status_msg = (
-                "URL resolution complete"
-                if success_count == num_urls
-                else f"Resolved {success_count}/{num_urls} URLs"
-            )
-            self._emit_status_update(
-                event_emitter, final_status_msg, pipe_start_time, done=True
-            )
-
-        except Exception as e:
-            log.error(f"Error during URL resolution: {e}")
-            resolved_uris_map = {url: url for _, url in initial_metadatas}
-
-            # Emit failure status.
-            self._emit_status_update(
-                event_emitter, "URL resolution failed", pipe_start_time, done=True
-            )
-
         populated_metadatas = [m.copy() for m in source_metadatas_template]
 
         for chunk_index, original_uri in initial_metadatas:
-            resolved_uri = resolved_uris_map.get(original_uri, original_uri)
+            # Use the resolved URI if it exists in the map, otherwise use the original URI.
+            final_uri = resolved_uris_map.get(original_uri, original_uri)
             if 0 <= chunk_index < len(populated_metadatas):
                 populated_metadatas[chunk_index]["original_url"] = original_uri
-                populated_metadatas[chunk_index]["source"] = resolved_uri
+                populated_metadatas[chunk_index]["source"] = final_uri
             else:
                 log.warning(
                     f"Chunk index {chunk_index} out of bounds when populating resolved URLs."
