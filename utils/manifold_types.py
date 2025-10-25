@@ -179,6 +179,7 @@ class Features(TypedDict):
     upload_documents: NotRequired[bool]
     reason: NotRequired[bool]
     url_context: NotRequired[bool]
+    google_maps_grounding: NotRequired[bool]
     stream: NotRequired[bool]
     gemini_manifold_companion_version: NotRequired[str]
 
@@ -263,7 +264,7 @@ Message = UserMessage | AssistantMessage | SystemMessage
 # endregion `body.messages`
 
 
-# region `body` dict given to `Pipe.pipe()`
+# region `body` dict
 class Options(TypedDict):
     """Represents optional parameters for the model request."""
 
@@ -276,18 +277,19 @@ class Options(TypedDict):
 
 
 class Body(TypedDict):
-    """Represents the main request body structure."""
+    """
+    Represents the main request body structure. 
+    This differs between `Filter.inlet`, `Pipe.pipe`, and `Filter.outlet`.
+    """
 
     stream: bool
     model: str
     messages: list[Message]
-    files: NotRequired[list[FileAttachmentTD]]  # Optional list of files
-    features: NotRequired[Features]  # Optional features object
-    metadata: Metadata
-    options: NotRequired[Options]  # Optional options object
-
-
-# endregion `body` dict given to `Pipe.pipe()`
+    files: NotRequired[list[FileAttachmentTD]]
+    features: NotRequired[Features]  # Only present in `Filter.inlet`
+    metadata: Metadata # Only present in `Filter.inlet`
+    options: NotRequired[Options]
+# endregion `body` dict
 
 
 # region `ChatModel.chat`
