@@ -530,8 +530,16 @@ class Filter:
         """
         initial_metadatas: list[tuple[int, str]] = []
         for i, g_c in enumerate(grounding_chunks):
+            uri = None
+            # Check for web source information
             if (web_info := g_c.web) and web_info.uri:
-                initial_metadatas.append((i, web_info.uri))
+                uri = web_info.uri
+            # Else, check for maps source information
+            elif (maps_info := g_c.maps) and maps_info.uri:
+                uri = maps_info.uri
+
+            if uri:
+                initial_metadatas.append((i, uri))
 
         if not initial_metadatas:
             log.info("No source URIs found, skipping URL resolution.")
