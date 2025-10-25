@@ -71,10 +71,12 @@ from open_webui.storage.provider import Storage
 from open_webui.models.functions import Functions
 from open_webui.utils.misc import pop_system_message
 
+# This block is skipped at runtime.
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler  # type: ignore
-    from utils.manifold_types import *  # My personal types in a separate file for more robustness.
+    # Imports custom type definitions (TypedDicts) for static analysis purposes (mypy/pylance).
+    from utils.manifold_types import *
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
@@ -1413,6 +1415,33 @@ class GeminiContentBuilder:
 
 
 class Pipe:
+    
+    @staticmethod
+    def _validate_coordinates_format(v: str | None) -> str | None:
+        """Reusable validator for 'latitude,longitude' format."""
+        if v is not None and v != "":
+            try:
+                parts = v.split(",")
+                if len(parts) != 2:
+                    raise ValueError(
+                        "Must contain exactly two parts separated by a comma."
+                    )
+
+                lat_str, lon_str = parts
+                lat = float(lat_str.strip())
+                lon = float(lon_str.strip())
+
+                if not (-90 <= lat <= 90):
+                    raise ValueError("Latitude must be between -90 and 90.")
+                if not (-180 <= lon <= 180):
+                    raise ValueError("Longitude must be between -180 and 180.")
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Invalid format for MAPS_GROUNDING_COORDINATES: '{v}'. "
+                    f"Expected 'latitude,longitude' (e.g., '40.7128,-74.0060'). Original error: {e}"
+                )
+        return v
+
     class Valves(BaseModel):
         GEMINI_API_KEY: str | None = Field(default=None)
         IMAGE_GEN_GEMINI_API_KEY: str | None = Field(
@@ -1528,6 +1557,12 @@ class Pipe:
             default=False,
             description="""Enable the Enterprise Search tool to allow the model to fetch and use content from provided URLs. """,
         )
+        MAPS_GROUNDING_COORDINATES: str | None = Field(
+            default=None,
+            description="""Optional latitude and longitude coordinates for location-aware results with Google Maps grounding.
+            Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
+            Default value is None.""",
+        )
         HIDE_SUCCESSFUL_STATUS_MESSAGE: bool = Field(
             default=False,
             description="""Whether to hide the final 'Response finished' status message on success.
@@ -1541,6 +1576,11 @@ class Pipe:
             description="""Select logging level. Use `docker logs -f open-webui` to view logs.
             Default value is INFO.""",
         )
+
+        @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
+        @classmethod
+        def validate_coordinates_format(cls, v: str | None):
+            return Pipe._validate_coordinates_format(v)
 
     class UserValves(BaseModel):
         """Defines user-specific settings that can override the default `Valves`.
@@ -1648,6 +1688,12 @@ class Pipe:
             Set to True to enable, False to disable.
             Default is None (use the admin's setting).""",
         )
+        MAPS_GROUNDING_COORDINATES: str | None | Literal[""] = Field(
+            default=None,
+            description="""Optional latitude and longitude coordinates for location-aware results with Google Maps grounding.
+            Overrides the admin setting. Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
+            Default value is None.""",
+        )
         HIDE_SUCCESSFUL_STATUS_MESSAGE: bool | None | Literal[""] = Field(
             default=None,
             description="""Override the default setting for hiding the successful status message.
@@ -1664,6 +1710,11 @@ class Pipe:
                         "THINKING_BUDGET must be between -1 and 32768, inclusive."
                     )
             return v
+
+        @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
+        @classmethod
+        def validate_coordinates_format(cls, v: str | None):
+            return Pipe._validate_coordinates_format(v)
 
     def __init__(self):
         self.valves = self.Valves()
@@ -1697,9 +1748,6 @@ class Pipe:
         log.debug("pipes method has finished.")
 
         return filtered_models
-
-    def _is_image_model(self, model_name: str, pattern: str) -> bool:
-        return bool(re.search(pattern, model_name, re.IGNORECASE))
 
     async def pipe(
         self,
@@ -2260,6 +2308,10 @@ class Pipe:
         # Use regex to remove everything up to and including the last '/' or the first '.'
         stripped = re.sub(r"^(?:.*/|[^.]*\.)", "", model_name)
         return stripped
+
+    @staticmethod
+    def _is_image_model(model_name: str, pattern: str) -> bool:
+        return bool(re.search(pattern, model_name, re.IGNORECASE))
 
     # endregion 2.2 Model retrival from Google API
 
