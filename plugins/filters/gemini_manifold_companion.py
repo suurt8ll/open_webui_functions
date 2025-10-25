@@ -654,24 +654,26 @@ class Filter:
         event_emitter: Callable[["Event"], Awaitable[None]],
     ) -> None:
         """
-        Creates a StatusEvent with Google search URLs based on the web_search_queries
-        in the GenerateContentResponse.
+        Creates a StatusEvent with search URLs based on the web_search_queries
+        in the GroundingMetadata. This covers both Google Search and Google Maps grounding.
         """
         if not grounding_metadata.web_search_queries:
-            log.warning("Grounding metadata does not contain any search queries.")
+            log.debug("Grounding metadata does not contain any search queries.")
             return
 
         search_queries = grounding_metadata.web_search_queries
         if not search_queries:
             log.debug("web_search_queries list is empty.")
             return
+
+        # The queries are used for grounding, so we link them to a general Google search page.
         google_search_urls = [
             f"https://www.google.com/search?q={query}" for query in search_queries
         ]
 
         status_event_data: StatusEventData = {
             "action": "web_search",
-            "description": "This response was grounded with Google Search",
+            "description": "This response was grounded with a Google tool",
             "urls": google_search_urls,
         }
         status_event: StatusEvent = {
@@ -679,7 +681,7 @@ class Filter:
             "data": status_event_data,
         }
         await event_emitter(status_event)
-        log.info("Emitted search queries.")
+        log.info("Emitted grounding queries.")
         log.debug("StatusEvent:", payload=status_event)
 
     # endregion 1.1 Add citations
