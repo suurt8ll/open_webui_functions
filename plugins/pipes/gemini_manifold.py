@@ -2756,8 +2756,10 @@ class Pipe:
                 "error",
             )
 
+        # For the most common success case (STOP), we don't need to show the reason.
+        final_reason_str = "" if reason_name == "STOP" else f" [{reason_name}]"
         await event_emitter.emit_status(
-            f"{status_prefix} [{reason_name}] {time_str}",
+            f"{status_prefix}{final_reason_str} {time_str}",
             done=True,
             is_successful_finish=is_normal_finish,
         )
@@ -2772,7 +2774,9 @@ class Pipe:
             usage_data["completion_time"] = round(elapsed_time, 2)
             await event_emitter.emit_usage(usage_data)
 
-        self._add_grounding_data_to_state(model_response, request, chat_id, message_id, start_time)
+        self._add_grounding_data_to_state(
+            model_response, request, chat_id, message_id, start_time
+        )
 
     def _add_grounding_data_to_state(
         self,
