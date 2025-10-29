@@ -81,6 +81,7 @@ if TYPE_CHECKING:
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
 
+# FIXME: remove
 COMPATIBLE_MODELS_FOR_URL_CONTEXT: Final = [
     "gemini-2.5-pro",
     "gemini-flash-latest",
@@ -1534,6 +1535,7 @@ class Pipe:
             description="""Regex pattern to identify image generation models.
             Default value is r"image".""",
         )
+        # FIXME: remove
         ENABLE_URL_CONTEXT_TOOL: bool = Field(
             default=False,
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
@@ -2328,6 +2330,11 @@ class Pipe:
         features = __metadata__.get("features", {}) or {}
         is_vertex_ai = __metadata__.get("is_vertex_ai", False)
 
+        log.debug(
+            "Features extracted from metadata (UI toggles and config):",
+            payload=features
+        )
+
         safety_settings: list[types.SafetySetting] | None = __metadata__.get(
             "safety_settings"
         )
@@ -2337,9 +2344,12 @@ class Pipe:
         is_thinking_model = re.search(
             valves.THINKING_MODEL_PATTERN, model_name, re.IGNORECASE
         )
+        log.debug(
+            f"Model '{model_name}' is classified as a reasoning model: {bool(is_thinking_model)}. "
+            f"Pattern: '{valves.THINKING_MODEL_PATTERN}'"
+        )
 
         if is_thinking_model:
-            log.debug(f"Model ID '{model_name}' is a thinking model.")
             # Start with the default thinking configuration from valves.
             thinking_conf = types.ThinkingConfig(
                 thinking_budget=valves.THINKING_BUDGET,
@@ -2384,13 +2394,13 @@ class Pipe:
         gen_content_conf.tools = []
 
         if features.get("google_search_tool"):
-            log.info("Using grounding with Google Search as a Tool.")
             if valves.USE_ENTERPRISE_SEARCH and is_vertex_ai:
-                log.info("Using Enterprise Web Search instead of Google Search.")
+                log.info("Using grounding with Enterprise Web Search as a Tool.")
                 gen_content_conf.tools.append(
                     types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
                 )
             else:
+                log.info("Using grounding with Google Search as a Tool.")
                 gen_content_conf.tools.append(
                     types.Tool(google_search=types.GoogleSearch())
                 )
@@ -2415,7 +2425,7 @@ class Pipe:
         enable_url_context = valves.ENABLE_URL_CONTEXT_TOOL
         if self._is_function_active("gemini_url_context_toggle"):
             enable_url_context = features.get("url_context", False)
-            log.info(
+            log.debug(
                 "URL context toggle filter is active. URL context tool is "
                 f"{'enabled' if enable_url_context else 'disabled'} by front-end button."
             )
@@ -2448,7 +2458,7 @@ class Pipe:
         enable_maps_grounding = False
         if self._is_function_active("gemini_maps_grounding_toggle"):
             enable_maps_grounding = features.get("google_maps_grounding", False)
-            log.info(
+            log.debug(
                 "Maps grounding toggle filter is active. Maps grounding is "
                 f"{'enabled' if enable_maps_grounding else 'disabled'} by front-end button."
             )
@@ -3198,13 +3208,12 @@ class Pipe:
 
     # region 2.7 Utility helpers
 
-    # TODO: Check availability of companion filter too with this method.
     @staticmethod
     def _is_function_active(id: str) -> bool:
         # Get the filter's data from the database.
-        companion_filter = Functions.get_function_by_id(id)
+        f = Functions.get_function_by_id(id)
         # Return if the filter is installed and active.
-        return bool(companion_filter and companion_filter.is_active)
+        return bool(f and f.is_active)
 
     @staticmethod
     def _get_merged_valves(
