@@ -2351,6 +2351,7 @@ class Pipe:
 
         if is_thinking_model:
             # Start with the default thinking configuration from valves.
+            log.info(f"Setting `thinking_budget` to {valves.THINKING_BUDGET} and `include_thoughts` to {valves.SHOW_THINKING_SUMMARY}.")
             thinking_conf = types.ThinkingConfig(
                 thinking_budget=valves.THINKING_BUDGET,
                 include_thoughts=valves.SHOW_THINKING_SUMMARY,
@@ -2365,9 +2366,9 @@ class Pipe:
                 if is_reasoning_toggleable and reasoning_is_off:
                     log.info(
                         f"Model '{model_name}' supports disabling reasoning, and it is toggled OFF in the UI. "
-                        "Setting thinking budget to 0."
+                        "Overwriting `thinking_budget` to 0 to disable reasoning."
                     )
-                    # Override the budget to 0 to disable the feature.
+                    # Overwrite the budget to 0 to disable the feature.
                     thinking_conf.thinking_budget = 0
             else:
                 log.warning(
