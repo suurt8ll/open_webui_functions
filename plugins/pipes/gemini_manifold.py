@@ -2456,47 +2456,59 @@ class Pipe:
 
         # TODO: this kind of logic can be abstracted into a separate method
         # Determine if Google Maps grounding should be enabled.
-        enable_maps_grounding = False
+        # This logic is only triggered if the 'gemini_maps_grounding_toggle' filter
+        # is active for the current model.
+        # NOTE: `_is_function_active()` checks if the filter is installed and enabled
+        # in the model's settings, making the feature available. The `features`
+        # dictionary then tells us if the user has actually turned the UI toggle ON for this chat.
         if self._is_function_active("gemini_maps_grounding_toggle"):
             enable_maps_grounding = features.get("google_maps_grounding", False)
-            log.debug(
+
+            log.info(
                 "Maps grounding toggle filter is active. Maps grounding is "
                 f"{'enabled' if enable_maps_grounding else 'disabled'} by front-end button."
             )
 
-        if enable_maps_grounding:
-            log.info("Enabling Google Maps grounding tool.")
-            gen_content_conf.tools.append(types.Tool(google_maps=types.GoogleMaps()))
+            if enable_maps_grounding:
+                log.info("Enabling Google Maps grounding tool.")
+                gen_content_conf.tools.append(
+                    types.Tool(google_maps=types.GoogleMaps())
+                )
 
-            if valves.MAPS_GROUNDING_COORDINATES:
-                try:
-                    lat_str, lon_str = valves.MAPS_GROUNDING_COORDINATES.split(",")
-                    latitude = float(lat_str.strip())
-                    longitude = float(lon_str.strip())
+                if valves.MAPS_GROUNDING_COORDINATES:
+                    try:
+                        lat_str, lon_str = valves.MAPS_GROUNDING_COORDINATES.split(",")
+                        latitude = float(lat_str.strip())
+                        longitude = float(lon_str.strip())
 
-                    log.info(
-                        "Using coordinates for Maps grounding: "
-                        f"lat={latitude}, lon={longitude}"
-                    )
-
-                    lat_lng = types.LatLng(latitude=latitude, longitude=longitude)
-
-                    # Ensure tool_config and retrieval_config exist before assigning lat_lng.
-                    if not gen_content_conf.tool_config:
-                        gen_content_conf.tool_config = types.ToolConfig()
-                    if not gen_content_conf.tool_config.retrieval_config:
-                        gen_content_conf.tool_config.retrieval_config = (
-                            types.RetrievalConfig()
+                        log.info(
+                            "Using coordinates for Maps grounding: "
+                            f"lat={latitude}, lon={longitude}"
                         )
 
-                    gen_content_conf.tool_config.retrieval_config.lat_lng = lat_lng
+                        lat_lng = types.LatLng(latitude=latitude, longitude=longitude)
 
-                except (ValueError, TypeError) as e:
-                    # This should not happen due to the Pydantic validator, but it's good practice to be safe.
-                    log.error(
-                        "Failed to parse MAPS_GROUNDING_COORDINATES: "
-                        f"'{valves.MAPS_GROUNDING_COORDINATES}'. Error: {e}"
-                    )
+                        # Ensure tool_config and retrieval_config exist before assigning lat_lng.
+                        if not gen_content_conf.tool_config:
+                            gen_content_conf.tool_config = types.ToolConfig()
+                        if not gen_content_conf.tool_config.retrieval_config:
+                            gen_content_conf.tool_config.retrieval_config = (
+                                types.RetrievalConfig()
+                            )
+
+                        gen_content_conf.tool_config.retrieval_config.lat_lng = lat_lng
+
+                    except (ValueError, TypeError) as e:
+                        # This should not happen due to the Pydantic validator, but it's good practice to be safe.
+                        log.error(
+                            "Failed to parse MAPS_GROUNDING_COORDINATES: "
+                            f"'{valves.MAPS_GROUNDING_COORDINATES}'. Error: {e}"
+                        )
+        else:
+            log.warning(
+                "Gemini Maps Grounding Toggle filter is not active. "
+                "Install or enable it if you want to toggle Google Maps grounding on/off through a front-end button."
+            )
 
         return gen_content_conf
 
