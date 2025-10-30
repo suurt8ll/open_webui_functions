@@ -2453,6 +2453,7 @@ class Pipe:
                 event_emitter.emit_toast(toast_msg, "info")
 
             if not error_occurred:
+                yield "data: [DONE]"
                 log.info("Response processing finished successfully!")
 
             try:
