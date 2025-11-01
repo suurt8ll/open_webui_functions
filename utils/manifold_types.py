@@ -119,6 +119,8 @@ Event = ChatCompletionEvent | StatusEvent | NotificationEvent
 
 
 # region `__metadata__`
+
+# Ollama-specific model details. Not present for pipe models.
 class ModelDetails(TypedDict):
     """Details about the model within Ollama metadata."""
 
@@ -144,6 +146,67 @@ class OllamaDetails(TypedDict):
     ]  # Example shows [0], type might be more complex? List[Any] is safer if unsure.
 
 
+# Nested types for `MetadataModel.info`
+class ModelInfoMetaCapabilities(TypedDict):
+    vision: bool
+    file_upload: bool
+    web_search: bool
+    image_generation: bool
+    code_interpreter: bool
+    citations: bool
+    status_updates: bool
+    usage: bool
+
+
+class ModelInfoMeta(TypedDict):
+    profile_image_url: str
+    description: str | None
+    capabilities: ModelInfoMetaCapabilities
+    suggestion_prompts: Any | None
+    tags: list[str]
+    filterIds: list[str]
+    defaultFilterIds: list[str]
+
+
+class AccessControlPermissions(TypedDict):
+    group_ids: list[str]
+    user_ids: list[str]
+
+
+class ModelInfoAccessControl(TypedDict):
+    read: AccessControlPermissions
+    write: AccessControlPermissions
+
+
+class ModelInfo(TypedDict):
+    id: str
+    user_id: str
+    base_model_id: str | None
+    name: str
+    params: dict[str, Any]
+    meta: ModelInfoMeta
+    access_control: ModelInfoAccessControl
+    is_active: bool
+    updated_at: int
+    created_at: int
+
+
+class ModelFilter(TypedDict):
+    """Represents a filter associated with a model in the metadata."""
+
+    id: str
+    name: str
+    description: str
+    icon: str
+    has_user_valves: bool
+
+
+class ModelPipe(TypedDict):
+    """Represents the pipe information for a model."""
+
+    type: Literal["pipe"]
+
+
 class MetadataModel(TypedDict):
     """Represents the model information within metadata."""
 
@@ -152,9 +215,17 @@ class MetadataModel(TypedDict):
     object: Literal["model"]
     created: int  # Unix timestamp
     owned_by: str
-    ollama: OllamaDetails
+    actions: list[Any]
     tags: list[str]
-    actions: list[Any]  # Structure of actions is not clear from example
+
+    # Pipe-model specific fields
+    pipe: NotRequired[ModelPipe]
+    has_user_valves: NotRequired[bool]
+    info: NotRequired[ModelInfo]
+    filters: NotRequired[list[ModelFilter]]
+
+    # Ollama-model specific fields
+    ollama: NotRequired[OllamaDetails]
 
 
 class MetadataVariables(TypedDict):
@@ -184,6 +255,14 @@ class Features(TypedDict):
     gemini_manifold_companion_version: NotRequired[str]
 
 
+class MetadataParams(TypedDict):
+    """Represents the 'params' object within metadata."""
+
+    stream_delta_chunk_size: int | None
+    reasoning_tags: Any | None
+    function_calling: Literal["default", "native"]
+
+
 class Metadata(TypedDict):
     """Represents the metadata object in the request body."""
 
@@ -191,22 +270,23 @@ class Metadata(TypedDict):
     chat_id: str  # UUID
     message_id: str  # UUID
     session_id: str
-    tool_ids: list[str] | None  # Can be a list of strings or null
-    tool_servers: list[
-        dict[str, Any]
-    ]  # Example is empty list, assuming list of objects
-    files: list[FileAttachmentTD]  # List of files, using the same FileInfo structure
-    features: Features | None  # Using the specific Features TypedDict
-    variables: MetadataVariables  # Using the specific MetadataVariables TypedDict
-    model: MetadataModel  # Using the specific MetadataModel TypedDict
+    filter_ids: list[str]
+    tool_ids: list[str] | None
+    tool_servers: list[Any]
+    files: list[FileAttachmentTD] | None
+    features: Features | None
+    variables: MetadataVariables
+    model: MetadataModel
     direct: bool
-    task: str | None
-    task_body: dict[str, Any] | None
+    params: MetadataParams
+
+    # Optional/Context-dependent keys
+    task: NotRequired[str | None]
+    task_body: NotRequired[dict[str, Any] | None]
 
     # These are my own added custom keys, not used by Open WebUI.
     safety_settings: list[types.SafetySetting]
     is_vertex_ai: NotRequired[bool]
-
 
 # endregion `__metadata__`
 

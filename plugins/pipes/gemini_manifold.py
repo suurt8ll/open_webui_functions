@@ -1766,6 +1766,7 @@ class Pipe:
         log.debug(
             f"pipe method has been called. Gemini Manifold google_genai version is {VERSION}"
         )
+        log.trace("__metadata__:", payload=__metadata__)
         features = __metadata__.get("features", {}) or {}
 
         # Check the version of the companion filter
@@ -1799,7 +1800,7 @@ class Pipe:
         __metadata__["is_vertex_ai"] = client.vertexai
 
         if __metadata__.get("task"):
-            log.info(f'{__metadata__["task"]=}, disabling event emissions.')
+            log.info(f'{__metadata__["task"]=}, disabling event emissions.') # type: ignore
             # Task model is not user facing, so we should not emit any events.
             __event_emitter__ = None
 
@@ -1827,18 +1828,6 @@ class Pipe:
         log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
         )
-        # URL context front-end button takes precedence over valves setting if it is enabled.
-        if self._is_function_active("gemini_url_context_toggle"):
-            valves.ENABLE_URL_CONTEXT_TOOL = features.get("url_context", False)
-            log.info(
-                "URL context toggle filter is active. "
-                f"Setting valves.ENABLE_URL_CONTEXT_TOOL to {valves.ENABLE_URL_CONTEXT_TOOL}."
-            )
-        else:
-            log.warning(
-                "Gemini URL Context Toggle filter is not active. "
-                "Install or enable it if you want to toggle URL context tool on/off through a front-end button."
-            )
 
         builder = GeminiContentBuilder(
             messages_body=body.get("messages"),
@@ -2326,7 +2315,7 @@ class Pipe:
         valves: "Valves",
     ) -> types.GenerateContentConfig:
         """Assembles the GenerateContentConfig for a Gemini API request."""
-        model_name = body["model"]
+        model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
         features = __metadata__.get("features", {}) or {}
         is_vertex_ai = __metadata__.get("is_vertex_ai", False)
 
@@ -2357,24 +2346,19 @@ class Pipe:
                 include_thoughts=valves.SHOW_THINKING_SUMMARY,
             )
 
-            # Now, check if the reasoning toggle feature is active and should be applied.
-            if self._is_function_active("gemini_reasoning_toggle"):
+            # Check if reasoning can be disabled. This happens if the toggle is available but turned OFF by the user.
+            is_avail, is_on = self._get_toggleable_feature_status(
+                "gemini_reasoning_toggle", __metadata__
+            )
+            if is_avail and not is_on:
                 # This toggle is only applicable to flash/lite models, which support a budget of 0.
                 is_reasoning_toggleable = "flash" in model_name or "lite" in model_name
-                reasoning_is_off = not features.get("reason")
-
-                if is_reasoning_toggleable and reasoning_is_off:
+                if is_reasoning_toggleable:
                     log.info(
                         f"Model '{model_name}' supports disabling reasoning, and it is toggled OFF in the UI. "
                         "Overwriting `thinking_budget` to 0 to disable reasoning."
                     )
-                    # Overwrite the budget to 0 to disable the feature.
                     thinking_conf.thinking_budget = 0
-            else:
-                log.warning(
-                    "Gemini Reasoning Toggle filter is not active. "
-                    "Install or enable it if you want to toggle Gemini 2.5 Flash or Lite reasoning on/off through a front-end button."
-                )
 
         # TODO: Take defaults from the general front-end config.
         # system_instruction is intentionally left unset here. It will be set by the caller.
@@ -2422,19 +2406,14 @@ class Pipe:
                 types.Tool(code_execution=types.ToolCodeExecution())
             )
 
-        # Determine if URL context tool should be enabled, prioritizing the front-end toggle.
-        enable_url_context = valves.ENABLE_URL_CONTEXT_TOOL
-        if self._is_function_active("gemini_url_context_toggle"):
-            enable_url_context = features.get("url_context", False)
-            log.debug(
-                "URL context toggle filter is active. URL context tool is "
-                f"{'enabled' if enable_url_context else 'disabled'} by front-end button."
-            )
-        elif valves.ENABLE_URL_CONTEXT_TOOL:
-            log.warning(
-                "Gemini URL Context Toggle filter is not active. "
-                "Install or enable it if you want to toggle URL context tool on/off through a front-end button."
-            )
+        # Determine if URL context tool should be enabled.
+        is_avail, is_on = self._get_toggleable_feature_status(
+            "gemini_url_context_toggle", __metadata__
+        )
+        enable_url_context = valves.ENABLE_URL_CONTEXT_TOOL  # Start with valve default.
+        if is_avail:
+            # If the toggle filter is configured, it overrides the valve setting.
+            enable_url_context = is_on
 
         if enable_url_context:
             if model_name in COMPATIBLE_MODELS_FOR_URL_CONTEXT:
@@ -2454,61 +2433,45 @@ class Pipe:
                     f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
                 )
 
-        # TODO: this kind of logic can be abstracted into a separate method
         # Determine if Google Maps grounding should be enabled.
-        # This logic is only triggered if the 'gemini_maps_grounding_toggle' filter
-        # is active for the current model.
-        # NOTE: `_is_function_active()` checks if the filter is installed and enabled
-        # in the model's settings, making the feature available. The `features`
-        # dictionary then tells us if the user has actually turned the UI toggle ON for this chat.
-        if self._is_function_active("gemini_maps_grounding_toggle"):
-            enable_maps_grounding = features.get("google_maps_grounding", False)
-
-            log.info(
-                "Maps grounding toggle filter is active. Maps grounding is "
-                f"{'enabled' if enable_maps_grounding else 'disabled'} by front-end button."
+        is_avail, is_on = self._get_toggleable_feature_status(
+            "gemini_maps_grounding_toggle", __metadata__
+        )
+        if is_avail and is_on:
+            log.info("Enabling Google Maps grounding tool.")
+            gen_content_conf.tools.append(
+                types.Tool(google_maps=types.GoogleMaps())
             )
 
-            if enable_maps_grounding:
-                log.info("Enabling Google Maps grounding tool.")
-                gen_content_conf.tools.append(
-                    types.Tool(google_maps=types.GoogleMaps())
-                )
+            if valves.MAPS_GROUNDING_COORDINATES:
+                try:
+                    lat_str, lon_str = valves.MAPS_GROUNDING_COORDINATES.split(",")
+                    latitude = float(lat_str.strip())
+                    longitude = float(lon_str.strip())
 
-                if valves.MAPS_GROUNDING_COORDINATES:
-                    try:
-                        lat_str, lon_str = valves.MAPS_GROUNDING_COORDINATES.split(",")
-                        latitude = float(lat_str.strip())
-                        longitude = float(lon_str.strip())
+                    log.info(
+                        "Using coordinates for Maps grounding: "
+                        f"lat={latitude}, lon={longitude}"
+                    )
 
-                        log.info(
-                            "Using coordinates for Maps grounding: "
-                            f"lat={latitude}, lon={longitude}"
+                    lat_lng = types.LatLng(latitude=latitude, longitude=longitude)
+
+                    # Ensure tool_config and retrieval_config exist before assigning lat_lng.
+                    if not gen_content_conf.tool_config:
+                        gen_content_conf.tool_config = types.ToolConfig()
+                    if not gen_content_conf.tool_config.retrieval_config:
+                        gen_content_conf.tool_config.retrieval_config = (
+                            types.RetrievalConfig()
                         )
 
-                        lat_lng = types.LatLng(latitude=latitude, longitude=longitude)
+                    gen_content_conf.tool_config.retrieval_config.lat_lng = lat_lng
 
-                        # Ensure tool_config and retrieval_config exist before assigning lat_lng.
-                        if not gen_content_conf.tool_config:
-                            gen_content_conf.tool_config = types.ToolConfig()
-                        if not gen_content_conf.tool_config.retrieval_config:
-                            gen_content_conf.tool_config.retrieval_config = (
-                                types.RetrievalConfig()
-                            )
-
-                        gen_content_conf.tool_config.retrieval_config.lat_lng = lat_lng
-
-                    except (ValueError, TypeError) as e:
-                        # This should not happen due to the Pydantic validator, but it's good practice to be safe.
-                        log.error(
-                            "Failed to parse MAPS_GROUNDING_COORDINATES: "
-                            f"'{valves.MAPS_GROUNDING_COORDINATES}'. Error: {e}"
-                        )
-        else:
-            log.warning(
-                "Gemini Maps Grounding Toggle filter is not active. "
-                "Install or enable it if you want to toggle Google Maps grounding on/off through a front-end button."
-            )
+                except (ValueError, TypeError) as e:
+                    # This should not happen due to the Pydantic validator, but it's good practice to be safe.
+                    log.error(
+                        "Failed to parse MAPS_GROUNDING_COORDINATES: "
+                        f"'{valves.MAPS_GROUNDING_COORDINATES}'. Error: {e}"
+                    )
 
         return gen_content_conf
 
@@ -3222,11 +3185,77 @@ class Pipe:
     # region 2.7 Utility helpers
 
     @staticmethod
-    def _is_function_active(id: str) -> bool:
-        # Get the filter's data from the database.
-        f = Functions.get_function_by_id(id)
-        # Return if the filter is installed and active.
-        return bool(f and f.is_active)
+    def _get_toggleable_feature_status(
+        filter_id: str,
+        __metadata__: "Metadata",
+    ) -> tuple[bool, bool]:
+        """
+        Checks the complete status of a toggleable filter (function).
+
+        This function performs a series of checks to determine if a feature
+        is available for use and if the user has activated it.
+
+        1. Checks if the filter is installed.
+        2. Checks if the filter's master toggle is active in the Functions dashboard.
+        3. Checks if the filter is enabled for the current model (or is global).
+        4. Checks if the user has toggled the feature ON for the current request.
+
+        Args:
+            filter_id: The ID of the filter to check.
+            __metadata__: The metadata object for the current request.
+
+        Returns:
+            A tuple (is_available: bool, is_toggled_on: bool).
+            - is_available: True if the filter is installed, active, and configured for the model.
+            - is_toggled_on: True if the user has the toggle ON in the UI for this request.
+        """
+        # 1. Check if the filter is installed
+        f = Functions.get_function_by_id(filter_id)
+        if not f:
+            log.warning(
+                f"The '{filter_id}' filter is not installed. "
+                "Install it to use the corresponding front-end toggle."
+            )
+            return (False, False)
+
+        # 2. Check if the master toggle is active
+        if not f.is_active:
+            log.warning(
+                f"The '{filter_id}' filter is installed but is currently disabled in the "
+                "Functions dashboard (master toggle is off). Enable it to make it available."
+            )
+            return (False, False)
+
+        # 3. Check if the filter is enabled for the model or is global
+        model_info = __metadata__.get("model", {}).get("info", {})
+        model_filter_ids = model_info.get("meta", {}).get("filterIds", [])
+        is_enabled_for_model = filter_id in model_filter_ids or f.is_global
+
+        log.debug(
+            f"Checking model enablement for '{filter_id}': in_model_filters={filter_id in model_filter_ids}, "
+            f"is_global={f.is_global} -> is_enabled={is_enabled_for_model}"
+        )
+
+        if not is_enabled_for_model:
+            # This is a configuration issue, not a user-facing warning. Debug is appropriate.
+            model_id = __metadata__.get("model", {}).get("id", "Unknown")
+            log.debug(f"Filter '{filter_id}' is not enabled for model '{model_id}' and is not global.")
+            return (False, False)
+
+        # 4. Check if the user has toggled the feature ON for this request
+        user_toggled_ids = __metadata__.get("filter_ids", [])
+        is_toggled_on = filter_id in user_toggled_ids
+
+        if is_toggled_on:
+            log.info(
+                f"Feature '{filter_id}' is available and enabled by the front-end toggle for this request."
+            )
+        else:
+            log.debug(
+                f"Feature '{filter_id}' is available but not enabled by the front-end toggle for this request."
+            )
+
+        return (True, is_toggled_on)
 
     @staticmethod
     def _get_merged_valves(
