@@ -1479,9 +1479,9 @@ class Pipe:
             Default value is True.""",
         )
         THINKING_MODEL_PATTERN: str = Field(
-            default=r"^(?=.*gemini-2.5)(?!.*live)(?!.*image)",
+            default=r"^(?=.*(?:gemini-2\.5|gemini-flash-latest|gemini-flash-lite-latest))(?!(.*live))(?!(.*image))",
             description="""Regex pattern to identify thinking models.
-            Default value is r"^(?=.*gemini-2.5)(?!.*live)(?!.*image)".""",
+            Default value is r"^(?=.*(?:gemini-2\.5|gemini-flash-latest|gemini-flash-lite-latest))(?!(.*live))(?!(.*image))".""",
         )
         IMAGE_MODEL_PATTERN: str = Field(
             default=r"image",
