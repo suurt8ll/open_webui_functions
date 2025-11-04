@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 1.25.0
-requirements: google-genai==1.41.0
+requirements: google-genai==1.46.0
 """
 
 VERSION = "1.25.0"
@@ -71,13 +71,33 @@ from open_webui.storage.provider import Storage
 from open_webui.models.functions import Functions
 from open_webui.utils.misc import pop_system_message
 
+# This block is skipped at runtime.
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler  # type: ignore
-    from utils.manifold_types import *  # My personal types in a separate file for more robustness.
+    # Imports custom type definitions (TypedDicts) for static analysis purposes (mypy/pylance).
+    from utils.manifold_types import *
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
+
+# FIXME: remove
+COMPATIBLE_MODELS_FOR_URL_CONTEXT: Final = [
+    "gemini-2.5-pro",
+    "gemini-flash-latest",
+    "gemini-2.5-flash-preview-09-2025",
+    "gemini-2.5-flash",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash-lite-preview-09-2025",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash-lite-preview-06-17",
+    "gemini-2.5-pro-preview-06-05",
+    "gemini-2.5-pro-preview-05-06",
+    "gemini-2.5-flash-preview-05-20",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-001",
+    "gemini-2.0-flash-live-001",
+]
 
 # A mapping of finish reason names (str) to human-readable descriptions.
 # This allows handling of reasons that may not be defined in the current SDK version.
@@ -1396,6 +1416,33 @@ class GeminiContentBuilder:
 
 
 class Pipe:
+
+    @staticmethod
+    def _validate_coordinates_format(v: str | None) -> str | None:
+        """Reusable validator for 'latitude,longitude' format."""
+        if v is not None and v != "":
+            try:
+                parts = v.split(",")
+                if len(parts) != 2:
+                    raise ValueError(
+                        "Must contain exactly two parts separated by a comma."
+                    )
+
+                lat_str, lon_str = parts
+                lat = float(lat_str.strip())
+                lon = float(lon_str.strip())
+
+                if not (-90 <= lat <= 90):
+                    raise ValueError("Latitude must be between -90 and 90.")
+                if not (-180 <= lon <= 180):
+                    raise ValueError("Longitude must be between -180 and 180.")
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Invalid format for MAPS_GROUNDING_COORDINATES: '{v}'. "
+                    f"Expected 'latitude,longitude' (e.g., '40.7128,-74.0060'). Original error: {e}"
+                )
+        return v
+
     class Valves(BaseModel):
         GEMINI_API_KEY: str | None = Field(default=None)
         IMAGE_GEN_GEMINI_API_KEY: str | None = Field(
@@ -1488,6 +1535,7 @@ class Pipe:
             description="""Regex pattern to identify image generation models.
             Default value is r"image".""",
         )
+        # FIXME: remove
         ENABLE_URL_CONTEXT_TOOL: bool = Field(
             default=False,
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
@@ -1511,6 +1559,12 @@ class Pipe:
             default=False,
             description="""Enable the Enterprise Search tool to allow the model to fetch and use content from provided URLs. """,
         )
+        MAPS_GROUNDING_COORDINATES: str | None = Field(
+            default=None,
+            description="""Optional latitude and longitude coordinates for location-aware results with Google Maps grounding.
+            Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
+            Default value is None.""",
+        )
         HIDE_SUCCESSFUL_STATUS_MESSAGE: bool = Field(
             default=False,
             description="""Whether to hide the final 'Response finished' status message on success.
@@ -1524,6 +1578,11 @@ class Pipe:
             description="""Select logging level. Use `docker logs -f open-webui` to view logs.
             Default value is INFO.""",
         )
+
+        @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
+        @classmethod
+        def validate_coordinates_format(cls, v: str | None):
+            return Pipe._validate_coordinates_format(v)
 
     class UserValves(BaseModel):
         """Defines user-specific settings that can override the default `Valves`.
@@ -1631,6 +1690,12 @@ class Pipe:
             Set to True to enable, False to disable.
             Default is None (use the admin's setting).""",
         )
+        MAPS_GROUNDING_COORDINATES: str | None | Literal[""] = Field(
+            default=None,
+            description="""Optional latitude and longitude coordinates for location-aware results with Google Maps grounding.
+            Overrides the admin setting. Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
+            Default value is None.""",
+        )
         HIDE_SUCCESSFUL_STATUS_MESSAGE: bool | None | Literal[""] = Field(
             default=None,
             description="""Override the default setting for hiding the successful status message.
@@ -1647,6 +1712,11 @@ class Pipe:
                         "THINKING_BUDGET must be between -1 and 32768, inclusive."
                     )
             return v
+
+        @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
+        @classmethod
+        def validate_coordinates_format(cls, v: str | None):
+            return Pipe._validate_coordinates_format(v)
 
     def __init__(self):
         self.valves = self.Valves()
@@ -1681,9 +1751,6 @@ class Pipe:
 
         return filtered_models
 
-    def _is_image_model(self, model_name: str, pattern: str) -> bool:
-        return bool(re.search(pattern, model_name, re.IGNORECASE))
-
     async def pipe(
         self,
         body: "Body",
@@ -1699,6 +1766,7 @@ class Pipe:
         log.debug(
             f"pipe method has been called. Gemini Manifold google_genai version is {VERSION}"
         )
+        log.trace("__metadata__:", payload=__metadata__)
         features = __metadata__.get("features", {}) or {}
 
         # Check the version of the companion filter
@@ -1729,9 +1797,10 @@ class Pipe:
             f"Getting genai client (potentially cached) for user {__user__['email']}."
         )
         client = self._get_user_client(valves, __user__["email"])
+        __metadata__["is_vertex_ai"] = client.vertexai
 
         if __metadata__.get("task"):
-            log.info(f'{__metadata__["task"]=}, disabling event emissions.')
+            log.info(f'{__metadata__["task"]=}, disabling event emissions.') # type: ignore
             # Task model is not user facing, so we should not emit any events.
             __event_emitter__ = None
 
@@ -1759,18 +1828,6 @@ class Pipe:
         log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
         )
-        # URL context front-end button takes precedence over valves setting if it is enabled.
-        if self._is_function_active("gemini_url_context_toggle"):
-            valves.ENABLE_URL_CONTEXT_TOOL = features.get("url_context", False)
-            log.info(
-                "URL context toggle filter is active. "
-                f"Setting valves.ENABLE_URL_CONTEXT_TOOL to {valves.ENABLE_URL_CONTEXT_TOOL}."
-            )
-        else:
-            log.warning(
-                "Gemini URL Context Toggle filter is not active. "
-                "Install or enable it if you want to toggle URL context tool on/off through a front-end button."
-            )
 
         builder = GeminiContentBuilder(
             messages_body=body.get("messages"),
@@ -1784,144 +1841,25 @@ class Pipe:
         asyncio.create_task(event_emitter.emit_status("Preparing request..."))
         contents = await builder.build_contents(start_time=start_time)
 
-        # Assemble GenerateContentConfig
-        safety_settings: list[types.SafetySetting] | None = __metadata__.get(
-            "safety_settings"
-        )
+        gen_content_conf = self._build_gen_content_config(body, __metadata__, valves)
+        gen_content_conf.system_instruction = builder.system_prompt
 
-        thinking_conf = None
-        # Use the user-configurable regex to determine if this is a thinking model.
-        is_thinking_model = re.search(
-            valves.THINKING_MODEL_PATTERN, model_name, re.IGNORECASE
-        )
-
-        if is_thinking_model:
-            log.debug(f"Model ID '{model_name}' is a thinking model.")
-            # Start with the default thinking configuration from valves.
-            thinking_conf = types.ThinkingConfig(
-                thinking_budget=valves.THINKING_BUDGET,
-                include_thoughts=valves.SHOW_THINKING_SUMMARY,
-            )
-
-            # Now, check if the reasoning toggle feature is active and should be applied.
-            if self._is_function_active("gemini_reasoning_toggle"):
-                # This toggle is only applicable to flash/lite models, which support a budget of 0.
-                is_reasoning_toggleable = "flash" in model_name or "lite" in model_name
-                reasoning_is_off = not features.get("reason")
-
-                if is_reasoning_toggleable and reasoning_is_off:
-                    log.info(
-                        f"Model '{model_name}' supports disabling reasoning, and it is toggled OFF in the UI. "
-                        "Setting thinking budget to 0."
-                    )
-                    # Override the budget to 0 to disable the feature.
-                    thinking_conf.thinking_budget = 0
-            else:
-                log.warning(
-                    "Gemini Reasoning Toggle filter is not active. "
-                    "Install or enable it if you want to toggle Gemini 2.5 Flash or Lite reasoning on/off through a front-end button."
-                )
-
-        # TODO: Take defaults from the general front-end config.
-        gen_content_conf = types.GenerateContentConfig(
-            system_instruction=builder.system_prompt,
-            temperature=body.get("temperature"),
-            top_p=body.get("top_p"),
-            top_k=body.get("top_k"),
-            max_output_tokens=body.get("max_tokens"),
-            stop_sequences=body.get("stop"),
-            safety_settings=safety_settings,
-            thinking_config=thinking_conf,
-        )
-        gen_content_conf.response_modalities = ["TEXT"]
-        # Use maintainable lists for capability checks
-        image_generation_model_codes = [
-            "gemini-2.0-flash-preview-image-generation",
-            "gemini-2.5-flash-image-preview",
-            "gemini-2.5-flash-image",
-        ]
-        system_prompt_unsupported_model_substrings = (
-            image_generation_model_codes + ["gemma"]
-        )
-
-        if any(s in model_name for s in system_prompt_unsupported_model_substrings):
-            if any(s in model_name for s in image_generation_model_codes):
-                gen_content_conf.response_modalities.append("IMAGE")
+        # Some models (e.g., image generation, Gemma) do not support the system prompt message.
+        system_prompt_unsupported = is_image_model or "gemma" in model_name
+        if system_prompt_unsupported:
             # TODO: append to user message instead.
             if gen_content_conf.system_instruction:
                 gen_content_conf.system_instruction = None
                 log.warning(
-                    "Image Generation model does not support the system prompt message! Removing the system prompt."
+                    f"Model '{model_name}' does not support the system prompt message! Removing the system prompt."
                 )
-        gen_content_conf.tools = []
 
-        if features.get("google_search_tool"):
-            log.info("Using grounding with Google Search as a Tool.")
-            if valves.USE_ENTERPRISE_SEARCH and client.vertexai:
-                log.info("Using Enterprise Web Search instead of Google Search.")
-                gen_content_conf.tools.append(
-                    types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
-                )
-            else:
-                gen_content_conf.tools.append(
-                    types.Tool(google_search=types.GoogleSearch())
-                )
-        elif features.get("google_search_retrieval"):
-            log.info("Using grounding with Google Search Retrieval.")
-            gs = types.GoogleSearchRetrieval(
-                dynamic_retrieval_config=types.DynamicRetrievalConfig(
-                    dynamic_threshold=features.get("google_search_retrieval_threshold")
-                )
-            )
-            gen_content_conf.tools.append(types.Tool(google_search_retrieval=gs))
-        # NB: It is not possible to use both Search and Code execution at the same time,
-        # however, it can be changed later, so let's just handle it as a common error
-        if features.get("google_code_execution"):
-            log.info("Using code execution on Google side.")
-            gen_content_conf.tools.append(
-                types.Tool(code_execution=types.ToolCodeExecution())
-            )
         gen_content_args = {
             "model": model_name,
             "contents": contents,
             "config": gen_content_conf,
         }
         log.debug("Passing these args to the Google API:", payload=gen_content_args)
-
-        # Add URL context tool if enabled and model is compatible
-        if valves.ENABLE_URL_CONTEXT_TOOL:
-            compatible_models_for_url_context = [
-                "gemini-2.5-pro",
-                "gemini-flash-latest",
-                "gemini-2.5-flash-preview-09-2025",
-                "gemini-2.5-flash",
-                "gemini-flash-lite-latest",
-                "gemini-2.5-flash-lite-preview-09-2025",
-                "gemini-2.5-flash-lite",
-                "gemini-2.5-flash-lite-preview-06-17",
-                "gemini-2.5-pro-preview-06-05",
-                "gemini-2.5-pro-preview-05-06",
-                "gemini-2.5-flash-preview-05-20",
-                "gemini-2.0-flash",
-                "gemini-2.0-flash-001",
-                "gemini-2.0-flash-live-001",
-            ]
-            if model_name in compatible_models_for_url_context:
-                if client.vertexai and (len(gen_content_conf.tools) > 0):
-                    log.warning(
-                        "URL context tool is enabled, but Vertex AI is used with multiple tools. Skipping."
-                    )
-                else:
-                    log.info(
-                        f"Model {model_name} is compatible with URL context tool. Enabling."
-                    )
-                    gen_content_conf.tools.append(
-                        types.Tool(url_context=types.UrlContext())
-                    )
-            else:
-                log.warning(
-                    f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
-                )
 
         # Both streaming and non-streaming responses are now handled by the same
         # unified processor, which returns an AsyncGenerator. For non-streaming,
@@ -2362,9 +2300,184 @@ class Pipe:
         stripped = re.sub(r"^(?:.*/|[^.]*\.)", "", model_name)
         return stripped
 
+    @staticmethod
+    def _is_image_model(model_name: str, pattern: str) -> bool:
+        return bool(re.search(pattern, model_name, re.IGNORECASE))
+
     # endregion 2.2 Model retrival from Google API
 
-    # region 2.3 Model response processing
+    # region 2.3 GenerateContentConfig assembly
+
+    def _build_gen_content_config(
+        self,
+        body: "Body",
+        __metadata__: "Metadata",
+        valves: "Valves",
+    ) -> types.GenerateContentConfig:
+        """Assembles the GenerateContentConfig for a Gemini API request."""
+        model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
+        features = __metadata__.get("features", {}) or {}
+        is_vertex_ai = __metadata__.get("is_vertex_ai", False)
+
+        log.debug(
+            "Features extracted from metadata (UI toggles and config):",
+            payload=features
+        )
+
+        safety_settings: list[types.SafetySetting] | None = __metadata__.get(
+            "safety_settings"
+        )
+
+        thinking_conf = None
+        # Use the user-configurable regex to determine if this is a thinking model.
+        is_thinking_model = re.search(
+            valves.THINKING_MODEL_PATTERN, model_name, re.IGNORECASE
+        )
+        log.debug(
+            f"Model '{model_name}' is classified as a reasoning model: {bool(is_thinking_model)}. "
+            f"Pattern: '{valves.THINKING_MODEL_PATTERN}'"
+        )
+
+        if is_thinking_model:
+            # Start with the default thinking configuration from valves.
+            log.info(f"Setting `thinking_budget` to {valves.THINKING_BUDGET} and `include_thoughts` to {valves.SHOW_THINKING_SUMMARY}.")
+            thinking_conf = types.ThinkingConfig(
+                thinking_budget=valves.THINKING_BUDGET,
+                include_thoughts=valves.SHOW_THINKING_SUMMARY,
+            )
+
+            # Check if reasoning can be disabled. This happens if the toggle is available but turned OFF by the user.
+            is_avail, is_on = self._get_toggleable_feature_status(
+                "gemini_reasoning_toggle", __metadata__
+            )
+            if is_avail and not is_on:
+                # This toggle is only applicable to flash/lite models, which support a budget of 0.
+                is_reasoning_toggleable = "flash" in model_name or "lite" in model_name
+                if is_reasoning_toggleable:
+                    log.info(
+                        f"Model '{model_name}' supports disabling reasoning, and it is toggled OFF in the UI. "
+                        "Overwriting `thinking_budget` to 0 to disable reasoning."
+                    )
+                    thinking_conf.thinking_budget = 0
+
+        # TODO: Take defaults from the general front-end config.
+        # system_instruction is intentionally left unset here. It will be set by the caller.
+        gen_content_conf = types.GenerateContentConfig(
+            temperature=body.get("temperature"),
+            top_p=body.get("top_p"),
+            top_k=body.get("top_k"),
+            max_output_tokens=body.get("max_tokens"),
+            stop_sequences=body.get("stop"),
+            safety_settings=safety_settings,
+            thinking_config=thinking_conf,
+        )
+
+        gen_content_conf.response_modalities = ["TEXT"]
+        if self._is_image_model(model_name, valves.IMAGE_MODEL_PATTERN):
+            gen_content_conf.response_modalities.append("IMAGE")
+
+        gen_content_conf.tools = []
+
+        if features.get("google_search_tool"):
+            if valves.USE_ENTERPRISE_SEARCH and is_vertex_ai:
+                log.info("Using grounding with Enterprise Web Search as a Tool.")
+                gen_content_conf.tools.append(
+                    types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
+                )
+            else:
+                log.info("Using grounding with Google Search as a Tool.")
+                gen_content_conf.tools.append(
+                    types.Tool(google_search=types.GoogleSearch())
+                )
+        elif features.get("google_search_retrieval"):
+            log.info("Using grounding with Google Search Retrieval.")
+            gs = types.GoogleSearchRetrieval(
+                dynamic_retrieval_config=types.DynamicRetrievalConfig(
+                    dynamic_threshold=features.get("google_search_retrieval_threshold")
+                )
+            )
+            gen_content_conf.tools.append(types.Tool(google_search_retrieval=gs))
+
+        # NB: It is not possible to use both Search and Code execution at the same time,
+        # however, it can be changed later, so let's just handle it as a common error
+        if features.get("google_code_execution"):
+            log.info("Using code execution on Google side.")
+            gen_content_conf.tools.append(
+                types.Tool(code_execution=types.ToolCodeExecution())
+            )
+
+        # Determine if URL context tool should be enabled.
+        is_avail, is_on = self._get_toggleable_feature_status(
+            "gemini_url_context_toggle", __metadata__
+        )
+        enable_url_context = valves.ENABLE_URL_CONTEXT_TOOL  # Start with valve default.
+        if is_avail:
+            # If the toggle filter is configured, it overrides the valve setting.
+            enable_url_context = is_on
+
+        if enable_url_context:
+            if model_name in COMPATIBLE_MODELS_FOR_URL_CONTEXT:
+                if is_vertex_ai and (len(gen_content_conf.tools) > 0):
+                    log.warning(
+                        "URL context tool is enabled, but Vertex AI is used with other tools. Skipping."
+                    )
+                else:
+                    log.info(
+                        f"Model {model_name} is compatible with URL context tool. Enabling."
+                    )
+                    gen_content_conf.tools.append(
+                        types.Tool(url_context=types.UrlContext())
+                    )
+            else:
+                log.warning(
+                    f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
+                )
+
+        # Determine if Google Maps grounding should be enabled.
+        is_avail, is_on = self._get_toggleable_feature_status(
+            "gemini_maps_grounding_toggle", __metadata__
+        )
+        if is_avail and is_on:
+            log.info("Enabling Google Maps grounding tool.")
+            gen_content_conf.tools.append(
+                types.Tool(google_maps=types.GoogleMaps())
+            )
+
+            if valves.MAPS_GROUNDING_COORDINATES:
+                try:
+                    lat_str, lon_str = valves.MAPS_GROUNDING_COORDINATES.split(",")
+                    latitude = float(lat_str.strip())
+                    longitude = float(lon_str.strip())
+
+                    log.info(
+                        "Using coordinates for Maps grounding: "
+                        f"lat={latitude}, lon={longitude}"
+                    )
+
+                    lat_lng = types.LatLng(latitude=latitude, longitude=longitude)
+
+                    # Ensure tool_config and retrieval_config exist before assigning lat_lng.
+                    if not gen_content_conf.tool_config:
+                        gen_content_conf.tool_config = types.ToolConfig()
+                    if not gen_content_conf.tool_config.retrieval_config:
+                        gen_content_conf.tool_config.retrieval_config = (
+                            types.RetrievalConfig()
+                        )
+
+                    gen_content_conf.tool_config.retrieval_config.lat_lng = lat_lng
+
+                except (ValueError, TypeError) as e:
+                    # This should not happen due to the Pydantic validator, but it's good practice to be safe.
+                    log.error(
+                        "Failed to parse MAPS_GROUNDING_COORDINATES: "
+                        f"'{valves.MAPS_GROUNDING_COORDINATES}'. Error: {e}"
+                    )
+
+        return gen_content_conf
+
+    # endregion 2.3 GenerateContentConfig assembly
+
+    # region 2.4 Model response processing
     async def _unified_response_processor(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
@@ -2690,9 +2803,9 @@ class Pipe:
         else:
             return None
 
-    # endregion 2.3 Model response processing
+    # endregion 2.4 Model response processing
 
-    # region 2.4 Post-processing
+    # region 2.5 Post-processing
     async def _do_post_processing(
         self,
         model_response: types.GenerateContentResponse | None,
@@ -2840,9 +2953,9 @@ class Pipe:
 
         return usage_data
 
-    # endregion 2.4 Post-processing
+    # endregion 2.5 Post-processing
 
-    # region 2.5 Logging
+    # region 2.6 Logging
     # TODO: Move to a separate plugin that does not have any Open WebUI funcitonlity and is only imported by this plugin.
 
     def _is_flat_dict(self, data: Any) -> bool:
@@ -3071,17 +3184,82 @@ class Pipe:
                 f"Added new handler to loguru for {__name__} with level {desired_level_name}."
             )
 
-    # endregion 2.5 Logging
+    # endregion 2.6 Logging
 
-    # region 2.6 Utility helpers
+    # region 2.7 Utility helpers
 
-    # TODO: Check availability of companion filter too with this method.
     @staticmethod
-    def _is_function_active(id: str) -> bool:
-        # Get the filter's data from the database.
-        companion_filter = Functions.get_function_by_id(id)
-        # Return if the filter is installed and active.
-        return bool(companion_filter and companion_filter.is_active)
+    def _get_toggleable_feature_status(
+        filter_id: str,
+        __metadata__: "Metadata",
+    ) -> tuple[bool, bool]:
+        """
+        Checks the complete status of a toggleable filter (function).
+
+        This function performs a series of checks to determine if a feature
+        is available for use and if the user has activated it.
+
+        1. Checks if the filter is installed.
+        2. Checks if the filter's master toggle is active in the Functions dashboard.
+        3. Checks if the filter is enabled for the current model (or is global).
+        4. Checks if the user has toggled the feature ON for the current request.
+
+        Args:
+            filter_id: The ID of the filter to check.
+            __metadata__: The metadata object for the current request.
+
+        Returns:
+            A tuple (is_available: bool, is_toggled_on: bool).
+            - is_available: True if the filter is installed, active, and configured for the model.
+            - is_toggled_on: True if the user has the toggle ON in the UI for this request.
+        """
+        # 1. Check if the filter is installed
+        f = Functions.get_function_by_id(filter_id)
+        if not f:
+            log.warning(
+                f"The '{filter_id}' filter is not installed. "
+                "Install it to use the corresponding front-end toggle."
+            )
+            return (False, False)
+
+        # 2. Check if the master toggle is active
+        if not f.is_active:
+            log.warning(
+                f"The '{filter_id}' filter is installed but is currently disabled in the "
+                "Functions dashboard (master toggle is off). Enable it to make it available."
+            )
+            return (False, False)
+
+        # 3. Check if the filter is enabled for the model or is global
+        model_info = __metadata__.get("model", {}).get("info", {})
+        model_filter_ids = model_info.get("meta", {}).get("filterIds", [])
+        is_enabled_for_model = filter_id in model_filter_ids or f.is_global
+
+        log.debug(
+            f"Checking model enablement for '{filter_id}': in_model_filters={filter_id in model_filter_ids}, "
+            f"is_global={f.is_global} -> is_enabled={is_enabled_for_model}"
+        )
+
+        if not is_enabled_for_model:
+            # This is a configuration issue, not a user-facing warning. Debug is appropriate.
+            model_id = __metadata__.get("model", {}).get("id", "Unknown")
+            log.debug(f"Filter '{filter_id}' is not enabled for model '{model_id}' and is not global.")
+            return (False, False)
+
+        # 4. Check if the user has toggled the feature ON for this request
+        user_toggled_ids = __metadata__.get("filter_ids", [])
+        is_toggled_on = filter_id in user_toggled_ids
+
+        if is_toggled_on:
+            log.info(
+                f"Feature '{filter_id}' is available and enabled by the front-end toggle for this request."
+            )
+        else:
+            log.debug(
+                f"Feature '{filter_id}' is available but not enabled by the front-end toggle for this request."
+            )
+
+        return (True, is_toggled_on)
 
     @staticmethod
     def _get_merged_valves(
@@ -3198,6 +3376,6 @@ class Pipe:
                     f"Could not parse companion version string: '{companion_version}'. Version check skipped."
                 )
 
-    # endregion 2.6 Utility helpers
+    # endregion 2.7 Utility helpers
 
     # endregion 2. Helper methods inside the Pipe class
