@@ -15,7 +15,7 @@ Here's a breakdown of implemented and planned features for the Gemini Manifold p
 -   [x] Display thinking summary
 -   [x] Thinking budget
 -   [x] Reasoning toggle (Reason filter function required, see [it's doc](../filters/gemini_reasoning_toggle.md))
--   [x] Native image generation (image output), use "gemini-2.0-flash-exp-image-generation"
+-   [x] Native image generation and editing (image output)
 -   [x] Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 filter required, see [it's doc](../filters/gemini_manifold_companion.md))
 -   [x] Image input
 -   [x] YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
@@ -23,17 +23,19 @@ Here's a breakdown of implemented and planned features for the Gemini Manifold p
 -   [x] Audio input support
 -   [x] Google Files API
 -   [x] Grounding with Google Search (Gemini Manifold Companion >= 1.2.0 required)
+-   [x] Grounding with Google Maps (Gemini Manifold Companion >= 1.7.0 required). If you want to toggle this just like reasoning then install [Google Maps Grounding](../../../plugins/filters/gemini_map_grounding_toggle.py) filter function.
 -   [x] Display citations in the front-end. (Gemini Manifold Companion >= 1.5.0 required)
 -   [x] Permissive safety settings (Gemini Manifold Companion >= 1.3.0 required)
 -   [x] Each user can decide to use their own API key.
 -   [x] Token usage data
 -   [x] Code execution tool. (Gemini Manifold Companion >= 1.1.0 required)
--   [x] URL context tool (Gemini Manifold Companion >= 1.5.0 required if you want to see citations in the front-end). If you want to toggle this just like reasoning then install URL Context filter function, see [it's doc](../filters/gemini_url_context_toggle.md)
+-   [x] URL context tool (Gemini Manifold Companion >= 1.5.0 required if you want to see citations in the front-end). If you want to toggle this then install [URL Context](../../../plugins/filters/gemini_url_context_toggle.py) filter function.
 -   [x] Streaming and non-streaming responses.
 
 **Planned Features:**
 
 -   [ ] Native tool calling
+-   [ ] Ability to easily switch between paid and free API
 
 ## Installation
 
