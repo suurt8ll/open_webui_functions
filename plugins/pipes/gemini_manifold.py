@@ -1444,12 +1444,11 @@ class Pipe:
         return v
 
     class Valves(BaseModel):
-        GEMINI_API_KEY: str | None = Field(default=None)
-        IMAGE_GEN_GEMINI_API_KEY: str | None = Field(
-            default=None,
-            description="""Optional separate API key for image generation models.
-            If not provided, the main GEMINI_API_KEY will be used.
-            An image generation model is identified by the Image Model Pattern regex below.""",
+        GEMINI_FREE_API_KEY: str | None = Field(
+            default=None, description="Free Gemini Developer API key."
+        )
+        GEMINI_PAID_API_KEY: str | None = Field(
+            default=None, description="Paid Gemini Developer API key."
         )
         USER_MUST_PROVIDE_AUTH_CONFIG: bool = Field(
             default=False,
@@ -1459,7 +1458,7 @@ class Pipe:
         )
         AUTH_WHITELIST: str | None = Field(
             default=None,
-            description="""Comma separated list of user emails that are allowed to bypassUSER_MUST_PROVIDE_AUTH_CONFIG and use the default authentication configuration.
+            description="""Comma separated list of user emails that are allowed to bypass USER_MUST_PROVIDE_AUTH_CONFIG and use the default authentication configuration.
             Default value is None (no users are whitelisted).""",
         )
         GEMINI_API_BASE_URL: str | None = Field(
@@ -1528,7 +1527,7 @@ class Pipe:
         THINKING_MODEL_PATTERN: str = Field(
             default=r"^(?=.*(?:gemini-2\.5|gemini-flash-latest|gemini-flash-lite-latest))(?!(.*live))(?!(.*image))",
             description="""Regex pattern to identify thinking models.
-            Default value is r"^(?=.*(?:gemini-2\.5|gemini-flash-latest|gemini-flash-lite-latest))(?!(.*live))(?!(.*image))".""",
+            Default value is r"^(?=.*(?:gemini-2.5|gemini-flash-latest|gemini-flash-lite-latest))(?!(.*live))(?!(.*image))".""",
         )
         IMAGE_MODEL_PATTERN: str = Field(
             default=r"image",
@@ -1619,15 +1618,13 @@ class Pipe:
         certain parameters, like their API key or model settings, for their own use.
         """
 
-        GEMINI_API_KEY: str | None = Field(
+        GEMINI_FREE_API_KEY: str | None = Field(
             default=None,
-            description="""Gemini Developer API key.
-            Default value is None (uses the default from Valves, same goes for other options below).""",
+            description="""Free Gemini Developer API key. If not provided, the admin's key may be used if permitted.""",
         )
-        IMAGE_GEN_GEMINI_API_KEY: str | None = Field(
+        GEMINI_PAID_API_KEY: str | None = Field(
             default=None,
-            description="""Optional separate API key for image generation models.
-            If not provided, the main GEMINI_API_KEY will be used.""",
+            description="""Paid Gemini Developer API key. If not provided, the admin's key may be used if permitted.""",
         )
         GEMINI_API_BASE_URL: str | None = Field(
             default=None,
@@ -1776,22 +1773,34 @@ class Pipe:
         valves: Pipe.Valves = self._get_merged_valves(
             self.valves, __user__.get("valves"), __user__.get("email")
         )
-
-        model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
-        is_image_model = self._is_image_model(model_name, valves.IMAGE_MODEL_PATTERN)
-
-        if is_image_model and valves.IMAGE_GEN_GEMINI_API_KEY:
-            log.info("Using separate API key for image generation model.")
-            valves.GEMINI_API_KEY = valves.IMAGE_GEN_GEMINI_API_KEY
-
-            # When using a separate key, assume it's for Gemini API, not Vertex AI
-            # TODO: check if it would work for Vertex AI as well
-            valves.USE_VERTEX_AI = False
-            valves.VERTEX_PROJECT = None
-
         log.debug(
-            f"USE_VERTEX_AI: {valves.USE_VERTEX_AI}, VERTEX_PROJECT set: {bool(valves.VERTEX_PROJECT)}, API_KEY set: {bool(valves.GEMINI_API_KEY)}"
+            f"USE_VERTEX_AI: {valves.USE_VERTEX_AI}, VERTEX_PROJECT set: {bool(valves.VERTEX_PROJECT)},"
+            f" GEMINI_FREE_API_KEY set: {bool(valves.GEMINI_FREE_API_KEY)}, GEMINI_PAID_API_KEY set: {bool(valves.GEMINI_PAID_API_KEY)}"
         )
+
+        # Check for the 'Gemini Paid API' toggle and adjust API key usage accordingly.
+        is_paid_api_available, is_paid_api_toggled_on = (
+            self._get_toggleable_feature_status("gemini_paid_api", __metadata__)
+        )
+        if is_paid_api_available:
+            if is_paid_api_toggled_on:
+                # User has toggled ON the paid API filter, so we prioritize the paid key.
+                # Setting the free key to None ensures the client uses the paid one.
+                valves.GEMINI_FREE_API_KEY = None
+                log.info("Paid API toggle is enabled. Prioritizing paid Gemini key.")
+            else:
+                # User has toggled OFF the paid API filter, so we prioritize the free key.
+                # Setting the paid key to None ensures the client uses the free one.
+                valves.GEMINI_PAID_API_KEY = None
+                log.info(
+                    "Paid API toggle is available but disabled. Prioritizing free Gemini key."
+                )
+        else:
+            # The filter is not available/configured, so we use the default logic:
+            # prefer free key if both are present.
+            log.info(
+                "Paid API toggle not configured for this model. Defaulting to free key if available."
+            )
 
         log.debug(
             f"Getting genai client (potentially cached) for user {__user__['email']}."
@@ -1845,6 +1854,8 @@ class Pipe:
         gen_content_conf.system_instruction = builder.system_prompt
 
         # Some models (e.g., image generation, Gemma) do not support the system prompt message.
+        model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
+        is_image_model = self._is_image_model(model_name, valves.IMAGE_MODEL_PATTERN)
         system_prompt_unsupported = is_image_model or "gemma" in model_name
         if system_prompt_unsupported:
             # TODO: append to user message instead.
@@ -1897,6 +1908,7 @@ class Pipe:
             )
         else:
             # Non-streaming response.
+            # FIXME: Catch and handle any exceptions from the API call.
             res = await client.aio.models.generate_content(**gen_content_args)
 
             # Adapter: Create a simple, one-shot async generator that yields the
@@ -1928,7 +1940,8 @@ class Pipe:
     @staticmethod
     @cache
     def _get_or_create_genai_client(
-        api_key: str | None = None,
+        free_api_key: str | None = None,
+        paid_api_key: str | None = None,
         base_url: str | None = None,
         use_vertex_ai: bool | None = None,
         vertex_project: str | None = None,
@@ -1939,9 +1952,12 @@ class Pipe:
         Raises GenaiApiError on failure.
         """
 
+        # Prioritize the free key, then fall back to the paid key.
+        api_key = free_api_key or paid_api_key
+
         if not vertex_project and not api_key:
             # FIXME: More detailed reason in the exception (tell user to set the API key).
-            msg = "Neither VERTEX_PROJECT nor GEMINI_API_KEY is set."
+            msg = "Neither VERTEX_PROJECT nor a Gemini API key (free or paid) is set."
             raise GenaiApiError(msg)
 
         if use_vertex_ai and vertex_project:
@@ -1981,10 +1997,10 @@ class Pipe:
             f"USER_MUST_PROVIDE_AUTH_CONFIG: {valves.USER_MUST_PROVIDE_AUTH_CONFIG}"
         )
         if valves.USER_MUST_PROVIDE_AUTH_CONFIG and user_email not in user_whitelist:
-            if not valves.GEMINI_API_KEY:
+            if not valves.GEMINI_FREE_API_KEY and not valves.GEMINI_PAID_API_KEY:
                 error_msg = (
                     "User must provide their own authentication configuration. "
-                    "Please set GEMINI_API_KEY in your UserValves."
+                    "Please set GEMINI_FREE_API_KEY or GEMINI_PAID_API_KEY in your UserValves."
                 )
                 raise ValueError(error_msg)
         try:
@@ -2002,13 +2018,14 @@ class Pipe:
     ) -> list[str | bool | None]:
         """Prepares arguments for _get_or_create_genai_client from source_valves."""
         ATTRS = [
-            "GEMINI_API_KEY",
+            "GEMINI_FREE_API_KEY",
+            "GEMINI_PAID_API_KEY",
             "GEMINI_API_BASE_URL",
             "USE_VERTEX_AI",
             "VERTEX_PROJECT",
             "VERTEX_LOCATION",
         ]
-        return [getattr(source_valves, attr) for attr in ATTRS]
+        return [getattr(source_valves, attr, None) for attr in ATTRS]
 
     # endregion 2.1 Client initialization
 
@@ -2016,13 +2033,14 @@ class Pipe:
     @cached()  # aiocache.cached for async method
     async def _get_genai_models(
         self,
-        api_key: str | None,
-        base_url: str | None,
-        use_vertex_ai: bool | None,  # User's preference from config
-        vertex_project: str | None,
-        vertex_location: str | None,
-        whitelist_str: str,
-        blacklist_str: str | None,
+        free_api_key: str | None = None,
+        paid_api_key: str | None = None,
+        base_url: str | None = None,
+        use_vertex_ai: bool | None = None,
+        vertex_project: str | None = None,
+        vertex_location: str | None = None,
+        whitelist_str: str = "*",
+        blacklist_str: str | None = None,
     ) -> list["ModelData"]:
         """
         Gets valid Google models from API(s) and filters them.
@@ -2032,7 +2050,7 @@ class Pipe:
         all_raw_models: list[types.Model] = []
 
         # Condition for fetching from both sources
-        fetch_both = bool(use_vertex_ai and vertex_project and api_key)
+        fetch_both = bool(use_vertex_ai and vertex_project and (free_api_key or paid_api_key))
 
         if fetch_both:
             log.info(
@@ -2045,7 +2063,8 @@ class Pipe:
             # 1. Fetch from Gemini Developer API
             try:
                 gemini_client = self._get_or_create_genai_client(
-                    api_key=api_key,
+                    free_api_key=free_api_key,
+                    paid_api_key=paid_api_key,
                     base_url=base_url,
                     use_vertex_ai=False,  # Explicitly target Gemini API
                     vertex_project=None,
@@ -2070,7 +2089,6 @@ class Pipe:
                     use_vertex_ai=True,  # Explicitly target Vertex AI
                     vertex_project=vertex_project,
                     vertex_location=vertex_location,
-                    api_key=None,  # API key is not used for Vertex AI with project auth
                     base_url=base_url,  # Pass base_url for potential Vertex custom endpoints
                 )
                 vertex_models_list = await self._fetch_models_from_client_internal(
@@ -2146,7 +2164,8 @@ class Pipe:
 
             try:
                 client = self._get_or_create_genai_client(
-                    api_key=api_key,
+                    free_api_key=free_api_key,
+                    paid_api_key=paid_api_key,
                     base_url=base_url,
                     use_vertex_ai=client_target_is_vertex,  # Pass the determined target
                     vertex_project=vertex_project if client_target_is_vertex else None,
@@ -3271,14 +3290,15 @@ class Pipe:
         """
         Merges UserValves into a base Valves configuration.
 
-        The general rule is that if a field in UserValves is not None, it overrides
-        the corresponding field in the default_valves. Otherwise, the default_valves
-        field value is used.
+        The general rule is that if a field in UserValves is not None or an empty
+        string, it overrides the corresponding field in the default_valves.
+        Otherwise, the default_valves field value is used.
 
         Exceptions:
-        - If default_valves.USER_MUST_PROVIDE_AUTH_CONFIG is True, then GEMINI_API_KEY and
-          VERTEX_PROJECT in the merged result will be taken directly from
-          user_valves (even if they are None), ignoring the values in default_valves.
+        - If default_valves.USER_MUST_PROVIDE_AUTH_CONFIG is True and the user is
+          not on the AUTH_WHITELIST, then GEMINI_FREE_API_KEY and
+          GEMINI_PAID_API_KEY in the merged result will be taken directly from
+          user_valves (even if they are None), and Vertex AI usage is disabled.
 
         Args:
             default_valves: The base Valves object with default configurations.
@@ -3317,10 +3337,15 @@ class Pipe:
             default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
             and user_email not in user_whitelist
         ):
+            log.info(
+                f"User '{user_email}' is required to provide their own authentication credentials due to USER_MUST_PROVIDE_AUTH_CONFIG=True."
+                " Admin-provided API keys and Vertex AI settings will not be used."
+            )
             # If USER_MUST_PROVIDE_AUTH_CONFIG is True and user is not in the whitelist,
-            # then user must provide their own GEMINI_API_KEY
-            # User is disallowed from using Vertex AI in this case.
-            merged_data["GEMINI_API_KEY"] = user_valves.GEMINI_API_KEY
+            # they must provide their own API keys.
+            # They are also disallowed from using the admin's Vertex AI configuration.
+            merged_data["GEMINI_FREE_API_KEY"] = user_valves.GEMINI_FREE_API_KEY
+            merged_data["GEMINI_PAID_API_KEY"] = user_valves.GEMINI_PAID_API_KEY
             merged_data["VERTEX_PROJECT"] = None
             merged_data["USE_VERTEX_AI"] = False
 
