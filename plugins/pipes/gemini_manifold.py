@@ -396,8 +396,34 @@ class FilesAPIManager:
         self.id_hash_cache = id_hash_cache
         self.event_emitter = event_emitter
         # A dictionary to manage locks for concurrent uploads.
-        # The key is the content_hash, the value is an asyncio.Lock.
+        # The key is a composite of api_key_hash and content_hash.
         self.upload_locks: dict[str, asyncio.Lock] = {}
+        self.api_key_hash = self._get_api_key_hash()
+
+    def _get_api_key_hash(self) -> str:
+        """
+        Returns a hash of the API key for use in cache keys.
+
+        Returns 'no_key' if the client is not using an API key (e.g., Vertex AI with ADC).
+        """
+        # The genai.Client object doesn't expose the API key directly.
+        # It's stored in the internal _api_client.
+        api_key = getattr(self.client._api_client, "api_key", None)
+        if not api_key:
+            # This could happen if using Vertex AI with Application Default Credentials
+            return "no_key"
+        return xxhash.xxh64(api_key.encode("utf-8")).hexdigest()
+
+    def _get_file_cache_key(self, content_hash: str) -> str:
+        """Gets the namespaced key for the file cache."""
+        return f"{self.api_key_hash}:{content_hash}"
+
+    def _get_lock_key(self, content_hash: str) -> str:
+        """Gets the namespaced key for upload locks."""
+        # Although the deterministic_name is content-based, the file's ownership
+        # is tied to the API key (project). Locking per API key + content hash
+        # allows concurrent uploads of the same file for different users.
+        return f"{self.api_key_hash}:{content_hash}"
 
     async def get_or_upload_file(
         self,
@@ -432,7 +458,8 @@ class FilesAPIManager:
 
         # Step 2: The Hot Path (Check Local File Cache)
         # A cache hit means the file is valid and we can return immediately.
-        cached_file: types.File | None = await self.file_cache.get(content_hash)
+        file_cache_key = self._get_file_cache_key(content_hash)
+        cached_file: types.File | None = await self.file_cache.get(file_cache_key)
         if cached_file:
             log_id = f"OWUI ID: {owui_file_id}" if owui_file_id else "anonymous file"
             log.debug(
@@ -442,10 +469,11 @@ class FilesAPIManager:
 
         # On cache miss, acquire a lock specific to this file's content to prevent race conditions.
         # dict.setdefault is atomic, ensuring only one lock is created per hash.
-        lock = self.upload_locks.setdefault(content_hash, asyncio.Lock())
+        lock_key = self._get_lock_key(content_hash)
+        lock = self.upload_locks.setdefault(lock_key, asyncio.Lock())
         if lock.locked():
             log.debug(
-                f"Lock for hash {content_hash} is held by another task. "
+                f"Lock for key {lock_key} is held by another task. "
                 f"This call will now wait for the lock to be released."
             )
 
@@ -453,7 +481,7 @@ class FilesAPIManager:
             # Step 2.5: Double-Checked Locking
             # After acquiring the lock, check the cache again. Another task might have
             # completed the upload while we were waiting for the lock.
-            cached_file = await self.file_cache.get(content_hash)
+            cached_file = await self.file_cache.get(file_cache_key)
             if cached_file:
                 log.debug(
                     f"Cache HIT for file hash {content_hash} after acquiring lock. Returning."
@@ -461,7 +489,9 @@ class FilesAPIManager:
                 return cached_file
 
             # Step 3: The Warm/Cold Path (On Cache Miss)
-            deterministic_name = f"files/owui-v1-{content_hash}"
+            # The file ID (name after "files/") must be <= 40 chars.
+            # "owui-" (5) + hash (16) + "-" (1) + hash (16) = 38 chars.
+            deterministic_name = f"files/owui-{self.api_key_hash}-{content_hash}"
             log.debug(
                 f"Cache MISS for hash {content_hash}. Attempting stateless recovery with GET: {deterministic_name}"
             )
@@ -480,13 +510,17 @@ class FilesAPIManager:
                 active_file = await self._poll_for_active_state(file.name, owui_file_id)
 
                 ttl_seconds = self._calculate_ttl(active_file.expiration_time)
-                await self.file_cache.set(content_hash, active_file, ttl=ttl_seconds)
+                await self.file_cache.set(file_cache_key, active_file, ttl=ttl_seconds)
 
                 return active_file
             except genai_errors.ClientError as e:
-                if e.code == 403:  # "Not found" signal from the API.
+                # NOTE: The Gemini Files API returns 403 Forbidden when trying to GET
+                # a file that either does not exist or belongs to another project.
+                # We treat 403 as the "not found" signal for our warm path and
+                # include 404 for forward compatibility.
+                if e.code == 403 or e.code == 404:
                     log.info(
-                        f"File {deterministic_name} not found on server (received 403). Proceeding to upload."
+                        f"File {deterministic_name} not found on server (received {e.code}). Proceeding to upload."
                     )
                     # Proceed to upload (Cold Path)
                     return await self._upload_and_process_file(
@@ -499,7 +533,7 @@ class FilesAPIManager:
                     )
                 else:
                     log.exception(
-                        f"A non-403 client error occurred during stateless recovery for {deterministic_name}."
+                        f"An unhandled client error (code: {e.code}) occurred during stateless recovery for {deterministic_name}."
                     )
                     self.event_emitter.emit_toast(
                         f"API error for file: {e.code}. Please check permissions.",
@@ -523,8 +557,8 @@ class FilesAPIManager:
                 # Clean up the lock from the dictionary once processing is complete
                 # for this hash, preventing memory growth over time.
                 # This is safe because any future request for this hash will hit the cache.
-                if content_hash in self.upload_locks:
-                    del self.upload_locks[content_hash]
+                if lock_key in self.upload_locks:
+                    del self.upload_locks[lock_key]
 
     async def _get_content_hash(
         self, file_bytes: bytes, owui_file_id: str | None
@@ -538,6 +572,8 @@ class FilesAPIManager:
         """
         if owui_file_id:
             # First, check the ID-to-Hash cache for known files.
+            # This cache is NOT namespaced by API key, as the mapping from
+            # an OWUI file ID to its content hash is constant.
             cached_hash: str | None = await self.id_hash_cache.get(owui_file_id)
             if cached_hash:
                 log.trace(f"Hash cache HIT for OWUI ID {owui_file_id}.")
@@ -617,7 +653,8 @@ class FilesAPIManager:
 
             # Calculate TTL and set in the main file cache using the content hash as the key.
             ttl_seconds = self._calculate_ttl(active_file.expiration_time)
-            await self.file_cache.set(content_hash, active_file, ttl=ttl_seconds)
+            file_cache_key = self._get_file_cache_key(content_hash)
+            await self.file_cache.set(file_cache_key, active_file, ttl=ttl_seconds)
             log.debug(
                 f"Cached new file object for hash {content_hash} with TTL: {ttl_seconds}s."
             )
