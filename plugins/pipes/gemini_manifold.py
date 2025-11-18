@@ -6,15 +6,15 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.26.0
+version: 1.27.0
 requirements: google-genai==1.49.0
 """
 
-VERSION = "1.26.0"
+VERSION = "1.27.0"
 # This is the recommended version for the companion filter.
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
-RECOMMENDED_COMPANION_VERSION = "1.7.0"
+RECOMMENDED_COMPANION_VERSION = "1.7.1"
 
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
@@ -1531,9 +1531,9 @@ class Pipe:
             Titles are emitted as status updates and hidden when thinking ends.""",
         )
         THINKING_MODEL_PATTERN: str = Field(
-            default=r"^(?=.*(?:gemini-2\.5|gemini-flash-latest|gemini-flash-lite-latest))(?!(.*live))(?!(.*image))",
+            default=r"^(?=.*(?:gemini-2\.5|gemini-flash-latest|gemini-flash-lite-latest|gemini-3-pro-preview))(?!(.*live))(?!(.*image))",
             description="""Regex pattern to identify thinking models.
-            Default value is r"^(?=.*(?:gemini-2\.5|gemini-flash-latest|gemini-flash-lite-latest))(?!(.*live))(?!(.*image))".""",
+            Default value is r"^(?=.*(?:gemini-2\.5|gemini-flash-latest|gemini-flash-lite-latest|gemini-3-pro-preview))(?!(.*live))(?!(.*image))".""",
         )
         IMAGE_MODEL_PATTERN: str = Field(
             default=r"image",
