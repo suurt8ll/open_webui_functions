@@ -1525,6 +1525,11 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is True.""",
         )
+        SHOW_THOUGHT_TITLES: bool = Field(
+            default=True,
+            description="""Displays live thought summary titles while the model is thinking.
+            Titles are emitted as status updates and hidden when thinking ends.""",
+        )
         THINKING_MODEL_PATTERN: str = Field(
             default=r"^(?=.*(?:gemini-2\.5|gemini-flash-latest|gemini-flash-lite-latest))(?!(.*live))(?!(.*image))",
             description="""Regex pattern to identify thinking models.
@@ -1672,6 +1677,11 @@ class Pipe:
             default=None,
             description="""Regex pattern to identify thinking models.
             Default value is None.""",
+        )
+        SHOW_THOUGHT_TITLES: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Whether to display live thought summary titles while thinking.
+            Default value is None (use admin setting).""",
         )
         ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
             default=None,
@@ -2503,6 +2513,9 @@ class Pipe:
         total_substitutions = 0
         first_chunk_received = False
         chunk_counter = 0
+        in_think = False
+        last_title: str | None = None
+        show_titles = bool(getattr(self.valves, "SHOW_THOUGHT_TITLES", True))
 
         try:
             async for chunk in response_stream:
@@ -2529,6 +2542,64 @@ class Pipe:
                 # This inner loop makes the method robust. It handles a single chunk
                 # with many parts (non-streaming) or many chunks with one part (streaming).
                 for part in parts:
+                    # Handle thought titles and transitions between reasoning and normal content.
+                    match part:
+                        case types.Part(text=str(text), thought=True):
+                            if show_titles and text:
+                                try:
+                                    title: str | None = None
+                                    # Prefer markdown-style "### Heading" titles.
+                                    for m in re.finditer(
+                                        r"(^|\n)###\s+(.+?)(?=\n|$)", text or ""
+                                    ):
+                                        title = m.group(2).strip()
+                                    # Fall back to bold "**Title**" lines if no heading was found.
+                                    if not title:
+                                        for m in re.finditer(
+                                            r"(^|\n)\s*\*\*(.+?)\*\*\s*(?=\n|$)",
+                                            text or "",
+                                        ):
+                                            title = (m.group(2) or "").strip()
+                                    if title:
+                                        # Trim common surrounding quotes.
+                                        title = title.strip('"“”‘’').strip()
+                                    if title and title != last_title:
+                                        last_title = title
+                                        asyncio.create_task(
+                                            event_emitter.emit_status(
+                                                title,
+                                                done=False,
+                                                hidden=False,
+                                            )
+                                        )
+                                except Exception:
+                                    # Thought titles are a best-effort feature; failures should not break the stream.
+                                    pass
+                            if not in_think:
+                                in_think = True
+                        case types.Part(text=str(text)):
+                            if in_think:
+                                in_think = False
+                                # Clear the last thought title when normal content begins.
+                                asyncio.create_task(
+                                    event_emitter.emit_status(
+                                        "",
+                                        done=True,
+                                        hidden=True,
+                                    )
+                                )
+                        case types.Part(inline_data=_) | types.Part(
+                            executable_code=_
+                        ) | types.Part(code_execution_result=_):
+                            if in_think:
+                                in_think = False
+                                asyncio.create_task(
+                                    event_emitter.emit_status(
+                                        "",
+                                        done=True,
+                                        hidden=True,
+                                    )
+                                )
                     payload, count = await self._process_part(
                         part,
                         __request__,
