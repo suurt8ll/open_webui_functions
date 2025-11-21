@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
 # According to https://ai.google.dev/gemini-api/docs/models
 ALLOWED_GROUNDING_MODELS = {
+    "gemini-3-pro-image-preview",
     "gemini-3-pro-preview",
     "gemini-2.5-pro",
     "gemini-flash-latest",
