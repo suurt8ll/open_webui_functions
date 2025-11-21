@@ -262,6 +262,7 @@ class Filter:
 
         user_stream_intent = body.get("stream", True)
         image_generation_models = {
+            "gemini-3-pro-image-preview",
             "gemini-2.0-flash-preview-image-generation",
             "gemini-2.5-flash-image-preview",
             "gemini-2.5-flash-image",
