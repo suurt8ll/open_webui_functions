@@ -1531,9 +1531,9 @@ class Pipe:
             Titles are emitted as status updates and hidden when thinking ends.""",
         )
         THINKING_MODEL_PATTERN: str = Field(
-            default=r"^(?=.*(?:gemini-2\.5|gemini-flash-latest|gemini-flash-lite-latest|gemini-3-pro-preview|gemini-3-pro-image-preview))(?!(.*live))(?!(?!gemini-3-pro-image-preview).*image)",
+            default=r"^(?!.*live)(?=.*gemini-(?:3|2\.5|flash(?:-lite)?-latest))(?=.*gemini-3|(?!.*image))",
             description="""Regex pattern to identify thinking models.
-            Default value is r"^(?=.*(?:gemini-2\.5|gemini-flash-latest|gemini-flash-lite-latest|gemini-3-pro-preview|gemini-3-pro-image-preview))(?!(.*live))(?!(?!gemini-3-pro-image-preview).*image)".""",
+            Default value is r"^(?!.*live)(?=.*gemini-(?:3|2\.5|flash(?:-lite)?-latest))(?=.*gemini-3|(?!.*image))".""",
         )
         IMAGE_MODEL_PATTERN: str = Field(
             default=r"image",
