@@ -1503,6 +1503,7 @@ class Pipe:
             description="""The base URL for calling the Gemini API.
             Default value is None.""",
         )
+        # FIXME: assume the user wants Vertex if they set VERTEX_PROJECT, removing the need for this valve.
         USE_VERTEX_AI: bool = Field(
             default=False,
             description="""Whether to use Google Cloud Vertex AI instead of the standard Gemini API.
@@ -1571,7 +1572,7 @@ class Pipe:
             description="""Regex pattern to identify image generation models.
             Default value is r"image".""",
         )
-        # FIXME: remove
+        # FIXME: remove, toggle filter handles this now
         ENABLE_URL_CONTEXT_TOOL: bool = Field(
             default=False,
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
@@ -1810,34 +1811,14 @@ class Pipe:
         valves: Pipe.Valves = self._get_merged_valves(
             self.valves, __user__.get("valves"), __user__.get("email")
         )
+
+        # Apply UI toggle overrides (Paid API & Vertex AI)
+        valves = self._apply_toggle_configurations(valves, __metadata__)
+
         log.debug(
             f"USE_VERTEX_AI: {valves.USE_VERTEX_AI}, VERTEX_PROJECT set: {bool(valves.VERTEX_PROJECT)},"
             f" GEMINI_FREE_API_KEY set: {bool(valves.GEMINI_FREE_API_KEY)}, GEMINI_PAID_API_KEY set: {bool(valves.GEMINI_PAID_API_KEY)}"
         )
-
-        # Check for the 'Gemini Paid API' toggle and adjust API key usage accordingly.
-        is_paid_api_available, is_paid_api_toggled_on = (
-            self._get_toggleable_feature_status("gemini_paid_api", __metadata__)
-        )
-        if is_paid_api_available:
-            if is_paid_api_toggled_on:
-                # User has toggled ON the paid API filter, so we prioritize the paid key.
-                # Setting the free key to None ensures the client uses the paid one.
-                valves.GEMINI_FREE_API_KEY = None
-                log.info("Paid API toggle is enabled. Prioritizing paid Gemini key.")
-            else:
-                # User has toggled OFF the paid API filter, so we prioritize the free key.
-                # Setting the paid key to None ensures the client uses the free one.
-                valves.GEMINI_PAID_API_KEY = None
-                log.info(
-                    "Paid API toggle is available but disabled. Prioritizing free Gemini key."
-                )
-        else:
-            # The filter is not available/configured, so we use the default logic:
-            # prefer free key if both are present.
-            log.info(
-                "Paid API toggle not configured for this model. Defaulting to free key if available."
-            )
 
         log.debug(
             f"Getting genai client (potentially cached) for user {__user__['email']}."
@@ -3317,6 +3298,60 @@ class Pipe:
             )
 
         return (True, is_toggled_on)
+
+    def _apply_toggle_configurations(
+        self,
+        valves: "Pipe.Valves",
+        __metadata__: "Metadata",
+    ) -> "Pipe.Valves":
+        """
+        Applies logic for toggleable filters (Paid API, Vertex AI) to the valves.
+        Returns a modified Valves object.
+        """
+
+        # --- Logic for Gemini Paid API Toggle ---
+        is_paid_api_available, is_paid_api_toggled_on = (
+            self._get_toggleable_feature_status("gemini_paid_api", __metadata__)
+        )
+
+        if is_paid_api_available:
+            if is_paid_api_toggled_on:
+                # User has toggled ON the paid API filter. Prioritize paid key.
+                valves.GEMINI_FREE_API_KEY = None
+                log.info("Paid API toggle is enabled. Prioritizing paid Gemini key.")
+            else:
+                # User has toggled OFF the paid API filter. Prioritize free key.
+                valves.GEMINI_PAID_API_KEY = None
+                log.info(
+                    "Paid API toggle is available but disabled. Prioritizing free Gemini key."
+                )
+        else:
+            log.info(
+                "Paid API toggle not configured for this model. Defaulting to free key if available."
+            )
+
+        # --- Logic for Vertex AI Toggle ---
+        is_vertex_available, is_vertex_toggled_on = self._get_toggleable_feature_status(
+            "gemini_vertex_ai_toggle", __metadata__
+        )
+
+        # Only override valves if the toggle system is actually active/installed
+        if is_vertex_available:
+            if is_vertex_toggled_on:
+                # Toggle is ON: Ensure Vertex is enabled in valves (if credentials exist)
+                valves.USE_VERTEX_AI = True
+                log.info("Vertex AI toggle is enabled. Enforcing Vertex AI usage.")
+            else:
+                # Toggle is OFF: Force Vertex settings to disabled state
+                valves.USE_VERTEX_AI = False
+                valves.VERTEX_PROJECT = None
+                # Resetting location to default just in case, though strictly not necessary if disabled
+                valves.VERTEX_LOCATION = "global"
+                log.info(
+                    "Vertex AI toggle is disabled. Forcing standard Gemini Developer API."
+                )
+
+        return valves
 
     @staticmethod
     def _get_merged_valves(
