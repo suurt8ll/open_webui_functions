@@ -6,15 +6,15 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.27.0
+version: 1.26.0
 requirements: google-genai==1.49.0
 """
 
-VERSION = "1.27.0"
+VERSION = "1.26.0"
 # This is the recommended version for the companion filter.
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
-RECOMMENDED_COMPANION_VERSION = "1.7.1"
+RECOMMENDED_COMPANION_VERSION = "1.7.0"
 
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
@@ -396,8 +396,34 @@ class FilesAPIManager:
         self.id_hash_cache = id_hash_cache
         self.event_emitter = event_emitter
         # A dictionary to manage locks for concurrent uploads.
-        # The key is the content_hash, the value is an asyncio.Lock.
+        # The key is a composite of api_key_hash and content_hash.
         self.upload_locks: dict[str, asyncio.Lock] = {}
+        self.api_key_hash = self._get_api_key_hash()
+
+    def _get_api_key_hash(self) -> str:
+        """
+        Returns a hash of the API key for use in cache keys.
+
+        Returns 'no_key' if the client is not using an API key (e.g., Vertex AI with ADC).
+        """
+        # The genai.Client object doesn't expose the API key directly.
+        # It's stored in the internal _api_client.
+        api_key = getattr(self.client._api_client, "api_key", None)
+        if not api_key:
+            # This could happen if using Vertex AI with Application Default Credentials
+            return "no_key"
+        return xxhash.xxh64(api_key.encode("utf-8")).hexdigest()
+
+    def _get_file_cache_key(self, content_hash: str) -> str:
+        """Gets the namespaced key for the file cache."""
+        return f"{self.api_key_hash}:{content_hash}"
+
+    def _get_lock_key(self, content_hash: str) -> str:
+        """Gets the namespaced key for upload locks."""
+        # Although the deterministic_name is content-based, the file's ownership
+        # is tied to the API key (project). Locking per API key + content hash
+        # allows concurrent uploads of the same file for different users.
+        return f"{self.api_key_hash}:{content_hash}"
 
     async def get_or_upload_file(
         self,
@@ -432,7 +458,8 @@ class FilesAPIManager:
 
         # Step 2: The Hot Path (Check Local File Cache)
         # A cache hit means the file is valid and we can return immediately.
-        cached_file: types.File | None = await self.file_cache.get(content_hash)
+        file_cache_key = self._get_file_cache_key(content_hash)
+        cached_file: types.File | None = await self.file_cache.get(file_cache_key)
         if cached_file:
             log_id = f"OWUI ID: {owui_file_id}" if owui_file_id else "anonymous file"
             log.debug(
@@ -442,10 +469,11 @@ class FilesAPIManager:
 
         # On cache miss, acquire a lock specific to this file's content to prevent race conditions.
         # dict.setdefault is atomic, ensuring only one lock is created per hash.
-        lock = self.upload_locks.setdefault(content_hash, asyncio.Lock())
+        lock_key = self._get_lock_key(content_hash)
+        lock = self.upload_locks.setdefault(lock_key, asyncio.Lock())
         if lock.locked():
             log.debug(
-                f"Lock for hash {content_hash} is held by another task. "
+                f"Lock for key {lock_key} is held by another task. "
                 f"This call will now wait for the lock to be released."
             )
 
@@ -453,7 +481,7 @@ class FilesAPIManager:
             # Step 2.5: Double-Checked Locking
             # After acquiring the lock, check the cache again. Another task might have
             # completed the upload while we were waiting for the lock.
-            cached_file = await self.file_cache.get(content_hash)
+            cached_file = await self.file_cache.get(file_cache_key)
             if cached_file:
                 log.debug(
                     f"Cache HIT for file hash {content_hash} after acquiring lock. Returning."
@@ -461,7 +489,9 @@ class FilesAPIManager:
                 return cached_file
 
             # Step 3: The Warm/Cold Path (On Cache Miss)
-            deterministic_name = f"files/owui-v1-{content_hash}"
+            # The file ID (name after "files/") must be <= 40 chars.
+            # "owui-" (5) + hash (16) + "-" (1) + hash (16) = 38 chars.
+            deterministic_name = f"files/owui-{self.api_key_hash}-{content_hash}"
             log.debug(
                 f"Cache MISS for hash {content_hash}. Attempting stateless recovery with GET: {deterministic_name}"
             )
@@ -480,13 +510,17 @@ class FilesAPIManager:
                 active_file = await self._poll_for_active_state(file.name, owui_file_id)
 
                 ttl_seconds = self._calculate_ttl(active_file.expiration_time)
-                await self.file_cache.set(content_hash, active_file, ttl=ttl_seconds)
+                await self.file_cache.set(file_cache_key, active_file, ttl=ttl_seconds)
 
                 return active_file
             except genai_errors.ClientError as e:
-                if e.code == 403:  # "Not found" signal from the API.
+                # NOTE: The Gemini Files API returns 403 Forbidden when trying to GET
+                # a file that either does not exist or belongs to another project.
+                # We treat 403 as the "not found" signal for our warm path and
+                # include 404 for forward compatibility.
+                if e.code == 403 or e.code == 404:
                     log.info(
-                        f"File {deterministic_name} not found on server (received 403). Proceeding to upload."
+                        f"File {deterministic_name} not found on server (received {e.code}). Proceeding to upload."
                     )
                     # Proceed to upload (Cold Path)
                     return await self._upload_and_process_file(
@@ -499,7 +533,7 @@ class FilesAPIManager:
                     )
                 else:
                     log.exception(
-                        f"A non-403 client error occurred during stateless recovery for {deterministic_name}."
+                        f"An unhandled client error (code: {e.code}) occurred during stateless recovery for {deterministic_name}."
                     )
                     self.event_emitter.emit_toast(
                         f"API error for file: {e.code}. Please check permissions.",
@@ -523,8 +557,8 @@ class FilesAPIManager:
                 # Clean up the lock from the dictionary once processing is complete
                 # for this hash, preventing memory growth over time.
                 # This is safe because any future request for this hash will hit the cache.
-                if content_hash in self.upload_locks:
-                    del self.upload_locks[content_hash]
+                if lock_key in self.upload_locks:
+                    del self.upload_locks[lock_key]
 
     async def _get_content_hash(
         self, file_bytes: bytes, owui_file_id: str | None
@@ -538,6 +572,8 @@ class FilesAPIManager:
         """
         if owui_file_id:
             # First, check the ID-to-Hash cache for known files.
+            # This cache is NOT namespaced by API key, as the mapping from
+            # an OWUI file ID to its content hash is constant.
             cached_hash: str | None = await self.id_hash_cache.get(owui_file_id)
             if cached_hash:
                 log.trace(f"Hash cache HIT for OWUI ID {owui_file_id}.")
@@ -617,7 +653,8 @@ class FilesAPIManager:
 
             # Calculate TTL and set in the main file cache using the content hash as the key.
             ttl_seconds = self._calculate_ttl(active_file.expiration_time)
-            await self.file_cache.set(content_hash, active_file, ttl=ttl_seconds)
+            file_cache_key = self._get_file_cache_key(content_hash)
+            await self.file_cache.set(file_cache_key, active_file, ttl=ttl_seconds)
             log.debug(
                 f"Cached new file object for hash {content_hash} with TTL: {ttl_seconds}s."
             )
@@ -1444,12 +1481,11 @@ class Pipe:
         return v
 
     class Valves(BaseModel):
-        GEMINI_API_KEY: str | None = Field(default=None)
-        IMAGE_GEN_GEMINI_API_KEY: str | None = Field(
-            default=None,
-            description="""Optional separate API key for image generation models.
-            If not provided, the main GEMINI_API_KEY will be used.
-            An image generation model is identified by the Image Model Pattern regex below.""",
+        GEMINI_FREE_API_KEY: str | None = Field(
+            default=None, description="Free Gemini Developer API key."
+        )
+        GEMINI_PAID_API_KEY: str | None = Field(
+            default=None, description="Paid Gemini Developer API key."
         )
         USER_MUST_PROVIDE_AUTH_CONFIG: bool = Field(
             default=False,
@@ -1459,7 +1495,7 @@ class Pipe:
         )
         AUTH_WHITELIST: str | None = Field(
             default=None,
-            description="""Comma separated list of user emails that are allowed to bypassUSER_MUST_PROVIDE_AUTH_CONFIG and use the default authentication configuration.
+            description="""Comma separated list of user emails that are allowed to bypass USER_MUST_PROVIDE_AUTH_CONFIG and use the default authentication configuration.
             Default value is None (no users are whitelisted).""",
         )
         GEMINI_API_BASE_URL: str | None = Field(
@@ -1467,6 +1503,7 @@ class Pipe:
             description="""The base URL for calling the Gemini API.
             Default value is None.""",
         )
+        # FIXME: assume the user wants Vertex if they set VERTEX_PROJECT, removing the need for this valve.
         USE_VERTEX_AI: bool = Field(
             default=False,
             description="""Whether to use Google Cloud Vertex AI instead of the standard Gemini API.
@@ -1540,7 +1577,7 @@ class Pipe:
             description="""Regex pattern to identify image generation models.
             Default value is r"image".""",
         )
-        # FIXME: remove
+        # FIXME: remove, toggle filter handles this now
         ENABLE_URL_CONTEXT_TOOL: bool = Field(
             default=False,
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
@@ -1624,15 +1661,13 @@ class Pipe:
         certain parameters, like their API key or model settings, for their own use.
         """
 
-        GEMINI_API_KEY: str | None = Field(
+        GEMINI_FREE_API_KEY: str | None = Field(
             default=None,
-            description="""Gemini Developer API key.
-            Default value is None (uses the default from Valves, same goes for other options below).""",
+            description="""Free Gemini Developer API key. If not provided, the admin's key may be used if permitted.""",
         )
-        IMAGE_GEN_GEMINI_API_KEY: str | None = Field(
+        GEMINI_PAID_API_KEY: str | None = Field(
             default=None,
-            description="""Optional separate API key for image generation models.
-            If not provided, the main GEMINI_API_KEY will be used.""",
+            description="""Paid Gemini Developer API key. If not provided, the admin's key may be used if permitted.""",
         )
         GEMINI_API_BASE_URL: str | None = Field(
             default=None,
@@ -1787,20 +1822,12 @@ class Pipe:
             self.valves, __user__.get("valves"), __user__.get("email")
         )
 
-        model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
-        is_image_model = self._is_image_model(model_name, valves.IMAGE_MODEL_PATTERN)
-
-        if is_image_model and valves.IMAGE_GEN_GEMINI_API_KEY:
-            log.info("Using separate API key for image generation model.")
-            valves.GEMINI_API_KEY = valves.IMAGE_GEN_GEMINI_API_KEY
-
-            # When using a separate key, assume it's for Gemini API, not Vertex AI
-            # TODO: check if it would work for Vertex AI as well
-            valves.USE_VERTEX_AI = False
-            valves.VERTEX_PROJECT = None
+        # Apply UI toggle overrides (Paid API & Vertex AI)
+        valves = self._apply_toggle_configurations(valves, __metadata__)
 
         log.debug(
-            f"USE_VERTEX_AI: {valves.USE_VERTEX_AI}, VERTEX_PROJECT set: {bool(valves.VERTEX_PROJECT)}, API_KEY set: {bool(valves.GEMINI_API_KEY)}"
+            f"USE_VERTEX_AI: {valves.USE_VERTEX_AI}, VERTEX_PROJECT set: {bool(valves.VERTEX_PROJECT)},"
+            f" GEMINI_FREE_API_KEY set: {bool(valves.GEMINI_FREE_API_KEY)}, GEMINI_PAID_API_KEY set: {bool(valves.GEMINI_PAID_API_KEY)}"
         )
 
         log.debug(
@@ -1808,9 +1835,11 @@ class Pipe:
         )
         client = self._get_user_client(valves, __user__["email"])
         __metadata__["is_vertex_ai"] = client.vertexai
+        # Determine the correct API name for logging and status messages.
+        api_name = "Vertex AI Gemini API" if client.vertexai else "Gemini Developer API"
 
         if __metadata__.get("task"):
-            log.info(f'{__metadata__["task"]=}, disabling event emissions.') # type: ignore
+            log.info(f'{__metadata__["task"]=}, disabling event emissions.')  # type: ignore
             # Task model is not user facing, so we should not emit any events.
             __event_emitter__ = None
 
@@ -1855,6 +1884,8 @@ class Pipe:
         gen_content_conf.system_instruction = builder.system_prompt
 
         # Some models (e.g., image generation, Gemma) do not support the system prompt message.
+        model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
+        is_image_model = self._is_image_model(model_name, valves.IMAGE_MODEL_PATTERN)
         system_prompt_unsupported = is_image_model or "gemma" in model_name
         if system_prompt_unsupported:
             # TODO: append to user message instead.
@@ -1869,7 +1900,7 @@ class Pipe:
             "contents": contents,
             "config": gen_content_conf,
         }
-        log.debug("Passing these args to the Google API:", payload=gen_content_args)
+        log.debug(f"Passing these args to the {api_name}:", payload=gen_content_args)
 
         # Both streaming and non-streaming responses are now handled by the same
         # unified processor, which returns an AsyncGenerator. For non-streaming,
@@ -1883,7 +1914,11 @@ class Pipe:
         request_type_str = "streaming" if is_streaming else "non-streaming"
 
         # Emit a status update with timing before making the actual API call.
-        asyncio.create_task(event_emitter.emit_status(f"Sending {request_type_str} request to Google API... {time_str}"))
+        asyncio.create_task(
+            event_emitter.emit_status(
+                f"Sending {request_type_str} request to {api_name}... {time_str}"
+            )
+        )
 
         if is_streaming:
             # Streaming response
@@ -1907,6 +1942,7 @@ class Pipe:
             )
         else:
             # Non-streaming response.
+            # FIXME: Catch and handle any exceptions from the API call.
             res = await client.aio.models.generate_content(**gen_content_args)
 
             # Adapter: Create a simple, one-shot async generator that yields the
@@ -1938,7 +1974,8 @@ class Pipe:
     @staticmethod
     @cache
     def _get_or_create_genai_client(
-        api_key: str | None = None,
+        free_api_key: str | None = None,
+        paid_api_key: str | None = None,
         base_url: str | None = None,
         use_vertex_ai: bool | None = None,
         vertex_project: str | None = None,
@@ -1949,9 +1986,12 @@ class Pipe:
         Raises GenaiApiError on failure.
         """
 
+        # Prioritize the free key, then fall back to the paid key.
+        api_key = free_api_key or paid_api_key
+
         if not vertex_project and not api_key:
             # FIXME: More detailed reason in the exception (tell user to set the API key).
-            msg = "Neither VERTEX_PROJECT nor GEMINI_API_KEY is set."
+            msg = "Neither VERTEX_PROJECT nor a Gemini API key (free or paid) is set."
             raise GenaiApiError(msg)
 
         if use_vertex_ai and vertex_project:
@@ -1991,10 +2031,10 @@ class Pipe:
             f"USER_MUST_PROVIDE_AUTH_CONFIG: {valves.USER_MUST_PROVIDE_AUTH_CONFIG}"
         )
         if valves.USER_MUST_PROVIDE_AUTH_CONFIG and user_email not in user_whitelist:
-            if not valves.GEMINI_API_KEY:
+            if not valves.GEMINI_FREE_API_KEY and not valves.GEMINI_PAID_API_KEY:
                 error_msg = (
                     "User must provide their own authentication configuration. "
-                    "Please set GEMINI_API_KEY in your UserValves."
+                    "Please set GEMINI_FREE_API_KEY or GEMINI_PAID_API_KEY in your UserValves."
                 )
                 raise ValueError(error_msg)
         try:
@@ -2012,13 +2052,14 @@ class Pipe:
     ) -> list[str | bool | None]:
         """Prepares arguments for _get_or_create_genai_client from source_valves."""
         ATTRS = [
-            "GEMINI_API_KEY",
+            "GEMINI_FREE_API_KEY",
+            "GEMINI_PAID_API_KEY",
             "GEMINI_API_BASE_URL",
             "USE_VERTEX_AI",
             "VERTEX_PROJECT",
             "VERTEX_LOCATION",
         ]
-        return [getattr(source_valves, attr) for attr in ATTRS]
+        return [getattr(source_valves, attr, None) for attr in ATTRS]
 
     # endregion 2.1 Client initialization
 
@@ -2026,13 +2067,14 @@ class Pipe:
     @cached()  # aiocache.cached for async method
     async def _get_genai_models(
         self,
-        api_key: str | None,
-        base_url: str | None,
-        use_vertex_ai: bool | None,  # User's preference from config
-        vertex_project: str | None,
-        vertex_location: str | None,
-        whitelist_str: str,
-        blacklist_str: str | None,
+        free_api_key: str | None = None,
+        paid_api_key: str | None = None,
+        base_url: str | None = None,
+        use_vertex_ai: bool | None = None,
+        vertex_project: str | None = None,
+        vertex_location: str | None = None,
+        whitelist_str: str = "*",
+        blacklist_str: str | None = None,
     ) -> list["ModelData"]:
         """
         Gets valid Google models from API(s) and filters them.
@@ -2042,7 +2084,7 @@ class Pipe:
         all_raw_models: list[types.Model] = []
 
         # Condition for fetching from both sources
-        fetch_both = bool(use_vertex_ai and vertex_project and api_key)
+        fetch_both = bool(use_vertex_ai and vertex_project and (free_api_key or paid_api_key))
 
         if fetch_both:
             log.info(
@@ -2055,7 +2097,8 @@ class Pipe:
             # 1. Fetch from Gemini Developer API
             try:
                 gemini_client = self._get_or_create_genai_client(
-                    api_key=api_key,
+                    free_api_key=free_api_key,
+                    paid_api_key=paid_api_key,
                     base_url=base_url,
                     use_vertex_ai=False,  # Explicitly target Gemini API
                     vertex_project=None,
@@ -2080,7 +2123,6 @@ class Pipe:
                     use_vertex_ai=True,  # Explicitly target Vertex AI
                     vertex_project=vertex_project,
                     vertex_location=vertex_location,
-                    api_key=None,  # API key is not used for Vertex AI with project auth
                     base_url=base_url,  # Pass base_url for potential Vertex custom endpoints
                 )
                 vertex_models_list = await self._fetch_models_from_client_internal(
@@ -2156,7 +2198,8 @@ class Pipe:
 
             try:
                 client = self._get_or_create_genai_client(
-                    api_key=api_key,
+                    free_api_key=free_api_key,
+                    paid_api_key=paid_api_key,
                     base_url=base_url,
                     use_vertex_ai=client_target_is_vertex,  # Pass the determined target
                     vertex_project=vertex_project if client_target_is_vertex else None,
@@ -3333,6 +3376,60 @@ class Pipe:
 
         return (True, is_toggled_on)
 
+    def _apply_toggle_configurations(
+        self,
+        valves: "Pipe.Valves",
+        __metadata__: "Metadata",
+    ) -> "Pipe.Valves":
+        """
+        Applies logic for toggleable filters (Paid API, Vertex AI) to the valves.
+        Returns a modified Valves object.
+        """
+
+        # --- Logic for Gemini Paid API Toggle ---
+        is_paid_api_available, is_paid_api_toggled_on = (
+            self._get_toggleable_feature_status("gemini_paid_api", __metadata__)
+        )
+
+        if is_paid_api_available:
+            if is_paid_api_toggled_on:
+                # User has toggled ON the paid API filter. Prioritize paid key.
+                valves.GEMINI_FREE_API_KEY = None
+                log.info("Paid API toggle is enabled. Prioritizing paid Gemini key.")
+            else:
+                # User has toggled OFF the paid API filter. Prioritize free key.
+                valves.GEMINI_PAID_API_KEY = None
+                log.info(
+                    "Paid API toggle is available but disabled. Prioritizing free Gemini key."
+                )
+        else:
+            log.info(
+                "Paid API toggle not configured for this model. Defaulting to free key if available."
+            )
+
+        # --- Logic for Vertex AI Toggle ---
+        is_vertex_available, is_vertex_toggled_on = self._get_toggleable_feature_status(
+            "gemini_vertex_ai_toggle", __metadata__
+        )
+
+        # Only override valves if the toggle system is actually active/installed
+        if is_vertex_available:
+            if is_vertex_toggled_on:
+                # Toggle is ON: Ensure Vertex is enabled in valves (if credentials exist)
+                valves.USE_VERTEX_AI = True
+                log.info("Vertex AI toggle is enabled. Enforcing Vertex AI usage.")
+            else:
+                # Toggle is OFF: Force Vertex settings to disabled state
+                valves.USE_VERTEX_AI = False
+                valves.VERTEX_PROJECT = None
+                # Resetting location to default just in case, though strictly not necessary if disabled
+                valves.VERTEX_LOCATION = "global"
+                log.info(
+                    "Vertex AI toggle is disabled. Forcing standard Gemini Developer API."
+                )
+
+        return valves
+
     @staticmethod
     def _get_merged_valves(
         default_valves: "Pipe.Valves",
@@ -3342,14 +3439,15 @@ class Pipe:
         """
         Merges UserValves into a base Valves configuration.
 
-        The general rule is that if a field in UserValves is not None, it overrides
-        the corresponding field in the default_valves. Otherwise, the default_valves
-        field value is used.
+        The general rule is that if a field in UserValves is not None or an empty
+        string, it overrides the corresponding field in the default_valves.
+        Otherwise, the default_valves field value is used.
 
         Exceptions:
-        - If default_valves.USER_MUST_PROVIDE_AUTH_CONFIG is True, then GEMINI_API_KEY and
-          VERTEX_PROJECT in the merged result will be taken directly from
-          user_valves (even if they are None), ignoring the values in default_valves.
+        - If default_valves.USER_MUST_PROVIDE_AUTH_CONFIG is True and the user is
+          not on the AUTH_WHITELIST, then GEMINI_FREE_API_KEY and
+          GEMINI_PAID_API_KEY in the merged result will be taken directly from
+          user_valves (even if they are None), and Vertex AI usage is disabled.
 
         Args:
             default_valves: The base Valves object with default configurations.
@@ -3388,10 +3486,15 @@ class Pipe:
             default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
             and user_email not in user_whitelist
         ):
+            log.info(
+                f"User '{user_email}' is required to provide their own authentication credentials due to USER_MUST_PROVIDE_AUTH_CONFIG=True."
+                " Admin-provided API keys and Vertex AI settings will not be used."
+            )
             # If USER_MUST_PROVIDE_AUTH_CONFIG is True and user is not in the whitelist,
-            # then user must provide their own GEMINI_API_KEY
-            # User is disallowed from using Vertex AI in this case.
-            merged_data["GEMINI_API_KEY"] = user_valves.GEMINI_API_KEY
+            # they must provide their own API keys.
+            # They are also disallowed from using the admin's Vertex AI configuration.
+            merged_data["GEMINI_FREE_API_KEY"] = user_valves.GEMINI_FREE_API_KEY
+            merged_data["GEMINI_PAID_API_KEY"] = user_valves.GEMINI_PAID_API_KEY
             merged_data["VERTEX_PROJECT"] = None
             merged_data["USE_VERTEX_AI"] = False
 
