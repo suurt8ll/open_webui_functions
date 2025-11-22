@@ -1825,9 +1825,11 @@ class Pipe:
         )
         client = self._get_user_client(valves, __user__["email"])
         __metadata__["is_vertex_ai"] = client.vertexai
+        # Determine the correct API name for logging and status messages.
+        api_name = "Vertex AI Gemini API" if client.vertexai else "Gemini Developer API"
 
         if __metadata__.get("task"):
-            log.info(f'{__metadata__["task"]=}, disabling event emissions.') # type: ignore
+            log.info(f'{__metadata__["task"]=}, disabling event emissions.')  # type: ignore
             # Task model is not user facing, so we should not emit any events.
             __event_emitter__ = None
 
@@ -1888,7 +1890,7 @@ class Pipe:
             "contents": contents,
             "config": gen_content_conf,
         }
-        log.debug("Passing these args to the Google API:", payload=gen_content_args)
+        log.debug(f"Passing these args to the {api_name}:", payload=gen_content_args)
 
         # Both streaming and non-streaming responses are now handled by the same
         # unified processor, which returns an AsyncGenerator. For non-streaming,
@@ -1902,7 +1904,11 @@ class Pipe:
         request_type_str = "streaming" if is_streaming else "non-streaming"
 
         # Emit a status update with timing before making the actual API call.
-        asyncio.create_task(event_emitter.emit_status(f"Sending {request_type_str} request to Google API... {time_str}"))
+        asyncio.create_task(
+            event_emitter.emit_status(
+                f"Sending {request_type_str} request to {api_name}... {time_str}"
+            )
+        )
 
         if is_streaming:
             # Streaming response
