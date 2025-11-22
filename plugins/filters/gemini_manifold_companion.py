@@ -6,10 +6,10 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.7.0
+version: 1.7.1
 """
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
 # This filter can detect that a feature like web search or code execution is enabled in the front-end,
 # set the feature back to False so Open WebUI does not run it's own logic and then
@@ -40,6 +40,8 @@ if TYPE_CHECKING:
 
 # According to https://ai.google.dev/gemini-api/docs/models
 ALLOWED_GROUNDING_MODELS = {
+    "gemini-3-pro-image-preview",
+    "gemini-3-pro-preview",
     "gemini-2.5-pro",
     "gemini-flash-latest",
     "gemini-2.5-flash-preview-09-2025",
@@ -65,6 +67,7 @@ ALLOWED_GROUNDING_MODELS = {
     "gemini-1.0-pro",
 }
 ALLOWED_CODE_EXECUTION_MODELS = {
+    "gemini-3-pro-preview",
     "gemini-2.5-pro",
     "gemini-flash-latest",
     "gemini-2.5-flash-preview-09-2025",
@@ -259,6 +262,7 @@ class Filter:
 
         user_stream_intent = body.get("stream", True)
         image_generation_models = {
+            "gemini-3-pro-image-preview",
             "gemini-2.0-flash-preview-image-generation",
             "gemini-2.5-flash-image-preview",
             "gemini-2.5-flash-image",
