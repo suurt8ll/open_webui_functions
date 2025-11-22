@@ -575,7 +575,6 @@ async def test_paid_api_toggle_selects_correct_key(
 ):
     """
     Tests that the 'gemini_paid_api' toggle correctly selects the paid or free key.
-    This test simulates the logic block added at the beginning of the `pipe` method.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
@@ -586,19 +585,30 @@ async def test_paid_api_toggle_selects_correct_key(
     pipe.valves.GEMINI_FREE_API_KEY = ADMIN_FREE_KEY
     pipe.valves.GEMINI_PAID_API_KEY = ADMIN_PAID_KEY
 
+    def mock_toggle_side_effect(filter_id, metadata):
+        # This test focuses on the paid API toggle.
+        # We return the parametrized status for it.
+        if filter_id == "gemini_paid_api":
+            return toggle_status
+        # For the Vertex toggle, we return a neutral/disabled status
+        # to prevent it from interfering with the logic under test.
+        if filter_id == "gemini_vertex_ai_toggle":
+            return (False, False)
+        # Default fallback for any other unexpected calls.
+        return (False, False)
+
     # We need to test the full pipe method to see the interaction
     with patch.object(
-        pipe, "_get_toggleable_feature_status", return_value=toggle_status
+        pipe, "_get_toggleable_feature_status", side_effect=mock_toggle_side_effect
     ) as mock_toggle_status, patch.object(
         pipe, "_get_user_client", wraps=pipe._get_user_client
-    ) as mock_get_user_client, patch(
+    ), patch(
         "plugins.pipes.gemini_manifold.log.info"
     ) as mock_log_info, patch.object(
         pipe, "_check_companion_filter_version"
     ), patch.object(
         pipe, "_get_merged_valves", return_value=pipe.valves
     ):
-
         # The pipe method has a complex return type, we only care about the setup phase
         # so we can ignore the actual generation by catching an exception
         try:
@@ -613,8 +623,10 @@ async def test_paid_api_toggle_selects_correct_key(
             # We expect exceptions because we are not mocking the full pipeline
             pass
 
-        # Assert the toggle check was called
-        mock_toggle_status.assert_called_once_with("gemini_paid_api", __metadata__)
+        # Assert the toggle check was called for the paid API.
+        # We use assert_any_call because the function is now called twice.
+        mock_toggle_status.assert_any_call("gemini_paid_api", __metadata__)
+        assert mock_toggle_status.call_count == 2
 
         # Assert the correct log message was emitted
         mock_log_info.assert_any_call(log_message)
