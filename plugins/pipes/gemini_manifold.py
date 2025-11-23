@@ -202,6 +202,7 @@ class EventEmitter:
         *,
         is_successful_finish: bool = False,
         is_thought: bool = False,
+        indent_level: int = 0,
     ) -> None:
         """Emit status updates asynchronously based on the configured status_mode."""
         if not self.event_emitter:
@@ -220,10 +221,14 @@ class EventEmitter:
             elapsed = time.monotonic() - self.start_time
             message = f"{message} (+{elapsed:.2f}s)"
 
-        # Hierarchy Logic for hiding the final message:
-        if is_successful_finish:
-            if self.status_mode in ("hidden_compact", "hidden_detailed"):
-                hidden = True
+        # Determine if the final status should be hidden.
+        final_hidden = self.status_mode in ("hidden_compact", "hidden_detailed")
+        if is_successful_finish and final_hidden:
+            hidden = True
+
+        # Add indentation prefix if the final status will be visible.
+        if not final_hidden and indent_level > 0:
+            message = f"{'- ' * indent_level}{message}"
 
         status_event: "StatusEvent" = {
             "type": "status",
@@ -358,12 +363,12 @@ class UploadStatusManager:
         )
 
         if is_done:
-            message = f"- Upload complete. {self.uploads_completed} file(s) processed."
+            message = f"Upload complete. {self.uploads_completed} file(s) processed."
         else:
             # Show "Uploading 1 of N..."
-            message = f"- Uploading file {self.uploads_completed + 1} of {self.total_uploads_expected}..."
+            message = f"Uploading file {self.uploads_completed + 1} of {self.total_uploads_expected}..."
 
-        await self.event_emitter.emit_status(message, done=is_done)
+        await self.event_emitter.emit_status(message, done=is_done, indent_level=1)
 
 
 class FilesAPIManager:
@@ -2624,6 +2629,7 @@ class Pipe:
                                                 done=False,
                                                 hidden=False,
                                                 is_thought=True,
+                                                indent_level=1,
                                             )
                                         )
                                 except Exception:
