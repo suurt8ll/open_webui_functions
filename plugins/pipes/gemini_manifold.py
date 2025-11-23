@@ -2573,7 +2573,6 @@ class Pipe:
         chunk_counter = 0
         in_think = False
         last_title: str | None = None
-        show_titles = bool(getattr(self.valves, "SHOW_THOUGHT_TITLES", True))
 
         try:
             async for chunk in response_stream:
@@ -2598,38 +2597,37 @@ class Pipe:
                     # Handle thought titles and transitions between reasoning and normal content.
                     match part:
                         case types.Part(text=str(text), thought=True):
-                            if show_titles and text:
-                                try:
-                                    title: str | None = None
-                                    # Prefer markdown-style "### Heading" titles.
+                            try:
+                                title: str | None = None
+                                # Prefer markdown-style "### Heading" titles.
+                                for m in re.finditer(
+                                    r"(^|\n)###\s+(.+?)(?=\n|$)", text or ""
+                                ):
+                                    title = m.group(2).strip()
+                                # Fall back to bold "**Title**" lines if no heading was found.
+                                if not title:
                                     for m in re.finditer(
-                                        r"(^|\n)###\s+(.+?)(?=\n|$)", text or ""
+                                        r"(^|\n)\s*\*\*(.+?)\*\*\s*(?=\n|$)",
+                                        text or "",
                                     ):
-                                        title = m.group(2).strip()
-                                    # Fall back to bold "**Title**" lines if no heading was found.
-                                    if not title:
-                                        for m in re.finditer(
-                                            r"(^|\n)\s*\*\*(.+?)\*\*\s*(?=\n|$)",
-                                            text or "",
-                                        ):
-                                            title = (m.group(2) or "").strip()
-                                    if title:
-                                        # Trim common surrounding quotes.
-                                        title = title.strip('"“”‘’').strip()
-                                    if title and title != last_title:
-                                        last_title = title
-                                        asyncio.create_task(
-                                            event_emitter.emit_status(
-                                                title,
-                                                done=False,
-                                                hidden=False,
-                                                is_thought=True,
-                                                indent_level=1,
-                                            )
+                                        title = (m.group(2) or "").strip()
+                                if title:
+                                    # Trim common surrounding quotes.
+                                    title = title.strip('"“”‘’').strip()
+                                if title and title != last_title:
+                                    last_title = title
+                                    asyncio.create_task(
+                                        event_emitter.emit_status(
+                                            title,
+                                            done=False,
+                                            hidden=False,
+                                            is_thought=True,
+                                            indent_level=1,
                                         )
-                                except Exception:
-                                    # Thought titles are a best-effort feature; failures should not break the stream.
-                                    pass
+                                    )
+                            except Exception:
+                                # Thought titles are a best-effort feature; failures should not break the stream.
+                                pass
                             if not in_think:
                                 in_think = True
                         case types.Part(text=str(text)):
