@@ -1731,11 +1731,6 @@ class Pipe:
             description="""Regex pattern to identify thinking models.
             Default value is None.""",
         )
-        SHOW_THOUGHT_TITLES: bool | None | Literal[""] = Field(
-            default=None,
-            description="""Whether to display live thought summary titles while thinking.
-            Default value is None (use admin setting).""",
-        )
         ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
             default=None,
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
