@@ -3015,7 +3015,7 @@ class Pipe:
             request,
             chat_id,
             message_id,
-            event_emitter.start_time,
+            event_emitter,
         )
 
     def _add_grounding_data_to_state(
@@ -3024,7 +3024,7 @@ class Pipe:
         request: Request,
         chat_id: str,
         message_id: str,
-        pipe_start_time: float,
+        event_emitter: EventEmitter,
     ):
         candidate = self._get_first_candidate(response.candidates)
         grounding_metadata_obj = candidate.grounding_metadata if candidate else None
@@ -3040,7 +3040,11 @@ class Pipe:
             # Using shared `request.app.state` to pass data to Filter.outlet.
             # This is necessary because the Pipe and Filter operate on different requests.
             app_state._state[grounding_key] = grounding_metadata_obj
-            app_state._state[time_key] = pipe_start_time
+
+            # Only store the start time if the user wants to see timestamps in the grounding display.
+            # The filter will gracefully handle the absence of this key.
+            if event_emitter.status_mode == "visible_timed":
+                app_state._state[time_key] = event_emitter.start_time
         else:
             log.debug(f"Response {message_id} does not have grounding metadata.")
 
