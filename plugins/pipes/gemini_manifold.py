@@ -161,10 +161,11 @@ class EventEmitter:
         self,
         event_emitter: Callable[["Event"], Awaitable[None]] | None,
         *,
-        hide_successful_status: bool = False,
+        status_mode: str = "visible",
     ):
         self.event_emitter = event_emitter
-        self.hide_successful_status = hide_successful_status
+        self.status_mode = status_mode
+        self.start_time = time.monotonic()
 
     def emit_toast(
         self,
@@ -200,15 +201,34 @@ class EventEmitter:
         hidden: bool = False,
         *,
         is_successful_finish: bool = False,
+        is_thought: bool = False,
+        indent_level: int = 0,
     ) -> None:
-        """Emit status updates asynchronously."""
+        """Emit status updates asynchronously based on the configured status_mode."""
         if not self.event_emitter:
             return
 
-        # If this is a successful finish status and the user wants to hide it,
-        # we override the hidden flag.
-        if is_successful_finish and self.hide_successful_status:
+        # Mode: Completely disabled
+        if self.status_mode == "disable":
+            return
+
+        # Mode: Hidden Compact - Hide thought titles/updates
+        if self.status_mode == "hidden_compact" and is_thought:
+            return
+
+        # Mode: Visible + Timestamps
+        if self.status_mode == "visible_timed":
+            elapsed = time.monotonic() - self.start_time
+            message = f"{message} (+{elapsed:.2f}s)"
+
+        # Determine if the final status should be hidden.
+        final_hidden = self.status_mode in ("hidden_compact", "hidden_detailed")
+        if is_successful_finish and final_hidden:
             hidden = True
+
+        # Add indentation prefix if the final status will be visible.
+        if not final_hidden and indent_level > 0:
+            message = f"{'- ' * indent_level}{message}"
 
         status_event: "StatusEvent" = {
             "type": "status",
@@ -297,10 +317,9 @@ class UploadStatusManager:
     def __init__(
         self,
         event_emitter: EventEmitter,
-        start_time: float,
     ):
         self.event_emitter = event_emitter
-        self.start_time = start_time
+        self.start_time = event_emitter.start_time
         self.queue = asyncio.Queue()
         self.total_uploads_expected = 0
         self.uploads_completed = 0
@@ -338,21 +357,18 @@ class UploadStatusManager:
         if not self.is_active:
             return
 
-        elapsed_time = time.monotonic() - self.start_time
-        time_str = f"(+{elapsed_time:.2f}s)"
-
         is_done = (
             self.total_uploads_expected > 0
             and self.uploads_completed == self.total_uploads_expected
         )
 
         if is_done:
-            message = f"- Upload complete. {self.uploads_completed} file(s) processed. {time_str}"
+            message = f"Upload complete. {self.uploads_completed} file(s) processed."
         else:
             # Show "Uploading 1 of N..."
-            message = f"- Uploading file {self.uploads_completed + 1} of {self.total_uploads_expected}... {time_str}"
+            message = f"Uploading file {self.uploads_completed + 1} of {self.total_uploads_expected}..."
 
-        await self.event_emitter.emit_status(message, done=is_done)
+        await self.event_emitter.emit_status(message, done=is_done, indent_level=1)
 
 
 class FilesAPIManager:
@@ -744,7 +760,7 @@ class GeminiContentBuilder:
             metadata_body, user_data
         )
 
-    async def build_contents(self, start_time: float) -> list[types.Content]:
+    async def build_contents(self) -> list[types.Content]:
         """
         The main public method to generate the contents list by processing all
         message turns concurrently and using a self-configuring status manager.
@@ -758,7 +774,7 @@ class GeminiContentBuilder:
             self.event_emitter.emit_toast(warn_msg, "warning")
 
         # 1. Set up and launch the status manager. It will activate itself if needed.
-        status_manager = UploadStatusManager(self.event_emitter, start_time=start_time)
+        status_manager = UploadStatusManager(self.event_emitter)
         manager_task = asyncio.create_task(status_manager.run())
 
         # 2. Create and run concurrent processing tasks for each message turn.
@@ -1481,6 +1497,7 @@ class Pipe:
         return v
 
     class Valves(BaseModel):
+        # FIXME: docstrings don't get markdown rendered in the admin UI currently. rewrite docstrings accordingly.
         GEMINI_FREE_API_KEY: str | None = Field(
             default=None, description="Free Gemini Developer API key."
         )
@@ -1562,11 +1579,6 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is True.""",
         )
-        SHOW_THOUGHT_TITLES: bool = Field(
-            default=True,
-            description="""Displays live thought summary titles while the model is thinking.
-            Titles are emitted as status updates and hidden when thinking ends.""",
-        )
         THINKING_MODEL_PATTERN: str = Field(
             default=r"^(?!.*live)(?=.*gemini-(?:3|2\.5|flash(?:-lite)?-latest))(?=.*gemini-3|(?!.*image))",
             description="""Regex pattern to identify thinking models.
@@ -1607,11 +1619,17 @@ class Pipe:
             Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
             Default value is None.""",
         )
-        HIDE_SUCCESSFUL_STATUS_MESSAGE: bool = Field(
-            default=False,
-            description="""Whether to hide the final 'Response finished' status message on success.
-            Error messages will always be shown.
-            Default value is False.""",
+        STATUS_EMISSION_BEHAVIOR: Literal[
+            "disable",
+            "hidden_compact",
+            "hidden_detailed",
+            "visible",
+            "visible_timed",
+        ] = Field(
+            default="hidden_detailed",
+            description="""Control status display. (Default: hidden_detailed) • Options • disable: No status. 
+            • hidden_compact: Final success hidden, no thoughts. • hidden_detailed: Final success hidden, with thoughts. 
+            • visible: All status visible. • visible_timed: Visible with timestamps.""",
         )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
@@ -1660,7 +1678,7 @@ class Pipe:
         and enforce policies, while still giving users the flexibility to tailor
         certain parameters, like their API key or model settings, for their own use.
         """
-
+        # FIXME: `Literal[""]` might not be necessary anymore
         GEMINI_FREE_API_KEY: str | None = Field(
             default=None,
             description="""Free Gemini Developer API key. If not provided, the admin's key may be used if permitted.""",
@@ -1713,11 +1731,6 @@ class Pipe:
             description="""Regex pattern to identify thinking models.
             Default value is None.""",
         )
-        SHOW_THOUGHT_TITLES: bool | None | Literal[""] = Field(
-            default=None,
-            description="""Whether to display live thought summary titles while thinking.
-            Default value is None (use admin setting).""",
-        )
         ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
             default=None,
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
@@ -1741,11 +1754,20 @@ class Pipe:
             Overrides the admin setting. Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
             Default value is None.""",
         )
-        HIDE_SUCCESSFUL_STATUS_MESSAGE: bool | None | Literal[""] = Field(
+        STATUS_EMISSION_BEHAVIOR: (
+            Literal[
+                "disable",
+                "hidden_compact",
+                "hidden_detailed",
+                "visible",
+                "visible_timed",
+                "",
+            ]
+            | None
+        ) = Field(
             default=None,
-            description="""Override the default setting for hiding the successful status message.
-            Set to True to hide, False to show.
-            Default is None (use the admin's setting).""",
+            description="""Override admin setting (leave empty to use default). 
+            Options: disable | hidden_compact | hidden_detailed | visible | visible_timed""",
         )
 
         @field_validator("THINKING_BUDGET", mode="after")
@@ -1803,9 +1825,8 @@ class Pipe:
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]] | None,
         __metadata__: "Metadata",
-    ) -> AsyncGenerator[dict, None] | str:
+    ) -> AsyncGenerator[dict | str, None] | str:
 
-        start_time = time.monotonic()
         self._add_log_handler(self.valves.LOG_LEVEL)
 
         log.debug(
@@ -1843,9 +1864,11 @@ class Pipe:
             # Task model is not user facing, so we should not emit any events.
             __event_emitter__ = None
 
+        # Initialize EventEmitter with the user's chosen status behavior.
+        # Start time is automatically captured inside __init__.
         event_emitter = EventEmitter(
             __event_emitter__,
-            hide_successful_status=valves.HIDE_SUCCESSFUL_STATUS_MESSAGE,
+            status_mode=valves.STATUS_EMISSION_BEHAVIOR,
         )
 
         files_api_manager = FilesAPIManager(
@@ -1876,9 +1899,8 @@ class Pipe:
             valves=valves,
             files_api_manager=files_api_manager,
         )
-        # This is our first timed event, marking the start of payload preparation.
         asyncio.create_task(event_emitter.emit_status("Preparing request..."))
-        contents = await builder.build_contents(start_time=start_time)
+        contents = await builder.build_contents()
 
         gen_content_conf = self._build_gen_content_config(body, __metadata__, valves)
         gen_content_conf.system_instruction = builder.system_prompt
@@ -1903,20 +1925,16 @@ class Pipe:
         log.debug(f"Passing these args to the {api_name}:", payload=gen_content_args)
 
         # Both streaming and non-streaming responses are now handled by the same
-        # unified processor, which returns an AsyncGenerator. For non-streaming,
-        # we adapt the single response object into a one-item async generator.
-
-        elapsed_time = time.monotonic() - start_time
-        time_str = f"(+{elapsed_time:.2f}s)"
+        # unified processor, which returns an AsyncGenerator.
 
         # Determine the request type to provide a more informative status message.
         is_streaming = features.get("stream", True)
         request_type_str = "streaming" if is_streaming else "non-streaming"
 
-        # Emit a status update with timing before making the actual API call.
+        # Emit a status update. EventEmitter handles formatting and timestamps.
         asyncio.create_task(
             event_emitter.emit_status(
-                f"Sending {request_type_str} request to {api_name}... {time_str}"
+                f"Sending {request_type_str} request to {api_name}..."
             )
         )
 
@@ -1938,7 +1956,6 @@ class Pipe:
                 __user__["id"],
                 chat_id,
                 message_id,
-                start_time=start_time,
             )
         else:
             # Non-streaming response.
@@ -1965,7 +1982,6 @@ class Pipe:
                 __user__["id"],
                 chat_id,
                 message_id,
-                start_time=start_time,
             )
 
     # region 2. Helper methods inside the Pipe class
@@ -2540,8 +2556,7 @@ class Pipe:
         user_id: str,
         chat_id: str,
         message_id: str,
-        start_time: float,
-    ) -> AsyncGenerator[dict, None]:
+    ) -> AsyncGenerator[dict | str, None]:
         """
         Processes an async iterator of GenerateContentResponse objects, yielding
         structured dictionary chunks for the Open WebUI frontend.
@@ -2558,7 +2573,6 @@ class Pipe:
         chunk_counter = 0
         in_think = False
         last_title: str | None = None
-        show_titles = bool(getattr(self.valves, "SHOW_THOUGHT_TITLES", True))
 
         try:
             async for chunk in response_stream:
@@ -2568,13 +2582,8 @@ class Pipe:
 
                 if not first_chunk_received:
                     # This is the first (and possibly only) chunk.
-                    elapsed_time = time.monotonic() - start_time
-                    time_str = f"(+{elapsed_time:.2f}s)"
                     asyncio.create_task(
-                        event_emitter.emit_status(
-                            f"Response received {time_str}",
-                            done=True,
-                        )
+                        event_emitter.emit_status("Response received", done=True)
                     )
                     first_chunk_received = True
 
@@ -2588,36 +2597,37 @@ class Pipe:
                     # Handle thought titles and transitions between reasoning and normal content.
                     match part:
                         case types.Part(text=str(text), thought=True):
-                            if show_titles and text:
-                                try:
-                                    title: str | None = None
-                                    # Prefer markdown-style "### Heading" titles.
+                            try:
+                                title: str | None = None
+                                # Prefer markdown-style "### Heading" titles.
+                                for m in re.finditer(
+                                    r"(^|\n)###\s+(.+?)(?=\n|$)", text or ""
+                                ):
+                                    title = m.group(2).strip()
+                                # Fall back to bold "**Title**" lines if no heading was found.
+                                if not title:
                                     for m in re.finditer(
-                                        r"(^|\n)###\s+(.+?)(?=\n|$)", text or ""
+                                        r"(^|\n)\s*\*\*(.+?)\*\*\s*(?=\n|$)",
+                                        text or "",
                                     ):
-                                        title = m.group(2).strip()
-                                    # Fall back to bold "**Title**" lines if no heading was found.
-                                    if not title:
-                                        for m in re.finditer(
-                                            r"(^|\n)\s*\*\*(.+?)\*\*\s*(?=\n|$)",
-                                            text or "",
-                                        ):
-                                            title = (m.group(2) or "").strip()
-                                    if title:
-                                        # Trim common surrounding quotes.
-                                        title = title.strip('"“”‘’').strip()
-                                    if title and title != last_title:
-                                        last_title = title
-                                        asyncio.create_task(
-                                            event_emitter.emit_status(
-                                                title,
-                                                done=False,
-                                                hidden=False,
-                                            )
+                                        title = (m.group(2) or "").strip()
+                                if title:
+                                    # Trim common surrounding quotes.
+                                    title = title.strip('"“”‘’').strip()
+                                if title and title != last_title:
+                                    last_title = title
+                                    asyncio.create_task(
+                                        event_emitter.emit_status(
+                                            title,
+                                            done=False,
+                                            hidden=False,
+                                            is_thought=True,
+                                            indent_level=1,
                                         )
-                                except Exception:
-                                    # Thought titles are a best-effort feature; failures should not break the stream.
-                                    pass
+                                    )
+                            except Exception:
+                                # Thought titles are a best-effort feature; failures should not break the stream.
+                                pass
                             if not in_think:
                                 in_think = True
                         case types.Part(text=str(text)):
@@ -2626,21 +2636,24 @@ class Pipe:
                                 # Clear the last thought title when normal content begins.
                                 asyncio.create_task(
                                     event_emitter.emit_status(
-                                        "",
+                                        "Thinking finished",
                                         done=True,
-                                        hidden=True,
+                                        is_thought=False,
                                     )
                                 )
-                        case types.Part(inline_data=_) | types.Part(
-                            executable_code=_
-                        ) | types.Part(code_execution_result=_):
+                        case (
+                            types.Part(inline_data=_)
+                            | types.Part(executable_code=_)
+                            | types.Part(code_execution_result=_)
+                        ):
                             if in_think:
                                 in_think = False
+                                # Clear the last thought title when normal content begins.
                                 asyncio.create_task(
                                     event_emitter.emit_status(
-                                        "",
+                                        "Thinking finished",
                                         done=True,
-                                        hidden=True,
+                                        is_thought=False,
                                     )
                                 )
                     payload, count = await self._process_part(
@@ -2691,7 +2704,6 @@ class Pipe:
                     chat_id=chat_id,
                     message_id=message_id,
                     stream_error_happened=error_occurred,
-                    start_time=start_time,
                 )
             except Exception as e:
                 error_msg = f"Post-processing failed with error:\n\n{e}"
@@ -2930,32 +2942,26 @@ class Pipe:
         message_id: str,
         *,
         stream_error_happened: bool = False,
-        start_time: float,
     ):
         """Handles emitting usage, grounding, and sources after the main response/stream is done."""
         log.info("Post-processing the model response.")
 
-        elapsed_time = time.monotonic() - start_time
-        time_str = f"(+{elapsed_time:.2f}s)"
-
         if stream_error_happened:
             log.warning("Response processing failed due to stream error.")
-            await event_emitter.emit_status(
-                f"Response failed [Stream Error] {time_str}", done=True
-            )
+            await event_emitter.emit_status("Response failed [Stream Error]", done=True)
             return
 
         if not model_response:
             log.warning("Response processing skipped: Model response was empty.")
             await event_emitter.emit_status(
-                f"Response failed [Empty Response] {time_str}", done=True
+                "Response failed [Empty Response]", done=True
             )
             return
 
         if not (candidate := self._get_first_candidate(model_response.candidates)):
             log.warning("Response processing skipped: No candidates found.")
             await event_emitter.emit_status(
-                f"Response failed [No Candidates] {time_str}", done=True
+                "Response failed [No Candidates]", done=True
             )
             return
 
@@ -2987,7 +2993,7 @@ class Pipe:
         # For the most common success case (STOP), we don't need to show the reason.
         final_reason_str = "" if reason_name == "STOP" else f" [{reason_name}]"
         await event_emitter.emit_status(
-            f"{status_prefix}{final_reason_str} {time_str}",
+            f"{status_prefix}{final_reason_str}",
             done=True,
             is_successful_finish=is_normal_finish,
         )
@@ -2999,11 +3005,16 @@ class Pipe:
         # as usage data might still be available.
         if usage_data := self._get_usage_data(model_response):
             # Inject the total processing time into the usage payload.
+            elapsed_time = time.monotonic() - event_emitter.start_time
             usage_data["completion_time"] = round(elapsed_time, 2)
             await event_emitter.emit_usage(usage_data)
 
         self._add_grounding_data_to_state(
-            model_response, request, chat_id, message_id, start_time
+            model_response,
+            request,
+            chat_id,
+            message_id,
+            event_emitter,
         )
 
     def _add_grounding_data_to_state(
@@ -3012,7 +3023,7 @@ class Pipe:
         request: Request,
         chat_id: str,
         message_id: str,
-        pipe_start_time: float,
+        event_emitter: EventEmitter,
     ):
         candidate = self._get_first_candidate(response.candidates)
         grounding_metadata_obj = candidate.grounding_metadata if candidate else None
@@ -3028,7 +3039,11 @@ class Pipe:
             # Using shared `request.app.state` to pass data to Filter.outlet.
             # This is necessary because the Pipe and Filter operate on different requests.
             app_state._state[grounding_key] = grounding_metadata_obj
-            app_state._state[time_key] = pipe_start_time
+
+            # Only store the start time if the user wants to see timestamps in the grounding display.
+            # The filter will gracefully handle the absence of this key.
+            if event_emitter.status_mode == "visible_timed":
+                app_state._state[time_key] = event_emitter.start_time
         else:
             log.debug(f"Response {message_id} does not have grounding metadata.")
 
