@@ -52,7 +52,7 @@ import re
 import fnmatch
 import sys
 from loguru import logger
-from fastapi import Request
+from fastapi import Request, FastAPI
 import pydantic_core
 from pydantic import BaseModel, Field, field_validator
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -1950,7 +1950,7 @@ class Pipe:
             log.debug("pipe method has finished.")
             return self._unified_response_processor(
                 response_stream,
-                __request__,
+                __request__.app,
                 model_name,
                 event_emitter,
                 __user__["id"],
@@ -1976,7 +1976,7 @@ class Pipe:
             log.debug("pipe method has finished.")
             return self._unified_response_processor(
                 single_item_stream(res),
-                __request__,
+                __request__.app,
                 model_name,
                 event_emitter,
                 __user__["id"],
@@ -2550,7 +2550,7 @@ class Pipe:
     async def _unified_response_processor(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
-        __request__: Request,
+        app: FastAPI,
         model: str,
         event_emitter: EventEmitter,
         user_id: str,
@@ -2658,7 +2658,7 @@ class Pipe:
                                 )
                     payload, count = await self._process_part(
                         part,
-                        __request__,
+                        app,
                         model,
                         user_id,
                         chat_id,
@@ -2700,7 +2700,7 @@ class Pipe:
                 await self._do_post_processing(
                     final_response_chunk,
                     event_emitter,
-                    __request__,
+                    app.state,
                     chat_id=chat_id,
                     message_id=message_id,
                     stream_error_happened=error_occurred,
@@ -2715,7 +2715,7 @@ class Pipe:
     async def _process_part(
         self,
         part: types.Part,
-        __request__: Request,
+        app: FastAPI, # We need the app to generate URLs for model returned images.
         model: str,
         user_id: str,
         chat_id: str,
@@ -2750,7 +2750,7 @@ class Pipe:
             case types.Part(inline_data=data) if data:
                 # Image parts don't need tag disabling.
                 processed_text = await self._process_image_part(
-                    data, model, user_id, chat_id, message_id, __request__
+                    data, model, user_id, chat_id, message_id, app
                 )
                 payload = {"content": processed_text}
             case types.Part(executable_code=code) if code:
@@ -2794,7 +2794,7 @@ class Pipe:
         user_id: str,
         chat_id: str,
         message_id: str,
-        request: Request,
+        app: FastAPI,
     ) -> str:
         """
         Handles image data by saving it to the Open WebUI backend and returning a markdown link.
@@ -2810,7 +2810,7 @@ class Pipe:
                 user_id=user_id,
                 chat_id=chat_id,
                 message_id=message_id,
-                __request__=request,
+                app=app,
             )
         else:
             log.warning(
@@ -2833,7 +2833,7 @@ class Pipe:
         user_id: str,
         chat_id: str,
         message_id: str,
-        __request__: Request,
+        app: FastAPI,
     ) -> str | None:
         """
         Helper method that uploads a generated image to the configured Open WebUI storage provider.
@@ -2884,7 +2884,7 @@ class Pipe:
             log.warning("Image upload to Open WebUI database likely failed.")
             return None
 
-        image_url: str = __request__.app.url_path_for(
+        image_url: str = app.url_path_for(
             "get_file_content_by_id", id=file_item.id
         )
         log.success("Image upload finished!")
@@ -2937,7 +2937,7 @@ class Pipe:
         self,
         model_response: types.GenerateContentResponse | None,
         event_emitter: EventEmitter,
-        request: Request,
+        app_state: State,
         chat_id: str,
         message_id: str,
         *,
@@ -3009,43 +3009,41 @@ class Pipe:
             usage_data["completion_time"] = round(elapsed_time, 2)
             await event_emitter.emit_usage(usage_data)
 
-        self._add_grounding_data_to_state(
-            model_response,
-            request,
-            chat_id,
-            message_id,
-            event_emitter,
-        )
+        # --- Store grounding and timing data in state for the Filter ---
+        if candidate and (grounding_metadata_obj := candidate.grounding_metadata):
+            self._store_data_in_state(
+                app_state,
+                chat_id,
+                message_id,
+                "grounding",
+                grounding_metadata_obj,
+            )
 
-    def _add_grounding_data_to_state(
-        self,
-        response: types.GenerateContentResponse,
-        request: Request,
+        # Only store the start time if the user wants to see timestamps in the grounding display.
+        # The filter will gracefully handle the absence of this key.
+        if event_emitter.status_mode == "visible_timed":
+            self._store_data_in_state(
+                app_state,
+                chat_id,
+                message_id,
+                "pipe_start_time",
+                event_emitter.start_time,
+            )
+    
+    @staticmethod
+    def _store_data_in_state(
+        app_state: State,
         chat_id: str,
         message_id: str,
-        event_emitter: EventEmitter,
+        key_suffix: str,
+        value: Any,
     ):
-        candidate = self._get_first_candidate(response.candidates)
-        grounding_metadata_obj = candidate.grounding_metadata if candidate else None
-
-        app_state: State = request.app.state
-        grounding_key = f"grounding_{chat_id}_{message_id}"
-        time_key = f"pipe_start_time_{chat_id}_{message_id}"
-
-        if grounding_metadata_obj:
-            log.debug(
-                f"Found grounding metadata. Storing in request's app state using key {grounding_key}."
-            )
-            # Using shared `request.app.state` to pass data to Filter.outlet.
-            # This is necessary because the Pipe and Filter operate on different requests.
-            app_state._state[grounding_key] = grounding_metadata_obj
-
-            # Only store the start time if the user wants to see timestamps in the grounding display.
-            # The filter will gracefully handle the absence of this key.
-            if event_emitter.status_mode == "visible_timed":
-                app_state._state[time_key] = event_emitter.start_time
-        else:
-            log.debug(f"Response {message_id} does not have grounding metadata.")
+        """Stores a value in the app state, namespaced by chat and message ID."""
+        key = f"{key_suffix}_{chat_id}_{message_id}"
+        log.debug(f"Storing data in app state with key '{key}'.")
+        # Using shared `request.app.state` to pass data to Filter.outlet.
+        # This is necessary because Pipe.pipe and Filter.outlet operate on different requests.
+        app_state._state[key] = value
 
     @staticmethod
     def _get_usage_data(
