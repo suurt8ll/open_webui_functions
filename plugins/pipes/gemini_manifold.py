@@ -6,15 +6,15 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.27.0
+version: 1.26.0
 requirements: google-genai==1.49.0
 """
 
-VERSION = "1.27.0"
+VERSION = "1.26.0"
 # This is the recommended version for the companion filter.
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
-RECOMMENDED_COMPANION_VERSION = "1.7.1"
+RECOMMENDED_COMPANION_VERSION = "1.7.0"
 
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
@@ -161,10 +161,11 @@ class EventEmitter:
         self,
         event_emitter: Callable[["Event"], Awaitable[None]] | None,
         *,
-        hide_successful_status: bool = False,
+        status_mode: str = "visible",
     ):
         self.event_emitter = event_emitter
-        self.hide_successful_status = hide_successful_status
+        self.status_mode = status_mode
+        self.start_time = time.monotonic()
 
     def emit_toast(
         self,
@@ -200,15 +201,34 @@ class EventEmitter:
         hidden: bool = False,
         *,
         is_successful_finish: bool = False,
+        is_thought: bool = False,
+        indent_level: int = 0,
     ) -> None:
-        """Emit status updates asynchronously."""
+        """Emit status updates asynchronously based on the configured status_mode."""
         if not self.event_emitter:
             return
 
-        # If this is a successful finish status and the user wants to hide it,
-        # we override the hidden flag.
-        if is_successful_finish and self.hide_successful_status:
+        # Mode: Completely disabled
+        if self.status_mode == "disable":
+            return
+
+        # Mode: Hidden Compact - Hide thought titles/updates
+        if self.status_mode == "hidden_compact" and is_thought:
+            return
+
+        # Mode: Visible + Timestamps
+        if self.status_mode == "visible_timed":
+            elapsed = time.monotonic() - self.start_time
+            message = f"{message} (+{elapsed:.2f}s)"
+
+        # Determine if the final status should be hidden.
+        final_hidden = self.status_mode in ("hidden_compact", "hidden_detailed")
+        if is_successful_finish and final_hidden:
             hidden = True
+
+        # Add indentation prefix if the final status will be visible.
+        if not final_hidden and indent_level > 0:
+            message = f"{'- ' * indent_level}{message}"
 
         status_event: "StatusEvent" = {
             "type": "status",
@@ -297,10 +317,9 @@ class UploadStatusManager:
     def __init__(
         self,
         event_emitter: EventEmitter,
-        start_time: float,
     ):
         self.event_emitter = event_emitter
-        self.start_time = start_time
+        self.start_time = event_emitter.start_time
         self.queue = asyncio.Queue()
         self.total_uploads_expected = 0
         self.uploads_completed = 0
@@ -338,21 +357,18 @@ class UploadStatusManager:
         if not self.is_active:
             return
 
-        elapsed_time = time.monotonic() - self.start_time
-        time_str = f"(+{elapsed_time:.2f}s)"
-
         is_done = (
             self.total_uploads_expected > 0
             and self.uploads_completed == self.total_uploads_expected
         )
 
         if is_done:
-            message = f"- Upload complete. {self.uploads_completed} file(s) processed. {time_str}"
+            message = f"Upload complete. {self.uploads_completed} file(s) processed."
         else:
             # Show "Uploading 1 of N..."
-            message = f"- Uploading file {self.uploads_completed + 1} of {self.total_uploads_expected}... {time_str}"
+            message = f"Uploading file {self.uploads_completed + 1} of {self.total_uploads_expected}..."
 
-        await self.event_emitter.emit_status(message, done=is_done)
+        await self.event_emitter.emit_status(message, done=is_done, indent_level=1)
 
 
 class FilesAPIManager:
@@ -396,8 +412,34 @@ class FilesAPIManager:
         self.id_hash_cache = id_hash_cache
         self.event_emitter = event_emitter
         # A dictionary to manage locks for concurrent uploads.
-        # The key is the content_hash, the value is an asyncio.Lock.
+        # The key is a composite of api_key_hash and content_hash.
         self.upload_locks: dict[str, asyncio.Lock] = {}
+        self.api_key_hash = self._get_api_key_hash()
+
+    def _get_api_key_hash(self) -> str:
+        """
+        Returns a hash of the API key for use in cache keys.
+
+        Returns 'no_key' if the client is not using an API key (e.g., Vertex AI with ADC).
+        """
+        # The genai.Client object doesn't expose the API key directly.
+        # It's stored in the internal _api_client.
+        api_key = getattr(self.client._api_client, "api_key", None)
+        if not api_key:
+            # This could happen if using Vertex AI with Application Default Credentials
+            return "no_key"
+        return xxhash.xxh64(api_key.encode("utf-8")).hexdigest()
+
+    def _get_file_cache_key(self, content_hash: str) -> str:
+        """Gets the namespaced key for the file cache."""
+        return f"{self.api_key_hash}:{content_hash}"
+
+    def _get_lock_key(self, content_hash: str) -> str:
+        """Gets the namespaced key for upload locks."""
+        # Although the deterministic_name is content-based, the file's ownership
+        # is tied to the API key (project). Locking per API key + content hash
+        # allows concurrent uploads of the same file for different users.
+        return f"{self.api_key_hash}:{content_hash}"
 
     async def get_or_upload_file(
         self,
@@ -432,7 +474,8 @@ class FilesAPIManager:
 
         # Step 2: The Hot Path (Check Local File Cache)
         # A cache hit means the file is valid and we can return immediately.
-        cached_file: types.File | None = await self.file_cache.get(content_hash)
+        file_cache_key = self._get_file_cache_key(content_hash)
+        cached_file: types.File | None = await self.file_cache.get(file_cache_key)
         if cached_file:
             log_id = f"OWUI ID: {owui_file_id}" if owui_file_id else "anonymous file"
             log.debug(
@@ -442,10 +485,11 @@ class FilesAPIManager:
 
         # On cache miss, acquire a lock specific to this file's content to prevent race conditions.
         # dict.setdefault is atomic, ensuring only one lock is created per hash.
-        lock = self.upload_locks.setdefault(content_hash, asyncio.Lock())
+        lock_key = self._get_lock_key(content_hash)
+        lock = self.upload_locks.setdefault(lock_key, asyncio.Lock())
         if lock.locked():
             log.debug(
-                f"Lock for hash {content_hash} is held by another task. "
+                f"Lock for key {lock_key} is held by another task. "
                 f"This call will now wait for the lock to be released."
             )
 
@@ -453,7 +497,7 @@ class FilesAPIManager:
             # Step 2.5: Double-Checked Locking
             # After acquiring the lock, check the cache again. Another task might have
             # completed the upload while we were waiting for the lock.
-            cached_file = await self.file_cache.get(content_hash)
+            cached_file = await self.file_cache.get(file_cache_key)
             if cached_file:
                 log.debug(
                     f"Cache HIT for file hash {content_hash} after acquiring lock. Returning."
@@ -461,7 +505,9 @@ class FilesAPIManager:
                 return cached_file
 
             # Step 3: The Warm/Cold Path (On Cache Miss)
-            deterministic_name = f"files/owui-v1-{content_hash}"
+            # The file ID (name after "files/") must be <= 40 chars.
+            # "owui-" (5) + hash (16) + "-" (1) + hash (16) = 38 chars.
+            deterministic_name = f"files/owui-{self.api_key_hash}-{content_hash}"
             log.debug(
                 f"Cache MISS for hash {content_hash}. Attempting stateless recovery with GET: {deterministic_name}"
             )
@@ -480,13 +526,17 @@ class FilesAPIManager:
                 active_file = await self._poll_for_active_state(file.name, owui_file_id)
 
                 ttl_seconds = self._calculate_ttl(active_file.expiration_time)
-                await self.file_cache.set(content_hash, active_file, ttl=ttl_seconds)
+                await self.file_cache.set(file_cache_key, active_file, ttl=ttl_seconds)
 
                 return active_file
             except genai_errors.ClientError as e:
-                if e.code == 403:  # "Not found" signal from the API.
+                # NOTE: The Gemini Files API returns 403 Forbidden when trying to GET
+                # a file that either does not exist or belongs to another project.
+                # We treat 403 as the "not found" signal for our warm path and
+                # include 404 for forward compatibility.
+                if e.code == 403 or e.code == 404:
                     log.info(
-                        f"File {deterministic_name} not found on server (received 403). Proceeding to upload."
+                        f"File {deterministic_name} not found on server (received {e.code}). Proceeding to upload."
                     )
                     # Proceed to upload (Cold Path)
                     return await self._upload_and_process_file(
@@ -499,7 +549,7 @@ class FilesAPIManager:
                     )
                 else:
                     log.exception(
-                        f"A non-403 client error occurred during stateless recovery for {deterministic_name}."
+                        f"An unhandled client error (code: {e.code}) occurred during stateless recovery for {deterministic_name}."
                     )
                     self.event_emitter.emit_toast(
                         f"API error for file: {e.code}. Please check permissions.",
@@ -523,8 +573,8 @@ class FilesAPIManager:
                 # Clean up the lock from the dictionary once processing is complete
                 # for this hash, preventing memory growth over time.
                 # This is safe because any future request for this hash will hit the cache.
-                if content_hash in self.upload_locks:
-                    del self.upload_locks[content_hash]
+                if lock_key in self.upload_locks:
+                    del self.upload_locks[lock_key]
 
     async def _get_content_hash(
         self, file_bytes: bytes, owui_file_id: str | None
@@ -538,6 +588,8 @@ class FilesAPIManager:
         """
         if owui_file_id:
             # First, check the ID-to-Hash cache for known files.
+            # This cache is NOT namespaced by API key, as the mapping from
+            # an OWUI file ID to its content hash is constant.
             cached_hash: str | None = await self.id_hash_cache.get(owui_file_id)
             if cached_hash:
                 log.trace(f"Hash cache HIT for OWUI ID {owui_file_id}.")
@@ -617,7 +669,8 @@ class FilesAPIManager:
 
             # Calculate TTL and set in the main file cache using the content hash as the key.
             ttl_seconds = self._calculate_ttl(active_file.expiration_time)
-            await self.file_cache.set(content_hash, active_file, ttl=ttl_seconds)
+            file_cache_key = self._get_file_cache_key(content_hash)
+            await self.file_cache.set(file_cache_key, active_file, ttl=ttl_seconds)
             log.debug(
                 f"Cached new file object for hash {content_hash} with TTL: {ttl_seconds}s."
             )
@@ -707,7 +760,7 @@ class GeminiContentBuilder:
             metadata_body, user_data
         )
 
-    async def build_contents(self, start_time: float) -> list[types.Content]:
+    async def build_contents(self) -> list[types.Content]:
         """
         The main public method to generate the contents list by processing all
         message turns concurrently and using a self-configuring status manager.
@@ -721,7 +774,7 @@ class GeminiContentBuilder:
             self.event_emitter.emit_toast(warn_msg, "warning")
 
         # 1. Set up and launch the status manager. It will activate itself if needed.
-        status_manager = UploadStatusManager(self.event_emitter, start_time=start_time)
+        status_manager = UploadStatusManager(self.event_emitter)
         manager_task = asyncio.create_task(status_manager.run())
 
         # 2. Create and run concurrent processing tasks for each message turn.
@@ -1444,12 +1497,12 @@ class Pipe:
         return v
 
     class Valves(BaseModel):
-        GEMINI_API_KEY: str | None = Field(default=None)
-        IMAGE_GEN_GEMINI_API_KEY: str | None = Field(
-            default=None,
-            description="""Optional separate API key for image generation models.
-            If not provided, the main GEMINI_API_KEY will be used.
-            An image generation model is identified by the Image Model Pattern regex below.""",
+        # FIXME: docstrings don't get markdown rendered in the admin UI currently. rewrite docstrings accordingly.
+        GEMINI_FREE_API_KEY: str | None = Field(
+            default=None, description="Free Gemini Developer API key."
+        )
+        GEMINI_PAID_API_KEY: str | None = Field(
+            default=None, description="Paid Gemini Developer API key."
         )
         USER_MUST_PROVIDE_AUTH_CONFIG: bool = Field(
             default=False,
@@ -1459,7 +1512,7 @@ class Pipe:
         )
         AUTH_WHITELIST: str | None = Field(
             default=None,
-            description="""Comma separated list of user emails that are allowed to bypassUSER_MUST_PROVIDE_AUTH_CONFIG and use the default authentication configuration.
+            description="""Comma separated list of user emails that are allowed to bypass USER_MUST_PROVIDE_AUTH_CONFIG and use the default authentication configuration.
             Default value is None (no users are whitelisted).""",
         )
         GEMINI_API_BASE_URL: str | None = Field(
@@ -1467,6 +1520,7 @@ class Pipe:
             description="""The base URL for calling the Gemini API.
             Default value is None.""",
         )
+        # FIXME: assume the user wants Vertex if they set VERTEX_PROJECT, removing the need for this valve.
         USE_VERTEX_AI: bool = Field(
             default=False,
             description="""Whether to use Google Cloud Vertex AI instead of the standard Gemini API.
@@ -1525,22 +1579,17 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is True.""",
         )
-        SHOW_THOUGHT_TITLES: bool = Field(
-            default=True,
-            description="""Displays live thought summary titles while the model is thinking.
-            Titles are emitted as status updates and hidden when thinking ends.""",
-        )
         THINKING_MODEL_PATTERN: str = Field(
-            default=r"^(?=.*(?:gemini-2\.5|gemini-flash-latest|gemini-flash-lite-latest|gemini-3-pro-preview))(?!(.*live))(?!(.*image))",
+            default=r"^(?!.*live)(?=.*gemini-(?:3|2\.5|flash(?:-lite)?-latest))(?=.*gemini-3|(?!.*image))",
             description="""Regex pattern to identify thinking models.
-            Default value is r"^(?=.*(?:gemini-2\.5|gemini-flash-latest|gemini-flash-lite-latest|gemini-3-pro-preview))(?!(.*live))(?!(.*image))".""",
+            Default value is r"^(?!.*live)(?=.*gemini-(?:3|2\.5|flash(?:-lite)?-latest))(?=.*gemini-3|(?!.*image))".""",
         )
         IMAGE_MODEL_PATTERN: str = Field(
             default=r"image",
             description="""Regex pattern to identify image generation models.
             Default value is r"image".""",
         )
-        # FIXME: remove
+        # FIXME: remove, toggle filter handles this now
         ENABLE_URL_CONTEXT_TOOL: bool = Field(
             default=False,
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
@@ -1570,11 +1619,17 @@ class Pipe:
             Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
             Default value is None.""",
         )
-        HIDE_SUCCESSFUL_STATUS_MESSAGE: bool = Field(
-            default=False,
-            description="""Whether to hide the final 'Response finished' status message on success.
-            Error messages will always be shown.
-            Default value is False.""",
+        STATUS_EMISSION_BEHAVIOR: Literal[
+            "disable",
+            "hidden_compact",
+            "hidden_detailed",
+            "visible",
+            "visible_timed",
+        ] = Field(
+            default="hidden_detailed",
+            description="""Control status display. (Default: hidden_detailed) • Options • disable: No status. 
+            • hidden_compact: Final success hidden, no thoughts. • hidden_detailed: Final success hidden, with thoughts. 
+            • visible: All status visible. • visible_timed: Visible with timestamps.""",
         )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
@@ -1623,16 +1678,14 @@ class Pipe:
         and enforce policies, while still giving users the flexibility to tailor
         certain parameters, like their API key or model settings, for their own use.
         """
-
-        GEMINI_API_KEY: str | None = Field(
+        # FIXME: `Literal[""]` might not be necessary anymore
+        GEMINI_FREE_API_KEY: str | None = Field(
             default=None,
-            description="""Gemini Developer API key.
-            Default value is None (uses the default from Valves, same goes for other options below).""",
+            description="""Free Gemini Developer API key. If not provided, the admin's key may be used if permitted.""",
         )
-        IMAGE_GEN_GEMINI_API_KEY: str | None = Field(
+        GEMINI_PAID_API_KEY: str | None = Field(
             default=None,
-            description="""Optional separate API key for image generation models.
-            If not provided, the main GEMINI_API_KEY will be used.""",
+            description="""Paid Gemini Developer API key. If not provided, the admin's key may be used if permitted.""",
         )
         GEMINI_API_BASE_URL: str | None = Field(
             default=None,
@@ -1678,11 +1731,6 @@ class Pipe:
             description="""Regex pattern to identify thinking models.
             Default value is None.""",
         )
-        SHOW_THOUGHT_TITLES: bool | None | Literal[""] = Field(
-            default=None,
-            description="""Whether to display live thought summary titles while thinking.
-            Default value is None (use admin setting).""",
-        )
         ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
             default=None,
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
@@ -1706,11 +1754,20 @@ class Pipe:
             Overrides the admin setting. Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
             Default value is None.""",
         )
-        HIDE_SUCCESSFUL_STATUS_MESSAGE: bool | None | Literal[""] = Field(
+        STATUS_EMISSION_BEHAVIOR: (
+            Literal[
+                "disable",
+                "hidden_compact",
+                "hidden_detailed",
+                "visible",
+                "visible_timed",
+                "",
+            ]
+            | None
+        ) = Field(
             default=None,
-            description="""Override the default setting for hiding the successful status message.
-            Set to True to hide, False to show.
-            Default is None (use the admin's setting).""",
+            description="""Override admin setting (leave empty to use default). 
+            Options: disable | hidden_compact | hidden_detailed | visible | visible_timed""",
         )
 
         @field_validator("THINKING_BUDGET", mode="after")
@@ -1768,9 +1825,8 @@ class Pipe:
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]] | None,
         __metadata__: "Metadata",
-    ) -> AsyncGenerator[dict, None] | str:
+    ) -> AsyncGenerator[dict | str, None] | str:
 
-        start_time = time.monotonic()
         self._add_log_handler(self.valves.LOG_LEVEL)
 
         log.debug(
@@ -1787,20 +1843,12 @@ class Pipe:
             self.valves, __user__.get("valves"), __user__.get("email")
         )
 
-        model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
-        is_image_model = self._is_image_model(model_name, valves.IMAGE_MODEL_PATTERN)
-
-        if is_image_model and valves.IMAGE_GEN_GEMINI_API_KEY:
-            log.info("Using separate API key for image generation model.")
-            valves.GEMINI_API_KEY = valves.IMAGE_GEN_GEMINI_API_KEY
-
-            # When using a separate key, assume it's for Gemini API, not Vertex AI
-            # TODO: check if it would work for Vertex AI as well
-            valves.USE_VERTEX_AI = False
-            valves.VERTEX_PROJECT = None
+        # Apply UI toggle overrides (Paid API & Vertex AI)
+        valves = self._apply_toggle_configurations(valves, __metadata__)
 
         log.debug(
-            f"USE_VERTEX_AI: {valves.USE_VERTEX_AI}, VERTEX_PROJECT set: {bool(valves.VERTEX_PROJECT)}, API_KEY set: {bool(valves.GEMINI_API_KEY)}"
+            f"USE_VERTEX_AI: {valves.USE_VERTEX_AI}, VERTEX_PROJECT set: {bool(valves.VERTEX_PROJECT)},"
+            f" GEMINI_FREE_API_KEY set: {bool(valves.GEMINI_FREE_API_KEY)}, GEMINI_PAID_API_KEY set: {bool(valves.GEMINI_PAID_API_KEY)}"
         )
 
         log.debug(
@@ -1808,15 +1856,19 @@ class Pipe:
         )
         client = self._get_user_client(valves, __user__["email"])
         __metadata__["is_vertex_ai"] = client.vertexai
+        # Determine the correct API name for logging and status messages.
+        api_name = "Vertex AI Gemini API" if client.vertexai else "Gemini Developer API"
 
         if __metadata__.get("task"):
-            log.info(f'{__metadata__["task"]=}, disabling event emissions.') # type: ignore
+            log.info(f'{__metadata__["task"]=}, disabling event emissions.')  # type: ignore
             # Task model is not user facing, so we should not emit any events.
             __event_emitter__ = None
 
+        # Initialize EventEmitter with the user's chosen status behavior.
+        # Start time is automatically captured inside __init__.
         event_emitter = EventEmitter(
             __event_emitter__,
-            hide_successful_status=valves.HIDE_SUCCESSFUL_STATUS_MESSAGE,
+            status_mode=valves.STATUS_EMISSION_BEHAVIOR,
         )
 
         files_api_manager = FilesAPIManager(
@@ -1847,14 +1899,15 @@ class Pipe:
             valves=valves,
             files_api_manager=files_api_manager,
         )
-        # This is our first timed event, marking the start of payload preparation.
         asyncio.create_task(event_emitter.emit_status("Preparing request..."))
-        contents = await builder.build_contents(start_time=start_time)
+        contents = await builder.build_contents()
 
         gen_content_conf = self._build_gen_content_config(body, __metadata__, valves)
         gen_content_conf.system_instruction = builder.system_prompt
 
         # Some models (e.g., image generation, Gemma) do not support the system prompt message.
+        model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
+        is_image_model = self._is_image_model(model_name, valves.IMAGE_MODEL_PATTERN)
         system_prompt_unsupported = is_image_model or "gemma" in model_name
         if system_prompt_unsupported:
             # TODO: append to user message instead.
@@ -1869,21 +1922,21 @@ class Pipe:
             "contents": contents,
             "config": gen_content_conf,
         }
-        log.debug("Passing these args to the Google API:", payload=gen_content_args)
+        log.debug(f"Passing these args to the {api_name}:", payload=gen_content_args)
 
         # Both streaming and non-streaming responses are now handled by the same
-        # unified processor, which returns an AsyncGenerator. For non-streaming,
-        # we adapt the single response object into a one-item async generator.
-
-        elapsed_time = time.monotonic() - start_time
-        time_str = f"(+{elapsed_time:.2f}s)"
+        # unified processor, which returns an AsyncGenerator.
 
         # Determine the request type to provide a more informative status message.
         is_streaming = features.get("stream", True)
         request_type_str = "streaming" if is_streaming else "non-streaming"
 
-        # Emit a status update with timing before making the actual API call.
-        asyncio.create_task(event_emitter.emit_status(f"Sending {request_type_str} request to Google API... {time_str}"))
+        # Emit a status update. EventEmitter handles formatting and timestamps.
+        asyncio.create_task(
+            event_emitter.emit_status(
+                f"Sending {request_type_str} request to {api_name}..."
+            )
+        )
 
         if is_streaming:
             # Streaming response
@@ -1903,10 +1956,10 @@ class Pipe:
                 __user__["id"],
                 chat_id,
                 message_id,
-                start_time=start_time,
             )
         else:
             # Non-streaming response.
+            # FIXME: Catch and handle any exceptions from the API call.
             res = await client.aio.models.generate_content(**gen_content_args)
 
             # Adapter: Create a simple, one-shot async generator that yields the
@@ -1929,7 +1982,6 @@ class Pipe:
                 __user__["id"],
                 chat_id,
                 message_id,
-                start_time=start_time,
             )
 
     # region 2. Helper methods inside the Pipe class
@@ -1938,7 +1990,8 @@ class Pipe:
     @staticmethod
     @cache
     def _get_or_create_genai_client(
-        api_key: str | None = None,
+        free_api_key: str | None = None,
+        paid_api_key: str | None = None,
         base_url: str | None = None,
         use_vertex_ai: bool | None = None,
         vertex_project: str | None = None,
@@ -1949,9 +2002,12 @@ class Pipe:
         Raises GenaiApiError on failure.
         """
 
+        # Prioritize the free key, then fall back to the paid key.
+        api_key = free_api_key or paid_api_key
+
         if not vertex_project and not api_key:
             # FIXME: More detailed reason in the exception (tell user to set the API key).
-            msg = "Neither VERTEX_PROJECT nor GEMINI_API_KEY is set."
+            msg = "Neither VERTEX_PROJECT nor a Gemini API key (free or paid) is set."
             raise GenaiApiError(msg)
 
         if use_vertex_ai and vertex_project:
@@ -1991,10 +2047,10 @@ class Pipe:
             f"USER_MUST_PROVIDE_AUTH_CONFIG: {valves.USER_MUST_PROVIDE_AUTH_CONFIG}"
         )
         if valves.USER_MUST_PROVIDE_AUTH_CONFIG and user_email not in user_whitelist:
-            if not valves.GEMINI_API_KEY:
+            if not valves.GEMINI_FREE_API_KEY and not valves.GEMINI_PAID_API_KEY:
                 error_msg = (
                     "User must provide their own authentication configuration. "
-                    "Please set GEMINI_API_KEY in your UserValves."
+                    "Please set GEMINI_FREE_API_KEY or GEMINI_PAID_API_KEY in your UserValves."
                 )
                 raise ValueError(error_msg)
         try:
@@ -2012,13 +2068,14 @@ class Pipe:
     ) -> list[str | bool | None]:
         """Prepares arguments for _get_or_create_genai_client from source_valves."""
         ATTRS = [
-            "GEMINI_API_KEY",
+            "GEMINI_FREE_API_KEY",
+            "GEMINI_PAID_API_KEY",
             "GEMINI_API_BASE_URL",
             "USE_VERTEX_AI",
             "VERTEX_PROJECT",
             "VERTEX_LOCATION",
         ]
-        return [getattr(source_valves, attr) for attr in ATTRS]
+        return [getattr(source_valves, attr, None) for attr in ATTRS]
 
     # endregion 2.1 Client initialization
 
@@ -2026,13 +2083,14 @@ class Pipe:
     @cached()  # aiocache.cached for async method
     async def _get_genai_models(
         self,
-        api_key: str | None,
-        base_url: str | None,
-        use_vertex_ai: bool | None,  # User's preference from config
-        vertex_project: str | None,
-        vertex_location: str | None,
-        whitelist_str: str,
-        blacklist_str: str | None,
+        free_api_key: str | None = None,
+        paid_api_key: str | None = None,
+        base_url: str | None = None,
+        use_vertex_ai: bool | None = None,
+        vertex_project: str | None = None,
+        vertex_location: str | None = None,
+        whitelist_str: str = "*",
+        blacklist_str: str | None = None,
     ) -> list["ModelData"]:
         """
         Gets valid Google models from API(s) and filters them.
@@ -2042,7 +2100,7 @@ class Pipe:
         all_raw_models: list[types.Model] = []
 
         # Condition for fetching from both sources
-        fetch_both = bool(use_vertex_ai and vertex_project and api_key)
+        fetch_both = bool(use_vertex_ai and vertex_project and (free_api_key or paid_api_key))
 
         if fetch_both:
             log.info(
@@ -2055,7 +2113,8 @@ class Pipe:
             # 1. Fetch from Gemini Developer API
             try:
                 gemini_client = self._get_or_create_genai_client(
-                    api_key=api_key,
+                    free_api_key=free_api_key,
+                    paid_api_key=paid_api_key,
                     base_url=base_url,
                     use_vertex_ai=False,  # Explicitly target Gemini API
                     vertex_project=None,
@@ -2080,7 +2139,6 @@ class Pipe:
                     use_vertex_ai=True,  # Explicitly target Vertex AI
                     vertex_project=vertex_project,
                     vertex_location=vertex_location,
-                    api_key=None,  # API key is not used for Vertex AI with project auth
                     base_url=base_url,  # Pass base_url for potential Vertex custom endpoints
                 )
                 vertex_models_list = await self._fetch_models_from_client_internal(
@@ -2156,7 +2214,8 @@ class Pipe:
 
             try:
                 client = self._get_or_create_genai_client(
-                    api_key=api_key,
+                    free_api_key=free_api_key,
+                    paid_api_key=paid_api_key,
                     base_url=base_url,
                     use_vertex_ai=client_target_is_vertex,  # Pass the determined target
                     vertex_project=vertex_project if client_target_is_vertex else None,
@@ -2497,8 +2556,7 @@ class Pipe:
         user_id: str,
         chat_id: str,
         message_id: str,
-        start_time: float,
-    ) -> AsyncGenerator[dict, None]:
+    ) -> AsyncGenerator[dict | str, None]:
         """
         Processes an async iterator of GenerateContentResponse objects, yielding
         structured dictionary chunks for the Open WebUI frontend.
@@ -2515,7 +2573,6 @@ class Pipe:
         chunk_counter = 0
         in_think = False
         last_title: str | None = None
-        show_titles = bool(getattr(self.valves, "SHOW_THOUGHT_TITLES", True))
 
         try:
             async for chunk in response_stream:
@@ -2525,13 +2582,8 @@ class Pipe:
 
                 if not first_chunk_received:
                     # This is the first (and possibly only) chunk.
-                    elapsed_time = time.monotonic() - start_time
-                    time_str = f"(+{elapsed_time:.2f}s)"
                     asyncio.create_task(
-                        event_emitter.emit_status(
-                            f"Response received {time_str}",
-                            done=True,
-                        )
+                        event_emitter.emit_status("Response received", done=True)
                     )
                     first_chunk_received = True
 
@@ -2545,36 +2597,37 @@ class Pipe:
                     # Handle thought titles and transitions between reasoning and normal content.
                     match part:
                         case types.Part(text=str(text), thought=True):
-                            if show_titles and text:
-                                try:
-                                    title: str | None = None
-                                    # Prefer markdown-style "### Heading" titles.
+                            try:
+                                title: str | None = None
+                                # Prefer markdown-style "### Heading" titles.
+                                for m in re.finditer(
+                                    r"(^|\n)###\s+(.+?)(?=\n|$)", text or ""
+                                ):
+                                    title = m.group(2).strip()
+                                # Fall back to bold "**Title**" lines if no heading was found.
+                                if not title:
                                     for m in re.finditer(
-                                        r"(^|\n)###\s+(.+?)(?=\n|$)", text or ""
+                                        r"(^|\n)\s*\*\*(.+?)\*\*\s*(?=\n|$)",
+                                        text or "",
                                     ):
-                                        title = m.group(2).strip()
-                                    # Fall back to bold "**Title**" lines if no heading was found.
-                                    if not title:
-                                        for m in re.finditer(
-                                            r"(^|\n)\s*\*\*(.+?)\*\*\s*(?=\n|$)",
-                                            text or "",
-                                        ):
-                                            title = (m.group(2) or "").strip()
-                                    if title:
-                                        # Trim common surrounding quotes.
-                                        title = title.strip('"“”‘’').strip()
-                                    if title and title != last_title:
-                                        last_title = title
-                                        asyncio.create_task(
-                                            event_emitter.emit_status(
-                                                title,
-                                                done=False,
-                                                hidden=False,
-                                            )
+                                        title = (m.group(2) or "").strip()
+                                if title:
+                                    # Trim common surrounding quotes.
+                                    title = title.strip('"“”‘’').strip()
+                                if title and title != last_title:
+                                    last_title = title
+                                    asyncio.create_task(
+                                        event_emitter.emit_status(
+                                            title,
+                                            done=False,
+                                            hidden=False,
+                                            is_thought=True,
+                                            indent_level=1,
                                         )
-                                except Exception:
-                                    # Thought titles are a best-effort feature; failures should not break the stream.
-                                    pass
+                                    )
+                            except Exception:
+                                # Thought titles are a best-effort feature; failures should not break the stream.
+                                pass
                             if not in_think:
                                 in_think = True
                         case types.Part(text=str(text)):
@@ -2583,21 +2636,24 @@ class Pipe:
                                 # Clear the last thought title when normal content begins.
                                 asyncio.create_task(
                                     event_emitter.emit_status(
-                                        "",
+                                        "Thinking finished",
                                         done=True,
-                                        hidden=True,
+                                        is_thought=False,
                                     )
                                 )
-                        case types.Part(inline_data=_) | types.Part(
-                            executable_code=_
-                        ) | types.Part(code_execution_result=_):
+                        case (
+                            types.Part(inline_data=_)
+                            | types.Part(executable_code=_)
+                            | types.Part(code_execution_result=_)
+                        ):
                             if in_think:
                                 in_think = False
+                                # Clear the last thought title when normal content begins.
                                 asyncio.create_task(
                                     event_emitter.emit_status(
-                                        "",
+                                        "Thinking finished",
                                         done=True,
-                                        hidden=True,
+                                        is_thought=False,
                                     )
                                 )
                     payload, count = await self._process_part(
@@ -2648,7 +2704,6 @@ class Pipe:
                     chat_id=chat_id,
                     message_id=message_id,
                     stream_error_happened=error_occurred,
-                    start_time=start_time,
                 )
             except Exception as e:
                 error_msg = f"Post-processing failed with error:\n\n{e}"
@@ -2887,32 +2942,26 @@ class Pipe:
         message_id: str,
         *,
         stream_error_happened: bool = False,
-        start_time: float,
     ):
         """Handles emitting usage, grounding, and sources after the main response/stream is done."""
         log.info("Post-processing the model response.")
 
-        elapsed_time = time.monotonic() - start_time
-        time_str = f"(+{elapsed_time:.2f}s)"
-
         if stream_error_happened:
             log.warning("Response processing failed due to stream error.")
-            await event_emitter.emit_status(
-                f"Response failed [Stream Error] {time_str}", done=True
-            )
+            await event_emitter.emit_status("Response failed [Stream Error]", done=True)
             return
 
         if not model_response:
             log.warning("Response processing skipped: Model response was empty.")
             await event_emitter.emit_status(
-                f"Response failed [Empty Response] {time_str}", done=True
+                "Response failed [Empty Response]", done=True
             )
             return
 
         if not (candidate := self._get_first_candidate(model_response.candidates)):
             log.warning("Response processing skipped: No candidates found.")
             await event_emitter.emit_status(
-                f"Response failed [No Candidates] {time_str}", done=True
+                "Response failed [No Candidates]", done=True
             )
             return
 
@@ -2944,7 +2993,7 @@ class Pipe:
         # For the most common success case (STOP), we don't need to show the reason.
         final_reason_str = "" if reason_name == "STOP" else f" [{reason_name}]"
         await event_emitter.emit_status(
-            f"{status_prefix}{final_reason_str} {time_str}",
+            f"{status_prefix}{final_reason_str}",
             done=True,
             is_successful_finish=is_normal_finish,
         )
@@ -2956,11 +3005,16 @@ class Pipe:
         # as usage data might still be available.
         if usage_data := self._get_usage_data(model_response):
             # Inject the total processing time into the usage payload.
+            elapsed_time = time.monotonic() - event_emitter.start_time
             usage_data["completion_time"] = round(elapsed_time, 2)
             await event_emitter.emit_usage(usage_data)
 
         self._add_grounding_data_to_state(
-            model_response, request, chat_id, message_id, start_time
+            model_response,
+            request,
+            chat_id,
+            message_id,
+            event_emitter,
         )
 
     def _add_grounding_data_to_state(
@@ -2969,7 +3023,7 @@ class Pipe:
         request: Request,
         chat_id: str,
         message_id: str,
-        pipe_start_time: float,
+        event_emitter: EventEmitter,
     ):
         candidate = self._get_first_candidate(response.candidates)
         grounding_metadata_obj = candidate.grounding_metadata if candidate else None
@@ -2985,7 +3039,11 @@ class Pipe:
             # Using shared `request.app.state` to pass data to Filter.outlet.
             # This is necessary because the Pipe and Filter operate on different requests.
             app_state._state[grounding_key] = grounding_metadata_obj
-            app_state._state[time_key] = pipe_start_time
+
+            # Only store the start time if the user wants to see timestamps in the grounding display.
+            # The filter will gracefully handle the absence of this key.
+            if event_emitter.status_mode == "visible_timed":
+                app_state._state[time_key] = event_emitter.start_time
         else:
             log.debug(f"Response {message_id} does not have grounding metadata.")
 
@@ -3333,6 +3391,60 @@ class Pipe:
 
         return (True, is_toggled_on)
 
+    def _apply_toggle_configurations(
+        self,
+        valves: "Pipe.Valves",
+        __metadata__: "Metadata",
+    ) -> "Pipe.Valves":
+        """
+        Applies logic for toggleable filters (Paid API, Vertex AI) to the valves.
+        Returns a modified Valves object.
+        """
+
+        # --- Logic for Gemini Paid API Toggle ---
+        is_paid_api_available, is_paid_api_toggled_on = (
+            self._get_toggleable_feature_status("gemini_paid_api", __metadata__)
+        )
+
+        if is_paid_api_available:
+            if is_paid_api_toggled_on:
+                # User has toggled ON the paid API filter. Prioritize paid key.
+                valves.GEMINI_FREE_API_KEY = None
+                log.info("Paid API toggle is enabled. Prioritizing paid Gemini key.")
+            else:
+                # User has toggled OFF the paid API filter. Prioritize free key.
+                valves.GEMINI_PAID_API_KEY = None
+                log.info(
+                    "Paid API toggle is available but disabled. Prioritizing free Gemini key."
+                )
+        else:
+            log.info(
+                "Paid API toggle not configured for this model. Defaulting to free key if available."
+            )
+
+        # --- Logic for Vertex AI Toggle ---
+        is_vertex_available, is_vertex_toggled_on = self._get_toggleable_feature_status(
+            "gemini_vertex_ai_toggle", __metadata__
+        )
+
+        # Only override valves if the toggle system is actually active/installed
+        if is_vertex_available:
+            if is_vertex_toggled_on:
+                # Toggle is ON: Ensure Vertex is enabled in valves (if credentials exist)
+                valves.USE_VERTEX_AI = True
+                log.info("Vertex AI toggle is enabled. Enforcing Vertex AI usage.")
+            else:
+                # Toggle is OFF: Force Vertex settings to disabled state
+                valves.USE_VERTEX_AI = False
+                valves.VERTEX_PROJECT = None
+                # Resetting location to default just in case, though strictly not necessary if disabled
+                valves.VERTEX_LOCATION = "global"
+                log.info(
+                    "Vertex AI toggle is disabled. Forcing standard Gemini Developer API."
+                )
+
+        return valves
+
     @staticmethod
     def _get_merged_valves(
         default_valves: "Pipe.Valves",
@@ -3342,14 +3454,15 @@ class Pipe:
         """
         Merges UserValves into a base Valves configuration.
 
-        The general rule is that if a field in UserValves is not None, it overrides
-        the corresponding field in the default_valves. Otherwise, the default_valves
-        field value is used.
+        The general rule is that if a field in UserValves is not None or an empty
+        string, it overrides the corresponding field in the default_valves.
+        Otherwise, the default_valves field value is used.
 
         Exceptions:
-        - If default_valves.USER_MUST_PROVIDE_AUTH_CONFIG is True, then GEMINI_API_KEY and
-          VERTEX_PROJECT in the merged result will be taken directly from
-          user_valves (even if they are None), ignoring the values in default_valves.
+        - If default_valves.USER_MUST_PROVIDE_AUTH_CONFIG is True and the user is
+          not on the AUTH_WHITELIST, then GEMINI_FREE_API_KEY and
+          GEMINI_PAID_API_KEY in the merged result will be taken directly from
+          user_valves (even if they are None), and Vertex AI usage is disabled.
 
         Args:
             default_valves: The base Valves object with default configurations.
@@ -3388,10 +3501,15 @@ class Pipe:
             default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
             and user_email not in user_whitelist
         ):
+            log.info(
+                f"User '{user_email}' is required to provide their own authentication credentials due to USER_MUST_PROVIDE_AUTH_CONFIG=True."
+                " Admin-provided API keys and Vertex AI settings will not be used."
+            )
             # If USER_MUST_PROVIDE_AUTH_CONFIG is True and user is not in the whitelist,
-            # then user must provide their own GEMINI_API_KEY
-            # User is disallowed from using Vertex AI in this case.
-            merged_data["GEMINI_API_KEY"] = user_valves.GEMINI_API_KEY
+            # they must provide their own API keys.
+            # They are also disallowed from using the admin's Vertex AI configuration.
+            merged_data["GEMINI_FREE_API_KEY"] = user_valves.GEMINI_FREE_API_KEY
+            merged_data["GEMINI_PAID_API_KEY"] = user_valves.GEMINI_PAID_API_KEY
             merged_data["VERTEX_PROJECT"] = None
             merged_data["USE_VERTEX_AI"] = False
 

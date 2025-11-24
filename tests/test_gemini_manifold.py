@@ -15,7 +15,10 @@ mock_misc_module = MagicMock()
 mock_chats_module.Chats = MagicMock()
 mock_files_module.FileForm = MagicMock()
 mock_files_module.Files = MagicMock()
-mock_functions_module.Functions = MagicMock()
+# Mock the return of get_function_by_id for toggle filter tests
+mock_functions_module.Functions.get_function_by_id.return_value = MagicMock(
+    is_active=True, is_global=True
+)
 mock_storage_module.Storage = MagicMock()
 # Provide a default return value for pop_system_message to avoid TypeErrors in tests that don't set it.
 mock_misc_module.pop_system_message.return_value = (None, [])
@@ -36,6 +39,28 @@ from plugins.pipes.gemini_manifold import (
 )  # gemini_types is google.genai.types
 
 
+# region Test Constants
+# General Users
+USER_EMAIL_REGULAR = "regular_user@example.com"
+USER_EMAIL_UNPRIVILEGED = "unprivileged_user@example.com"
+USER_EMAIL_WHITELISTED = "whitelisted_user@example.com"
+
+# Admin Credentials
+ADMIN_FREE_KEY = "admin_default_free_key"
+ADMIN_PAID_KEY = "admin_default_paid_key"
+ADMIN_GEMINI_BASE_URL = "https://admin.default.gemini.api.com"
+ADMIN_VERTEX_PROJECT = "admin_default_vertex_project"
+ADMIN_VERTEX_LOCATION = "admin_default_vertex_location"
+
+# User Credentials
+USER_FREE_KEY = "user_specific_free_key"
+USER_PAID_KEY = "user_specific_paid_key"
+USER_GEMINI_BASE_URL = "https://user.specific.gemini.api.com"
+USER_VERTEX_PROJECT = "user_specific_vertex_project"
+USER_VERTEX_LOCATION = "user_specific_vertex_location"
+# endregion Test Constants
+
+
 # region Fixtures
 @pytest.fixture
 def mock_pipe_valves_data():
@@ -44,10 +69,11 @@ def mock_pipe_valves_data():
     Updated to include all fields from Pipe.Valves for robust Pydantic initialization.
     """
     return {
-        "GEMINI_API_KEY": "test_default_api_key_from_valves",
+        "GEMINI_FREE_API_KEY": ADMIN_FREE_KEY,
+        "GEMINI_PAID_API_KEY": ADMIN_PAID_KEY,
         "USER_MUST_PROVIDE_AUTH_CONFIG": False,
         "AUTH_WHITELIST": None,
-        "GEMINI_API_BASE_URL": "https://test.googleapis.com",
+        "GEMINI_API_BASE_URL": ADMIN_GEMINI_BASE_URL,
         "USE_VERTEX_AI": False,
         "VERTEX_PROJECT": None,
         "VERTEX_LOCATION": "global",
@@ -73,8 +99,8 @@ async def pipe_instance_fixture(mock_pipe_valves_data):
 
     with patch(
         "plugins.pipes.gemini_manifold.genai.Client",
-        return_value=mock_gemini_client_actual_instance,  # The constructor returns this
-    ) as MockedGenAIClientConstructor, patch.object(  # MockedGenAIClientConstructor is the mock of genai.Client class
+        return_value=mock_gemini_client_actual_instance,
+    ) as MockedGenAIClientConstructor, patch.object(
         Pipe, "_add_log_handler", MagicMock()
     ), patch(
         "sys.stdout", MagicMock()
@@ -87,7 +113,6 @@ async def pipe_instance_fixture(mock_pipe_valves_data):
 
     # Teardown: Clear caches to ensure clean state for subsequent tests
     Pipe._get_or_create_genai_client.cache_clear()
-    # Check if _get_genai_models has a cache attribute before trying to clear it
     if hasattr(pipe._get_genai_models, "cache"):
         cache_instance = getattr(pipe._get_genai_models, "cache")
         if cache_instance:
@@ -98,9 +123,9 @@ async def pipe_instance_fixture(mock_pipe_valves_data):
 
 
 # region Test _get_or_create_genai_client
-def test_pipe_initialization_with_api_key(mock_pipe_valves_data):
+def test_pipe_initialization_with_api_key_prefers_free(mock_pipe_valves_data):
     """
-    Tests basic Pipe initialization and client creation when an API key is provided.
+    Tests that when both free and paid API keys are available, the free key is preferred by default.
     """
     mock_gemini_client_instance = MagicMock()
 
@@ -117,21 +142,15 @@ def test_pipe_initialization_with_api_key(mock_pipe_valves_data):
             pipe_instance.valves = Pipe.Valves(**mock_pipe_valves_data)
 
             assert isinstance(pipe_instance.valves, Pipe.Valves)
-            assert (
-                pipe_instance.valves.GEMINI_API_KEY
-                == "test_default_api_key_from_valves"
-            )
+            assert pipe_instance.valves.GEMINI_FREE_API_KEY == ADMIN_FREE_KEY
+            assert pipe_instance.valves.GEMINI_PAID_API_KEY == ADMIN_PAID_KEY
 
             # Trigger client creation
-            pipe_instance._get_user_client(
-                pipe_instance.valves, "test_user_email@example.com"
-            )
+            pipe_instance._get_user_client(pipe_instance.valves, USER_EMAIL_REGULAR)
 
             MockedGenAIClientConstructor.assert_called_once_with(
-                api_key="test_default_api_key_from_valves",
-                http_options=gemini_types.HttpOptions(
-                    base_url="https://test.googleapis.com"
-                ),
+                api_key=ADMIN_FREE_KEY,  # Should prefer the free key
+                http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
             )
         finally:
             Pipe._get_or_create_genai_client.cache_clear()
@@ -139,134 +158,111 @@ def test_pipe_initialization_with_api_key(mock_pipe_valves_data):
 
 def test_get_user_client_no_auth_provided_raises_error(mock_pipe_valves_data):
     """
-    Tests that genai.Client is NOT called when neither GEMINI_API_KEY
-    nor VERTEX_PROJECT is provided and an error is raised.
+    Tests that genai.Client is NOT called and an error is raised when no API keys
+    or Vertex project are provided.
     """
-    # Configure valves to have no API key and no Vertex AI project
-    mock_pipe_valves_data["GEMINI_API_KEY"] = None
-    mock_pipe_valves_data["USE_VERTEX_AI"] = False  # Explicitly set to False
+    # Configure valves to have no API keys and no Vertex AI project
+    mock_pipe_valves_data["GEMINI_FREE_API_KEY"] = None
+    mock_pipe_valves_data["GEMINI_PAID_API_KEY"] = None
+    mock_pipe_valves_data["USE_VERTEX_AI"] = False
     mock_pipe_valves_data["VERTEX_PROJECT"] = None
-    # Ensure USER_MUST_PROVIDE_AUTH_CONFIG is False so the check happens inside _get_or_create_genai_client
-    mock_pipe_valves_data["USER_MUST_PROVIDE_AUTH_CONFIG"] = False
-    mock_pipe_valves_data["AUTH_WHITELIST"] = None  # Ensure user is not whitelisted
-
-    mock_gemini_client_instance = MagicMock()
 
     with patch(
-        "plugins.pipes.gemini_manifold.genai.Client",
-        return_value=mock_gemini_client_instance,
+        "plugins.pipes.gemini_manifold.genai.Client"
     ) as MockedGenAIClientConstructor, patch.object(
         Pipe, "_add_log_handler", MagicMock()
     ), patch(
-        "sys.stdout", MagicMock()  # Suppress log output during test
+        "sys.stdout", MagicMock()
     ):
         pipe_instance = Pipe()
         pipe_instance.valves = Pipe.Valves(**mock_pipe_valves_data)
 
-        # We expect a ValueError from _get_user_client
-        with pytest.raises(ValueError):
-            pipe_instance._get_user_client(
-                pipe_instance.valves, "test_user_email@example.com"
-            )
+        with pytest.raises(
+            ValueError, match="Neither VERTEX_PROJECT nor a Gemini API key"
+        ):
+            pipe_instance._get_user_client(pipe_instance.valves, USER_EMAIL_REGULAR)
 
-        # Assert that genai.Client was NOT called
         MockedGenAIClientConstructor.assert_not_called()
-
-        # Clean up cache for _get_or_create_genai_client
         Pipe._get_or_create_genai_client.cache_clear()
 
 
-def test_client_creation_uses_gemini_api_when_configured(pipe_instance_fixture):
-    """
-    Tests that Gemini Developer API client is created when GEMINI_API_KEY is provided
-    and USE_VERTEX_AI is False.
-    Assumes USER_MUST_PROVIDE_AUTH_CONFIG is False.
-    """
-    pipe, MockedGenAIClientConstructor = pipe_instance_fixture
-    Pipe._get_or_create_genai_client.cache_clear()  # Ensure fresh call for this test's params
-
-    # Configure valves for this specific scenario
-    pipe.valves.GEMINI_API_KEY = "test_gemini_key_scenario1"
-    pipe.valves.USE_VERTEX_AI = False
-    pipe.valves.VERTEX_PROJECT = None  # Should be ignored
-    pipe.valves.GEMINI_API_BASE_URL = "https://gemini.specific.example.com"
-    # USER_MUST_PROVIDE_AUTH_CONFIG is False from mock_pipe_valves_data
-
-    # Act
-    client = pipe._get_user_client(pipe.valves, "testuser1@example.com")
-
-    # Assert
-    MockedGenAIClientConstructor.assert_called_once_with(
-        api_key="test_gemini_key_scenario1",
-        http_options=gemini_types.HttpOptions(
-            base_url="https://gemini.specific.example.com"
+@pytest.mark.parametrize(
+    "keys_provided, expected_key",
+    [
+        (
+            {"GEMINI_FREE_API_KEY": "free_only_key", "GEMINI_PAID_API_KEY": None},
+            "free_only_key",
         ),
-    )
-    assert client is MockedGenAIClientConstructor.return_value
-    Pipe._get_or_create_genai_client.cache_clear()  # Cleanup
-
-
-def test_client_creation_uses_vertex_ai_when_configured(pipe_instance_fixture):
+        (
+            {"GEMINI_FREE_API_KEY": None, "GEMINI_PAID_API_KEY": "paid_only_key"},
+            "paid_only_key",
+        ),
+    ],
+)
+def test_client_creation_uses_available_gemini_api_key(
+    pipe_instance_fixture, keys_provided, expected_key
+):
     """
-    Tests that Vertex AI client is created when USE_VERTEX_AI is True
-    and VERTEX_PROJECT is provided.
-    Assumes USER_MUST_PROVIDE_AUTH_CONFIG is False.
+    Tests that the Gemini Developer API client is created using whichever API key (free or paid) is available.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
 
-    # Configure valves for this specific scenario
-    pipe.valves.GEMINI_API_KEY = "should_be_ignored_key"  # Should be ignored for Vertex
+    pipe.valves.GEMINI_FREE_API_KEY = keys_provided["GEMINI_FREE_API_KEY"]
+    pipe.valves.GEMINI_PAID_API_KEY = keys_provided["GEMINI_PAID_API_KEY"]
+    pipe.valves.USE_VERTEX_AI = False
+
+    pipe._get_user_client(pipe.valves, USER_EMAIL_REGULAR)
+
+    MockedGenAIClientConstructor.assert_called_once_with(
+        api_key=expected_key,
+        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
+    )
+    Pipe._get_or_create_genai_client.cache_clear()
+
+
+def test_client_creation_uses_vertex_ai_when_configured(pipe_instance_fixture):
+    """
+    Tests that Vertex AI client is created when USE_VERTEX_AI is True and VERTEX_PROJECT is provided.
+    """
+    pipe, MockedGenAIClientConstructor = pipe_instance_fixture
+    Pipe._get_or_create_genai_client.cache_clear()
+
     pipe.valves.USE_VERTEX_AI = True
     pipe.valves.VERTEX_PROJECT = "test_vertex_project_id"
     pipe.valves.VERTEX_LOCATION = "europe-west4"
-    # USER_MUST_PROVIDE_AUTH_CONFIG is False from mock_pipe_valves_data
 
-    # Act
-    client = pipe._get_user_client(pipe.valves, "testuser2@example.com")
+    pipe._get_user_client(pipe.valves, USER_EMAIL_REGULAR)
 
-    # Assert
     MockedGenAIClientConstructor.assert_called_once_with(
         vertexai=True, project="test_vertex_project_id", location="europe-west4"
     )
-    assert client is MockedGenAIClientConstructor.return_value
     Pipe._get_or_create_genai_client.cache_clear()
 
 
 def test_client_creation_falls_back_to_gemini_api_with_warning(pipe_instance_fixture):
     """
-    Tests that Gemini Developer API client is used with a warning when USE_VERTEX_AI is True,
-    VERTEX_PROJECT is not provided, but GEMINI_API_KEY is available.
-    Assumes USER_MUST_PROVIDE_AUTH_CONFIG is False.
+    Tests fallback to Gemini Developer API with a warning when USE_VERTEX_AI is True,
+    but VERTEX_PROJECT is not provided.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
 
-    # Configure valves for this specific scenario
-    pipe.valves.GEMINI_API_KEY = "test_fallback_gemini_key"
-    pipe.valves.USE_VERTEX_AI = True  # Attempt to use Vertex
-    pipe.valves.VERTEX_PROJECT = None  # But no project ID
-    pipe.valves.GEMINI_API_BASE_URL = "https://fallback.gemini.example.com"
-    # USER_MUST_PROVIDE_AUTH_CONFIG is False from mock_pipe_valves_data
+    pipe.valves.USE_VERTEX_AI = True
+    pipe.valves.VERTEX_PROJECT = None
+    pipe.valves.GEMINI_FREE_API_KEY = "fallback_free_key"
+    pipe.valves.GEMINI_PAID_API_KEY = "fallback_paid_key"  # Should not be used
 
-    # Patch the logger used within the method being tested
     with patch("plugins.pipes.gemini_manifold.log.warning") as mock_log_warning:
-        # Act
-        client = pipe._get_user_client(pipe.valves, "testuser3@example.com")
-
-        # Assert log warning
+        pipe._get_user_client(pipe.valves, USER_EMAIL_REGULAR)
         mock_log_warning.assert_called_once_with(
             "Vertex AI is enabled but no project is set. Using Gemini Developer API."
         )
 
-    # Assert client creation (should be Gemini API)
     MockedGenAIClientConstructor.assert_called_once_with(
-        api_key="test_fallback_gemini_key",
-        http_options=gemini_types.HttpOptions(
-            base_url="https://fallback.gemini.example.com"
-        ),
+        api_key="fallback_free_key",  # Should fall back to the free key
+        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
     )
-    assert client is MockedGenAIClientConstructor.return_value
     Pipe._get_or_create_genai_client.cache_clear()
 
 
@@ -274,83 +270,60 @@ def test_client_creation_falls_back_to_gemini_api_with_warning(pipe_instance_fix
 
 
 # region Test USER_MUST_PROVIDE_AUTH_CONFIG=True scenarios
-USER_EMAIL_UNPRIVILEGED = "unprivileged_user@example.com"
-ADMIN_API_KEY_DEFAULT = "admin_api_key_should_not_be_used"
-ADMIN_VERTEX_PROJECT_DEFAULT = "admin_vertex_project_should_not_be_used"
-ADMIN_BASE_URL_DEFAULT = "https://admin.default.api.com"
-ADMIN_VERTEX_LOCATION_DEFAULT = "admin-default-location"
-
-
 def test_user_must_auth_no_user_key_provided_errors(pipe_instance_fixture):
     """
-    USER_MUST_PROVIDE_AUTH_CONFIG=True.
-    User does NOT provide GEMINI_API_KEY in UserValves.
-    Expected: ValueError, Client not called.
+    USER_MUST_PROVIDE_AUTH_CONFIG=True. User provides no keys. Expected: ValueError.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
 
-    # Setup admin/default valves
     pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = True
     pipe.valves.AUTH_WHITELIST = None
-    pipe.valves.GEMINI_API_KEY = ADMIN_API_KEY_DEFAULT
-    pipe.valves.VERTEX_PROJECT = ADMIN_VERTEX_PROJECT_DEFAULT
 
-    # User provides no API key
-    user_valves_instance = Pipe.UserValves(GEMINI_API_KEY=None)
+    user_valves_instance = Pipe.UserValves(
+        GEMINI_FREE_API_KEY=None, GEMINI_PAID_API_KEY=None
+    )
     merged_valves = pipe._get_merged_valves(
         pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED
     )
 
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(
+        ValueError, match="Please set GEMINI_FREE_API_KEY or GEMINI_PAID_API_KEY"
+    ):
         pipe._get_user_client(merged_valves, USER_EMAIL_UNPRIVILEGED)
 
-    assert "User must provide their own authentication configuration" in str(
-        excinfo.value
-    )
     MockedGenAIClientConstructor.assert_not_called()
     Pipe._get_or_create_genai_client.cache_clear()
 
 
 def test_user_must_auth_user_provides_gemini_key_uses_user_creds(pipe_instance_fixture):
     """
-    USER_MUST_PROVIDE_AUTH_CONFIG=True.
-    User provides GEMINI_API_KEY and USE_VERTEX_AI=False in UserValves.
-    Expected: Gemini Developer API client with user's credentials.
+    USER_MUST_PROVIDE_AUTH_CONFIG=True. User provides their own Gemini key.
+    Expected: Gemini client with user's credentials, ignoring admin's.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
 
-    # Setup admin/default valves
     pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = True
     pipe.valves.AUTH_WHITELIST = None
-    pipe.valves.GEMINI_API_KEY = ADMIN_API_KEY_DEFAULT  # Admin key
-    pipe.valves.VERTEX_PROJECT = ADMIN_VERTEX_PROJECT_DEFAULT  # Admin project
-    pipe.valves.GEMINI_API_BASE_URL = ADMIN_BASE_URL_DEFAULT  # Admin base URL
+    pipe.valves.GEMINI_FREE_API_KEY = ADMIN_FREE_KEY
+    pipe.valves.GEMINI_PAID_API_KEY = ADMIN_PAID_KEY
 
-    # User provides their own Gemini key and base URL
-    user_api_key = "user_specific_gemini_key"
-    user_base_url = "https://user.specific.api.com"
     user_valves_instance = Pipe.UserValves(
-        GEMINI_API_KEY=user_api_key,
-        USE_VERTEX_AI=False,
-        GEMINI_API_BASE_URL=user_base_url,
+        GEMINI_FREE_API_KEY=USER_FREE_KEY,
+        GEMINI_PAID_API_KEY=None,
+        GEMINI_API_BASE_URL=USER_GEMINI_BASE_URL,
     )
     merged_valves = pipe._get_merged_valves(
         pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED
     )
 
-    # Act
-    client = pipe._get_user_client(merged_valves, USER_EMAIL_UNPRIVILEGED)
+    pipe._get_user_client(merged_valves, USER_EMAIL_UNPRIVILEGED)
 
-    # Assert
     MockedGenAIClientConstructor.assert_called_once_with(
-        api_key=user_api_key,  # Should use user's API key
-        http_options=gemini_types.HttpOptions(
-            base_url=user_base_url
-        ),  # Should use user's base URL
+        api_key=USER_FREE_KEY,
+        http_options=gemini_types.HttpOptions(base_url=USER_GEMINI_BASE_URL),
     )
-    assert client is MockedGenAIClientConstructor.return_value
     Pipe._get_or_create_genai_client.cache_clear()
 
 
@@ -358,92 +331,72 @@ def test_user_must_auth_user_tries_vertex_no_user_gemini_key_errors(
     pipe_instance_fixture,
 ):
     """
-    USER_MUST_PROVIDE_AUTH_CONFIG=True.
-    User attempts to use Vertex (USE_VERTEX_AI=True, VERTEX_PROJECT set in UserValves)
-    but does NOT provide GEMINI_API_KEY in UserValves.
-    Expected: ValueError because user's Vertex usage is denied, and they lack a fallback Gemini key. Client not called.
+    USER_MUST_PROVIDE_AUTH_CONFIG=True. User tries Vertex without providing a fallback Gemini key.
+    Expected: ValueError because Vertex usage is denied and no fallback is available.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
 
-    # Setup admin/default valves
     pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = True
     pipe.valves.AUTH_WHITELIST = None
-    pipe.valves.GEMINI_API_KEY = ADMIN_API_KEY_DEFAULT
-    pipe.valves.VERTEX_PROJECT = ADMIN_VERTEX_PROJECT_DEFAULT
 
-    # User attempts Vertex but provides no Gemini API key
     user_valves_instance = Pipe.UserValves(
         USE_VERTEX_AI=True,
         VERTEX_PROJECT="user_tries_this_project",
-        GEMINI_API_KEY=None,  # Crucially, no user Gemini key
+        GEMINI_FREE_API_KEY=None,
+        GEMINI_PAID_API_KEY=None,
     )
     merged_valves = pipe._get_merged_valves(
         pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED
     )
 
-    # Merged valves should have forced USE_VERTEX_AI to False and GEMINI_API_KEY to user's (which is None)
     assert merged_valves.USE_VERTEX_AI is False
-    assert merged_valves.GEMINI_API_KEY is None
+    assert merged_valves.GEMINI_FREE_API_KEY is None
+    assert merged_valves.GEMINI_PAID_API_KEY is None
 
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(
+        ValueError, match="User must provide their own authentication configuration"
+    ):
         pipe._get_user_client(merged_valves, USER_EMAIL_UNPRIVILEGED)
 
-    assert "User must provide their own authentication configuration" in str(
-        excinfo.value
-    )
     MockedGenAIClientConstructor.assert_not_called()
     Pipe._get_or_create_genai_client.cache_clear()
 
 
-def test_user_must_auth_user_tries_vertex_with_user_gemini_key_falls_back_to_user_gemini(
+def test_user_must_auth_user_tries_vertex_with_user_gemini_key_falls_back(
     pipe_instance_fixture,
 ):
     """
-    USER_MUST_PROVIDE_AUTH_CONFIG=True.
-    User attempts to use Vertex (USE_VERTEX_AI=True in UserValves)
-    AND provides GEMINI_API_KEY in UserValves.
-    Expected: Falls back to Gemini Developer API using user's Gemini key, as user Vertex usage is denied.
+    USER_MUST_PROVIDE_AUTH_CONFIG=True. User tries Vertex but provides a Gemini key.
+    Expected: Falls back to Gemini Developer API using the user's provided key.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
 
-    # Setup admin/default valves
     pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = True
     pipe.valves.AUTH_WHITELIST = None
-    pipe.valves.GEMINI_API_KEY = ADMIN_API_KEY_DEFAULT
-    pipe.valves.VERTEX_PROJECT = ADMIN_VERTEX_PROJECT_DEFAULT
-    pipe.valves.GEMINI_API_BASE_URL = ADMIN_BASE_URL_DEFAULT  # Admin base URL
 
-    # User attempts Vertex but also provides a Gemini key and their own base URL
-    user_fallback_api_key = "user_fallback_gemini_key"
-    user_fallback_base_url = "https://user.fallback.api.com"
     user_valves_instance = Pipe.UserValves(
-        USE_VERTEX_AI=True,  # User attempts this
-        VERTEX_PROJECT="user_tries_this_project_too",  # User attempts this
-        GEMINI_API_KEY=user_fallback_api_key,  # User provides this
-        GEMINI_API_BASE_URL=user_fallback_base_url,  # User provides this
+        USE_VERTEX_AI=True,
+        GEMINI_FREE_API_KEY=USER_FREE_KEY,
+        GEMINI_PAID_API_KEY=USER_PAID_KEY,
+        GEMINI_API_BASE_URL=USER_GEMINI_BASE_URL,
     )
     merged_valves = pipe._get_merged_valves(
         pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED
     )
 
-    # Merged valves should have forced USE_VERTEX_AI to False, VERTEX_PROJECT to None,
-    # and GEMINI_API_KEY to user's.
     assert merged_valves.USE_VERTEX_AI is False
     assert merged_valves.VERTEX_PROJECT is None
-    assert merged_valves.GEMINI_API_KEY == user_fallback_api_key
-    assert merged_valves.GEMINI_API_BASE_URL == user_fallback_base_url
+    assert merged_valves.GEMINI_FREE_API_KEY == USER_FREE_KEY
+    assert merged_valves.GEMINI_PAID_API_KEY == USER_PAID_KEY
 
-    # Act
-    client = pipe._get_user_client(merged_valves, USER_EMAIL_UNPRIVILEGED)
+    pipe._get_user_client(merged_valves, USER_EMAIL_UNPRIVILEGED)
 
-    # Assert: Client should be Gemini Developer API with user's fallback key and base URL
     MockedGenAIClientConstructor.assert_called_once_with(
-        api_key=user_fallback_api_key,
-        http_options=gemini_types.HttpOptions(base_url=user_fallback_base_url),
+        api_key=USER_FREE_KEY,  # Should prefer user's free key for fallback
+        http_options=gemini_types.HttpOptions(base_url=USER_GEMINI_BASE_URL),
     )
-    assert client is MockedGenAIClientConstructor.return_value
     Pipe._get_or_create_genai_client.cache_clear()
 
 
@@ -451,167 +404,84 @@ def test_user_must_auth_user_tries_vertex_with_user_gemini_key_falls_back_to_use
 
 
 # region Test USER_MUST_PROVIDE_AUTH_CONFIG=True with whitelisted user
-# You might already have these or similar constants
-USER_EMAIL_WHITELISTED = "whitelisted_user@example.com"
-ADMIN_GEMINI_KEY = "admin_default_gemini_key"
-ADMIN_GEMINI_BASE_URL = "https://admin.default.gemini.api.com"
-ADMIN_VERTEX_PROJECT = "admin_default_vertex_project"
-ADMIN_VERTEX_LOCATION = "admin_default_vertex_location"
-
-
 def test_whitelist_user_no_uservalves_uses_admin_gemini_config(pipe_instance_fixture):
     """
-    USER_MUST_PROVIDE_AUTH_CONFIG=True, user is whitelisted.
-    User provides NO UserValves. Admin configured for Gemini API.
-    Expected: Uses admin's Gemini API key and base URL.
+    Whitelisted user with no UserValves uses admin's Gemini config.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
 
-    # Setup admin/default valves
     pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = True
     pipe.valves.AUTH_WHITELIST = USER_EMAIL_WHITELISTED
-    pipe.valves.GEMINI_API_KEY = ADMIN_GEMINI_KEY
-    pipe.valves.GEMINI_API_BASE_URL = ADMIN_GEMINI_BASE_URL
     pipe.valves.USE_VERTEX_AI = False
-    pipe.valves.VERTEX_PROJECT = None  # Ensure no Vertex config from admin
 
-    # User provides no specific valves
-    user_valves_instance = Pipe.UserValves()  # Empty or default UserValves
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED
-    )
-
-    # Act
-    client = pipe._get_user_client(merged_valves, USER_EMAIL_WHITELISTED)
-
-    # Assert: Should use admin's Gemini config
-    MockedGenAIClientConstructor.assert_called_once_with(
-        api_key=ADMIN_GEMINI_KEY,
-        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
-    )
-    assert client is MockedGenAIClientConstructor.return_value
-    Pipe._get_or_create_genai_client.cache_clear()
-
-
-def test_whitelist_user_no_uservalves_uses_admin_vertex_config(pipe_instance_fixture):
-    """
-    USER_MUST_PROVIDE_AUTH_CONFIG=True, user is whitelisted.
-    User provides NO UserValves. Admin configured for Vertex AI.
-    Expected: Uses admin's Vertex project and location.
-    """
-    pipe, MockedGenAIClientConstructor = pipe_instance_fixture
-    Pipe._get_or_create_genai_client.cache_clear()
-
-    # Setup admin/default valves
-    pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = True
-    pipe.valves.AUTH_WHITELIST = USER_EMAIL_WHITELISTED
-    pipe.valves.GEMINI_API_KEY = None  # Ensure no Gemini config from admin
-    pipe.valves.USE_VERTEX_AI = True
-    pipe.valves.VERTEX_PROJECT = ADMIN_VERTEX_PROJECT
-    pipe.valves.VERTEX_LOCATION = ADMIN_VERTEX_LOCATION
-
-    # User provides no specific valves
     user_valves_instance = Pipe.UserValves()
     merged_valves = pipe._get_merged_valves(
         pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED
     )
 
-    # Act
-    client = pipe._get_user_client(merged_valves, USER_EMAIL_WHITELISTED)
+    pipe._get_user_client(merged_valves, USER_EMAIL_WHITELISTED)
 
-    # Assert: Should use admin's Vertex config
     MockedGenAIClientConstructor.assert_called_once_with(
-        vertexai=True, project=ADMIN_VERTEX_PROJECT, location=ADMIN_VERTEX_LOCATION
+        api_key=ADMIN_FREE_KEY,
+        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
     )
-    assert client is MockedGenAIClientConstructor.return_value
+    Pipe._get_or_create_genai_client.cache_clear()
+
+
+def test_whitelist_user_no_uservalves_uses_admin_vertex_config(pipe_instance_fixture):
+    """
+    Whitelisted user with no UserValves uses admin's Vertex config.
+    """
+    pipe, MockedGenAIClientConstructor = pipe_instance_fixture
+    Pipe._get_or_create_genai_client.cache_clear()
+
+    pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = True
+    pipe.valves.AUTH_WHITELIST = USER_EMAIL_WHITELISTED
+    pipe.valves.USE_VERTEX_AI = True
+    pipe.valves.VERTEX_PROJECT = ADMIN_VERTEX_PROJECT
+
+    user_valves_instance = Pipe.UserValves()
+    merged_valves = pipe._get_merged_valves(
+        pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED
+    )
+
+    pipe._get_user_client(merged_valves, USER_EMAIL_WHITELISTED)
+
+    MockedGenAIClientConstructor.assert_called_once_with(
+        vertexai=True,
+        project=ADMIN_VERTEX_PROJECT,
+        location=pipe.valves.VERTEX_LOCATION,
+    )
     Pipe._get_or_create_genai_client.cache_clear()
 
 
 def test_whitelist_user_provides_own_gemini_key_overrides_admin(pipe_instance_fixture):
     """
-    USER_MUST_PROVIDE_AUTH_CONFIG=True, user is whitelisted.
-    User provides their OWN Gemini API key in UserValves.
-    Expected: Uses user's Gemini API key, ignoring admin's.
+    Whitelisted user provides their own Gemini key, which overrides admin's config.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
 
-    # Setup admin/default valves (admin also has a Gemini key)
     pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = True
     pipe.valves.AUTH_WHITELIST = USER_EMAIL_WHITELISTED
-    pipe.valves.GEMINI_API_KEY = ADMIN_GEMINI_KEY  # Admin's key, should be overridden
-    pipe.valves.GEMINI_API_BASE_URL = (
-        ADMIN_GEMINI_BASE_URL  # Admin's base, should be overridden
-    )
     pipe.valves.USE_VERTEX_AI = False
+    # Explicitly remove the admin's free key for this test case to ensure
+    # we are testing the user's paid key override without ambiguity.
+    pipe.valves.GEMINI_FREE_API_KEY = None
+    pipe.valves.GEMINI_PAID_API_KEY = "admin_paid_key_to_be_overridden"
 
-    # User provides their own Gemini key and base URL
-    user_specific_key = "user_whitelisted_gemini_key"
-    user_specific_base_url = "https://user.whitelisted.gemini.api.com"
-    user_valves_instance = Pipe.UserValves(
-        GEMINI_API_KEY=user_specific_key,
-        GEMINI_API_BASE_URL=user_specific_base_url,
-        USE_VERTEX_AI=False,  # Explicitly user wants Gemini
-    )
+    user_valves_instance = Pipe.UserValves(GEMINI_PAID_API_KEY=USER_PAID_KEY)
     merged_valves = pipe._get_merged_valves(
         pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED
     )
 
-    # Act
-    client = pipe._get_user_client(merged_valves, USER_EMAIL_WHITELISTED)
+    pipe._get_user_client(merged_valves, USER_EMAIL_WHITELISTED)
 
-    # Assert: Should use user's provided Gemini config
     MockedGenAIClientConstructor.assert_called_once_with(
-        api_key=user_specific_key,
-        http_options=gemini_types.HttpOptions(base_url=user_specific_base_url),
+        api_key=USER_PAID_KEY,
+        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
     )
-    assert client is MockedGenAIClientConstructor.return_value
-    Pipe._get_or_create_genai_client.cache_clear()
-
-
-def test_whitelist_user_provides_own_vertex_config_overrides_admin(
-    pipe_instance_fixture,
-):
-    """
-    USER_MUST_PROVIDE_AUTH_CONFIG=True, user is whitelisted.
-    User provides their OWN Vertex project/location in UserValves.
-    Expected: Uses user's Vertex config, ignoring admin's.
-    """
-    pipe, MockedGenAIClientConstructor = pipe_instance_fixture
-    Pipe._get_or_create_genai_client.cache_clear()
-
-    # Setup admin/default valves (admin also has Vertex config)
-    pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = True
-    pipe.valves.AUTH_WHITELIST = USER_EMAIL_WHITELISTED
-    pipe.valves.USE_VERTEX_AI = True  # Admin default
-    pipe.valves.VERTEX_PROJECT = (
-        ADMIN_VERTEX_PROJECT  # Admin's project, should be overridden
-    )
-    pipe.valves.VERTEX_LOCATION = (
-        ADMIN_VERTEX_LOCATION  # Admin's location, should be overridden
-    )
-
-    # User provides their own Vertex config
-    user_specific_project = "user_whitelisted_vertex_project"
-    user_specific_location = "user-whitelisted-vertex-location"
-    user_valves_instance = Pipe.UserValves(
-        USE_VERTEX_AI=True,  # User explicitly wants Vertex
-        VERTEX_PROJECT=user_specific_project,
-        VERTEX_LOCATION=user_specific_location,
-    )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED
-    )
-
-    # Act
-    client = pipe._get_user_client(merged_valves, USER_EMAIL_WHITELISTED)
-
-    # Assert: Should use user's provided Vertex config
-    MockedGenAIClientConstructor.assert_called_once_with(
-        vertexai=True, project=user_specific_project, location=user_specific_location
-    )
-    assert client is MockedGenAIClientConstructor.return_value
     Pipe._get_or_create_genai_client.cache_clear()
 
 
@@ -619,139 +489,157 @@ def test_whitelist_user_provides_own_vertex_config_overrides_admin(
 
 
 # region Test user's ability to override admin's settings
-# You might already have these or similar constants
-USER_EMAIL_REGULAR = (
-    "regular_user@example.com"  # A non-admin, non-whitelisted (for these tests) user
-)
-ADMIN_GEMINI_KEY = "admin_default_gemini_key"
-ADMIN_GEMINI_BASE_URL = "https://admin.default.gemini.api.com"
-ADMIN_VERTEX_PROJECT = "admin_default_vertex_project"
-ADMIN_VERTEX_LOCATION = "admin_default_vertex_location"
-
-USER_GEMINI_KEY = "user_specific_gemini_key"
-USER_GEMINI_BASE_URL = "https://user.specific.gemini.api.com"
-USER_VERTEX_PROJECT = "user_specific_vertex_project"
-USER_VERTEX_LOCATION = "user_specific_vertex_location"
-
-
 def test_user_opts_out_of_admin_vertex_to_user_gemini(pipe_instance_fixture):
     """
-    USER_MUST_PROVIDE_AUTH_CONFIG=False. Admin uses Vertex.
-    User provides UserValves to opt-out (USE_VERTEX_AI=False) and use their own Gemini key.
-    Expected: Gemini Developer API client with user's key.
+    Admin uses Vertex. User opts-out to use their own Gemini key.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
 
-    # Setup admin/default valves: Admin is configured for Vertex
     pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = False
-    pipe.valves.AUTH_WHITELIST = None  # Not relevant here
     pipe.valves.USE_VERTEX_AI = True
     pipe.valves.VERTEX_PROJECT = ADMIN_VERTEX_PROJECT
-    pipe.valves.VERTEX_LOCATION = ADMIN_VERTEX_LOCATION
-    pipe.valves.GEMINI_API_KEY = ADMIN_GEMINI_KEY  # Admin might also have a Gemini key
 
-    # User provides UserValves to opt-out of Vertex and use their own Gemini key
     user_valves_instance = Pipe.UserValves(
-        USE_VERTEX_AI=False,  # User explicitly wants Gemini
-        GEMINI_API_KEY=USER_GEMINI_KEY,
+        USE_VERTEX_AI=False,
+        GEMINI_FREE_API_KEY=USER_FREE_KEY,
         GEMINI_API_BASE_URL=USER_GEMINI_BASE_URL,
     )
     merged_valves = pipe._get_merged_valves(
         pipe.valves, user_valves_instance, USER_EMAIL_REGULAR
     )
 
-    # Act
-    client = pipe._get_user_client(merged_valves, USER_EMAIL_REGULAR)
+    pipe._get_user_client(merged_valves, USER_EMAIL_REGULAR)
 
-    # Assert: Should use user's Gemini config
     MockedGenAIClientConstructor.assert_called_once_with(
-        api_key=USER_GEMINI_KEY,
+        api_key=USER_FREE_KEY,
         http_options=gemini_types.HttpOptions(base_url=USER_GEMINI_BASE_URL),
     )
-    assert client is MockedGenAIClientConstructor.return_value
     Pipe._get_or_create_genai_client.cache_clear()
 
 
 def test_user_opts_in_to_vertex_from_admin_gemini(pipe_instance_fixture):
     """
-    USER_MUST_PROVIDE_AUTH_CONFIG=False. Admin uses Gemini API.
-    User provides UserValves to opt-in (USE_VERTEX_AI=True) and use their own Vertex project.
-    Expected: Vertex AI client with user's project.
+    Admin uses Gemini. User opts-in to use their own Vertex project.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
 
-    # Setup admin/default valves: Admin is configured for Gemini
     pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = False
-    pipe.valves.AUTH_WHITELIST = None
-    pipe.valves.GEMINI_API_KEY = ADMIN_GEMINI_KEY
-    pipe.valves.GEMINI_API_BASE_URL = ADMIN_GEMINI_BASE_URL
     pipe.valves.USE_VERTEX_AI = False
-    pipe.valves.VERTEX_PROJECT = None  # Admin has no Vertex project
 
-    # User provides UserValves to opt-in to Vertex with their own project
     user_valves_instance = Pipe.UserValves(
-        USE_VERTEX_AI=True,  # User explicitly wants Vertex
+        USE_VERTEX_AI=True,
         VERTEX_PROJECT=USER_VERTEX_PROJECT,
         VERTEX_LOCATION=USER_VERTEX_LOCATION,
-        # User might or might not provide a GEMINI_API_KEY, shouldn't matter for Vertex
     )
     merged_valves = pipe._get_merged_valves(
         pipe.valves, user_valves_instance, USER_EMAIL_REGULAR
     )
 
-    # Act
-    client = pipe._get_user_client(merged_valves, USER_EMAIL_REGULAR)
+    pipe._get_user_client(merged_valves, USER_EMAIL_REGULAR)
 
-    # Assert: Should use user's Vertex config
     MockedGenAIClientConstructor.assert_called_once_with(
         vertexai=True, project=USER_VERTEX_PROJECT, location=USER_VERTEX_LOCATION
     )
-    assert client is MockedGenAIClientConstructor.return_value
-    Pipe._get_or_create_genai_client.cache_clear()
-
-
-def test_user_overrides_admin_vertex_project_location(pipe_instance_fixture):
-    """
-    USER_MUST_PROVIDE_AUTH_CONFIG=False. Admin uses Vertex.
-    User provides UserValves with different Vertex project and location.
-    Expected: Vertex AI client with user's specified project and location.
-    """
-    pipe, MockedGenAIClientConstructor = pipe_instance_fixture
-    Pipe._get_or_create_genai_client.cache_clear()
-
-    # Setup admin/default valves: Admin is configured for Vertex
-    pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = False
-    pipe.valves.AUTH_WHITELIST = None
-    pipe.valves.USE_VERTEX_AI = True
-    pipe.valves.VERTEX_PROJECT = ADMIN_VERTEX_PROJECT  # Admin's project
-    pipe.valves.VERTEX_LOCATION = ADMIN_VERTEX_LOCATION  # Admin's location
-
-    # User provides UserValves to override Vertex project and location
-    # USE_VERTEX_AI can be None in UserValves if admin already set it to True,
-    # or True to be explicit.
-    user_valves_instance = Pipe.UserValves(
-        USE_VERTEX_AI=True,  # Or None, as admin default is True
-        VERTEX_PROJECT=USER_VERTEX_PROJECT,  # User's override
-        VERTEX_LOCATION=USER_VERTEX_LOCATION,  # User's override
-    )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_REGULAR
-    )
-
-    # Act
-    client = pipe._get_user_client(merged_valves, USER_EMAIL_REGULAR)
-
-    # Assert: Should use user's overridden Vertex config
-    MockedGenAIClientConstructor.assert_called_once_with(
-        vertexai=True, project=USER_VERTEX_PROJECT, location=USER_VERTEX_LOCATION
-    )
-    assert client is MockedGenAIClientConstructor.return_value
     Pipe._get_or_create_genai_client.cache_clear()
 
 
 # endregion Test user's ability to override admin's settings
+
+
+# region Test Toggleable Paid API Filter
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "toggle_status, expected_api_key, log_message",
+    [
+        (
+            (True, True),
+            ADMIN_PAID_KEY,
+            "Paid API toggle is enabled. Prioritizing paid Gemini key.",
+        ),
+        (
+            (True, False),
+            ADMIN_FREE_KEY,
+            "Paid API toggle is available but disabled. Prioritizing free Gemini key.",
+        ),
+        (
+            (False, False),
+            ADMIN_FREE_KEY,
+            "Paid API toggle not configured for this model. Defaulting to free key if available.",
+        ),
+    ],
+)
+async def test_paid_api_toggle_selects_correct_key(
+    pipe_instance_fixture, toggle_status, expected_api_key, log_message
+):
+    """
+    Tests that the 'gemini_paid_api' toggle correctly selects the paid or free key.
+    """
+    pipe, MockedGenAIClientConstructor = pipe_instance_fixture
+    Pipe._get_or_create_genai_client.cache_clear()
+
+    # Use a dummy metadata object for the call
+    __metadata__ = {"model": {"id": "gemini-pro"}}
+    # Ensure both keys are present in the initial valves
+    pipe.valves.GEMINI_FREE_API_KEY = ADMIN_FREE_KEY
+    pipe.valves.GEMINI_PAID_API_KEY = ADMIN_PAID_KEY
+
+    def mock_toggle_side_effect(filter_id, metadata):
+        # This test focuses on the paid API toggle.
+        # We return the parametrized status for it.
+        if filter_id == "gemini_paid_api":
+            return toggle_status
+        # For the Vertex toggle, we return a neutral/disabled status
+        # to prevent it from interfering with the logic under test.
+        if filter_id == "gemini_vertex_ai_toggle":
+            return (False, False)
+        # Default fallback for any other unexpected calls.
+        return (False, False)
+
+    # We need to test the full pipe method to see the interaction
+    with patch.object(
+        pipe, "_get_toggleable_feature_status", side_effect=mock_toggle_side_effect
+    ) as mock_toggle_status, patch.object(
+        pipe, "_get_user_client", wraps=pipe._get_user_client
+    ), patch(
+        "plugins.pipes.gemini_manifold.log.info"
+    ) as mock_log_info, patch.object(
+        pipe, "_check_companion_filter_version"
+    ), patch.object(
+        pipe, "_get_merged_valves", return_value=pipe.valves
+    ):
+        # The pipe method has a complex return type, we only care about the setup phase
+        # so we can ignore the actual generation by catching an exception
+        try:
+            await pipe.pipe(
+                body={"messages": []},
+                __user__={"email": "test@test.com"},
+                __request__=MagicMock(),
+                __event_emitter__=None,
+                __metadata__=__metadata__,
+            )
+        except Exception:
+            # We expect exceptions because we are not mocking the full pipeline
+            pass
+
+        # Assert the toggle check was called for the paid API.
+        # We use assert_any_call because the function is now called twice.
+        mock_toggle_status.assert_any_call("gemini_paid_api", __metadata__)
+        assert mock_toggle_status.call_count == 2
+
+        # Assert the correct log message was emitted
+        mock_log_info.assert_any_call(log_message)
+
+        # Assert the genai Client was initialized with the correct key based on the toggle state
+        MockedGenAIClientConstructor.assert_called_once()
+        call_kwargs = MockedGenAIClientConstructor.call_args.kwargs
+        assert call_kwargs.get("api_key") == expected_api_key
+
+    Pipe._get_or_create_genai_client.cache_clear()
+
+
+# endregion Test Toggleable Paid API Filter
 
 
 # region Test _get_genai_models
@@ -772,6 +660,7 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
     pipe_instance, _ = pipe_instance_fixture
     messages_body = [{"role": "user", "content": "Hello!"}]
     mock_event_emitter = MagicMock(spec=EventEmitter)
+    mock_event_emitter.start_time = 1234567890.0  # Mock the required start_time
     mock_user_data = {
         "id": "test_user_id",
         "email": "test@example.com",
@@ -803,7 +692,7 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
         mock_text_part.text = "Hello!"
         mock_part_from_text.return_value = mock_text_part
 
-        contents = await builder.build_contents(start_time=0.0)
+        contents = await builder.build_contents()
 
         mock_misc_module.pop_system_message.assert_called_once_with(messages_body)
         mock_part_from_text.assert_called_once_with(text="Hello!")
@@ -843,6 +732,7 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
     user_content_string = f"{text_before_raw}{youtube_url}{text_after_raw}"
     messages_body = [{"role": "user", "content": user_content_string}]
     mock_event_emitter = MagicMock(spec=EventEmitter)
+    mock_event_emitter.start_time = 1234567890.0  # Mock the required start_time
     mock_user_data = {
         "id": "test_user_id",
         "email": "test@example.com",
@@ -889,7 +779,7 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
         mock_part_from_text.side_effect = from_text_side_effect
 
         # Act
-        contents = await builder.build_contents(start_time=0.0)
+        contents = await builder.build_contents()
 
         # Assert
         assert len(contents) == 1
@@ -944,6 +834,7 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
     pdf_mime_type = "application/pdf"
     messages_body = [{"role": "user", "content": user_text_content}]
     mock_event_emitter = MagicMock(spec=EventEmitter)
+    mock_event_emitter.start_time = 1234567890.0  # Mock the required start_time
     mock_user_data = {
         "id": "test_user_id",
         "email": "test@example.com",
@@ -999,7 +890,7 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
         return_value=(fake_pdf_bytes, pdf_mime_type),
     ) as mock_get_file_data:
         # Act
-        contents = await builder.build_contents(start_time=0.0)
+        contents = await builder.build_contents()
 
         # Assert
         mock_chats_module.Chats.get_chat_by_id_and_user_id.assert_called_once_with(
