@@ -101,12 +101,7 @@ log = logger.bind(auditable=False)
 class Filter:
 
     class Valves(BaseModel):
-        FORCE_NON_STREAM_FOR_IMAGE_MODELS: bool = Field(
-            default=True,
-            description="""Automatically disable streaming for image generation models
-            (e.g., gemini-2.5-flash-image-preview) to prevent 'Chunk too big' errors.
-            Set to False to attempt streaming with these models.""",
-        )
+
         SET_TEMP_TO_ZERO: bool = Field(
             default=False,
             description="""Decide if you want to set the temperature to 0 for grounded answers,
@@ -260,24 +255,6 @@ class Filter:
         # streaming intent and then force the backend into streaming mode.
 
         user_stream_intent = body.get("stream", True)
-        image_generation_models = {
-            "gemini-2.0-flash-preview-image-generation",
-            "gemini-2.5-flash-image-preview",
-            "gemini-2.5-flash-image",
-        }
-
-        # Check if the current model is an image generation model and if the
-        # user has enabled the non-streaming override for them.
-        if (
-            self.valves.FORCE_NON_STREAM_FOR_IMAGE_MODELS
-            and canonical_model_name in image_generation_models
-        ):
-            log.info(
-                f"Image generation model '{canonical_model_name}' detected. "
-                "Forcing non-streaming mode to prevent potential 'Chunk too big' errors."
-            )
-            # Override the user's intent to ensure stability.
-            user_stream_intent = False
 
         log.info(
             f"Storing user's stream intent ({user_stream_intent}) into __metadata__. "
