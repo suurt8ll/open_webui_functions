@@ -2573,6 +2573,7 @@ class Pipe:
         chunk_counter = 0
         in_think = False
         last_title: str | None = None
+        response_parts: list[types.Part] = []
 
         try:
             async for chunk in response_stream:
@@ -2590,6 +2591,8 @@ class Pipe:
                 if not (parts := chunk.parts):
                     log.warning("Chunk has no parts, skipping.")
                     continue
+
+                response_parts.extend(parts)
 
                 # This inner loop makes the method robust. It handles a single chunk
                 # with many parts (non-streaming) or many chunks with one part (streaming).
@@ -2695,6 +2698,18 @@ class Pipe:
             if not error_occurred:
                 yield "data: [DONE]"
                 log.info("Response processing finished successfully!")
+
+            if not error_occurred and response_parts:
+                # Storing the complete list of response parts for Filter.outlet.
+                # The filter will serialize this and add it to the final message payload,
+                # allowing the frontend to store it in the database with the assistant's message.
+                self._store_data_in_state(
+                    app.state,
+                    chat_id,
+                    message_id,
+                    "response_parts",
+                    response_parts,
+                )
 
             try:
                 await self._do_post_processing(
@@ -3029,7 +3044,7 @@ class Pipe:
                 "pipe_start_time",
                 event_emitter.start_time,
             )
-    
+
     @staticmethod
     def _store_data_in_state(
         app_state: State,

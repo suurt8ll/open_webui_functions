@@ -331,6 +331,10 @@ class AssistantMessage(TypedDict):
 
     role: Literal["assistant"]
     content: str  # Assistant messages typically have string content
+    # This custom key is added by the Gemini Manifold companion filter to store the
+    # raw structured response parts from the Gemini API for potential future use.
+    # It is not part of the standard Open WebUI message format and will be ignored by the core system.
+    gemini_parts: NotRequired[list[dict[str, Any]]]
 
 
 class SystemMessage(TypedDict):
