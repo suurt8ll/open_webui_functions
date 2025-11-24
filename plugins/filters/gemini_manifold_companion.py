@@ -325,6 +325,9 @@ class Filter:
         response_parts: list[types.Part] | None = self._get_and_clear_data_from_state(
             app_state, chat_id, message_id, "response_parts"
         )
+        original_content: str | None = self._get_and_clear_data_from_state(
+            app_state, chat_id, message_id, "original_content"
+        )
 
         if stored_metadata:
             log.info("Found grounding metadata, processing citations.")
@@ -379,14 +382,13 @@ class Filter:
         else:
             log.info("No grounding metadata found in request state.")
 
+        assistant_message = cast("AssistantMessage", body["messages"][-1])
+
         if response_parts:
             log.info(
                 f"Found {len(response_parts)} response parts, adding to final message."
             )
             try:
-                # The last message is the assistant's response we need to modify.
-                assistant_message = cast("AssistantMessage", body["messages"][-1])
-
                 # Use .model_dump() to create JSON-serializable dictionaries from the Pydantic models.
                 assistant_message["gemini_parts"] = [
                     part.model_dump(mode="json", exclude_none=True) for part in response_parts
@@ -394,6 +396,15 @@ class Filter:
             except (IndexError, KeyError) as e:
                 log.exception(
                     f"Failed to inject response parts into the message body: {e}"
+                )
+
+        if original_content:
+            log.info("Found original content, adding to final message.")
+            try:
+                assistant_message["original_content"] = original_content
+            except (IndexError, KeyError) as e:
+                log.exception(
+                    f"Failed to inject original content into the message body: {e}"
                 )
 
         log.debug("outlet method has finished.")

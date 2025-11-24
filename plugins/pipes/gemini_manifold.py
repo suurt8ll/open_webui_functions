@@ -2574,6 +2574,7 @@ class Pipe:
         in_think = False
         last_title: str | None = None
         response_parts: list[types.Part] = []
+        content_parts_text: list[str] = []
 
         try:
             async for chunk in response_stream:
@@ -2670,6 +2671,10 @@ class Pipe:
                     )
 
                     if payload:
+                        # Collect the original content text before it's sent to the frontend.
+                        if "content" in payload and payload["content"]:
+                            content_parts_text.append(payload["content"])
+
                         if count > 0:
                             total_substitutions += count
                             log.debug(f"Disabled {count} special tag(s) in a part.")
@@ -2709,6 +2714,17 @@ class Pipe:
                     message_id,
                     "response_parts",
                     response_parts,
+                )
+
+            if not error_occurred and content_parts_text:
+                original_content = "".join(content_parts_text)
+                # FIXME: allow passing list of keys and values to store multiple items at once
+                self._store_data_in_state(
+                    app.state,
+                    chat_id,
+                    message_id,
+                    "original_content",
+                    original_content,
                 )
 
             try:
