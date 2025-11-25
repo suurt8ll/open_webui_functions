@@ -825,6 +825,7 @@ class GeminiContentBuilder:
         if chat := Chats.get_chat_by_id_and_user_id(
             id=chat_id, user_id=user_data["id"]
         ):
+            log.debug("Full chat data retrieved from database.", payload=chat)
             chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
             # Last message is the upcoming assistant response, at this point in the logic it's empty.
             messages_db = chat_content.get("messages", [])[:-1]
@@ -1008,6 +1009,43 @@ class GeminiContentBuilder:
 
         return user_parts
 
+    async def _rehydrate_assistant_parts(
+        self,
+        gemini_parts: list[dict[str, Any]],
+        status_queue: asyncio.Queue,
+    ) -> list[types.Part]:
+        """
+        Reconstructs `types.Part` objects from dictionaries, rehydrating file-based parts
+        by fetching their content from the OWUI backend.
+        """
+        rehydrated_parts: list[types.Part] = []
+        for part_dict in gemini_parts:
+            part = types.Part.model_validate(part_dict)
+
+            if part.file_data and (file_uri := part.file_data.file_uri):
+                if not file_uri.startswith("/api/v1/files/"):
+                    raise ValueError(
+                        f"Unsupported file_uri in assistant history: {file_uri}. "
+                        "Only local Open WebUI files are supported for reconstruction."
+                    )
+
+                file_id = file_uri.split("/")[4]
+                file_bytes, mime_type = await self._get_file_data(file_id)
+
+                if not (file_bytes and mime_type):
+                    raise ValueError(
+                        f"Could not retrieve content for file_id '{file_id}' from assistant history."
+                    )
+
+                rehydrated_part = await self._create_genai_part_from_file_data(
+                    file_bytes, mime_type, file_id, status_queue
+                )
+                rehydrated_parts.append(rehydrated_part)
+            else:
+                rehydrated_parts.append(part)
+
+        return rehydrated_parts
+
     async def _process_assistant_message(
         self,
         i: int,
@@ -1033,10 +1071,10 @@ class GeminiContentBuilder:
                     f"Reconstructing assistant message at index {i} from stored parts."
                 )
                 try:
-                    # Use Pydantic's robust validation to reconstruct Part objects from dicts.
-                    # FIXME: special handling for generated images
-                    return [types.Part.model_validate(p) for p in gemini_parts]
-                except (pydantic_core.ValidationError, TypeError):
+                    return await self._rehydrate_assistant_parts(
+                        gemini_parts, status_queue
+                    )
+                except (pydantic_core.ValidationError, TypeError, ValueError):
                     log.exception(
                         f"Failed to reconstruct types.Part for message {i} from stored gemini_parts. "
                         "Falling back to text processing."
@@ -1078,14 +1116,62 @@ class GeminiContentBuilder:
             assistant_text = self._remove_citation_markers(assistant_text, sources)
         return await self._genai_parts_from_text(assistant_text, status_queue)
 
+    async def _create_genai_part_from_file_data(
+        self,
+        file_bytes: bytes,
+        mime_type: str,
+        owui_file_id: str | None,
+        status_queue: asyncio.Queue,
+    ) -> types.Part:
+        """
+        Creates a `types.Part` from file bytes, deciding whether to use the
+        Google Files API or send raw bytes based on configuration and context.
+        """
+        # TODO: The Files API is strict about MIME types (e.g., text/plain,
+        # application/pdf). In the future, inspect the content of files
+        # with unsupported text-like MIME types (e.g., 'application/json',
+        # 'text/markdown'). If the content is detected as plaintext,
+        # override the `mime_type` variable to 'text/plain' to allow the upload.
+
+        # Determine whether to use the Files API based on the specified conditions.
+        use_files_api = True
+        reason = ""
+
+        if not self.valves.USE_FILES_API:
+            reason = "disabled by user setting (USE_FILES_API=False)"
+            use_files_api = False
+        elif self.vertexai:
+            reason = "the active client is configured for Vertex AI, which does not support the Files API"
+            use_files_api = False
+        elif self.is_temp_chat:
+            reason = "temporary chat mode is active"
+            use_files_api = False
+
+        if use_files_api:
+            log.info("Using Google Files API for resource.")
+            gemini_file = await self.files_api_manager.get_or_upload_file(
+                file_bytes=file_bytes,
+                mime_type=mime_type,
+                owui_file_id=owui_file_id,
+                status_queue=status_queue,
+            )
+            return types.Part(
+                file_data=types.FileData(
+                    file_uri=gemini_file.uri,
+                    mime_type=gemini_file.mime_type,
+                )
+            )
+        else:
+            log.info(f"Sending raw bytes because {reason}.")
+            return types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+
     async def _genai_part_from_uri(
         self, uri: str, status_queue: asyncio.Queue
     ) -> types.Part | None:
         """
         Processes any resource URI and returns a genai.types.Part.
         This is the central dispatcher for all media processing, handling data URIs,
-        local API file paths, and YouTube URLs. It decides whether to use the
-        Files API or send raw bytes based on configuration and context.
+        local API file paths, and YouTube URLs.
         """
         if not uri:
             log.warning("Received an empty URI, skipping.")
@@ -1119,47 +1205,14 @@ class GeminiContentBuilder:
                 self.event_emitter.emit_toast(warn_msg, "warning")
                 return None
 
-            # Step 2: If we have bytes, decide how to create the Part
+            # Step 2: If we have bytes, create the Part using the modularized helper
             if file_bytes and mime_type:
-                # TODO: The Files API is strict about MIME types (e.g., text/plain,
-                # application/pdf). In the future, inspect the content of files
-                # with unsupported text-like MIME types (e.g., 'application/json',
-                # 'text/markdown'). If the content is detected as plaintext,
-                # override the `mime_type` variable to 'text/plain' to allow the upload.
-
-                # Determine whether to use the Files API based on the specified conditions.
-                use_files_api = True
-                reason = ""
-
-                if not self.valves.USE_FILES_API:
-                    reason = "disabled by user setting (USE_FILES_API=False)"
-                    use_files_api = False
-                elif self.vertexai:
-                    reason = "the active client is configured for Vertex AI, which does not support the Files API"
-                    use_files_api = False
-                elif self.is_temp_chat:
-                    reason = "temporary chat mode is active"
-                    use_files_api = False
-
-                if use_files_api:
-                    log.info(f"Using Files API for resource from URI: {uri[:64]}...")
-                    gemini_file = await self.files_api_manager.get_or_upload_file(
-                        file_bytes=file_bytes,
-                        mime_type=mime_type,
-                        owui_file_id=owui_file_id,
-                        status_queue=status_queue,
-                    )
-                    return types.Part(
-                        file_data=types.FileData(
-                            file_uri=gemini_file.uri,
-                            mime_type=gemini_file.mime_type,
-                        )
-                    )
-                else:
-                    log.info(
-                        f"Sending raw bytes because {reason}. Resource from URI: {uri[:64]}..."
-                    )
-                    return types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+                return await self._create_genai_part_from_file_data(
+                    file_bytes=file_bytes,
+                    mime_type=mime_type,
+                    owui_file_id=owui_file_id,
+                    status_queue=status_queue,
+                )
 
             return None  # Return None if bytes/mime_type could not be determined
 
@@ -2637,7 +2690,7 @@ class Pipe:
 
         try:
             async for chunk in response_stream:
-                log.trace(f"Processing response chunk #{chunk_counter}:", payload=chunk)
+                log.debug(f"Processing response chunk #{chunk_counter}:", payload=chunk)
                 chunk_counter += 1
                 final_response_chunk = chunk  # Keep the latest chunk for metadata
 
@@ -2805,7 +2858,7 @@ class Pipe:
     async def _process_part(
         self,
         part: types.Part,
-        app: FastAPI, # We need the app to generate URLs for model returned images.
+        app: FastAPI,  # We need the app to generate URLs for model returned images.
         model: str,
         user_id: str,
         chat_id: str,
@@ -2822,6 +2875,7 @@ class Pipe:
         key: str = "content"
 
         match part:
+            # FIXME: Gemini 3 models can have images in their thoughts too.
             case types.Part(text=str(text), thought=True):
                 # It's a thought, so we'll use the "reasoning" key.
                 key = "reasoning"
@@ -2830,7 +2884,7 @@ class Pipe:
                 # For non-streaming responses, wrap the thought/reasoning block
                 # in details block manually for nice front-end rendering.
                 if not is_stream:
-                    sanitized_text = f'\n<details type="reasoning" done="true">\n<summary>Thinking...</summary>\n{sanitized_text}\n</details>\n'
+                    sanitized_text = f"\n\n{sanitized_text}\n\n"
 
                 payload = {key: sanitized_text}
             case types.Part(text=str(text)):
@@ -2839,10 +2893,18 @@ class Pipe:
                 payload = {key: sanitized_text}
             case types.Part(inline_data=data) if data:
                 # Image parts don't need tag disabling.
-                processed_text = await self._process_image_part(
+                processed_text, image_url = await self._process_image_part(
                     data, model, user_id, chat_id, message_id, app
                 )
                 payload = {"content": processed_text}
+
+                # Transform inline_data into file_data to avoid storing raw bytes in the database.
+                # This mutates the part object which is held by reference in `response_parts`.
+                if image_url and data.mime_type:
+                    part.inline_data = None
+                    part.file_data = types.FileData(
+                        file_uri=image_url, mime_type=data.mime_type
+                    )
             case types.Part(executable_code=code) if code:
                 # Code blocks are already formatted and safe.
                 if processed_text := self._process_executable_code_part(code):
@@ -2885,12 +2947,14 @@ class Pipe:
         chat_id: str,
         message_id: str,
         app: FastAPI,
-    ) -> str:
+    ) -> tuple[str, str | None]:
         """
-        Handles image data by saving it to the Open WebUI backend and returning a markdown link.
+        Handles image data by saving it to the Open WebUI backend and returning a markdown link
+        and the URL.
         """
         mime_type = inline_data.mime_type
         image_data = inline_data.data
+        image_url = None
 
         if mime_type and image_data:
             image_url = await self._upload_image(
@@ -2907,13 +2971,13 @@ class Pipe:
                 "Image part has no mime_type or data, cannot upload image. "
                 "Returning a placeholder message."
             )
-            image_url = None
 
-        return (
+        markdown_text = (
             f"![Generated Image]({image_url})"
             if image_url
             else "*An error occurred while trying to store this model generated image.*"
         )
+        return markdown_text, image_url
 
     async def _upload_image(
         self,
@@ -3252,7 +3316,7 @@ class Pipe:
         if data_to_process is not None:
             try:
                 serializable_data = pydantic_core.to_jsonable_python(
-                    data_to_process, serialize_unknown=True
+                    data_to_process, serialize_unknown=True, exclude_none=True
                 )
 
                 # Determine truncation settings
