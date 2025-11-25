@@ -1040,8 +1040,8 @@ class GeminiContentBuilder:
                 rehydrated_part = await self._create_genai_part_from_file_data(
                     file_bytes, mime_type, file_id, status_queue
                 )
-                # FIXME: merge rehydrated part into the original part, replacing duplicate fields
-                rehydrated_parts.append(rehydrated_part)
+                part.file_data = rehydrated_part.file_data
+                rehydrated_parts.append(part)
             else:
                 rehydrated_parts.append(part)
 
