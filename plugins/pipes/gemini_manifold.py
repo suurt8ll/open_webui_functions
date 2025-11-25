@@ -825,7 +825,7 @@ class GeminiContentBuilder:
         if chat := Chats.get_chat_by_id_and_user_id(
             id=chat_id, user_id=user_data["id"]
         ):
-            log.debug("Full chat data retrieved from database.", payload=chat)
+            log.trace("Full chat data retrieved from database.", payload=chat)
             chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
             # Last message is the upcoming assistant response, at this point in the logic it's empty.
             messages_db = chat_content.get("messages", [])[:-1]
@@ -1040,6 +1040,7 @@ class GeminiContentBuilder:
                 rehydrated_part = await self._create_genai_part_from_file_data(
                     file_bytes, mime_type, file_id, status_queue
                 )
+                # FIXME: merge rehydrated part into the original part, replacing duplicate fields
                 rehydrated_parts.append(rehydrated_part)
             else:
                 rehydrated_parts.append(part)
@@ -2693,7 +2694,7 @@ class Pipe:
 
         try:
             async for chunk in response_stream:
-                log.debug(f"Processing response chunk #{chunk_counter}:", payload=chunk)
+                log.trace(f"Processing response chunk #{chunk_counter}:", payload=chunk)
                 chunk_counter += 1
                 final_response_chunk = chunk  # Keep the latest chunk for metadata
 
@@ -2714,23 +2715,24 @@ class Pipe:
                 # with many parts (non-streaming) or many chunks with one part (streaming).
                 for part in parts:
                     # Handle thought titles and transitions between reasoning and normal content.
-                    # FIXME: Gemini 3 can include an image part inside a thought
-                    # FIXME: If a though is followed by a non-thought part but it has no text, the "Thinking finished" status is not yet emitted.
-                    # We'll wait for actual text content to appear.
-                    match part:
-                        case types.Part(text=str(text), thought=True):
+                    if part.thought:
+                        if not in_think:
+                            in_think = True
+
+                        # Attempt to extract a title from any text within a thought part.
+                        if isinstance(part.text, str):
                             try:
                                 title: str | None = None
                                 # Prefer markdown-style "### Heading" titles.
                                 for m in re.finditer(
-                                    r"(^|\n)###\s+(.+?)(?=\n|$)", text or ""
+                                    r"(^|\n)###\s+(.+?)(?=\n|$)", part.text or ""
                                 ):
                                     title = m.group(2).strip()
                                 # Fall back to bold "**Title**" lines if no heading was found.
                                 if not title:
                                     for m in re.finditer(
                                         r"(^|\n)\s*\*\*(.+?)\*\*\s*(?=\n|$)",
-                                        text or "",
+                                        part.text or "",
                                     ):
                                         title = (m.group(2) or "").strip()
                                 if title:
@@ -2750,34 +2752,26 @@ class Pipe:
                             except Exception:
                                 # Thought titles are a best-effort feature; failures should not break the stream.
                                 pass
-                            if not in_think:
-                                in_think = True
-                        case types.Part(text=str(text)):
-                            if in_think:
-                                in_think = False
-                                # Clear the last thought title when normal content begins.
-                                asyncio.create_task(
-                                    event_emitter.emit_status(
-                                        "Thinking finished",
-                                        done=True,
-                                        is_thought=False,
-                                    )
+                    elif in_think:
+                        # Terminate the 'in_think' state only when a non-thought part with actual content arrives.
+                        # This prevents empty text parts from prematurely ending the thought block in the UI.
+                        has_content = (
+                            (isinstance(part.text, str) and part.text)
+                            or part.inline_data
+                            or part.executable_code
+                            or part.code_execution_result
+                        )
+                        if has_content:
+                            in_think = False
+                            # Clear the last thought title when normal content begins.
+                            asyncio.create_task(
+                                event_emitter.emit_status(
+                                    "Thinking finished",
+                                    done=True,
+                                    is_thought=False,
                                 )
-                        case (
-                            types.Part(inline_data=_)
-                            | types.Part(executable_code=_)
-                            | types.Part(code_execution_result=_)
-                        ):
-                            if in_think:
-                                in_think = False
-                                # Clear the last thought title when normal content begins.
-                                asyncio.create_task(
-                                    event_emitter.emit_status(
-                                        "Thinking finished",
-                                        done=True,
-                                        is_thought=False,
-                                    )
-                                )
+                            )
+
                     payload, count = await self._process_part(
                         part,
                         app,
@@ -2789,6 +2783,7 @@ class Pipe:
 
                     if payload:
                         # Collect the original content text before it's sent to the frontend.
+                        # We only care about the "content" key for the final message.
                         if "content" in payload and payload["content"]:
                             content_parts_text.append(payload["content"])
 
@@ -2872,29 +2867,25 @@ class Pipe:
         """
         Processes a single `types.Part` object and returns a payload dictionary
         for the Open WebUI stream, along with a count of tag substitutions.
+        The payload key is 'reasoning' for thought parts and 'content' for others.
         """
-        # Initialize variables to ensure they always have a defined state.
-        payload: dict[str, str] | None = None
+        # Determine the payload key based on whether the part is a thought.
+        key = "reasoning" if part.thought else "content"
+        payload_content: str | None = None
         count: int = 0
-        key: str = "content"
 
         match part:
-            # FIXME: Gemini 3 models can have images in their thoughts too.
-            case types.Part(text=str(text), thought=True):
-                # It's a thought, so we'll use the "reasoning" key.
-                key = "reasoning"
-                sanitized_text, count = self._disable_special_tags(text)
-                payload = {key: sanitized_text}
             case types.Part(text=str(text)):
-                # It's regular content, using the default "content" key.
+                # It's regular content or a thought with text.
                 sanitized_text, count = self._disable_special_tags(text)
-                payload = {key: sanitized_text}
+                payload_content = sanitized_text
             case types.Part(inline_data=data) if data:
+                # An image part, which can be part of a thought or regular content.
                 # Image parts don't need tag disabling.
                 processed_text, image_url = await self._process_image_part(
                     data, model, user_id, chat_id, message_id, app
                 )
-                payload = {"content": processed_text}
+                payload_content = processed_text
 
                 # Transform inline_data into file_data to avoid storing raw bytes in the database.
                 # This mutates the part object which is held by reference in `response_parts`.
@@ -2906,13 +2897,16 @@ class Pipe:
             case types.Part(executable_code=code) if code:
                 # Code blocks are already formatted and safe.
                 if processed_text := self._process_executable_code_part(code):
-                    payload = {"content": processed_text}
+                    payload_content = processed_text
             case types.Part(code_execution_result=result) if result:
                 # Code results are also safe.
                 if processed_text := self._process_code_execution_result_part(result):
-                    payload = {"content": processed_text}
+                    payload_content = processed_text
 
-        return payload, count
+        if payload_content is not None:
+            return {key: payload_content}, count
+
+        return None, 0
 
     @staticmethod
     def _disable_special_tags(text: str) -> tuple[str, int]:
