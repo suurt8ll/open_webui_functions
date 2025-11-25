@@ -2785,7 +2785,6 @@ class Pipe:
                         user_id,
                         chat_id,
                         message_id,
-                        is_stream=True,  # We always yield chunks, so this is effectively true
                     )
 
                     if payload:
@@ -2869,7 +2868,6 @@ class Pipe:
         user_id: str,
         chat_id: str,
         message_id: str,
-        is_stream: bool,
     ) -> tuple[dict | None, int]:
         """
         Processes a single `types.Part` object and returns a payload dictionary
@@ -2886,12 +2884,6 @@ class Pipe:
                 # It's a thought, so we'll use the "reasoning" key.
                 key = "reasoning"
                 sanitized_text, count = self._disable_special_tags(text)
-
-                # For non-streaming responses, wrap the thought/reasoning block
-                # in details block manually for nice front-end rendering.
-                if not is_stream:
-                    sanitized_text = f"\n\n{sanitized_text}\n\n"
-
                 payload = {key: sanitized_text}
             case types.Part(text=str(text)):
                 # It's regular content, using the default "content" key.
