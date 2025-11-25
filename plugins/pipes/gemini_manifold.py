@@ -51,6 +51,7 @@ import base64
 import re
 import fnmatch
 import sys
+import difflib
 from loguru import logger
 from fastapi import Request, FastAPI
 import pydantic_core
@@ -829,7 +830,8 @@ class GeminiContentBuilder:
             messages_db = chat_content.get("messages", [])[:-1]
         else:
             log.warning(
-                f"Chat {chat_id} not found. Cannot process files or filter citations."
+                f"Chat {chat_id} not found. File handling (audio, video, PDF), citation filtering, "
+                "and high-fidelity assistant response restoration are unavailable."
             )
             return None
 
@@ -839,7 +841,7 @@ class GeminiContentBuilder:
                 f"Messages in the body ({len(self.messages_body)}) and "
                 f"messages in the database ({len(messages_db)}) do not match. "
                 "This is likely due to a bug in Open WebUI. "
-                "Cannot process files or filter citations."
+                "File handling and high-fidelity response restoration will be disabled."
             )
 
             # TODO: Emit a toast to the user in the front-end.
@@ -921,12 +923,10 @@ class GeminiContentBuilder:
             message = cast("AssistantMessage", message)
             # Google API's assistant role is "model"
             role = "model"
-            sources = None
-            if self.messages_db:
-                message_db = self.messages_db[i]
-                sources = message_db.get("sources")
+            message_db = self.messages_db[i] if self.messages_db else None
+            sources = message_db.get("sources") if message_db else None
             parts = await self._process_assistant_message(
-                message, sources, status_queue
+                i, message, message_db, sources, status_queue
             )
         else:
             warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
@@ -1010,11 +1010,70 @@ class GeminiContentBuilder:
 
     async def _process_assistant_message(
         self,
-        message: "AssistantMessage",
+        i: int,
+        message_body: "AssistantMessage",
+        message_db: "ChatMessageTD | None",
         sources: list["Source"] | None,
         status_queue: asyncio.Queue,
     ) -> list[types.Part]:
-        assistant_text = message.get("content")
+        """
+        Processes an assistant message, prioritizing reconstruction from stored 'gemini_parts'
+        if available and unmodified. Falls back to processing the text content if parts
+        are missing or if the user has edited the message.
+        """
+        gemini_parts = message_db.get("gemini_parts") if message_db else None
+        original_content = message_db.get("original_content") if message_db else None
+        current_content = message_body.get("content", "")
+
+        # --- PATH 1: Restore from stored parts (ideal case) ---
+        if gemini_parts and original_content is not None:
+            # Compare stripped versions to be robust against whitespace changes from the UI/backend.
+            if current_content.strip() == original_content.strip():
+                log.debug(
+                    f"Reconstructing assistant message at index {i} from stored parts."
+                )
+                try:
+                    # Use Pydantic's robust validation to reconstruct Part objects from dicts.
+                    # FIXME: special handling for generated images
+                    return [types.Part.model_validate(p) for p in gemini_parts]
+                except (pydantic_core.ValidationError, TypeError):
+                    log.exception(
+                        f"Failed to reconstruct types.Part for message {i} from stored gemini_parts. "
+                        "Falling back to text processing."
+                    )
+            else:
+                # A meaningful edit was detected after accounting for whitespace.
+                diff = difflib.unified_diff(
+                    original_content.strip().splitlines(keepends=True),
+                    current_content.strip().splitlines(keepends=True),
+                    fromfile="original_content_stripped",
+                    tofile="current_content_stripped",
+                )
+                diff_str = "".join(diff)
+
+                log.warning(
+                    f"An edit was detected in assistant message at index {i}. The message will be "
+                    "reconstructed from the current edited text, and the original high-fidelity data "
+                    "from the database will be ignored for this turn.\n"
+                    f"--- Diff (on stripped content) ---\n{diff_str}"
+                )
+                self.event_emitter.emit_toast(
+                    f"An edit was detected in assistant message #{i + 1}. "
+                    "Using the edited text, which may affect model context for this turn.",
+                    "warning",
+                )
+        elif message_db:
+            # Warn if the message was likely from another model (no-toast).
+            log.warning(
+                f"Assistant message at index {i} lacks 'gemini_parts' or 'original_content'. "
+                "This message was likely not generated by this plugin. "
+                "Falling back to processing its plain text content."
+            )
+
+        # --- PATH 2: Fallback to processing text content ---
+        # This path is used for non-Gemini messages, edited messages, or on reconstruction failure.
+        log.debug(f"Processing assistant message {i} content as plain text.")
+        assistant_text = current_content
         if sources:
             assistant_text = self._remove_citation_markers(assistant_text, sources)
         return await self._genai_parts_from_text(assistant_text, status_queue)

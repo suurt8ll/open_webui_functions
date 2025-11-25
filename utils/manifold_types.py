@@ -405,6 +405,10 @@ class ChatMessageTD(TypedDict):
         list[Source]
     ]  # Present in history.messages for assistant, not in top-level messages list
 
+    # Custom keys added by Gemini Manifold plugin
+    gemini_parts: NotRequired[list[dict[str, Any]]]
+    original_content: NotRequired[str]
+
 
 class ChatHistoryTD(TypedDict):
     messages: dict[str, ChatMessageTD]  # Key is message ID
