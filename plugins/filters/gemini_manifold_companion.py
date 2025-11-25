@@ -286,15 +286,24 @@ class Filter:
 
         chat_id: str = __metadata__.get("chat_id", "")
         message_id: str = __metadata__.get("message_id", "")
-        grounding_key = f"grounding_{chat_id}_{message_id}"
-        time_key = f"pipe_start_time_{chat_id}_{message_id}"
-
         app_state: State = __request__.app.state
+
         log.debug(f"Checking for attributes for message {message_id} in request state.")
-        stored_metadata: types.GroundingMetadata | None = getattr(
-            app_state, grounding_key, None
+
+        stored_metadata: types.GroundingMetadata | None = (
+            self._get_and_clear_data_from_state(
+                app_state, chat_id, message_id, "grounding"
+            )
         )
-        pipe_start_time: float | None = getattr(app_state, time_key, None)
+        pipe_start_time: float | None = self._get_and_clear_data_from_state(
+            app_state, chat_id, message_id, "pipe_start_time"
+        )
+        response_parts: list[types.Part] | None = self._get_and_clear_data_from_state(
+            app_state, chat_id, message_id, "response_parts"
+        )
+        original_content: str | None = self._get_and_clear_data_from_state(
+            app_state, chat_id, message_id, "original_content"
+        )
 
         if stored_metadata:
             log.info("Found grounding metadata, processing citations.")
@@ -346,13 +355,33 @@ class Filter:
 
             # Emit status event with search queries
             await self._emit_status_event_w_queries(stored_metadata, __event_emitter__)
-
-            # Clean up state
-            delattr(app_state, grounding_key)
-            if hasattr(app_state, time_key):
-                delattr(app_state, time_key)
         else:
             log.info("No grounding metadata found in request state.")
+
+        assistant_message = cast("AssistantMessage", body["messages"][-1])
+
+        if response_parts:
+            log.info(
+                f"Found {len(response_parts)} response parts, adding to final message."
+            )
+            try:
+                # Use .model_dump() to create JSON-serializable dictionaries from the Pydantic models.
+                assistant_message["gemini_parts"] = [
+                    part.model_dump(mode="json", exclude_none=True) for part in response_parts
+                ]
+            except (IndexError, KeyError) as e:
+                log.exception(
+                    f"Failed to inject response parts into the message body: {e}"
+                )
+
+        if original_content:
+            log.info("Found original content, adding to final message.")
+            try:
+                assistant_message["original_content"] = original_content
+            except (IndexError, KeyError) as e:
+                log.exception(
+                    f"Failed to inject original content into the message body: {e}"
+                )
 
         log.debug("outlet method has finished.")
         return body
@@ -755,6 +784,27 @@ class Filter:
     # endregion 1.3 Get permissive safety settings
 
     # region 1.4 Utility helpers
+
+    def _get_and_clear_data_from_state(
+        self,
+        app_state: State,
+        chat_id: str,
+        message_id: str,
+        key_suffix: str,
+    ) -> Any | None:
+        """Retrieves data from the app state using a namespaced key and then deletes it."""
+        key = f"{key_suffix}_{chat_id}_{message_id}"
+        value = getattr(app_state, key, None)
+        if value is not None:
+            log.debug(f"Retrieved and cleared data from app state for key '{key}'.")
+            try:
+                delattr(app_state, key)
+            except AttributeError:
+                # This case is unlikely but handles a race condition where the attribute might already be gone.
+                log.warning(
+                    f"State key '{key}' was already gone before deletion attempt."
+                )
+        return value
 
     def _emit_status_update(
         self,

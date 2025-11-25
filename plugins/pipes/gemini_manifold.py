@@ -51,8 +51,9 @@ import base64
 import re
 import fnmatch
 import sys
+import difflib
 from loguru import logger
-from fastapi import Request
+from fastapi import Request, FastAPI
 import pydantic_core
 from pydantic import BaseModel, Field, field_validator
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -824,12 +825,14 @@ class GeminiContentBuilder:
         if chat := Chats.get_chat_by_id_and_user_id(
             id=chat_id, user_id=user_data["id"]
         ):
+            log.debug("Full chat data retrieved from database.", payload=chat)
             chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
             # Last message is the upcoming assistant response, at this point in the logic it's empty.
             messages_db = chat_content.get("messages", [])[:-1]
         else:
             log.warning(
-                f"Chat {chat_id} not found. Cannot process files or filter citations."
+                f"Chat {chat_id} not found. File handling (audio, video, PDF), citation filtering, "
+                "and high-fidelity assistant response restoration are unavailable."
             )
             return None
 
@@ -839,7 +842,7 @@ class GeminiContentBuilder:
                 f"Messages in the body ({len(self.messages_body)}) and "
                 f"messages in the database ({len(messages_db)}) do not match. "
                 "This is likely due to a bug in Open WebUI. "
-                "Cannot process files or filter citations."
+                "File handling and high-fidelity response restoration will be disabled."
             )
 
             # TODO: Emit a toast to the user in the front-end.
@@ -921,12 +924,10 @@ class GeminiContentBuilder:
             message = cast("AssistantMessage", message)
             # Google API's assistant role is "model"
             role = "model"
-            sources = None
-            if self.messages_db:
-                message_db = self.messages_db[i]
-                sources = message_db.get("sources")
+            message_db = self.messages_db[i] if self.messages_db else None
+            sources = message_db.get("sources") if message_db else None
             parts = await self._process_assistant_message(
-                message, sources, status_queue
+                i, message, message_db, sources, status_queue
             )
         else:
             warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
@@ -1008,16 +1009,162 @@ class GeminiContentBuilder:
 
         return user_parts
 
+    async def _rehydrate_assistant_parts(
+        self,
+        gemini_parts: list[dict[str, Any]],
+        status_queue: asyncio.Queue,
+    ) -> list[types.Part]:
+        """
+        Reconstructs `types.Part` objects from dictionaries, rehydrating file-based parts
+        by fetching their content from the OWUI backend.
+        """
+        rehydrated_parts: list[types.Part] = []
+        for part_dict in gemini_parts:
+            part = types.Part.model_validate(part_dict)
+
+            if part.file_data and (file_uri := part.file_data.file_uri):
+                if not file_uri.startswith("/api/v1/files/"):
+                    raise ValueError(
+                        f"Unsupported file_uri in assistant history: {file_uri}. "
+                        "Only local Open WebUI files are supported for reconstruction."
+                    )
+
+                file_id = file_uri.split("/")[4]
+                file_bytes, mime_type = await self._get_file_data(file_id)
+
+                if not (file_bytes and mime_type):
+                    raise ValueError(
+                        f"Could not retrieve content for file_id '{file_id}' from assistant history."
+                    )
+
+                rehydrated_part = await self._create_genai_part_from_file_data(
+                    file_bytes, mime_type, file_id, status_queue
+                )
+                rehydrated_parts.append(rehydrated_part)
+            else:
+                rehydrated_parts.append(part)
+
+        return rehydrated_parts
+
     async def _process_assistant_message(
         self,
-        message: "AssistantMessage",
+        i: int,
+        message_body: "AssistantMessage",
+        message_db: "ChatMessageTD | None",
         sources: list["Source"] | None,
         status_queue: asyncio.Queue,
     ) -> list[types.Part]:
-        assistant_text = message.get("content")
+        """
+        Processes an assistant message, prioritizing reconstruction from stored 'gemini_parts'
+        if available and unmodified. Falls back to processing the text content if parts
+        are missing or if the user has edited the message.
+        """
+        gemini_parts = message_db.get("gemini_parts") if message_db else None
+        original_content = message_db.get("original_content") if message_db else None
+        current_content = message_body.get("content", "")
+
+        # Citations need to be stripped from the current content before comparison.
         if sources:
-            assistant_text = self._remove_citation_markers(assistant_text, sources)
-        return await self._genai_parts_from_text(assistant_text, status_queue)
+            current_content = self._remove_citation_markers(current_content, sources)
+
+        # --- PATH 1: Restore from stored parts (ideal case) ---
+        if gemini_parts and original_content is not None:
+            # Compare stripped versions to be robust against whitespace changes from the UI/backend.
+            if current_content.strip() == original_content.strip():
+                log.debug(
+                    f"Reconstructing assistant message at index {i} from stored parts."
+                )
+                try:
+                    return await self._rehydrate_assistant_parts(
+                        gemini_parts, status_queue
+                    )
+                except (pydantic_core.ValidationError, TypeError, ValueError):
+                    log.exception(
+                        f"Failed to reconstruct types.Part for message {i} from stored gemini_parts. "
+                        "Falling back to text processing."
+                    )
+            else:
+                # A meaningful edit was detected after accounting for whitespace.
+                diff = difflib.unified_diff(
+                    original_content.strip().splitlines(keepends=True),
+                    current_content.strip().splitlines(keepends=True),
+                    fromfile="original_content_stripped",
+                    tofile="current_content_stripped",
+                )
+                diff_str = "".join(diff)
+
+                log.warning(
+                    f"An edit was detected in assistant message at index {i}. The message will be "
+                    "reconstructed from the current edited text, and the original high-fidelity data "
+                    "from the database will be ignored for this turn.\n"
+                    f"--- Diff (on stripped content) ---\n{diff_str}"
+                )
+                self.event_emitter.emit_toast(
+                    f"An edit was detected in assistant message #{i + 1}. "
+                    "Using the edited text, which may affect model context for this turn.",
+                    "warning",
+                )
+        elif message_db:
+            # Warn if the message was likely from another model (no-toast).
+            log.warning(
+                f"Assistant message at index {i} lacks 'gemini_parts' or 'original_content'. "
+                "This message was likely not generated by this plugin. "
+                "Falling back to processing its plain text content."
+            )
+
+        # --- PATH 2: Fallback to processing text content ---
+        # This path is used for non-Gemini messages, edited messages, or on reconstruction failure.
+        log.debug(f"Processing assistant message {i} content as plain text.")
+        return await self._genai_parts_from_text(current_content, status_queue)
+
+    async def _create_genai_part_from_file_data(
+        self,
+        file_bytes: bytes,
+        mime_type: str,
+        owui_file_id: str | None,
+        status_queue: asyncio.Queue,
+    ) -> types.Part:
+        """
+        Creates a `types.Part` from file bytes, deciding whether to use the
+        Google Files API or send raw bytes based on configuration and context.
+        """
+        # TODO: The Files API is strict about MIME types (e.g., text/plain,
+        # application/pdf). In the future, inspect the content of files
+        # with unsupported text-like MIME types (e.g., 'application/json',
+        # 'text/markdown'). If the content is detected as plaintext,
+        # override the `mime_type` variable to 'text/plain' to allow the upload.
+
+        # Determine whether to use the Files API based on the specified conditions.
+        use_files_api = True
+        reason = ""
+
+        if not self.valves.USE_FILES_API:
+            reason = "disabled by user setting (USE_FILES_API=False)"
+            use_files_api = False
+        elif self.vertexai:
+            reason = "the active client is configured for Vertex AI, which does not support the Files API"
+            use_files_api = False
+        elif self.is_temp_chat:
+            reason = "temporary chat mode is active"
+            use_files_api = False
+
+        if use_files_api:
+            log.info("Using Google Files API for resource.")
+            gemini_file = await self.files_api_manager.get_or_upload_file(
+                file_bytes=file_bytes,
+                mime_type=mime_type,
+                owui_file_id=owui_file_id,
+                status_queue=status_queue,
+            )
+            return types.Part(
+                file_data=types.FileData(
+                    file_uri=gemini_file.uri,
+                    mime_type=gemini_file.mime_type,
+                )
+            )
+        else:
+            log.info(f"Sending raw bytes because {reason}.")
+            return types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
 
     async def _genai_part_from_uri(
         self, uri: str, status_queue: asyncio.Queue
@@ -1025,8 +1172,7 @@ class GeminiContentBuilder:
         """
         Processes any resource URI and returns a genai.types.Part.
         This is the central dispatcher for all media processing, handling data URIs,
-        local API file paths, and YouTube URLs. It decides whether to use the
-        Files API or send raw bytes based on configuration and context.
+        local API file paths, and YouTube URLs.
         """
         if not uri:
             log.warning("Received an empty URI, skipping.")
@@ -1060,47 +1206,14 @@ class GeminiContentBuilder:
                 self.event_emitter.emit_toast(warn_msg, "warning")
                 return None
 
-            # Step 2: If we have bytes, decide how to create the Part
+            # Step 2: If we have bytes, create the Part using the modularized helper
             if file_bytes and mime_type:
-                # TODO: The Files API is strict about MIME types (e.g., text/plain,
-                # application/pdf). In the future, inspect the content of files
-                # with unsupported text-like MIME types (e.g., 'application/json',
-                # 'text/markdown'). If the content is detected as plaintext,
-                # override the `mime_type` variable to 'text/plain' to allow the upload.
-
-                # Determine whether to use the Files API based on the specified conditions.
-                use_files_api = True
-                reason = ""
-
-                if not self.valves.USE_FILES_API:
-                    reason = "disabled by user setting (USE_FILES_API=False)"
-                    use_files_api = False
-                elif self.vertexai:
-                    reason = "the active client is configured for Vertex AI, which does not support the Files API"
-                    use_files_api = False
-                elif self.is_temp_chat:
-                    reason = "temporary chat mode is active"
-                    use_files_api = False
-
-                if use_files_api:
-                    log.info(f"Using Files API for resource from URI: {uri[:64]}...")
-                    gemini_file = await self.files_api_manager.get_or_upload_file(
-                        file_bytes=file_bytes,
-                        mime_type=mime_type,
-                        owui_file_id=owui_file_id,
-                        status_queue=status_queue,
-                    )
-                    return types.Part(
-                        file_data=types.FileData(
-                            file_uri=gemini_file.uri,
-                            mime_type=gemini_file.mime_type,
-                        )
-                    )
-                else:
-                    log.info(
-                        f"Sending raw bytes because {reason}. Resource from URI: {uri[:64]}..."
-                    )
-                    return types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+                return await self._create_genai_part_from_file_data(
+                    file_bytes=file_bytes,
+                    mime_type=mime_type,
+                    owui_file_id=owui_file_id,
+                    status_queue=status_queue,
+                )
 
             return None  # Return None if bytes/mime_type could not be determined
 
@@ -1427,6 +1540,8 @@ class GeminiContentBuilder:
 
     @staticmethod
     def _remove_citation_markers(text: str, sources: list["Source"]) -> str:
+        # FIXME: this should be moved to `Filter.inlet`
+        # FIXME: `text` still contains ZWS here, they need to be removed.
         original_text = text
         processed: set[str] = set()
         for source in sources:
@@ -1950,7 +2065,7 @@ class Pipe:
             log.debug("pipe method has finished.")
             return self._unified_response_processor(
                 response_stream,
-                __request__,
+                __request__.app,
                 model_name,
                 event_emitter,
                 __user__["id"],
@@ -1976,7 +2091,7 @@ class Pipe:
             log.debug("pipe method has finished.")
             return self._unified_response_processor(
                 single_item_stream(res),
-                __request__,
+                __request__.app,
                 model_name,
                 event_emitter,
                 __user__["id"],
@@ -2550,7 +2665,7 @@ class Pipe:
     async def _unified_response_processor(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
-        __request__: Request,
+        app: FastAPI,
         model: str,
         event_emitter: EventEmitter,
         user_id: str,
@@ -2573,10 +2688,12 @@ class Pipe:
         chunk_counter = 0
         in_think = False
         last_title: str | None = None
+        response_parts: list[types.Part] = []
+        content_parts_text: list[str] = []
 
         try:
             async for chunk in response_stream:
-                log.trace(f"Processing response chunk #{chunk_counter}:", payload=chunk)
+                log.debug(f"Processing response chunk #{chunk_counter}:", payload=chunk)
                 chunk_counter += 1
                 final_response_chunk = chunk  # Keep the latest chunk for metadata
 
@@ -2591,10 +2708,15 @@ class Pipe:
                     log.warning("Chunk has no parts, skipping.")
                     continue
 
+                response_parts.extend(parts)
+
                 # This inner loop makes the method robust. It handles a single chunk
                 # with many parts (non-streaming) or many chunks with one part (streaming).
                 for part in parts:
                     # Handle thought titles and transitions between reasoning and normal content.
+                    # FIXME: Gemini 3 can include an image part inside a thought
+                    # FIXME: If a though is followed by a non-thought part but it has no text, the "Thinking finished" status is not yet emitted.
+                    # We'll wait for actual text content to appear.
                     match part:
                         case types.Part(text=str(text), thought=True):
                             try:
@@ -2658,7 +2780,7 @@ class Pipe:
                                 )
                     payload, count = await self._process_part(
                         part,
-                        __request__,
+                        app,
                         model,
                         user_id,
                         chat_id,
@@ -2667,6 +2789,10 @@ class Pipe:
                     )
 
                     if payload:
+                        # Collect the original content text before it's sent to the frontend.
+                        if "content" in payload and payload["content"]:
+                            content_parts_text.append(payload["content"])
+
                         if count > 0:
                             total_substitutions += count
                             log.debug(f"Disabled {count} special tag(s) in a part.")
@@ -2696,11 +2822,34 @@ class Pipe:
                 yield "data: [DONE]"
                 log.info("Response processing finished successfully!")
 
+            if not error_occurred and response_parts:
+                # Storing the complete list of response parts for Filter.outlet.
+                # The filter will serialize this and add it to the final message payload,
+                # allowing the frontend to store it in the database with the assistant's message.
+                self._store_data_in_state(
+                    app.state,
+                    chat_id,
+                    message_id,
+                    "response_parts",
+                    response_parts,
+                )
+
+            if not error_occurred and content_parts_text:
+                original_content = "".join(content_parts_text)
+                # FIXME: allow passing list of keys and values to store multiple items at once
+                self._store_data_in_state(
+                    app.state,
+                    chat_id,
+                    message_id,
+                    "original_content",
+                    original_content,
+                )
+
             try:
                 await self._do_post_processing(
                     final_response_chunk,
                     event_emitter,
-                    __request__,
+                    app.state,
                     chat_id=chat_id,
                     message_id=message_id,
                     stream_error_happened=error_occurred,
@@ -2715,7 +2864,7 @@ class Pipe:
     async def _process_part(
         self,
         part: types.Part,
-        __request__: Request,
+        app: FastAPI,  # We need the app to generate URLs for model returned images.
         model: str,
         user_id: str,
         chat_id: str,
@@ -2732,6 +2881,7 @@ class Pipe:
         key: str = "content"
 
         match part:
+            # FIXME: Gemini 3 models can have images in their thoughts too.
             case types.Part(text=str(text), thought=True):
                 # It's a thought, so we'll use the "reasoning" key.
                 key = "reasoning"
@@ -2740,7 +2890,7 @@ class Pipe:
                 # For non-streaming responses, wrap the thought/reasoning block
                 # in details block manually for nice front-end rendering.
                 if not is_stream:
-                    sanitized_text = f'\n<details type="reasoning" done="true">\n<summary>Thinking...</summary>\n{sanitized_text}\n</details>\n'
+                    sanitized_text = f"\n\n{sanitized_text}\n\n"
 
                 payload = {key: sanitized_text}
             case types.Part(text=str(text)):
@@ -2749,10 +2899,18 @@ class Pipe:
                 payload = {key: sanitized_text}
             case types.Part(inline_data=data) if data:
                 # Image parts don't need tag disabling.
-                processed_text = await self._process_image_part(
-                    data, model, user_id, chat_id, message_id, __request__
+                processed_text, image_url = await self._process_image_part(
+                    data, model, user_id, chat_id, message_id, app
                 )
                 payload = {"content": processed_text}
+
+                # Transform inline_data into file_data to avoid storing raw bytes in the database.
+                # This mutates the part object which is held by reference in `response_parts`.
+                if image_url and data.mime_type:
+                    part.inline_data = None
+                    part.file_data = types.FileData(
+                        file_uri=image_url, mime_type=data.mime_type
+                    )
             case types.Part(executable_code=code) if code:
                 # Code blocks are already formatted and safe.
                 if processed_text := self._process_executable_code_part(code):
@@ -2794,13 +2952,15 @@ class Pipe:
         user_id: str,
         chat_id: str,
         message_id: str,
-        request: Request,
-    ) -> str:
+        app: FastAPI,
+    ) -> tuple[str, str | None]:
         """
-        Handles image data by saving it to the Open WebUI backend and returning a markdown link.
+        Handles image data by saving it to the Open WebUI backend and returning a markdown link
+        and the URL.
         """
         mime_type = inline_data.mime_type
         image_data = inline_data.data
+        image_url = None
 
         if mime_type and image_data:
             image_url = await self._upload_image(
@@ -2810,20 +2970,20 @@ class Pipe:
                 user_id=user_id,
                 chat_id=chat_id,
                 message_id=message_id,
-                __request__=request,
+                app=app,
             )
         else:
             log.warning(
                 "Image part has no mime_type or data, cannot upload image. "
                 "Returning a placeholder message."
             )
-            image_url = None
 
-        return (
+        markdown_text = (
             f"![Generated Image]({image_url})"
             if image_url
             else "*An error occurred while trying to store this model generated image.*"
         )
+        return markdown_text, image_url
 
     async def _upload_image(
         self,
@@ -2833,7 +2993,7 @@ class Pipe:
         user_id: str,
         chat_id: str,
         message_id: str,
-        __request__: Request,
+        app: FastAPI,
     ) -> str | None:
         """
         Helper method that uploads a generated image to the configured Open WebUI storage provider.
@@ -2884,7 +3044,7 @@ class Pipe:
             log.warning("Image upload to Open WebUI database likely failed.")
             return None
 
-        image_url: str = __request__.app.url_path_for(
+        image_url: str = app.url_path_for(
             "get_file_content_by_id", id=file_item.id
         )
         log.success("Image upload finished!")
@@ -2937,7 +3097,7 @@ class Pipe:
         self,
         model_response: types.GenerateContentResponse | None,
         event_emitter: EventEmitter,
-        request: Request,
+        app_state: State,
         chat_id: str,
         message_id: str,
         *,
@@ -3009,43 +3169,41 @@ class Pipe:
             usage_data["completion_time"] = round(elapsed_time, 2)
             await event_emitter.emit_usage(usage_data)
 
-        self._add_grounding_data_to_state(
-            model_response,
-            request,
-            chat_id,
-            message_id,
-            event_emitter,
-        )
+        # --- Store grounding and timing data in state for the Filter ---
+        if candidate and (grounding_metadata_obj := candidate.grounding_metadata):
+            self._store_data_in_state(
+                app_state,
+                chat_id,
+                message_id,
+                "grounding",
+                grounding_metadata_obj,
+            )
 
-    def _add_grounding_data_to_state(
-        self,
-        response: types.GenerateContentResponse,
-        request: Request,
+        # Only store the start time if the user wants to see timestamps in the grounding display.
+        # The filter will gracefully handle the absence of this key.
+        if event_emitter.status_mode == "visible_timed":
+            self._store_data_in_state(
+                app_state,
+                chat_id,
+                message_id,
+                "pipe_start_time",
+                event_emitter.start_time,
+            )
+
+    @staticmethod
+    def _store_data_in_state(
+        app_state: State,
         chat_id: str,
         message_id: str,
-        event_emitter: EventEmitter,
+        key_suffix: str,
+        value: Any,
     ):
-        candidate = self._get_first_candidate(response.candidates)
-        grounding_metadata_obj = candidate.grounding_metadata if candidate else None
-
-        app_state: State = request.app.state
-        grounding_key = f"grounding_{chat_id}_{message_id}"
-        time_key = f"pipe_start_time_{chat_id}_{message_id}"
-
-        if grounding_metadata_obj:
-            log.debug(
-                f"Found grounding metadata. Storing in request's app state using key {grounding_key}."
-            )
-            # Using shared `request.app.state` to pass data to Filter.outlet.
-            # This is necessary because the Pipe and Filter operate on different requests.
-            app_state._state[grounding_key] = grounding_metadata_obj
-
-            # Only store the start time if the user wants to see timestamps in the grounding display.
-            # The filter will gracefully handle the absence of this key.
-            if event_emitter.status_mode == "visible_timed":
-                app_state._state[time_key] = event_emitter.start_time
-        else:
-            log.debug(f"Response {message_id} does not have grounding metadata.")
+        """Stores a value in the app state, namespaced by chat and message ID."""
+        key = f"{key_suffix}_{chat_id}_{message_id}"
+        log.debug(f"Storing data in app state with key '{key}'.")
+        # Using shared `request.app.state` to pass data to Filter.outlet.
+        # This is necessary because Pipe.pipe and Filter.outlet operate on different requests.
+        app_state._state[key] = value
 
     @staticmethod
     def _get_usage_data(
@@ -3164,7 +3322,7 @@ class Pipe:
         if data_to_process is not None:
             try:
                 serializable_data = pydantic_core.to_jsonable_python(
-                    data_to_process, serialize_unknown=True
+                    data_to_process, serialize_unknown=True, exclude_none=True
                 )
 
                 # Determine truncation settings
