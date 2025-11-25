@@ -1063,6 +1063,10 @@ class GeminiContentBuilder:
         original_content = message_db.get("original_content") if message_db else None
         current_content = message_body.get("content", "")
 
+        # Citations need to be stripped from the current content before comparison.
+        if sources:
+            current_content = self._remove_citation_markers(current_content, sources)
+
         # --- PATH 1: Restore from stored parts (ideal case) ---
         if gemini_parts and original_content is not None:
             # Compare stripped versions to be robust against whitespace changes from the UI/backend.
@@ -1111,10 +1115,7 @@ class GeminiContentBuilder:
         # --- PATH 2: Fallback to processing text content ---
         # This path is used for non-Gemini messages, edited messages, or on reconstruction failure.
         log.debug(f"Processing assistant message {i} content as plain text.")
-        assistant_text = current_content
-        if sources:
-            assistant_text = self._remove_citation_markers(assistant_text, sources)
-        return await self._genai_parts_from_text(assistant_text, status_queue)
+        return await self._genai_parts_from_text(current_content, status_queue)
 
     async def _create_genai_part_from_file_data(
         self,
@@ -1539,6 +1540,8 @@ class GeminiContentBuilder:
 
     @staticmethod
     def _remove_citation_markers(text: str, sources: list["Source"]) -> str:
+        # FIXME: this should be moved to `Filter.inlet`
+        # FIXME: `text` still contains ZWS here, they need to be removed.
         original_text = text
         processed: set[str] = set()
         for source in sources:
@@ -2711,6 +2714,9 @@ class Pipe:
                 # with many parts (non-streaming) or many chunks with one part (streaming).
                 for part in parts:
                     # Handle thought titles and transitions between reasoning and normal content.
+                    # FIXME: Gemini 3 can include an image part inside a thought
+                    # FIXME: If a though is followed by a non-thought part but it has no text, the "Thinking finished" status is not yet emitted.
+                    # We'll wait for actual text content to appear.
                     match part:
                         case types.Part(text=str(text), thought=True):
                             try:
