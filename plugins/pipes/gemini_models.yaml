@@ -44,6 +44,41 @@ gemini-3-pro-preview:
       - up_to_tokens: null
         price_per_million: 0.40
 
+gemini-3-pro-image-preview:
+  description: "Image generation model. Designed for professional asset production and complex instructions. Features real-world grounding using Google Search and can generate images up to 4K resolution."
+  knowledge_cutoff: "2025-01"
+  latest_update: "2025-11"
+  supported_data_types:
+    inputs: [Text, Image]
+    outputs: [Text, Image]
+  tokens:
+    input: 65536
+    output: 32768
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: false
+    code_execution: false
+    file_search: false
+    function_calling: false
+    grounding_google_maps: false
+    image_generation: true
+    live_api: false
+    search_grounding: true
+    structured_outputs: true
+    thinking: true
+    url_context: false
+  pricing:
+    input:
+      - up_to_tokens: null
+        price_per_million: 2.00
+    output:
+      - up_to_tokens: null
+        price_per_million: 12.00
+    image_output:
+      - up_to_tokens: null
+        price_per_million: 30.00
+
 gemini-2.5-pro:
   description: "Our state-of-the-art thinking model, capable of reasoning over complex problems in code, math, and STEM."
   knowledge_cutoff: "2025-01"
@@ -114,6 +149,41 @@ gemini-2.5-flash:
     output:
       - up_to_tokens: null
         price_per_million: 2.50
+
+gemini-2.5-flash-image:
+  description: "Image generation model. Designed for speed and efficiency in image generation. Optimized for high-volume, low-latency tasks and generates images at 1024px resolution."
+  knowledge_cutoff: "2025-01"
+  latest_update: "2025-11"
+  supported_data_types:
+    inputs: [Text, Image]
+    outputs: [Text, Image]
+  tokens:
+    input: 65536
+    output: 32768
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: true
+    code_execution: false
+    file_search: false
+    function_calling: false
+    grounding_google_maps: false
+    image_generation: true
+    live_api: false
+    search_grounding: false
+    structured_outputs: true
+    thinking: false
+    url_context: false
+  pricing:
+    input:
+      - up_to_tokens: null
+        price_per_million: 0.30
+    output:
+      - up_to_tokens: null
+        price_per_million: 2.50
+    image_output:
+      - up_to_tokens: null
+        price_per_million: 30.00
 
 gemini-2.5-flash-lite:
   description: "Our fastest flash model optimized for cost-efficiency and high throughput."
