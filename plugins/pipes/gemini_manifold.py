@@ -6,15 +6,16 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.26.0
+version: 2.0.0-alpha1
 requirements: google-genai==1.49.0
 """
 
-VERSION = "1.26.0"
+VERSION = "2.0.0-alpha1"
 # This is the recommended version for the companion filter.
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
 RECOMMENDED_COMPANION_VERSION = "1.7.0"
+DEFAULT_MODEL_CONFIG_PATH = "https://raw.githubusercontent.com/torgal-dog/open_webui_functions/refs/heads/feature/model-to-yaml/plugins/pipes/gemini_models.yaml"
 
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
@@ -37,6 +38,9 @@ from urllib.parse import urlparse, parse_qs
 import xxhash
 import asyncio
 import aiofiles
+import yaml
+import urllib.request
+import os
 from aiocache import cached
 from aiocache.base import BaseCache
 from aiocache.serializers import NullSerializer
@@ -1702,15 +1706,11 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is True.""",
         )
-        THINKING_MODEL_PATTERN: str = Field(
-            default=r"^(?!.*live)(?=.*gemini-(?:3|2\.5|flash(?:-lite)?-latest))(?=.*gemini-3|(?!.*image))",
-            description="""Regex pattern to identify thinking models.
-            Default value is r"^(?!.*live)(?=.*gemini-(?:3|2\.5|flash(?:-lite)?-latest))(?=.*gemini-3|(?!.*image))".""",
-        )
-        IMAGE_MODEL_PATTERN: str = Field(
-            default=r"image",
-            description="""Regex pattern to identify image generation models.
-            Default value is r"image".""",
+        MODEL_CONFIG_PATH: str = Field(
+            default=DEFAULT_MODEL_CONFIG_PATH,
+            description=f"""Path or URL to the YAML file containing model definitions.
+            Can be a local absolute path, a path relative to the plugin directory, or a public URL.
+            Default value is '{DEFAULT_MODEL_CONFIG_PATH}'.""",
         )
         # FIXME: remove, toggle filter handles this now
         ENABLE_URL_CONTEXT_TOOL: bool = Field(
@@ -1849,9 +1849,9 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is None.""",
         )
-        THINKING_MODEL_PATTERN: str | None = Field(
+        MODEL_CONFIG_PATH: str | None = Field(
             default=None,
-            description="""Regex pattern to identify thinking models.
+            description="""Path or URL to the YAML file containing model definitions.
             Default value is None.""",
         )
         ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
@@ -2030,7 +2030,7 @@ class Pipe:
 
         # Some models (e.g., image generation, Gemma) do not support the system prompt message.
         model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
-        is_image_model = self._is_image_model(model_name, valves.IMAGE_MODEL_PATTERN)
+        is_image_model = self._is_image_model(model_name, valves)
         system_prompt_unsupported = is_image_model or "gemma" in model_name
         if system_prompt_unsupported:
             # TODO: append to user message instead.
@@ -2493,8 +2493,47 @@ class Pipe:
         return stripped
 
     @staticmethod
-    def _is_image_model(model_name: str, pattern: str) -> bool:
-        return bool(re.search(pattern, model_name, re.IGNORECASE))
+    @cache
+    def _load_model_config(config_path: str) -> dict:
+        """Loads the model configuration from a local file or URL."""
+        if not config_path:
+            return {}
+
+        try:
+            if config_path.startswith("http://") or config_path.startswith("https://"):
+                with urllib.request.urlopen(config_path) as response:
+                    return yaml.safe_load(response.read())
+            else:
+                # Try absolute path or relative to CWD
+                if os.path.exists(config_path):
+                    with open(config_path, "r") as f:
+                        return yaml.safe_load(f)
+
+                # Try relative to the plugin file directory
+                try:
+                    current_dir = os.path.dirname(os.path.abspath(__file__))
+                    local_path = os.path.join(current_dir, config_path)
+                    if os.path.exists(local_path):
+                        with open(local_path, "r") as f:
+                            return yaml.safe_load(f)
+                except NameError:
+                    pass
+
+                log.warning(f"Model config file not found at {config_path}")
+                return {}
+        except Exception as e:
+            log.error(f"Failed to load model config from {config_path}: {e}")
+            return {}
+
+    @classmethod
+    def _is_image_model(cls, model_name: str, valves: "Valves") -> bool:
+        config = cls._load_model_config(valves.MODEL_CONFIG_PATH)
+        model_id = cls.strip_prefix(model_name)
+        
+        if model_id in config:
+            return config[model_id].get("capabilities", {}).get("image_generation", False)
+            
+        return False
 
     # endregion 2.2 Model retrival from Google API
 
@@ -2521,13 +2560,14 @@ class Pipe:
         )
 
         thinking_conf = None
-        # Use the user-configurable regex to determine if this is a thinking model.
-        is_thinking_model = re.search(
-            valves.THINKING_MODEL_PATTERN, model_name, re.IGNORECASE
-        )
+        config = self._load_model_config(valves.MODEL_CONFIG_PATH)
+        model_id = self.strip_prefix(model_name)
+        is_thinking_model = False
+        if model_id in config:
+             is_thinking_model = config[model_id].get("capabilities", {}).get("thinking", False)
+
         log.debug(
             f"Model '{model_name}' is classified as a reasoning model: {bool(is_thinking_model)}. "
-            f"Pattern: '{valves.THINKING_MODEL_PATTERN}'"
         )
 
         if is_thinking_model:
@@ -2565,7 +2605,7 @@ class Pipe:
         )
 
         gen_content_conf.response_modalities = ["TEXT"]
-        if self._is_image_model(model_name, valves.IMAGE_MODEL_PATTERN):
+        if self._is_image_model(model_name, valves):
             gen_content_conf.response_modalities.append("IMAGE")
 
         gen_content_conf.tools = []
