@@ -285,8 +285,11 @@ class Metadata(TypedDict):
     task_body: NotRequired[dict[str, Any] | None]
 
     # These are my own added custom keys, not used by Open WebUI.
-    safety_settings: list[types.SafetySetting]
-    is_vertex_ai: NotRequired[bool]
+    safety_settings: list[types.SafetySetting]  # Added in `Filter.inlet`
+    chat_control_params: dict[str, Any]  # Added in `Filter.inlet`
+    merged_custom_params: dict[str, Any]  # Added in `Pipe.pipe`
+    is_vertex_ai: NotRequired[bool]  # Added in `Pipe.pipe`
+
 
 # endregion `__metadata__`
 

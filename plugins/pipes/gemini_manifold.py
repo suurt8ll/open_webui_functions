@@ -1969,6 +1969,31 @@ class Pipe:
         # Apply UI toggle overrides (Paid API & Vertex AI)
         valves = self._apply_toggle_configurations(valves, __metadata__)
 
+        # Resolve custom parameters from both the model page (in `body`) and chat
+        # controls (in `__metadata__`). Chat control settings take precedence.
+        known_body_keys = {
+            "stream",
+            "model",
+            "messages",
+            "files",
+            "options",
+            "stream_options",
+        }
+        model_page_params = {
+            key: value for key, value in body.items() if key not in known_body_keys
+        }
+        chat_control_params = __metadata__.get("chat_control_params", {})
+
+        # Merge parameters, with chat-level settings overriding model-level ones.
+        merged_custom_params = model_page_params.copy()
+        merged_custom_params.update(chat_control_params)
+
+        if merged_custom_params:
+            log.debug("Resolved custom parameters:", payload=merged_custom_params)
+
+        # Store the final merged params in metadata for later use.
+        __metadata__["merged_custom_params"] = merged_custom_params
+
         log.debug(
             f"USE_VERTEX_AI: {valves.USE_VERTEX_AI}, VERTEX_PROJECT set: {bool(valves.VERTEX_PROJECT)},"
             f" GEMINI_FREE_API_KEY set: {bool(valves.GEMINI_FREE_API_KEY)}, GEMINI_PAID_API_KEY set: {bool(valves.GEMINI_PAID_API_KEY)}"
@@ -2532,13 +2557,59 @@ class Pipe:
 
         if is_thinking_model:
             # Start with the default thinking configuration from valves.
-            log.info(f"Setting `thinking_budget` to {valves.THINKING_BUDGET} and `include_thoughts` to {valves.SHOW_THINKING_SUMMARY}.")
+            log.info(
+                f"Setting thinking config defaults: budget={valves.THINKING_BUDGET}, "
+                f"include_thoughts={valves.SHOW_THINKING_SUMMARY}."
+            )
             thinking_conf = types.ThinkingConfig(
                 thinking_budget=valves.THINKING_BUDGET,
                 include_thoughts=valves.SHOW_THINKING_SUMMARY,
             )
 
-            # Check if reasoning can be disabled. This happens if the toggle is available but turned OFF by the user.
+            # Override defaults with custom 'reasoning_effort' parameter if present.
+            merged_params = __metadata__.get("merged_custom_params", {})
+            if reasoning_effort := merged_params.get("reasoning_effort"):
+                log.info(
+                    f"Found `reasoning_effort` custom parameter: '{reasoning_effort}'. Overriding valve settings."
+                )
+
+                try:
+                    # Attempt to parse as a number (for thinking_budget).
+                    budget = round(float(reasoning_effort))
+                    log.info(
+                        f"Interpreting `reasoning_effort` as a thinking budget: {budget}"
+                    )
+                    thinking_conf.thinking_budget = budget
+                    thinking_conf.thinking_level = (
+                        None  # Budget and level are mutually exclusive.
+                    )
+                except (ValueError, TypeError):
+                    # If it's not a number, treat it as a thinking_level string.
+                    if isinstance(reasoning_effort, str):
+                        effort_level_str = reasoning_effort.upper()
+                        if effort_level_str in types.ThinkingLevel.__members__:
+                            log.info(
+                                f"Interpreting `reasoning_effort` as a thinking level: {effort_level_str}"
+                            )
+                            thinking_conf.thinking_level = types.ThinkingLevel[
+                                effort_level_str
+                            ]
+                            thinking_conf.thinking_budget = (
+                                None  # Budget and level are mutually exclusive.
+                            )
+                        else:
+                            log.warning(
+                                f"Invalid `reasoning_effort` string value: '{reasoning_effort}'. "
+                                f"Valid values are {list(types.ThinkingLevel.__members__.keys())}. "
+                                "Falling back to valve defaults."
+                            )
+                    else:
+                        log.warning(
+                            f"Unsupported type for `reasoning_effort`: {type(reasoning_effort)}. "
+                            "Expected a number or string. Falling back to valve defaults."
+                        )
+
+            # Check if reasoning can be disabled via toggle, which overrides other settings.
             is_avail, is_on = self._get_toggleable_feature_status(
                 "gemini_reasoning_toggle", __metadata__
             )
@@ -2551,6 +2622,9 @@ class Pipe:
                         "Overwriting `thinking_budget` to 0 to disable reasoning."
                     )
                     thinking_conf.thinking_budget = 0
+                    thinking_conf.thinking_level = (
+                        None  # Ensure level is cleared when budget is forced to 0.
+                    )
 
         # TODO: Take defaults from the general front-end config.
         # system_instruction is intentionally left unset here. It will be set by the caller.
@@ -2726,6 +2800,7 @@ class Pipe:
                     # Handle thought titles and transitions between reasoning and normal content.
                     if part.thought:
                         if not in_think:
+                            # TODO: emit an status indicating that reasoning has started. include budget or level if set.
                             in_think = True
 
                         # Attempt to extract a title from any text within a thought part.

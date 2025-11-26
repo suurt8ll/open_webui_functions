@@ -38,6 +38,9 @@ if TYPE_CHECKING:
     from loguru._handler import Handler  # type: ignore
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
+# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
+log = logger.bind(auditable=False)
+
 # According to https://ai.google.dev/gemini-api/docs/models
 ALLOWED_GROUNDING_MODELS = {
     "gemini-3-pro-image-preview",
@@ -94,9 +97,6 @@ ALLOWED_CODE_EXECUTION_MODELS = {
 # Default timeout for URL resolution
 # TODO: Move to Pipe.Valves.
 DEFAULT_URL_TIMEOUT = aiohttp.ClientTimeout(total=10)  # 10 seconds total timeout
-
-# Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
-log = logger.bind(auditable=False)
 
 
 class Filter:
@@ -179,6 +179,35 @@ class Filter:
         if metadata_features is None:
             metadata_features = cast(Features, {})
             metadata["features"] = metadata_features
+
+        # Copy custom chat control parameters into metadata. This preserves them
+        # from being overwritten by model-level parameters, which OWUI merges
+        # before the request reaches the pipe. The pipe can then prioritize
+        # chat-specific settings over model-wide defaults.
+        chat_control_params: dict[str, Any] = {}
+        # Standard OWUI body keys. Any others are treated as custom chat parameters.
+        known_body_keys = {
+            "stream",
+            "model",
+            "messages",
+            "files",
+            "features",
+            "metadata",
+            "options",
+            "stream_options",
+        }
+
+        custom_param_keys: list[str] = []
+        for key in body.keys():
+            if key not in known_body_keys:
+                custom_param_keys.append(key)
+                chat_control_params[key] = body[key]
+
+        if custom_param_keys:
+            log.debug(
+                f"Found and preserved custom chat control parameters: {custom_param_keys}"
+            )
+        metadata["chat_control_params"] = chat_control_params
 
         # Add the companion version to the payload for the pipe to consume.
         metadata_features["gemini_manifold_companion_version"] = VERSION
