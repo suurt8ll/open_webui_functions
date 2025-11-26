@@ -1708,8 +1708,8 @@ class Pipe:
         )
         MODEL_CONFIG_PATH: str = Field(
             default=DEFAULT_MODEL_CONFIG_PATH,
-            description=f"""Path or URL to the YAML file containing model definitions.
-            Can be a local absolute path, a path relative to the plugin directory, or a public URL.
+            description=f"""URL to the YAML file containing model definitions.
+            Must be a publicly accessible URL (http:// or https://).
             Default value is '{DEFAULT_MODEL_CONFIG_PATH}'.""",
         )
         # FIXME: remove, toggle filter handles this now
@@ -2495,32 +2495,17 @@ class Pipe:
     @staticmethod
     @cache
     def _load_model_config(config_path: str) -> dict:
-        """Loads the model configuration from a local file or URL."""
+        """Loads the model configuration from a URL."""
         if not config_path:
             return {}
 
         try:
-            if config_path.startswith("http://") or config_path.startswith("https://"):
-                with urllib.request.urlopen(config_path) as response:
-                    return yaml.safe_load(response.read())
-            else:
-                # Try absolute path or relative to CWD
-                if os.path.exists(config_path):
-                    with open(config_path, "r") as f:
-                        return yaml.safe_load(f)
-
-                # Try relative to the plugin file directory
-                try:
-                    current_dir = os.path.dirname(os.path.abspath(__file__))
-                    local_path = os.path.join(current_dir, config_path)
-                    if os.path.exists(local_path):
-                        with open(local_path, "r") as f:
-                            return yaml.safe_load(f)
-                except NameError:
-                    pass
-
-                log.warning(f"Model config file not found at {config_path}")
+            if not (config_path.startswith("http://") or config_path.startswith("https://")):
+                log.error(f"MODEL_CONFIG_PATH must be a URL (http:// or https://), got: {config_path}")
                 return {}
+            
+            with urllib.request.urlopen(config_path) as response:
+                return yaml.safe_load(response.read())
         except Exception as e:
             log.error(f"Failed to load model config from {config_path}: {e}")
             return {}
