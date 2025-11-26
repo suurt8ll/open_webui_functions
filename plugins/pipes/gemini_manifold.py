@@ -825,8 +825,8 @@ class GeminiContentBuilder:
         if chat := Chats.get_chat_by_id_and_user_id(
             id=chat_id, user_id=user_data["id"]
         ):
-            log.trace("Full chat data retrieved from database.", payload=chat)
             chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
+            log.trace("Fetched messages from database:", payload=chat_content.get("messages"))
             # Last message is the upcoming assistant response, at this point in the logic it's empty.
             messages_db = chat_content.get("messages", [])[:-1]
         else:
@@ -1037,9 +1037,12 @@ class GeminiContentBuilder:
                         f"Could not retrieve content for file_id '{file_id}' from assistant history."
                     )
 
+                # Force raw bytes (inline_data) to preserve exact history context for the model.
+                # This ensures we don't convert original inline images into Files API references.
                 rehydrated_part = await self._create_genai_part_from_file_data(
-                    file_bytes, mime_type, file_id, status_queue
+                    file_bytes, mime_type, file_id, status_queue, force_raw=True
                 )
+                part.inline_data = rehydrated_part.inline_data
                 part.file_data = rehydrated_part.file_data
                 rehydrated_parts.append(part)
             else:
@@ -1118,54 +1121,63 @@ class GeminiContentBuilder:
         log.debug(f"Processing assistant message {i} content as plain text.")
         return await self._genai_parts_from_text(current_content, status_queue)
 
-    async def _create_genai_part_from_file_data(
-        self,
-        file_bytes: bytes,
-        mime_type: str,
-        owui_file_id: str | None,
-        status_queue: asyncio.Queue,
-    ) -> types.Part:
-        """
-        Creates a `types.Part` from file bytes, deciding whether to use the
-        Google Files API or send raw bytes based on configuration and context.
-        """
-        # TODO: The Files API is strict about MIME types (e.g., text/plain,
-        # application/pdf). In the future, inspect the content of files
-        # with unsupported text-like MIME types (e.g., 'application/json',
-        # 'text/markdown'). If the content is detected as plaintext,
-        # override the `mime_type` variable to 'text/plain' to allow the upload.
+    async def _genai_parts_from_text(
+        self, text: str, status_queue: asyncio.Queue
+    ) -> list[types.Part]:
+        if not text:
+            return []
 
-        # Determine whether to use the Files API based on the specified conditions.
-        use_files_api = True
-        reason = ""
+        text = self._enable_special_tags(text)
+        parts: list[types.Part] = []
+        last_pos = 0
 
-        if not self.valves.USE_FILES_API:
-            reason = "disabled by user setting (USE_FILES_API=False)"
-            use_files_api = False
-        elif self.vertexai:
-            reason = "the active client is configured for Vertex AI, which does not support the Files API"
-            use_files_api = False
-        elif self.is_temp_chat:
-            reason = "temporary chat mode is active"
-            use_files_api = False
-
-        if use_files_api:
-            log.info("Using Google Files API for resource.")
-            gemini_file = await self.files_api_manager.get_or_upload_file(
-                file_bytes=file_bytes,
-                mime_type=mime_type,
-                owui_file_id=owui_file_id,
-                status_queue=status_queue,
-            )
-            return types.Part(
-                file_data=types.FileData(
-                    file_uri=gemini_file.uri,
-                    mime_type=gemini_file.mime_type,
-                )
-            )
+        # Conditionally build a regex to find media links.
+        # If YouTube parsing is disabled, the regex will only find markdown image links,
+        # leaving YouTube URLs to be treated as plain text.
+        markdown_part = r"!\[.*?\]\(([^)]+)\)"  # Group 1: Markdown URI
+        youtube_part = r"(https?://(?:(?:www|music)\.)?youtube\.com/(?:watch\?v=|shorts/|live/)[^\s)]+|https?://youtu\.be/[^\s)]+)"  # Group 2: YouTube URL
+        if self.valves.PARSE_YOUTUBE_URLS:
+            pattern = re.compile(f"{markdown_part}|{youtube_part}")
+            process_youtube = True
         else:
-            log.info(f"Sending raw bytes because {reason}.")
-            return types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+            pattern = re.compile(markdown_part)
+            process_youtube = False
+            log.info(
+                "YouTube URL parsing is disabled. URLs will be treated as plain text."
+            )
+
+        for match in pattern.finditer(text):
+            # Add the text segment that precedes the media link
+            if text_segment := text[last_pos : match.start()].strip():
+                parts.append(types.Part.from_text(text=text_segment))
+
+            # The URI is in group 1 for markdown, or group 2 for YouTube.
+            if process_youtube:
+                uri = match.group(1) or match.group(2)
+            else:
+                uri = match.group(1)
+
+            if not uri:
+                log.warning(
+                    f"Found unsupported URI format in text: {match.group(0)}. Skipping."
+                )
+                continue
+
+            # Delegate all URI processing to the unified helper
+            if media_part := await self._genai_part_from_uri(uri, status_queue):
+                parts.append(media_part)
+
+            last_pos = match.end()
+
+        # Add any remaining text after the last media link
+        if remaining_text := text[last_pos:].strip():
+            parts.append(types.Part.from_text(text=remaining_text))
+
+        # If no media links were found, the whole text is a single part
+        if not parts and text.strip():
+            parts.append(types.Part.from_text(text=text.strip()))
+
+        return parts
 
     async def _genai_part_from_uri(
         self, uri: str, status_queue: asyncio.Queue
@@ -1226,6 +1238,59 @@ class GeminiContentBuilder:
         except Exception:
             log.exception(f"Error processing URI: {uri[:64]}[...]")
             return None
+
+    async def _create_genai_part_from_file_data(
+        self,
+        file_bytes: bytes,
+        mime_type: str,
+        owui_file_id: str | None,
+        status_queue: asyncio.Queue,
+        force_raw: bool = False,
+    ) -> types.Part:
+        """
+        Creates a `types.Part` from file bytes, deciding whether to use the
+        Google Files API or send raw bytes based on configuration and context.
+        """
+        # TODO: The Files API is strict about MIME types (e.g., text/plain,
+        # application/pdf). In the future, inspect the content of files
+        # with unsupported text-like MIME types (e.g., 'application/json',
+        # 'text/markdown'). If the content is detected as plaintext,
+        # override the `mime_type` variable to 'text/plain' to allow the upload.
+
+        # Determine whether to use the Files API based on the specified conditions.
+        use_files_api = True
+        reason = ""
+
+        if force_raw:
+            reason = "raw bytes are forced (e.g. for assistant history reconstruction)"
+            use_files_api = False
+        elif not self.valves.USE_FILES_API:
+            reason = "disabled by user setting (USE_FILES_API=False)"
+            use_files_api = False
+        elif self.vertexai:
+            reason = "the active client is configured for Vertex AI, which does not support the Files API"
+            use_files_api = False
+        elif self.is_temp_chat:
+            reason = "temporary chat mode is active"
+            use_files_api = False
+
+        if use_files_api:
+            log.info("Using Google Files API for resource.")
+            gemini_file = await self.files_api_manager.get_or_upload_file(
+                file_bytes=file_bytes,
+                mime_type=mime_type,
+                owui_file_id=owui_file_id,
+                status_queue=status_queue,
+            )
+            return types.Part(
+                file_data=types.FileData(
+                    file_uri=gemini_file.uri,
+                    mime_type=gemini_file.mime_type,
+                )
+            )
+        else:
+            log.info(f"Sending raw bytes because {reason}.")
+            return types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
 
     def _genai_part_from_youtube_uri(self, uri: str) -> types.Part | None:
         """Creates a Gemini Part from a YouTube URL, with optional video metadata.
@@ -1399,64 +1464,6 @@ class GeminiContentBuilder:
             log.debug(f"Re-enabled {count} special tag(s) for model context.")
 
         return restored_text
-
-    async def _genai_parts_from_text(
-        self, text: str, status_queue: asyncio.Queue
-    ) -> list[types.Part]:
-        if not text:
-            return []
-
-        text = self._enable_special_tags(text)
-        parts: list[types.Part] = []
-        last_pos = 0
-
-        # Conditionally build a regex to find media links.
-        # If YouTube parsing is disabled, the regex will only find markdown image links,
-        # leaving YouTube URLs to be treated as plain text.
-        markdown_part = r"!\[.*?\]\(([^)]+)\)"  # Group 1: Markdown URI
-        youtube_part = r"(https?://(?:(?:www|music)\.)?youtube\.com/(?:watch\?v=|shorts/|live/)[^\s)]+|https?://youtu\.be/[^\s)]+)"  # Group 2: YouTube URL
-        if self.valves.PARSE_YOUTUBE_URLS:
-            pattern = re.compile(f"{markdown_part}|{youtube_part}")
-            process_youtube = True
-        else:
-            pattern = re.compile(markdown_part)
-            process_youtube = False
-            log.info(
-                "YouTube URL parsing is disabled. URLs will be treated as plain text."
-            )
-
-        for match in pattern.finditer(text):
-            # Add the text segment that precedes the media link
-            if text_segment := text[last_pos : match.start()].strip():
-                parts.append(types.Part.from_text(text=text_segment))
-
-            # The URI is in group 1 for markdown, or group 2 for YouTube.
-            if process_youtube:
-                uri = match.group(1) or match.group(2)
-            else:
-                uri = match.group(1)
-
-            if not uri:
-                log.warning(
-                    f"Found unsupported URI format in text: {match.group(0)}. Skipping."
-                )
-                continue
-
-            # Delegate all URI processing to the unified helper
-            if media_part := await self._genai_part_from_uri(uri, status_queue):
-                parts.append(media_part)
-
-            last_pos = match.end()
-
-        # Add any remaining text after the last media link
-        if remaining_text := text[last_pos:].strip():
-            parts.append(types.Part.from_text(text=remaining_text))
-
-        # If no media links were found, the whole text is a single part
-        if not parts and text.strip():
-            parts.append(types.Part.from_text(text=text.strip()))
-
-        return parts
 
     @staticmethod
     async def _get_file_data(file_id: str) -> tuple[bytes | None, str | None]:
@@ -2694,7 +2701,9 @@ class Pipe:
 
         try:
             async for chunk in response_stream:
-                log.trace(f"Processing response chunk #{chunk_counter}:", payload=chunk)
+                candidate = self._get_first_candidate(chunk.candidates)
+                content = candidate.content if candidate else None
+                log.trace(f"Processing response chunk #{chunk_counter}, first candidate's content:", payload=content)
                 chunk_counter += 1
                 final_response_chunk = chunk  # Keep the latest chunk for metadata
 
@@ -2827,6 +2836,7 @@ class Pipe:
                     "response_parts",
                     response_parts,
                 )
+                log.trace("Stored response parts in state for Filter.outlet.", payload=response_parts)
 
             if not error_occurred and content_parts_text:
                 original_content = "".join(content_parts_text)
