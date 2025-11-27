@@ -6,16 +6,15 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 2.0.0-alpha1
+version: 2.0.0-alpha2
 requirements: google-genai==1.49.0
 """
 
-VERSION = "2.0.0-alpha1"
+VERSION = "2.0.0-alpha2"
 # This is the recommended version for the companion filter.
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
-RECOMMENDED_COMPANION_VERSION = "1.7.0"
-DEFAULT_MODEL_CONFIG_PATH = "https://raw.githubusercontent.com/torgal-dog/open_webui_functions/refs/heads/feature/model-to-yaml/plugins/pipes/gemini_models.yaml"
+RECOMMENDED_COMPANION_VERSION = "2.0.0-alpha2"
 
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
@@ -1706,12 +1705,6 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is True.""",
         )
-        MODEL_CONFIG_PATH: str = Field(
-            default=DEFAULT_MODEL_CONFIG_PATH,
-            description=f"""URL to the YAML file containing model definitions.
-            Must be a publicly accessible URL (http:// or https://).
-            Default value is '{DEFAULT_MODEL_CONFIG_PATH}'.""",
-        )
         # FIXME: remove, toggle filter handles this now
         ENABLE_URL_CONTEXT_TOOL: bool = Field(
             default=False,
@@ -1849,11 +1842,6 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is None.""",
         )
-        MODEL_CONFIG_PATH: str | None = Field(
-            default=None,
-            description="""Path or URL to the YAML file containing model definitions.
-            Default value is None.""",
-        )
         ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
             default=None,
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
@@ -1969,6 +1957,17 @@ class Pipe:
         # Apply UI toggle overrides (Paid API & Vertex AI)
         valves = self._apply_toggle_configurations(valves, __metadata__)
 
+        # Retrieve model configuration from app state (loaded by companion filter)
+        model_config = __request__.app.state._state.get("gemini_model_config")
+        if model_config is None:
+            error_msg = (
+                "FATAL: Model configuration not found in app state. "
+                "Please ensure the Gemini Manifold Companion filter is installed and enabled."
+            )
+            log.error(error_msg)
+            raise ValueError(error_msg)
+        log.debug(f"Retrieved model config from app state with {len(model_config)} model(s).")
+
         log.debug(
             f"USE_VERTEX_AI: {valves.USE_VERTEX_AI}, VERTEX_PROJECT set: {bool(valves.VERTEX_PROJECT)},"
             f" GEMINI_FREE_API_KEY set: {bool(valves.GEMINI_FREE_API_KEY)}, GEMINI_PAID_API_KEY set: {bool(valves.GEMINI_PAID_API_KEY)}"
@@ -2025,12 +2024,12 @@ class Pipe:
         asyncio.create_task(event_emitter.emit_status("Preparing request..."))
         contents = await builder.build_contents()
 
-        gen_content_conf = self._build_gen_content_config(body, __metadata__, valves)
+        gen_content_conf = self._build_gen_content_config(body, __metadata__, valves, model_config)
         gen_content_conf.system_instruction = builder.system_prompt
 
         # Some models (e.g., image generation, Gemma) do not support the system prompt message.
         model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
-        is_image_model = self._is_image_model(model_name, valves)
+        is_image_model = self._is_image_model(model_name, model_config)
         system_prompt_unsupported = is_image_model or "gemma" in model_name
         if system_prompt_unsupported:
             # TODO: append to user message instead.
@@ -2492,27 +2491,13 @@ class Pipe:
         stripped = re.sub(r"^(?:.*/|[^.]*\.)", "", model_name)
         return stripped
 
-    @staticmethod
-    @cache
-    def _load_model_config(config_path: str) -> dict:
-        """Loads the model configuration from a URL."""
-        if not config_path:
-            return {}
+    # endregion 2.2 Model retrival from Google API
 
-        try:
-            if not (config_path.startswith("http://") or config_path.startswith("https://")):
-                log.error(f"MODEL_CONFIG_PATH must be a URL (http:// or https://), got: {config_path}")
-                return {}
-            
-            with urllib.request.urlopen(config_path) as response:
-                return yaml.safe_load(response.read())
-        except Exception as e:
-            log.error(f"Failed to load model config from {config_path}: {e}")
-            return {}
+    # region 2.3 Model capabilities
 
     @classmethod
-    def _is_image_model(cls, model_name: str, valves: "Valves") -> bool:
-        config = cls._load_model_config(valves.MODEL_CONFIG_PATH)
+    def _is_image_model(cls, model_name: str, config: dict) -> bool:
+        """Check if the model is an image generation model using provided config."""
         model_id = cls.strip_prefix(model_name)
         
         if model_id in config:
@@ -2529,6 +2514,7 @@ class Pipe:
         body: "Body",
         __metadata__: "Metadata",
         valves: "Valves",
+        config: dict,
     ) -> types.GenerateContentConfig:
         """Assembles the GenerateContentConfig for a Gemini API request."""
         model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
@@ -2545,7 +2531,6 @@ class Pipe:
         )
 
         thinking_conf = None
-        config = self._load_model_config(valves.MODEL_CONFIG_PATH)
         model_id = self.strip_prefix(model_name)
         is_thinking_model = False
         if model_id in config:
@@ -2590,7 +2575,7 @@ class Pipe:
         )
 
         gen_content_conf.response_modalities = ["TEXT"]
-        if self._is_image_model(model_name, valves):
+        if self._is_image_model(model_name, config):
             gen_content_conf.response_modalities.append("IMAGE")
 
         gen_content_conf.tools = []
@@ -3717,9 +3702,9 @@ class Pipe:
         if companion_version is None:
             log.warning(
                 "Gemini Manifold Companion filter not detected. "
-                "While this pipe can function without it, you are missing out on key features like native Google Search, "
-                "Code Execution, and direct document uploads. Please install the companion filter or ensure it is active "
-                "for this model to unlock the full functionality."
+                "Since v2.0.0, this pipe requires the companion filter to be installed and active. "
+                "Please install the companion filter or ensure it is active "
+                "for this model (or activate it globally)."
             )
         else:
             # Comparing tuples of integers is a robust way to handle versions like '1.10.0' vs '1.2.0'.
