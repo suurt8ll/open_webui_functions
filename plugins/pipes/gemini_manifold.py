@@ -6,15 +6,15 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.26.0
+version: 2.0.0-alpha3
 requirements: google-genai==1.49.0
 """
 
-VERSION = "1.26.0"
+VERSION = "2.0.0-alpha3"
 # This is the recommended version for the companion filter.
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
-RECOMMENDED_COMPANION_VERSION = "1.7.0"
+RECOMMENDED_COMPANION_VERSION = "2.0.0-alpha2"
 
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
@@ -37,6 +37,9 @@ from urllib.parse import urlparse, parse_qs
 import xxhash
 import asyncio
 import aiofiles
+import yaml
+import urllib.request
+import os
 from aiocache import cached
 from aiocache.base import BaseCache
 from aiocache.serializers import NullSerializer
@@ -82,23 +85,6 @@ if TYPE_CHECKING:
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
 
-# FIXME: remove
-COMPATIBLE_MODELS_FOR_URL_CONTEXT: Final = [
-    "gemini-2.5-pro",
-    "gemini-flash-latest",
-    "gemini-2.5-flash-preview-09-2025",
-    "gemini-2.5-flash",
-    "gemini-flash-lite-latest",
-    "gemini-2.5-flash-lite-preview-09-2025",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash-lite-preview-06-17",
-    "gemini-2.5-pro-preview-06-05",
-    "gemini-2.5-pro-preview-05-06",
-    "gemini-2.5-flash-preview-05-20",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-001",
-    "gemini-2.0-flash-live-001",
-]
 
 # A mapping of finish reason names (str) to human-readable descriptions.
 # This allows handling of reasons that may not be defined in the current SDK version.
@@ -1702,16 +1688,6 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is True.""",
         )
-        THINKING_MODEL_PATTERN: str = Field(
-            default=r"^(?!.*live)(?=.*gemini-(?:3|2\.5|flash(?:-lite)?-latest))(?=.*gemini-3|(?!.*image))",
-            description="""Regex pattern to identify thinking models.
-            Default value is r"^(?!.*live)(?=.*gemini-(?:3|2\.5|flash(?:-lite)?-latest))(?=.*gemini-3|(?!.*image))".""",
-        )
-        IMAGE_MODEL_PATTERN: str = Field(
-            default=r"image",
-            description="""Regex pattern to identify image generation models.
-            Default value is r"image".""",
-        )
         # FIXME: remove, toggle filter handles this now
         ENABLE_URL_CONTEXT_TOOL: bool = Field(
             default=False,
@@ -1849,11 +1825,6 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is None.""",
         )
-        THINKING_MODEL_PATTERN: str | None = Field(
-            default=None,
-            description="""Regex pattern to identify thinking models.
-            Default value is None.""",
-        )
         ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
             default=None,
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
@@ -1969,6 +1940,17 @@ class Pipe:
         # Apply UI toggle overrides (Paid API & Vertex AI)
         valves = self._apply_toggle_configurations(valves, __metadata__)
 
+        # Retrieve model configuration from app state (loaded by companion filter)
+        model_config = __request__.app.state._state.get("gemini_model_config")
+        if model_config is None:
+            error_msg = (
+                "FATAL: Model configuration not found in app state. "
+                "Please ensure the Gemini Manifold Companion filter is installed and enabled."
+            )
+            log.error(error_msg)
+            raise ValueError(error_msg)
+        log.debug(f"Retrieved model config from app state with {len(model_config)} model(s).")
+
         log.debug(
             f"USE_VERTEX_AI: {valves.USE_VERTEX_AI}, VERTEX_PROJECT set: {bool(valves.VERTEX_PROJECT)},"
             f" GEMINI_FREE_API_KEY set: {bool(valves.GEMINI_FREE_API_KEY)}, GEMINI_PAID_API_KEY set: {bool(valves.GEMINI_PAID_API_KEY)}"
@@ -2025,12 +2007,12 @@ class Pipe:
         asyncio.create_task(event_emitter.emit_status("Preparing request..."))
         contents = await builder.build_contents()
 
-        gen_content_conf = self._build_gen_content_config(body, __metadata__, valves)
+        gen_content_conf = self._build_gen_content_config(body, __metadata__, valves, model_config)
         gen_content_conf.system_instruction = builder.system_prompt
 
         # Some models (e.g., image generation, Gemma) do not support the system prompt message.
         model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
-        is_image_model = self._is_image_model(model_name, valves.IMAGE_MODEL_PATTERN)
+        is_image_model = self._is_image_model(model_name, model_config)
         system_prompt_unsupported = is_image_model or "gemma" in model_name
         if system_prompt_unsupported:
             # TODO: append to user message instead.
@@ -2492,9 +2474,19 @@ class Pipe:
         stripped = re.sub(r"^(?:.*/|[^.]*\.)", "", model_name)
         return stripped
 
-    @staticmethod
-    def _is_image_model(model_name: str, pattern: str) -> bool:
-        return bool(re.search(pattern, model_name, re.IGNORECASE))
+    # endregion 2.2 Model retrival from Google API
+
+    # region 2.3 Model capabilities
+
+    @classmethod
+    def _is_image_model(cls, model_name: str, config: dict) -> bool:
+        """Check if the model is an image generation model using provided config."""
+        model_id = cls.strip_prefix(model_name)
+        
+        if model_id in config:
+            return config[model_id].get("capabilities", {}).get("image_generation", False)
+            
+        return False
 
     # endregion 2.2 Model retrival from Google API
 
@@ -2505,6 +2497,7 @@ class Pipe:
         body: "Body",
         __metadata__: "Metadata",
         valves: "Valves",
+        config: dict,
     ) -> types.GenerateContentConfig:
         """Assembles the GenerateContentConfig for a Gemini API request."""
         model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
@@ -2521,13 +2514,13 @@ class Pipe:
         )
 
         thinking_conf = None
-        # Use the user-configurable regex to determine if this is a thinking model.
-        is_thinking_model = re.search(
-            valves.THINKING_MODEL_PATTERN, model_name, re.IGNORECASE
-        )
+        model_id = self.strip_prefix(model_name)
+        is_thinking_model = False
+        if model_id in config:
+             is_thinking_model = config[model_id].get("capabilities", {}).get("thinking", False)
+
         log.debug(
             f"Model '{model_name}' is classified as a reasoning model: {bool(is_thinking_model)}. "
-            f"Pattern: '{valves.THINKING_MODEL_PATTERN}'"
         )
 
         if is_thinking_model:
@@ -2565,7 +2558,7 @@ class Pipe:
         )
 
         gen_content_conf.response_modalities = ["TEXT"]
-        if self._is_image_model(model_name, valves.IMAGE_MODEL_PATTERN):
+        if self._is_image_model(model_name, config):
             gen_content_conf.response_modalities.append("IMAGE")
 
         gen_content_conf.tools = []
@@ -2608,7 +2601,12 @@ class Pipe:
             enable_url_context = is_on
 
         if enable_url_context:
-            if model_name in COMPATIBLE_MODELS_FOR_URL_CONTEXT:
+            # Check capability from config
+            is_compatible = False
+            if model_id in config:
+                is_compatible = config[model_id].get("capabilities", {}).get("url_context", False)
+
+            if is_compatible:
                 if is_vertex_ai and (len(gen_content_conf.tools) > 0):
                     log.warning(
                         "URL context tool is enabled, but Vertex AI is used with other tools. Skipping."
@@ -2622,7 +2620,7 @@ class Pipe:
                     )
             else:
                 log.warning(
-                    f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
+                    f"URL context tool is enabled, but model {model_name} does not support it (see capabilities.url_context in gemini_models.yaml). Skipping."
                 )
 
         # Determine if Google Maps grounding should be enabled.
@@ -3692,9 +3690,9 @@ class Pipe:
         if companion_version is None:
             log.warning(
                 "Gemini Manifold Companion filter not detected. "
-                "While this pipe can function without it, you are missing out on key features like native Google Search, "
-                "Code Execution, and direct document uploads. Please install the companion filter or ensure it is active "
-                "for this model to unlock the full functionality."
+                "Since v2.0.0, this pipe requires the companion filter to be installed and active. "
+                "Please install the companion filter or ensure it is active "
+                "for this model (or activate it globally)."
             )
         else:
             # Comparing tuples of integers is a robust way to handle versions like '1.10.0' vs '1.2.0'.
