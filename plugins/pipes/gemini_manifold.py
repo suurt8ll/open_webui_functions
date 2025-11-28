@@ -6,11 +6,11 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 2.0.0-alpha2
+version: 2.0.0-alpha3
 requirements: google-genai==1.49.0
 """
 
-VERSION = "2.0.0-alpha2"
+VERSION = "2.0.0-alpha3"
 # This is the recommended version for the companion filter.
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
@@ -85,23 +85,6 @@ if TYPE_CHECKING:
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
 
-# FIXME: remove
-COMPATIBLE_MODELS_FOR_URL_CONTEXT: Final = [
-    "gemini-2.5-pro",
-    "gemini-flash-latest",
-    "gemini-2.5-flash-preview-09-2025",
-    "gemini-2.5-flash",
-    "gemini-flash-lite-latest",
-    "gemini-2.5-flash-lite-preview-09-2025",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash-lite-preview-06-17",
-    "gemini-2.5-pro-preview-06-05",
-    "gemini-2.5-pro-preview-05-06",
-    "gemini-2.5-flash-preview-05-20",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-001",
-    "gemini-2.0-flash-live-001",
-]
 
 # A mapping of finish reason names (str) to human-readable descriptions.
 # This allows handling of reasons that may not be defined in the current SDK version.
@@ -2618,7 +2601,12 @@ class Pipe:
             enable_url_context = is_on
 
         if enable_url_context:
-            if model_name in COMPATIBLE_MODELS_FOR_URL_CONTEXT:
+            # Check capability from config
+            is_compatible = False
+            if model_id in config:
+                is_compatible = config[model_id].get("capabilities", {}).get("url_context", False)
+
+            if is_compatible:
                 if is_vertex_ai and (len(gen_content_conf.tools) > 0):
                     log.warning(
                         "URL context tool is enabled, but Vertex AI is used with other tools. Skipping."
@@ -2632,7 +2620,7 @@ class Pipe:
                     )
             else:
                 log.warning(
-                    f"URL context tool is enabled, but model {model_name} is not in the compatible list. Skipping."
+                    f"URL context tool is enabled, but model {model_name} does not support it (see capabilities.url_context in gemini_models.yaml). Skipping."
                 )
 
         # Determine if Google Maps grounding should be enabled.
