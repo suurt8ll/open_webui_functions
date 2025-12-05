@@ -101,7 +101,7 @@ class Filter:
         log.success("Function has been initialized.")
         log.trace("Full self object:", payload=self.__dict__)
 
-    def inlet(self, body: "Body", __request__: Request, __metadata__: dict[str, Any]) -> "Body":
+    def inlet(self, body: "Body", __request__: Request, __metadata__: "Metadata") -> "Body":
         """Modifies the incoming request payload before it's sent to the LLM. Operates on the `form_data` dictionary."""
 
         # Load and store model configuration in app state
@@ -123,6 +123,12 @@ class Filter:
         )
 
         canonical_model_name, is_manifold = self._get_model_name(body)
+
+        # Store the canonical model ID in metadata so the pipe doesn't need to re-parse it.
+        # This centralizes parsing logic and avoids repetition/inconsistency.
+        if is_manifold:
+            __metadata__["canonical_model_id"] = canonical_model_name
+
         # Exit early if we are filtering an unsupported model.
         if not is_manifold:
             log.debug(
@@ -770,7 +776,7 @@ class Filter:
             if not (config_path.startswith("http://") or config_path.startswith("https://")):
                 log.error(f"MODEL_CONFIG_PATH must be a URL (http:// or https://), got: {config_path}")
                 return {}
-            
+
             log.debug(f"Loading model configuration from: {config_path}")
             with urllib.request.urlopen(config_path) as response:
                 config = yaml.safe_load(response.read())
@@ -785,29 +791,26 @@ class Filter:
     # region 1.5 Model capability checks
 
     @staticmethod
-    def _check_model_capability(model_name: str, config: dict, capability: str) -> bool:
+    def _check_model_capability(model_id: str, config: dict, capability: str) -> bool:
         """Check if a model supports a specific capability based on YAML config.
         
         Args:
-            model_name: The model name (may include prefix like "models/")
+            model_id: The canonical model id (without prefixes)
             config: The loaded YAML configuration dict
             capability: The capability to check (e.g., "search_grounding", "code_execution")
             
         Returns:
             True if the model supports the capability, False otherwise
         """
-        # Strip prefix from model name (e.g., "models/gemini-2.5-pro" -> "gemini-2.5-pro")
-        import re
-        model_id = re.sub(r"^(?:.*/|[^.]*\.)", "", model_name)
-        
+        print(model_id)
         if model_id not in config:
             log.debug(f"Model '{model_id}' not found in config, capability '{capability}' check returns False.")
             return False
-        
+
         model_config = config[model_id]
         capabilities = model_config.get("capabilities", {})
         result = capabilities.get(capability, False)
-        
+
         log.debug(f"Model '{model_id}' capability '{capability}' check: {result}")
         return result
 

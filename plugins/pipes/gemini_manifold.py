@@ -2007,23 +2007,35 @@ class Pipe:
         asyncio.create_task(event_emitter.emit_status("Preparing request..."))
         contents = await builder.build_contents()
 
-        gen_content_conf = self._build_gen_content_config(body, __metadata__, valves, model_config)
+        # Retrieve the canonical model ID parsed by the companion filter.
+        # This is expected to be a clean ID (no "gemini_manifold..." prefix, no "models/" prefix).
+        model_id = __metadata__.get("canonical_model_id")
+        if not model_id:
+            error_msg = (
+                "FATAL: 'canonical_model_id' not found in metadata. "
+                "The Gemini Manifold Companion filter is required and must be active to parse the model ID."
+            )
+            log.error(error_msg)
+            raise ValueError(error_msg)
+
+        gen_content_conf = self._build_gen_content_config(
+            body, __metadata__, valves, model_config
+        )
         gen_content_conf.system_instruction = builder.system_prompt
 
-        # Some models (e.g., image generation, Gemma) do not support the system prompt message.
-        model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
-        is_image_model = self._is_image_model(model_name, model_config)
-        system_prompt_unsupported = is_image_model or "gemma" in model_name
+        # Check for image generation capabilities using the clean ID.
+        is_image_model = self._is_image_model(model_id, model_config)
+        system_prompt_unsupported = is_image_model or "gemma" in model_id
         if system_prompt_unsupported:
             # TODO: append to user message instead.
             if gen_content_conf.system_instruction:
                 gen_content_conf.system_instruction = None
                 log.warning(
-                    f"Model '{model_name}' does not support the system prompt message! Removing the system prompt."
+                    f"Model '{model_id}' does not support the system prompt message! Removing the system prompt."
                 )
 
         gen_content_args = {
-            "model": model_name,
+            "model": model_id,
             "contents": contents,
             "config": gen_content_conf,
         }
@@ -2056,7 +2068,7 @@ class Pipe:
             return self._unified_response_processor(
                 response_stream,
                 __request__.app,
-                model_name,
+                model_id,
                 event_emitter,
                 __user__["id"],
                 chat_id,
@@ -2082,7 +2094,7 @@ class Pipe:
             return self._unified_response_processor(
                 single_item_stream(res),
                 __request__.app,
-                model_name,
+                model_id,
                 event_emitter,
                 __user__["id"],
                 chat_id,
@@ -2265,7 +2277,7 @@ class Pipe:
 
             for model in gemini_models_list:
                 if model.name:
-                    model_id = Pipe.strip_prefix(model.name)
+                    model_id = self._strip_api_prefix(model.name)
                     if model_id and model_id not in combined_models_dict:
                         combined_models_dict[model_id] = model
                 else:
@@ -2275,7 +2287,7 @@ class Pipe:
 
             for model in vertex_models_list:
                 if model.name:
-                    model_id = Pipe.strip_prefix(model.name)
+                    model_id = self._strip_api_prefix(model.name)
                     if model_id:
                         if model_id not in combined_models_dict:
                             combined_models_dict[model_id] = model
@@ -2372,7 +2384,7 @@ class Pipe:
                 generative_models.append(model)
             else:
                 log.trace(
-                    f"Model '{model.name}' (ID: {Pipe.strip_prefix(model.name)}) skipped, not generative (actions: {actions})."
+                    f"Model '{model.name}' (ID: {self._strip_api_prefix(model.name)}) skipped, not generative (actions: {actions})."
                 )
 
         if not generative_models:
@@ -2394,7 +2406,8 @@ class Pipe:
         filtered_models_data: list["ModelData"] = []
         for model in generative_models:
             # model.name is guaranteed non-None by generative_models filter logic
-            stripped_name = Pipe.strip_prefix(model.name)  # type: ignore
+            assert model.name is not None
+            stripped_name = self._strip_api_prefix(model.name)
 
             if not stripped_name:
                 log.warning(
@@ -2463,29 +2476,22 @@ class Pipe:
         }
 
     @staticmethod
-    def strip_prefix(model_name: str) -> str:
+    def _strip_api_prefix(model_name: str) -> str:
         """
-        Extract the model identifier using regex, handling various naming conventions.
-        e.g., "gemini_manifold_google_genai.gemini-2.5-flash-preview-04-17" -> "gemini-2.5-flash-preview-04-17"
+        Extract the model identifier by removing API resource prefixes.
         e.g., "models/gemini-1.5-flash-001" -> "gemini-1.5-flash-001"
         e.g., "publishers/google/models/gemini-1.5-pro" -> "gemini-1.5-pro"
+        Does NOT handle the manifold pipe prefix (e.g. "gemini_manifold_google_genai.").
         """
-        # Use regex to remove everything up to and including the last '/' or the first '.'
-        stripped = re.sub(r"^(?:.*/|[^.]*\.)", "", model_name)
-        return stripped
+        # Remove everything up to the last '/'
+        return model_name.split("/")[-1]
 
-    # endregion 2.2 Model retrival from Google API
-
-    # region 2.3 Model capabilities
-
-    @classmethod
-    def _is_image_model(cls, model_name: str, config: dict) -> bool:
+    @staticmethod
+    def _is_image_model(model_id: str, config: dict) -> bool:
         """Check if the model is an image generation model using provided config."""
-        model_id = cls.strip_prefix(model_name)
-        
         if model_id in config:
             return config[model_id].get("capabilities", {}).get("image_generation", False)
-            
+
         return False
 
     # endregion 2.2 Model retrival from Google API
@@ -2500,7 +2506,6 @@ class Pipe:
         config: dict,
     ) -> types.GenerateContentConfig:
         """Assembles the GenerateContentConfig for a Gemini API request."""
-        model_name = re.sub(r"^.*?[./]", "", body.get("model", ""))
         features = __metadata__.get("features", {}) or {}
         is_vertex_ai = __metadata__.get("is_vertex_ai", False)
 
@@ -2514,13 +2519,14 @@ class Pipe:
         )
 
         thinking_conf = None
-        model_id = self.strip_prefix(model_name)
+        # We are ensured to have a valid model ID at this point.
+        model_id: str = __metadata__.get("canonical_model_id", "")
         is_thinking_model = False
         if model_id in config:
-             is_thinking_model = config[model_id].get("capabilities", {}).get("thinking", False)
+            is_thinking_model = config[model_id].get("capabilities", {}).get("thinking", False)
 
         log.debug(
-            f"Model '{model_name}' is classified as a reasoning model: {bool(is_thinking_model)}. "
+            f"Model '{model_id}' is classified as a reasoning model: {bool(is_thinking_model)}. "
         )
 
         if is_thinking_model:
@@ -2537,10 +2543,10 @@ class Pipe:
             )
             if is_avail and not is_on:
                 # This toggle is only applicable to flash/lite models, which support a budget of 0.
-                is_reasoning_toggleable = "flash" in model_name or "lite" in model_name
+                is_reasoning_toggleable = "flash" in model_id or "lite" in model_id
                 if is_reasoning_toggleable:
                     log.info(
-                        f"Model '{model_name}' supports disabling reasoning, and it is toggled OFF in the UI. "
+                        f"Model '{model_id}' supports disabling reasoning, and it is toggled OFF in the UI. "
                         "Overwriting `thinking_budget` to 0 to disable reasoning."
                     )
                     thinking_conf.thinking_budget = 0
@@ -2558,7 +2564,7 @@ class Pipe:
         )
 
         gen_content_conf.response_modalities = ["TEXT"]
-        if self._is_image_model(model_name, config):
+        if self._is_image_model(model_id, config):
             gen_content_conf.response_modalities.append("IMAGE")
 
         gen_content_conf.tools = []
@@ -2613,14 +2619,14 @@ class Pipe:
                     )
                 else:
                     log.info(
-                        f"Model {model_name} is compatible with URL context tool. Enabling."
+                        f"Model {model_id} is compatible with URL context tool. Enabling."
                     )
                     gen_content_conf.tools.append(
                         types.Tool(url_context=types.UrlContext())
                     )
             else:
                 log.warning(
-                    f"URL context tool is enabled, but model {model_name} does not support it (see capabilities.url_context in gemini_models.yaml). Skipping."
+                    f"URL context tool is enabled, but model {model_id} does not support it (see capabilities.url_context in gemini_models.yaml). Skipping."
                 )
 
         # Determine if Google Maps grounding should be enabled.
