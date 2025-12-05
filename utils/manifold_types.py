@@ -289,7 +289,7 @@ class Metadata(TypedDict):
     chat_control_params: dict[str, Any]  # Added in `Filter.inlet`
     merged_custom_params: dict[str, Any]  # Added in `Pipe.pipe`
     is_vertex_ai: NotRequired[bool]  # Added in `Pipe.pipe`
-
+    canonical_model_id: NotRequired[str] # Added in `Filter.inlet`
 
 # endregion `__metadata__`
 

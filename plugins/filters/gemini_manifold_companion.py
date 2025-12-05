@@ -16,18 +16,21 @@ VERSION = "1.7.1"
 # pass custom values to "Gemini Manifold google_genai" that signal which feature was enabled and intercepted.
 
 import copy
+import functools
 import json
 from google.genai import types
 
 import sys
 import time
 import asyncio
+import urllib.request
 import aiohttp
 from fastapi import Request
 from fastapi.datastructures import State
 from loguru import logger
 from pydantic import BaseModel, Field
 import pydantic_core
+import yaml
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal, TYPE_CHECKING, cast
 
@@ -41,58 +44,7 @@ if TYPE_CHECKING:
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
 
-# According to https://ai.google.dev/gemini-api/docs/models
-ALLOWED_GROUNDING_MODELS = {
-    "gemini-3-pro-image-preview",
-    "gemini-3-pro-preview",
-    "gemini-2.5-pro",
-    "gemini-flash-latest",
-    "gemini-2.5-flash-preview-09-2025",
-    "gemini-2.5-flash",
-    "gemini-flash-lite-latest",
-    "gemini-2.5-flash-lite-preview-09-2025",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash-lite-preview-06-17",
-    "gemini-2.5-pro-preview-06-05",
-    "gemini-2.5-flash-preview-05-20",
-    "gemini-2.5-pro-preview-05-06",
-    "gemini-2.5-flash-preview-04-17",
-    "gemini-2.5-pro-preview-03-25",
-    "gemini-2.5-pro-exp-03-25",
-    "gemini-2.0-pro-exp",
-    "gemini-2.0-pro-exp-02-05",
-    "gemini-exp-1206",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-exp",
-    "gemini-2.0-flash-001",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash",
-    "gemini-1.0-pro",
-}
-ALLOWED_CODE_EXECUTION_MODELS = {
-    "gemini-3-pro-preview",
-    "gemini-2.5-pro",
-    "gemini-flash-latest",
-    "gemini-2.5-flash-preview-09-2025",
-    "gemini-2.5-flash",
-    "gemini-flash-lite-latest",
-    "gemini-2.5-flash-lite-preview-09-2025",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash-lite-preview-06-17",
-    "gemini-2.5-pro-preview-06-05",
-    "gemini-2.5-flash-preview-05-20",
-    "gemini-2.5-pro-preview-05-06",
-    "gemini-2.5-flash-preview-04-17",
-    "gemini-2.5-pro-preview-03-25",
-    "gemini-2.5-pro-exp-03-25",
-    "gemini-2.0-pro-exp",
-    "gemini-2.0-pro-exp-02-05",
-    "gemini-exp-1206",
-    "gemini-2.0-flash-thinking-exp-01-21",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-exp",
-    "gemini-2.0-flash-001",
-}
+DEFAULT_MODEL_CONFIG_PATH = "https://raw.githubusercontent.com/suurt8ll/open_webui_functions/master/plugins/pipes/gemini_models.yaml"
 
 # Default timeout for URL resolution
 # TODO: Move to Pipe.Valves.
@@ -123,6 +75,12 @@ class Filter:
             description="""Decide if you want ot bypass Open WebUI's RAG and send your documents directly to Google API.
             Default value is True.""",
         )
+        MODEL_CONFIG_PATH: str = Field(
+            default=DEFAULT_MODEL_CONFIG_PATH,
+            description=f"""URL to the YAML file containing model definitions.
+            Must be a publicly accessible URL (http:// or https://).
+            Default value is '{DEFAULT_MODEL_CONFIG_PATH}'.""",
+        )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
@@ -142,8 +100,14 @@ class Filter:
         log.success("Function has been initialized.")
         log.trace("Full self object:", payload=self.__dict__)
 
-    def inlet(self, body: "Body", __metadata__: dict[str, Any]) -> "Body":
+    def inlet(self, body: "Body", __request__: Request, __metadata__: "Metadata") -> "Body":
         """Modifies the incoming request payload before it's sent to the LLM. Operates on the `form_data` dictionary."""
+
+        # Load and store model configuration in app state
+        log.debug("Loading model configuration...")
+        model_config = self._load_model_config(self.valves.MODEL_CONFIG_PATH)
+        __request__.app.state._state["gemini_model_config"] = model_config
+        log.debug(f"Stored model config in app state with {len(model_config)} model(s).")
 
         # Detect log level change inside self.valves
         if self.log_level != self.valves.LOG_LEVEL:
@@ -158,6 +122,12 @@ class Filter:
         )
 
         canonical_model_name, is_manifold = self._get_model_name(body)
+
+        # Store the canonical model ID in metadata so the pipe doesn't need to re-parse it.
+        # This centralizes parsing logic and avoids repetition/inconsistency.
+        if is_manifold:
+            __metadata__["canonical_model_id"] = canonical_model_name
+
         # Exit early if we are filtering an unsupported model.
         if not is_manifold:
             log.debug(
@@ -165,9 +135,13 @@ class Filter:
             )
             return body
 
-        # Check if it's a relevant model (supports either feature)
-        is_grounding_model = canonical_model_name in ALLOWED_GROUNDING_MODELS
-        is_code_exec_model = canonical_model_name in ALLOWED_CODE_EXECUTION_MODELS
+        # Check if the model supports grounding or code execution using YAML config
+        is_grounding_model = self._check_model_capability(
+            canonical_model_name, model_config, "search_grounding"
+        )
+        is_code_exec_model = self._check_model_capability(
+            canonical_model_name, model_config, "code_execution"
+        )
         log.debug(f"{is_grounding_model=}, {is_code_exec_model=}")
 
         features = body.get("features", {})
@@ -812,7 +786,64 @@ class Filter:
 
     # endregion 1.3 Get permissive safety settings
 
-    # region 1.4 Utility helpers
+    # region 1.4 Configuration loading
+
+    @staticmethod
+    @functools.lru_cache(maxsize=1)
+    def _load_model_config(config_path: str) -> dict:
+        """Loads the model configuration from a URL.
+        
+        Uses LRU cache to avoid reloading the same configuration repeatedly.
+        Cache is tied to the config_path argument.
+        """
+        if not config_path:
+            log.warning("MODEL_CONFIG_PATH is empty, returning empty config.")
+            return {}
+
+        try:
+            if not (config_path.startswith("http://") or config_path.startswith("https://")):
+                log.error(f"MODEL_CONFIG_PATH must be a URL (http:// or https://), got: {config_path}")
+                return {}
+
+            log.debug(f"Loading model configuration from: {config_path}")
+            with urllib.request.urlopen(config_path) as response:
+                config = yaml.safe_load(response.read())
+                log.success(f"Successfully loaded model configuration with {len(config)} model(s).")
+                return config
+        except Exception as e:
+            log.error(f"Failed to load model config from {config_path}: {e}")
+            return {}
+
+    # endregion 1.4 Configuration loading
+
+    # region 1.5 Model capability checks
+
+    @staticmethod
+    def _check_model_capability(model_id: str, config: dict, capability: str) -> bool:
+        """Check if a model supports a specific capability based on YAML config.
+        
+        Args:
+            model_id: The canonical model id (without prefixes)
+            config: The loaded YAML configuration dict
+            capability: The capability to check (e.g., "search_grounding", "code_execution")
+            
+        Returns:
+            True if the model supports the capability, False otherwise
+        """
+        if model_id not in config:
+            log.debug(f"Model '{model_id}' not found in config, capability '{capability}' check returns False.")
+            return False
+
+        model_config = config[model_id]
+        capabilities = model_config.get("capabilities", {})
+        result = capabilities.get(capability, False)
+
+        log.debug(f"Model '{model_id}' capability '{capability}' check: {result}")
+        return result
+
+    # endregion 1.5 Model capability checks
+
+    # region 1.6 Utility helpers
 
     def _get_and_clear_data_from_state(
         self,
