@@ -3283,7 +3283,7 @@ class Pipe:
                 pricing = model_config[model_id].get("pricing", {})
                 
                 if pricing:
-                    total_cost = input_cost = cache_cost = output_cost = 0.0
+                    total_cost = input_cost = cache_cost = output_cost = image_output_cost = 0.0
                     
                     # Calculate input cost (non-cached tokens)
                     prompt_tokens = usage_data["prompt_tokens"]
@@ -3303,21 +3303,37 @@ class Pipe:
                         )
                         total_cost += cache_cost
                     
-                    # Calculate output cost
+                    # Calculate output cost (image + text separately)
                     completion_tokens = usage_data["completion_tokens"]
-                    if completion_tokens > 0 and "output" in pricing:
-                        output_cost = self._calculate_cost(
-                            completion_tokens, pricing["output"]
-                        )
-                        total_cost += output_cost
+                    if completion_tokens > 0:
+                        # If there is an image generated, it would be in candidates_tokens_details
+                        candidates_details = usage_data.get("candidates_tokens_details", [])
+                        image_tokens = 0
+                        for detail in (candidates_details or []):
+                            if detail.get("modality") == "IMAGE":
+                                image_tokens += detail.get("token_count", 0)
+                        text_tokens = completion_tokens - image_tokens
+                        
+                        # Calculate text output cost
+                        if text_tokens > 0 and "output" in pricing:
+                            output_cost += self._calculate_cost(text_tokens, pricing["output"])
+                        
+                        # Calculate image output cost
+                        if image_tokens > 0 and "image_output" in pricing:
+                            image_output_cost += self._calculate_cost(image_tokens, pricing["image_output"])
+                        elif image_tokens > 0 and "output" in pricing:
+                            image_output_cost += self._calculate_cost(image_tokens, pricing["output"])
+                        
+                        total_cost += output_cost + image_output_cost
                     
                     usage_data["total_cost"] = round(total_cost, 6)
                     usage_data["cost_details"] = {
                         "input_cost": round(input_cost, 6),
                         "cache_cost": round(cache_cost, 6),
                         "output_cost": round(output_cost, 6),
+                        "image_output_cost": round(image_output_cost, 6),
                     }
-                    log.debug(f"Calculated cost for model {model_id}: ${total_cost:.6f} (output: ${output_cost:.6f}, input: ${input_cost:.6f}, cache: ${cache_cost:.6f})")
+                    log.debug(f"Calculated cost for model {model_id}: ${total_cost:.6f} (output: ${output_cost:.6f}, input: ${input_cost:.6f}, cache: ${cache_cost:.6f}, image_output: ${image_output_cost:.6f})")
                 else:
                     log.debug(f"No pricing data found for model {model_id}.")
             else:
