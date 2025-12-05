@@ -6,15 +6,17 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 2.0.0-alpha3
+version: 1.26.0
 requirements: google-genai==1.49.0
 """
 
-VERSION = "2.0.0-alpha3"
+# I change these only when I make a release to avoid PR merge conflicts.
+# If you are making a PR then please do not change these values.
+VERSION = "1.26.0"
 # This is the recommended version for the companion filter.
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
-RECOMMENDED_COMPANION_VERSION = "2.0.0-alpha2"
+RECOMMENDED_COMPANION_VERSION = "1.7.0"
 
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
@@ -37,9 +39,6 @@ from urllib.parse import urlparse, parse_qs
 import xxhash
 import asyncio
 import aiofiles
-import yaml
-import urllib.request
-import os
 from aiocache import cached
 from aiocache.base import BaseCache
 from aiocache.serializers import NullSerializer

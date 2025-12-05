@@ -6,10 +6,10 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 2.0.0-alpha2
+version: 1.7.1
 """
 
-VERSION = "2.0.0-alpha2"
+VERSION = "1.7.1"
 
 # This filter can detect that a feature like web search or code execution is enabled in the front-end,
 # set the feature back to False so Open WebUI does not run it's own logic and then
@@ -41,8 +41,7 @@ if TYPE_CHECKING:
     from loguru._handler import Handler  # type: ignore
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
-# FIXME update to suurt8ll/open_webui_functions before merging into master
-DEFAULT_MODEL_CONFIG_PATH = "https://raw.githubusercontent.com/torgal-dog/open_webui_functions/refs/heads/feature/model-to-yaml/plugins/pipes/gemini_models.yaml"
+DEFAULT_MODEL_CONFIG_PATH = "https://raw.githubusercontent.com/suurt8ll/open_webui_functions/master/plugins/pipes/gemini_models.yaml"
 
 # Default timeout for URL resolution
 # TODO: Move to Pipe.Valves.
