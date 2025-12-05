@@ -801,7 +801,6 @@ class Filter:
         Returns:
             True if the model supports the capability, False otherwise
         """
-        print(model_id)
         if model_id not in config:
             log.debug(f"Model '{model_id}' not found in config, capability '{capability}' check returns False.")
             return False
