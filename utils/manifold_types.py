@@ -286,6 +286,7 @@ class Metadata(TypedDict):
 
     # These are my own added custom keys, not used by Open WebUI.
     safety_settings: list[types.SafetySetting]
+    is_paid_api: NotRequired[bool]
     is_vertex_ai: NotRequired[bool]
     canonical_model_id: NotRequired[str]
 

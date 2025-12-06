@@ -1939,6 +1939,10 @@ class Pipe:
         # Apply UI toggle overrides (Paid API & Vertex AI)
         valves = self._apply_toggle_configurations(valves, __metadata__)
 
+        # Determine if a paid API (Vertex or Gemini Paid) is being used.
+        # This is used later to decide whether to calculate and display cost.
+        __metadata__["is_paid_api"] = not bool(valves.GEMINI_FREE_API_KEY)
+
         # Retrieve model configuration from app state (loaded by companion filter)
         model_config = __request__.app.state._state.get("gemini_model_config")
         if model_config is None:
@@ -3132,7 +3136,13 @@ class Pipe:
         # --- Emit usage and grounding data ---
         # Attempt to emit token usage data even if the finish reason was problematic,
         # as usage data might still be available.
-        if usage_data := self._get_usage_data(model_response, __metadata__.get("canonical_model_id", ""), app_state):
+        is_paid_api = __metadata__.get("is_paid_api", True)
+        if usage_data := self._get_usage_data(
+            model_response,
+            __metadata__.get("canonical_model_id", ""),
+            app_state,
+            is_paid_api,
+        ):
             # Inject the total processing time into the usage payload.
             elapsed_time = time.monotonic() - event_emitter.start_time
             usage_data["completion_time"] = round(elapsed_time, 2)
@@ -3183,28 +3193,28 @@ class Pipe:
         """
         if not pricing_tiers or token_count <= 0:
             return 0.0
-        
+
         total_cost = 0.0
         remaining_tokens = token_count
-        
+
         for tier in pricing_tiers:
             price_per_million = tier.get("price_per_million", 0.0)
             tier_limit = tier.get("up_to_tokens")  # None means unlimited
-            
+
             if tier_limit is None:
                 # Last tier with no limit - use all remaining tokens
                 tokens_in_tier = remaining_tokens
             else:
                 # Limited tier - use up to the tier limit
                 tokens_in_tier = min(remaining_tokens, tier_limit)
-            
+
             tier_cost = (tokens_in_tier / 1_000_000) * price_per_million
             total_cost += tier_cost
             remaining_tokens -= tokens_in_tier
-            
+
             if remaining_tokens <= 0:
                 break
-        
+
         return total_cost
 
     def _get_usage_data(
@@ -3212,6 +3222,7 @@ class Pipe:
         response: types.GenerateContentResponse,
         model_id: str,
         app_state: State,
+        is_paid_api: bool,
     ) -> dict[str, Any] | None:
         """
         Extracts usage data from a GenerateContentResponse object.
@@ -3226,20 +3237,40 @@ class Pipe:
 
         # Dump the raw token usage details, excluding any fields that are None.
         token_details = response.usage_metadata.model_dump(exclude_none=True)
+
+        # For the free API, cost is always zero.
+        if not is_paid_api:
+            log.debug("Using free API, costs are not applicable and will be reported as 0.")
+            cost_details = {
+                "input_cost": 0.0,
+                "cache_cost": 0.0,
+                "output_cost": 0.0,
+                "image_output_cost": 0.0,
+                "total_cost": 0.0,
+            }
+            return {
+                "token_details": token_details,
+                "cost_details": cost_details,
+            }
+
         cost_details: dict[str, float] = {}
 
-        # Calculate cost based on pricing from YAML config
+        # For paid APIs, attempt to calculate cost. Default to an empty dict on failure.
         try:
             model_config = app_state._state.get("gemini_model_config", {})
             if model_id in model_config:
                 pricing = model_config[model_id].get("pricing", {})
 
                 if pricing:
-                    total_cost = input_cost = cache_cost = output_cost = image_output_cost = 0.0
+                    total_cost = input_cost = cache_cost = output_cost = (
+                        image_output_cost
+                    ) = 0.0
 
                     # Calculate input cost (non-cached tokens)
                     prompt_tokens = token_details.get("prompt_token_count", 0)
-                    cached_tokens = token_details.get("cached_content_token_count", 0)
+                    cached_tokens = token_details.get(
+                        "cached_content_token_count", 0
+                    )
                     non_cached_input_tokens = prompt_tokens - cached_tokens
 
                     if non_cached_input_tokens > 0 and "input" in pricing:
@@ -3256,25 +3287,35 @@ class Pipe:
                         total_cost += cache_cost
 
                     # Calculate output cost (image + text separately)
-                    completion_tokens = token_details.get("candidates_token_count", 0)
+                    completion_tokens = token_details.get(
+                        "candidates_token_count", 0
+                    )
                     if completion_tokens > 0:
                         # If there is an image generated, it would be in candidates_tokens_details
-                        candidates_details = token_details.get("candidates_tokens_details", [])
+                        candidates_details = token_details.get(
+                            "candidates_tokens_details", []
+                        )
                         image_tokens = 0
-                        for detail in (candidates_details or []):
+                        for detail in candidates_details or []:
                             if detail.get("modality") == "IMAGE":
                                 image_tokens += detail.get("token_count", 0)
                         text_tokens = completion_tokens - image_tokens
 
                         # Calculate text output cost
                         if text_tokens > 0 and "output" in pricing:
-                            output_cost += self._calculate_cost(text_tokens, pricing["output"])
+                            output_cost += self._calculate_cost(
+                                text_tokens, pricing["output"]
+                            )
 
                         # Calculate image output cost
                         if image_tokens > 0 and "image_output" in pricing:
-                            image_output_cost += self._calculate_cost(image_tokens, pricing["image_output"])
+                            image_output_cost += self._calculate_cost(
+                                image_tokens, pricing["image_output"]
+                            )
                         elif image_tokens > 0 and "output" in pricing:
-                            image_output_cost += self._calculate_cost(image_tokens, pricing["output"])
+                            image_output_cost += self._calculate_cost(
+                                image_tokens, pricing["output"]
+                            )
 
                         total_cost += output_cost + image_output_cost
 
@@ -3287,11 +3328,17 @@ class Pipe:
                     }
                     log.debug(f"Calculated cost for model {model_id}:", payload=cost_details)
                 else:
-                    log.debug(f"No pricing data found for model {model_id}.")
+                    log.debug(
+                        f"No pricing data found for model {model_id}. Cost details will be empty."
+                    )
             else:
-                log.debug(f"Model {model_id} not found in config.")
+                log.debug(
+                    f"Model {model_id} not found in config. Cost details will be empty."
+                )
         except Exception as e:
-            log.warning(f"Failed to calculate cost: {e}.")
+            log.warning(
+                f"Failed to calculate cost: {e}. Cost details will be empty."
+            )
 
         return {
             "token_details": token_details,
