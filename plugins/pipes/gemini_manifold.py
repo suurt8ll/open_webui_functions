@@ -3214,7 +3214,7 @@ class Pipe:
         app_state: State,
     ) -> dict[str, Any] | None:
         """
-        Extracts and cleans usage data from a GenerateContentResponse object.
+        Extracts usage data from a GenerateContentResponse object.
         Calculates and includes cost based on pricing from YAML configuration.
         Returns None if usage metadata is not present.
         """
@@ -3224,84 +3224,68 @@ class Pipe:
             )
             return None
 
-        usage_data = response.usage_metadata.model_dump()
+        # Dump the raw token usage details, excluding any fields that are None.
+        token_details = response.usage_metadata.model_dump(exclude_none=True)
+        cost_details: dict[str, float] = {}
 
-        # 1. Rename the three core required fields.
-        usage_data["prompt_tokens"] = usage_data.pop("prompt_token_count")
-        usage_data["completion_tokens"] = usage_data.pop("candidates_token_count")
-        usage_data["total_tokens"] = usage_data.pop("total_token_count")
-
-        CORE_KEYS = {"prompt_tokens", "completion_tokens", "total_tokens"}
-
-        # 2. Remove auxiliary keys that have falsy values (None, empty list, etc.).
-        # We must iterate over a copy of keys to safely delete items from the dict.
-        for k in list(usage_data.keys()):
-            if k in CORE_KEYS:
-                continue
-
-            # If the value is falsy (None, 0, empty list), remove the key.
-            # This retains non-core data (like modality counts) if it exists.
-            if not usage_data[k]:
-                del usage_data[k]
-
-        # 3. Calculate cost based on pricing from YAML config
+        # Calculate cost based on pricing from YAML config
         try:
             model_config = app_state._state.get("gemini_model_config", {})
             if model_id in model_config:
                 pricing = model_config[model_id].get("pricing", {})
-                
+
                 if pricing:
                     total_cost = input_cost = cache_cost = output_cost = image_output_cost = 0.0
-                    
+
                     # Calculate input cost (non-cached tokens)
-                    prompt_tokens = usage_data["prompt_tokens"]
-                    cached_tokens = usage_data.get("cached_content_token_count", 0)
+                    prompt_tokens = token_details.get("prompt_token_count", 0)
+                    cached_tokens = token_details.get("cached_content_token_count", 0)
                     non_cached_input_tokens = prompt_tokens - cached_tokens
-                    
+
                     if non_cached_input_tokens > 0 and "input" in pricing:
                         input_cost = self._calculate_cost(
                             non_cached_input_tokens, pricing["input"]
                         )
                         total_cost += input_cost
-                    
+
                     # Calculate cached input cost (if applicable)
                     if cached_tokens > 0 and "caching" in pricing:
                         cache_cost = self._calculate_cost(
                             cached_tokens, pricing["caching"]
                         )
                         total_cost += cache_cost
-                    
+
                     # Calculate output cost (image + text separately)
-                    completion_tokens = usage_data["completion_tokens"]
+                    completion_tokens = token_details.get("candidates_token_count", 0)
                     if completion_tokens > 0:
                         # If there is an image generated, it would be in candidates_tokens_details
-                        candidates_details = usage_data.get("candidates_tokens_details", [])
+                        candidates_details = token_details.get("candidates_tokens_details", [])
                         image_tokens = 0
                         for detail in (candidates_details or []):
                             if detail.get("modality") == "IMAGE":
                                 image_tokens += detail.get("token_count", 0)
                         text_tokens = completion_tokens - image_tokens
-                        
+
                         # Calculate text output cost
                         if text_tokens > 0 and "output" in pricing:
                             output_cost += self._calculate_cost(text_tokens, pricing["output"])
-                        
+
                         # Calculate image output cost
                         if image_tokens > 0 and "image_output" in pricing:
                             image_output_cost += self._calculate_cost(image_tokens, pricing["image_output"])
                         elif image_tokens > 0 and "output" in pricing:
                             image_output_cost += self._calculate_cost(image_tokens, pricing["output"])
-                        
+
                         total_cost += output_cost + image_output_cost
-                    
-                    usage_data["total_cost"] = round(total_cost, 6)
-                    usage_data["cost_details"] = {
+
+                    cost_details = {
                         "input_cost": round(input_cost, 6),
                         "cache_cost": round(cache_cost, 6),
                         "output_cost": round(output_cost, 6),
                         "image_output_cost": round(image_output_cost, 6),
+                        "total_cost": round(total_cost, 6),
                     }
-                    log.debug(f"Calculated cost for model {model_id}: ${total_cost:.6f} (output: ${output_cost:.6f}, input: ${input_cost:.6f}, cache: ${cache_cost:.6f}, image_output: ${image_output_cost:.6f})")
+                    log.debug(f"Calculated cost for model {model_id}:", payload=cost_details)
                 else:
                     log.debug(f"No pricing data found for model {model_id}.")
             else:
@@ -3309,7 +3293,10 @@ class Pipe:
         except Exception as e:
             log.warning(f"Failed to calculate cost: {e}.")
 
-        return usage_data
+        return {
+            "token_details": token_details,
+            "cost_details": cost_details,
+        }
 
     # endregion 2.5 Post-processing
 
