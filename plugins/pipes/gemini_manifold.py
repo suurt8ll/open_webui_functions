@@ -811,7 +811,7 @@ class GeminiContentBuilder:
             id=chat_id, user_id=user_data["id"]
         ):
             chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
-            log.trace("Fetched messages from database:", payload=chat_content.get("messages"))
+            log.debug("Fetched messages from database:", payload=chat_content.get("messages"))
             # Last message is the upcoming assistant response, at this point in the logic it's empty.
             messages_db = chat_content.get("messages", [])[:-1]
         else:
@@ -1987,10 +1987,6 @@ class Pipe:
             error_msg = f"There has been an error during model retrival phase: {str(__metadata__['model'])}"
             raise ValueError(error_msg)
 
-        # NOTE: will be "local" if Temporary Chat is enabled.
-        chat_id = __metadata__.get("chat_id", "not_provided")
-        message_id = __metadata__.get("message_id", "not_provided")
-
         log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
         )
@@ -2067,11 +2063,8 @@ class Pipe:
             return self._unified_response_processor(
                 response_stream,
                 __request__.app,
-                model_id,
                 event_emitter,
-                __user__["id"],
-                chat_id,
-                message_id,
+                __metadata__,
             )
         else:
             # Non-streaming response.
@@ -2093,11 +2086,8 @@ class Pipe:
             return self._unified_response_processor(
                 single_item_stream(res),
                 __request__.app,
-                model_id,
                 event_emitter,
-                __user__["id"],
-                chat_id,
-                message_id,
+                __metadata__,
             )
 
     # region 2. Helper methods inside the Pipe class
@@ -2677,11 +2667,8 @@ class Pipe:
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
         app: FastAPI,
-        model: str,
         event_emitter: EventEmitter,
-        user_id: str,
-        chat_id: str,
-        message_id: str,
+        __metadata__: "Metadata",
     ) -> AsyncGenerator[dict | str, None]:
         """
         Processes an async iterator of GenerateContentResponse objects, yielding
@@ -2787,10 +2774,7 @@ class Pipe:
                     payload, count = await self._process_part(
                         part,
                         app,
-                        model,
-                        user_id,
-                        chat_id,
-                        message_id,
+                        __metadata__,
                     )
 
                     if payload:
@@ -2834,8 +2818,8 @@ class Pipe:
                 # allowing the frontend to store it in the database with the assistant's message.
                 self._store_data_in_state(
                     app.state,
-                    chat_id,
-                    message_id,
+                    __metadata__.get("chat_id"),
+                    __metadata__.get("message_id"),
                     "response_parts",
                     response_parts,
                 )
@@ -2846,8 +2830,8 @@ class Pipe:
                 # FIXME: allow passing list of keys and values to store multiple items at once
                 self._store_data_in_state(
                     app.state,
-                    chat_id,
-                    message_id,
+                    __metadata__.get("chat_id"),
+                    __metadata__.get("message_id"),
                     "original_content",
                     original_content,
                 )
@@ -2857,9 +2841,7 @@ class Pipe:
                     final_response_chunk,
                     event_emitter,
                     app.state,
-                    model,
-                    chat_id=chat_id,
-                    message_id=message_id,
+                    __metadata__,
                     stream_error_happened=error_occurred,
                 )
             except Exception as e:
@@ -2873,10 +2855,7 @@ class Pipe:
         self,
         part: types.Part,
         app: FastAPI,  # We need the app to generate URLs for model returned images.
-        model: str,
-        user_id: str,
-        chat_id: str,
-        message_id: str,
+        __metadata__: "Metadata",
     ) -> tuple[dict | None, int]:
         """
         Processes a single `types.Part` object and returns a payload dictionary
@@ -2897,7 +2876,7 @@ class Pipe:
                 # An image part, which can be part of a thought or regular content.
                 # Image parts don't need tag disabling.
                 processed_text, image_url = await self._process_image_part(
-                    data, model, user_id, chat_id, message_id, app
+                    data, __metadata__, app
                 )
                 payload_content = processed_text
 
@@ -2948,10 +2927,7 @@ class Pipe:
     async def _process_image_part(
         self,
         inline_data: types.Blob,
-        model: str,
-        user_id: str,
-        chat_id: str,
-        message_id: str,
+        __metadata__: "Metadata",
         app: FastAPI,
     ) -> tuple[str, str | None]:
         """
@@ -2964,13 +2940,10 @@ class Pipe:
 
         if mime_type and image_data:
             image_url = await self._upload_image(
-                image_data=image_data,
-                mime_type=mime_type,
-                model=model,
-                user_id=user_id,
-                chat_id=chat_id,
-                message_id=message_id,
-                app=app,
+                image_data,
+                mime_type,
+                __metadata__,
+                app,
             )
         else:
             log.warning(
@@ -2989,10 +2962,7 @@ class Pipe:
         self,
         image_data: bytes,
         mime_type: str,
-        model: str,
-        user_id: str,
-        chat_id: str,
-        message_id: str,
+        __metadata__: "Metadata",
         app: FastAPI,
     ) -> str | None:
         """
@@ -3009,9 +2979,9 @@ class Pipe:
 
         # Create a clean, precise metadata object linking to the generation context.
         image_metadata = {
-            "model": model,
-            "chat_id": chat_id,
-            "message_id": message_id,
+            "model": __metadata__.get("canonical_model_id"),
+            "chat_id": __metadata__.get("chat_id"),
+            "message_id": __metadata__.get("message_id"),
         }
 
         log.info("Uploading the model-generated image to the Open WebUI backend.")
@@ -3027,7 +2997,7 @@ class Pipe:
         log.debug("Adding the image file to the Open WebUI files database.")
         file_item = await asyncio.to_thread(
             Files.insert_new_file,
-            user_id,
+            __metadata__.get("user_id"),
             FileForm(
                 id=id,
                 filename=name,
@@ -3098,9 +3068,7 @@ class Pipe:
         model_response: types.GenerateContentResponse | None,
         event_emitter: EventEmitter,
         app_state: State,
-        model: str,
-        chat_id: str,
-        message_id: str,
+        __metadata__: "Metadata",
         *,
         stream_error_happened: bool = False,
     ):
@@ -3164,7 +3132,7 @@ class Pipe:
         # --- Emit usage and grounding data ---
         # Attempt to emit token usage data even if the finish reason was problematic,
         # as usage data might still be available.
-        if usage_data := self._get_usage_data(model_response, model, app_state):
+        if usage_data := self._get_usage_data(model_response, __metadata__.get("canonical_model_id", ""), app_state):
             # Inject the total processing time into the usage payload.
             elapsed_time = time.monotonic() - event_emitter.start_time
             usage_data["completion_time"] = round(elapsed_time, 2)
@@ -3174,8 +3142,8 @@ class Pipe:
         if candidate and (grounding_metadata_obj := candidate.grounding_metadata):
             self._store_data_in_state(
                 app_state,
-                chat_id,
-                message_id,
+                __metadata__.get("chat_id"),
+                __metadata__.get("message_id"),
                 "grounding",
                 grounding_metadata_obj,
             )
@@ -3185,8 +3153,8 @@ class Pipe:
         if event_emitter.status_mode == "visible_timed":
             self._store_data_in_state(
                 app_state,
-                chat_id,
-                message_id,
+                __metadata__.get("chat_id"),
+                __metadata__.get("message_id"),
                 "pipe_start_time",
                 event_emitter.start_time,
             )
