@@ -2857,6 +2857,7 @@ class Pipe:
                     final_response_chunk,
                     event_emitter,
                     app.state,
+                    model,
                     chat_id=chat_id,
                     message_id=message_id,
                     stream_error_happened=error_occurred,
@@ -3097,6 +3098,7 @@ class Pipe:
         model_response: types.GenerateContentResponse | None,
         event_emitter: EventEmitter,
         app_state: State,
+        model: str,
         chat_id: str,
         message_id: str,
         *,
@@ -3162,7 +3164,7 @@ class Pipe:
         # --- Emit usage and grounding data ---
         # Attempt to emit token usage data even if the finish reason was problematic,
         # as usage data might still be available.
-        if usage_data := self._get_usage_data(model_response):
+        if usage_data := self._get_usage_data(model_response, model, app_state):
             # Inject the total processing time into the usage payload.
             elapsed_time = time.monotonic() - event_emitter.start_time
             usage_data["completion_time"] = round(elapsed_time, 2)
@@ -3205,11 +3207,47 @@ class Pipe:
         app_state._state[key] = value
 
     @staticmethod
+    def _calculate_cost(
+        token_count: int, pricing_tiers: list[dict]
+    ) -> float:
+        """
+        Calculates cost based on tiered pricing structure (in USD)
+        """
+        if not pricing_tiers or token_count <= 0:
+            return 0.0
+        
+        total_cost = 0.0
+        remaining_tokens = token_count
+        
+        for tier in pricing_tiers:
+            price_per_million = tier.get("price_per_million", 0.0)
+            tier_limit = tier.get("up_to_tokens")  # None means unlimited
+            
+            if tier_limit is None:
+                # Last tier with no limit - use all remaining tokens
+                tokens_in_tier = remaining_tokens
+            else:
+                # Limited tier - use up to the tier limit
+                tokens_in_tier = min(remaining_tokens, tier_limit)
+            
+            tier_cost = (tokens_in_tier / 1_000_000) * price_per_million
+            total_cost += tier_cost
+            remaining_tokens -= tokens_in_tier
+            
+            if remaining_tokens <= 0:
+                break
+        
+        return total_cost
+
     def _get_usage_data(
+        self,
         response: types.GenerateContentResponse,
+        model_id: str,
+        app_state: State,
     ) -> dict[str, Any] | None:
         """
         Extracts and cleans usage data from a GenerateContentResponse object.
+        Calculates and includes cost based on pricing from YAML configuration.
         Returns None if usage metadata is not present.
         """
         if not response.usage_metadata:
@@ -3237,6 +3275,71 @@ class Pipe:
             # This retains non-core data (like modality counts) if it exists.
             if not usage_data[k]:
                 del usage_data[k]
+
+        # 3. Calculate cost based on pricing from YAML config
+        try:
+            model_config = app_state._state.get("gemini_model_config", {})
+            if model_id in model_config:
+                pricing = model_config[model_id].get("pricing", {})
+                
+                if pricing:
+                    total_cost = input_cost = cache_cost = output_cost = image_output_cost = 0.0
+                    
+                    # Calculate input cost (non-cached tokens)
+                    prompt_tokens = usage_data["prompt_tokens"]
+                    cached_tokens = usage_data.get("cached_content_token_count", 0)
+                    non_cached_input_tokens = prompt_tokens - cached_tokens
+                    
+                    if non_cached_input_tokens > 0 and "input" in pricing:
+                        input_cost = self._calculate_cost(
+                            non_cached_input_tokens, pricing["input"]
+                        )
+                        total_cost += input_cost
+                    
+                    # Calculate cached input cost (if applicable)
+                    if cached_tokens > 0 and "caching" in pricing:
+                        cache_cost = self._calculate_cost(
+                            cached_tokens, pricing["caching"]
+                        )
+                        total_cost += cache_cost
+                    
+                    # Calculate output cost (image + text separately)
+                    completion_tokens = usage_data["completion_tokens"]
+                    if completion_tokens > 0:
+                        # If there is an image generated, it would be in candidates_tokens_details
+                        candidates_details = usage_data.get("candidates_tokens_details", [])
+                        image_tokens = 0
+                        for detail in (candidates_details or []):
+                            if detail.get("modality") == "IMAGE":
+                                image_tokens += detail.get("token_count", 0)
+                        text_tokens = completion_tokens - image_tokens
+                        
+                        # Calculate text output cost
+                        if text_tokens > 0 and "output" in pricing:
+                            output_cost += self._calculate_cost(text_tokens, pricing["output"])
+                        
+                        # Calculate image output cost
+                        if image_tokens > 0 and "image_output" in pricing:
+                            image_output_cost += self._calculate_cost(image_tokens, pricing["image_output"])
+                        elif image_tokens > 0 and "output" in pricing:
+                            image_output_cost += self._calculate_cost(image_tokens, pricing["output"])
+                        
+                        total_cost += output_cost + image_output_cost
+                    
+                    usage_data["total_cost"] = round(total_cost, 6)
+                    usage_data["cost_details"] = {
+                        "input_cost": round(input_cost, 6),
+                        "cache_cost": round(cache_cost, 6),
+                        "output_cost": round(output_cost, 6),
+                        "image_output_cost": round(image_output_cost, 6),
+                    }
+                    log.debug(f"Calculated cost for model {model_id}: ${total_cost:.6f} (output: ${output_cost:.6f}, input: ${input_cost:.6f}, cache: ${cache_cost:.6f}, image_output: ${image_output_cost:.6f})")
+                else:
+                    log.debug(f"No pricing data found for model {model_id}.")
+            else:
+                log.debug(f"Model {model_id} not found in config.")
+        except Exception as e:
+            log.warning(f"Failed to calculate cost: {e}.")
 
         return usage_data
 
