@@ -286,8 +286,12 @@ class Metadata(TypedDict):
 
     # These are my own added custom keys, not used by Open WebUI.
     safety_settings: list[types.SafetySetting]
+    is_paid_api: NotRequired[bool]
     is_vertex_ai: NotRequired[bool]
     canonical_model_id: NotRequired[str]
+    cumulative_tokens: NotRequired[int | None]
+    cumulative_cost: NotRequired[float | None]
+
 
 # endregion `__metadata__`
 
@@ -405,6 +409,8 @@ class ChatMessageTD(TypedDict):
     sources: NotRequired[
         list[Source]
     ]  # Present in history.messages for assistant, not in top-level messages list
+    statusHistory: NotRequired[list[StatusEventData]] # assistant messages only
+    usage: NotRequired[dict[str, Any]]  # assistant messages only
 
     # Custom keys added by Gemini Manifold plugin
     gemini_parts: NotRequired[list[dict[str, Any]]]
