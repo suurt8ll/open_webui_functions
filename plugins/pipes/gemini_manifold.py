@@ -6,17 +6,17 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.26.0
+version: 2.0.0
 requirements: google-genai==1.49.0
 """
 
 # I change these only when I make a release to avoid PR merge conflicts.
 # If you are making a PR then please do not change these values.
-VERSION = "1.26.0"
+VERSION = "2.0.0"
 # This is the recommended version for the companion filter.
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
-RECOMMENDED_COMPANION_VERSION = "1.7.0"
+RECOMMENDED_COMPANION_VERSION = "2.0.0"
 
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
@@ -446,7 +446,7 @@ class FilesAPIManager:
             file_bytes: The raw byte content of the file. Required.
             mime_type: The MIME type of the file (e.g., 'image/png'). Required.
             owui_file_id: The unique ID of the file from Open WebUI, if available.
-                          Used for logging and as a key for the hash cache optimization.
+                      RECOMMENDED_COMPANION_VERSION    Used for logging and as a key for the hash cache optimization.
             status_queue: An optional asyncio.Queue to report upload lifecycle events.
 
         Returns:
