@@ -746,6 +746,12 @@ class GeminiContentBuilder:
             metadata_body, user_data
         )
 
+        # Retrieve cumulative usage from the DB history and inject it into metadata.
+        # This will be picked up later when constructing the final usage payload.
+        c_tokens, c_cost = self._retrieve_previous_usage_data()
+        metadata_body["cumulative_tokens"] = c_tokens
+        metadata_body["cumulative_cost"] = c_cost
+
     async def build_contents(self) -> list[types.Content]:
         """
         The main public method to generate the contents list by processing all
@@ -789,6 +795,36 @@ class GeminiContentBuilder:
                 )
         return contents
 
+    def _retrieve_previous_usage_data(self) -> tuple[int | None, float | None]:
+        """
+        Retrieves the cumulative token count and cost from the last assistant message in the database.
+
+        Returns:
+            - (0, 0.0) if it's the start of a conversation (no previous assistant message).
+            - (tokens, cost) if the previous assistant message has valid cumulative data.
+            - (None, None) if the chain is broken (previous message exists but lacks data)
+              or if DB history is unavailable (e.g., temp chat).
+        """
+        if not self.messages_db:
+            return None, None
+
+        for msg in reversed(self.messages_db):
+            if msg.get("role") == "assistant":
+                usage = msg.get("usage", {})
+                # These keys must be populated by the plugin in previous turns
+                c_tokens = usage.get("cumulative_token_count")
+                c_cost = usage.get("cumulative_total_cost")
+
+                if c_tokens is not None and c_cost is not None:
+                    return c_tokens, c_cost
+                else:
+                    # Previous assistant message exists but lacks cumulative data.
+                    # This indicates a broken chain (old message or different plugin).
+                    return None, None
+
+        # No assistant message found in history, implying this is the first turn.
+        return 0, 0.0
+
     @staticmethod
     def _extract_system_prompt(
         messages: list["Message"],
@@ -811,7 +847,7 @@ class GeminiContentBuilder:
             id=chat_id, user_id=user_data["id"]
         ):
             chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
-            log.debug("Fetched messages from database:", payload=chat_content.get("messages"))
+            log.trace("Fetched messages from database:", payload=chat_content.get("messages"))
             # Last message is the upcoming assistant response, at this point in the logic it's empty.
             messages_db = chat_content.get("messages", [])[:-1]
         else:
@@ -3067,6 +3103,7 @@ class Pipe:
     # endregion 2.4 Model response processing
 
     # region 2.5 Post-processing
+    # region 2.5 Post-processing
     async def _do_post_processing(
         self,
         model_response: types.GenerateContentResponse | None,
@@ -3136,12 +3173,10 @@ class Pipe:
         # --- Emit usage and grounding data ---
         # Attempt to emit token usage data even if the finish reason was problematic,
         # as usage data might still be available.
-        is_paid_api = __metadata__.get("is_paid_api", True)
         if usage_data := self._get_usage_data(
             model_response,
-            __metadata__.get("canonical_model_id", ""),
             app_state,
-            is_paid_api,
+            __metadata__,
         ):
             # Inject the total processing time into the usage payload.
             elapsed_time = time.monotonic() - event_emitter.start_time
@@ -3185,9 +3220,7 @@ class Pipe:
         app_state._state[key] = value
 
     @staticmethod
-    def _calculate_cost(
-        token_count: int, pricing_tiers: list[dict]
-    ) -> float:
+    def _calculate_cost(token_count: int, pricing_tiers: list[dict]) -> float:
         """
         Calculates cost based on tiered pricing structure (in USD)
         """
@@ -3220,13 +3253,13 @@ class Pipe:
     def _get_usage_data(
         self,
         response: types.GenerateContentResponse,
-        model_id: str,
         app_state: State,
-        is_paid_api: bool,
+        metadata: "Metadata",
     ) -> dict[str, Any] | None:
         """
         Extracts usage data from a GenerateContentResponse object.
         Calculates and includes cost based on pricing from YAML configuration.
+        Adds cumulative tokens and cost if previous history data is available.
         Returns None if usage metadata is not present.
         """
         if not response.usage_metadata:
@@ -3238,112 +3271,128 @@ class Pipe:
         # Dump the raw token usage details, excluding any fields that are None.
         token_details = response.usage_metadata.model_dump(exclude_none=True)
 
-        # For the free API, cost is always zero.
+        is_paid_api = metadata.get("is_paid_api", True)
+        model_id = metadata.get("canonical_model_id", "")
+
+        cost_details: dict[str, float] = {
+            "input_cost": 0.0,
+            "cache_cost": 0.0,
+            "output_cost": 0.0,
+            "image_output_cost": 0.0,
+            "total_cost": 0.0,
+        }
+
         if not is_paid_api:
-            log.debug("Using free API, costs are not applicable and will be reported as 0.")
-            cost_details = {
-                "input_cost": 0.0,
-                "cache_cost": 0.0,
-                "output_cost": 0.0,
-                "image_output_cost": 0.0,
-                "total_cost": 0.0,
-            }
-            return {
-                "token_details": token_details,
-                "cost_details": cost_details,
-            }
+            log.debug(
+                "Using free API, costs are not applicable and will be reported as 0."
+            )
+        else:
+            # For paid APIs, attempt to calculate cost.
+            try:
+                model_config = app_state._state.get("gemini_model_config", {})
+                if model_id in model_config:
+                    pricing = model_config[model_id].get("pricing", {})
 
-        cost_details: dict[str, float] = {}
+                    if pricing:
+                        total_cost = input_cost = cache_cost = output_cost = (
+                            image_output_cost
+                        ) = 0.0
 
-        # For paid APIs, attempt to calculate cost. Default to an empty dict on failure.
-        try:
-            model_config = app_state._state.get("gemini_model_config", {})
-            if model_id in model_config:
-                pricing = model_config[model_id].get("pricing", {})
-
-                if pricing:
-                    total_cost = input_cost = cache_cost = output_cost = (
-                        image_output_cost
-                    ) = 0.0
-
-                    # Calculate input cost (non-cached tokens)
-                    prompt_tokens = token_details.get("prompt_token_count", 0)
-                    cached_tokens = token_details.get(
-                        "cached_content_token_count", 0
-                    )
-                    non_cached_input_tokens = prompt_tokens - cached_tokens
-
-                    if non_cached_input_tokens > 0 and "input" in pricing:
-                        input_cost = self._calculate_cost(
-                            non_cached_input_tokens, pricing["input"]
+                        # Calculate input cost (non-cached tokens)
+                        prompt_tokens = token_details.get("prompt_token_count", 0)
+                        cached_tokens = token_details.get(
+                            "cached_content_token_count", 0
                         )
-                        total_cost += input_cost
+                        non_cached_input_tokens = prompt_tokens - cached_tokens
 
-                    # Calculate cached input cost (if applicable)
-                    if cached_tokens > 0 and "caching" in pricing:
-                        cache_cost = self._calculate_cost(
-                            cached_tokens, pricing["caching"]
+                        if non_cached_input_tokens > 0 and "input" in pricing:
+                            input_cost = self._calculate_cost(
+                                non_cached_input_tokens, pricing["input"]
+                            )
+                            total_cost += input_cost
+
+                        # Calculate cached input cost (if applicable)
+                        if cached_tokens > 0 and "caching" in pricing:
+                            cache_cost = self._calculate_cost(
+                                cached_tokens, pricing["caching"]
+                            )
+                            total_cost += cache_cost
+
+                        # Calculate output cost (image + text separately)
+                        completion_tokens = token_details.get(
+                            "candidates_token_count", 0
                         )
-                        total_cost += cache_cost
+                        if completion_tokens > 0:
+                            # If there is an image generated, it would be in candidates_tokens_details
+                            candidates_details = token_details.get(
+                                "candidates_tokens_details", []
+                            )
+                            image_tokens = 0
+                            for detail in candidates_details or []:
+                                if detail.get("modality") == "IMAGE":
+                                    image_tokens += detail.get("token_count", 0)
+                            text_tokens = completion_tokens - image_tokens
 
-                    # Calculate output cost (image + text separately)
-                    completion_tokens = token_details.get(
-                        "candidates_token_count", 0
-                    )
-                    if completion_tokens > 0:
-                        # If there is an image generated, it would be in candidates_tokens_details
-                        candidates_details = token_details.get(
-                            "candidates_tokens_details", []
+                            # Calculate text output cost
+                            if text_tokens > 0 and "output" in pricing:
+                                output_cost += self._calculate_cost(
+                                    text_tokens, pricing["output"]
+                                )
+
+                            # Calculate image output cost
+                            if image_tokens > 0 and "image_output" in pricing:
+                                image_output_cost += self._calculate_cost(
+                                    image_tokens, pricing["image_output"]
+                                )
+                            elif image_tokens > 0 and "output" in pricing:
+                                image_output_cost += self._calculate_cost(
+                                    image_tokens, pricing["output"]
+                                )
+
+                            total_cost += output_cost + image_output_cost
+
+                        cost_details = {
+                            "input_cost": round(input_cost, 6),
+                            "cache_cost": round(cache_cost, 6),
+                            "output_cost": round(output_cost, 6),
+                            "image_output_cost": round(image_output_cost, 6),
+                            "total_cost": round(total_cost, 6),
+                        }
+                        log.debug(
+                            f"Calculated cost for model {model_id}:",
+                            payload=cost_details,
                         )
-                        image_tokens = 0
-                        for detail in candidates_details or []:
-                            if detail.get("modality") == "IMAGE":
-                                image_tokens += detail.get("token_count", 0)
-                        text_tokens = completion_tokens - image_tokens
-
-                        # Calculate text output cost
-                        if text_tokens > 0 and "output" in pricing:
-                            output_cost += self._calculate_cost(
-                                text_tokens, pricing["output"]
-                            )
-
-                        # Calculate image output cost
-                        if image_tokens > 0 and "image_output" in pricing:
-                            image_output_cost += self._calculate_cost(
-                                image_tokens, pricing["image_output"]
-                            )
-                        elif image_tokens > 0 and "output" in pricing:
-                            image_output_cost += self._calculate_cost(
-                                image_tokens, pricing["output"]
-                            )
-
-                        total_cost += output_cost + image_output_cost
-
-                    cost_details = {
-                        "input_cost": round(input_cost, 6),
-                        "cache_cost": round(cache_cost, 6),
-                        "output_cost": round(output_cost, 6),
-                        "image_output_cost": round(image_output_cost, 6),
-                        "total_cost": round(total_cost, 6),
-                    }
-                    log.debug(f"Calculated cost for model {model_id}:", payload=cost_details)
+                    else:
+                        log.debug(
+                            f"No pricing data found for model {model_id}. Cost details will be empty."
+                        )
                 else:
                     log.debug(
-                        f"No pricing data found for model {model_id}. Cost details will be empty."
+                        f"Model {model_id} not found in config. Cost details will be empty."
                     )
-            else:
-                log.debug(
-                    f"Model {model_id} not found in config. Cost details will be empty."
+            except Exception as e:
+                log.warning(
+                    f"Failed to calculate cost: {e}. Cost details will be empty."
                 )
-        except Exception as e:
-            log.warning(
-                f"Failed to calculate cost: {e}. Cost details will be empty."
-            )
 
-        return {
+        usage_payload = {
             "token_details": token_details,
             "cost_details": cost_details,
         }
+
+        # --- Calculate and append cumulative usage ---
+        prev_tokens = metadata.get("cumulative_tokens")
+        prev_cost = metadata.get("cumulative_cost")
+
+        # Only add cumulative data if the chain is unbroken (previous data exists)
+        if prev_tokens is not None and prev_cost is not None:
+            current_tokens = token_details.get("total_token_count", 0)
+            current_cost = cost_details.get("total_cost", 0.0)
+
+            usage_payload["cumulative_token_count"] = prev_tokens + current_tokens
+            usage_payload["cumulative_total_cost"] = round(prev_cost + current_cost, 6)
+
+        return usage_payload
 
     # endregion 2.5 Post-processing
 
