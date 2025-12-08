@@ -6,10 +6,10 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.7.1
+version: 2.0.0
 """
 
-VERSION = "1.7.1"
+VERSION = "2.0.0"
 
 # This filter can detect that a feature like web search or code execution is enabled in the front-end,
 # set the feature back to False so Open WebUI does not run it's own logic and then

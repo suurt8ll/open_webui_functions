@@ -6,17 +6,17 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.26.0
+version: 2.0.0
 requirements: google-genai==1.52.0
 """
 
 # I change these only when I make a release to avoid PR merge conflicts.
 # If you are making a PR then please do not change these values.
-VERSION = "1.26.0"
+VERSION = "2.0.0"
 # This is the recommended version for the companion filter.
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
-RECOMMENDED_COMPANION_VERSION = "1.7.0"
+RECOMMENDED_COMPANION_VERSION = "2.0.0"
 
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
@@ -446,7 +446,7 @@ class FilesAPIManager:
             file_bytes: The raw byte content of the file. Required.
             mime_type: The MIME type of the file (e.g., 'image/png'). Required.
             owui_file_id: The unique ID of the file from Open WebUI, if available.
-                          Used for logging and as a key for the hash cache optimization.
+                      RECOMMENDED_COMPANION_VERSION    Used for logging and as a key for the hash cache optimization.
             status_queue: An optional asyncio.Queue to report upload lifecycle events.
 
         Returns:
@@ -746,6 +746,12 @@ class GeminiContentBuilder:
             metadata_body, user_data
         )
 
+        # Retrieve cumulative usage from the DB history and inject it into metadata.
+        # This will be picked up later when constructing the final usage payload.
+        c_tokens, c_cost = self._retrieve_previous_usage_data()
+        metadata_body["cumulative_tokens"] = c_tokens
+        metadata_body["cumulative_cost"] = c_cost
+
     async def build_contents(self) -> list[types.Content]:
         """
         The main public method to generate the contents list by processing all
@@ -788,6 +794,36 @@ class GeminiContentBuilder:
                     payload=res,
                 )
         return contents
+
+    def _retrieve_previous_usage_data(self) -> tuple[int | None, float | None]:
+        """
+        Retrieves the cumulative token count and cost from the last assistant message in the database.
+
+        Returns:
+            - (0, 0.0) if it's the start of a conversation (no previous assistant message).
+            - (tokens, cost) if the previous assistant message has valid cumulative data.
+            - (None, None) if the chain is broken (previous message exists but lacks data)
+              or if DB history is unavailable (e.g., temp chat).
+        """
+        if not self.messages_db:
+            return None, None
+
+        for msg in reversed(self.messages_db):
+            if msg.get("role") == "assistant":
+                usage = msg.get("usage", {})
+                # These keys must be populated by the plugin in previous turns
+                c_tokens = usage.get("cumulative_token_count")
+                c_cost = usage.get("cumulative_total_cost")
+
+                if c_tokens is not None and c_cost is not None:
+                    return c_tokens, c_cost
+                else:
+                    # Previous assistant message exists but lacks cumulative data.
+                    # This indicates a broken chain (old message or different plugin).
+                    return None, None
+
+        # No assistant message found in history, implying this is the first turn.
+        return 0, 0.0
 
     @staticmethod
     def _extract_system_prompt(
@@ -1939,6 +1975,10 @@ class Pipe:
         # Apply UI toggle overrides (Paid API & Vertex AI)
         valves = self._apply_toggle_configurations(valves, __metadata__)
 
+        # Determine if a paid API (Vertex or Gemini Paid) is being used.
+        # This is used later to decide whether to calculate and display cost.
+        __metadata__["is_paid_api"] = not bool(valves.GEMINI_FREE_API_KEY)
+
         # Retrieve model configuration from app state (loaded by companion filter)
         model_config = __request__.app.state._state.get("gemini_model_config")
         if model_config is None:
@@ -2011,10 +2051,6 @@ class Pipe:
         if "error" in __metadata__["model"]["id"]:
             error_msg = f"There has been an error during model retrival phase: {str(__metadata__['model'])}"
             raise ValueError(error_msg)
-
-        # NOTE: will be "local" if Temporary Chat is enabled.
-        chat_id = __metadata__.get("chat_id", "not_provided")
-        message_id = __metadata__.get("message_id", "not_provided")
 
         log.info(
             "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
@@ -2092,11 +2128,8 @@ class Pipe:
             return self._unified_response_processor(
                 response_stream,
                 __request__.app,
-                model_id,
                 event_emitter,
-                __user__["id"],
-                chat_id,
-                message_id,
+                __metadata__,
             )
         else:
             # Non-streaming response.
@@ -2118,11 +2151,8 @@ class Pipe:
             return self._unified_response_processor(
                 single_item_stream(res),
                 __request__.app,
-                model_id,
                 event_emitter,
-                __user__["id"],
-                chat_id,
-                message_id,
+                __metadata__,
             )
 
     # region 2. Helper methods inside the Pipe class
@@ -2751,11 +2781,8 @@ class Pipe:
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
         app: FastAPI,
-        model: str,
         event_emitter: EventEmitter,
-        user_id: str,
-        chat_id: str,
-        message_id: str,
+        __metadata__: "Metadata",
     ) -> AsyncGenerator[dict | str, None]:
         """
         Processes an async iterator of GenerateContentResponse objects, yielding
@@ -2862,10 +2889,7 @@ class Pipe:
                     payload, count = await self._process_part(
                         part,
                         app,
-                        model,
-                        user_id,
-                        chat_id,
-                        message_id,
+                        __metadata__,
                     )
 
                     if payload:
@@ -2909,8 +2933,8 @@ class Pipe:
                 # allowing the frontend to store it in the database with the assistant's message.
                 self._store_data_in_state(
                     app.state,
-                    chat_id,
-                    message_id,
+                    __metadata__.get("chat_id"),
+                    __metadata__.get("message_id"),
                     "response_parts",
                     response_parts,
                 )
@@ -2921,8 +2945,8 @@ class Pipe:
                 # FIXME: allow passing list of keys and values to store multiple items at once
                 self._store_data_in_state(
                     app.state,
-                    chat_id,
-                    message_id,
+                    __metadata__.get("chat_id"),
+                    __metadata__.get("message_id"),
                     "original_content",
                     original_content,
                 )
@@ -2932,8 +2956,7 @@ class Pipe:
                     final_response_chunk,
                     event_emitter,
                     app.state,
-                    chat_id=chat_id,
-                    message_id=message_id,
+                    __metadata__,
                     stream_error_happened=error_occurred,
                 )
             except Exception as e:
@@ -2947,10 +2970,7 @@ class Pipe:
         self,
         part: types.Part,
         app: FastAPI,  # We need the app to generate URLs for model returned images.
-        model: str,
-        user_id: str,
-        chat_id: str,
-        message_id: str,
+        __metadata__: "Metadata",
     ) -> tuple[dict | None, int]:
         """
         Processes a single `types.Part` object and returns a payload dictionary
@@ -2971,7 +2991,7 @@ class Pipe:
                 # An image part, which can be part of a thought or regular content.
                 # Image parts don't need tag disabling.
                 processed_text, image_url = await self._process_image_part(
-                    data, model, user_id, chat_id, message_id, app
+                    data, __metadata__, app
                 )
                 payload_content = processed_text
 
@@ -3022,10 +3042,7 @@ class Pipe:
     async def _process_image_part(
         self,
         inline_data: types.Blob,
-        model: str,
-        user_id: str,
-        chat_id: str,
-        message_id: str,
+        __metadata__: "Metadata",
         app: FastAPI,
     ) -> tuple[str, str | None]:
         """
@@ -3038,13 +3055,10 @@ class Pipe:
 
         if mime_type and image_data:
             image_url = await self._upload_image(
-                image_data=image_data,
-                mime_type=mime_type,
-                model=model,
-                user_id=user_id,
-                chat_id=chat_id,
-                message_id=message_id,
-                app=app,
+                image_data,
+                mime_type,
+                __metadata__,
+                app,
             )
         else:
             log.warning(
@@ -3063,10 +3077,7 @@ class Pipe:
         self,
         image_data: bytes,
         mime_type: str,
-        model: str,
-        user_id: str,
-        chat_id: str,
-        message_id: str,
+        __metadata__: "Metadata",
         app: FastAPI,
     ) -> str | None:
         """
@@ -3083,9 +3094,9 @@ class Pipe:
 
         # Create a clean, precise metadata object linking to the generation context.
         image_metadata = {
-            "model": model,
-            "chat_id": chat_id,
-            "message_id": message_id,
+            "model": __metadata__.get("canonical_model_id"),
+            "chat_id": __metadata__.get("chat_id"),
+            "message_id": __metadata__.get("message_id"),
         }
 
         log.info("Uploading the model-generated image to the Open WebUI backend.")
@@ -3101,7 +3112,7 @@ class Pipe:
         log.debug("Adding the image file to the Open WebUI files database.")
         file_item = await asyncio.to_thread(
             Files.insert_new_file,
-            user_id,
+            __metadata__.get("user_id"),
             FileForm(
                 id=id,
                 filename=name,
@@ -3167,13 +3178,13 @@ class Pipe:
     # endregion 2.4 Model response processing
 
     # region 2.5 Post-processing
+    # region 2.5 Post-processing
     async def _do_post_processing(
         self,
         model_response: types.GenerateContentResponse | None,
         event_emitter: EventEmitter,
         app_state: State,
-        chat_id: str,
-        message_id: str,
+        __metadata__: "Metadata",
         *,
         stream_error_happened: bool = False,
     ):
@@ -3237,7 +3248,11 @@ class Pipe:
         # --- Emit usage and grounding data ---
         # Attempt to emit token usage data even if the finish reason was problematic,
         # as usage data might still be available.
-        if usage_data := self._get_usage_data(model_response):
+        if usage_data := self._get_usage_data(
+            model_response,
+            app_state,
+            __metadata__,
+        ):
             # Inject the total processing time into the usage payload.
             elapsed_time = time.monotonic() - event_emitter.start_time
             usage_data["completion_time"] = round(elapsed_time, 2)
@@ -3247,8 +3262,8 @@ class Pipe:
         if candidate and (grounding_metadata_obj := candidate.grounding_metadata):
             self._store_data_in_state(
                 app_state,
-                chat_id,
-                message_id,
+                __metadata__.get("chat_id"),
+                __metadata__.get("message_id"),
                 "grounding",
                 grounding_metadata_obj,
             )
@@ -3258,8 +3273,8 @@ class Pipe:
         if event_emitter.status_mode == "visible_timed":
             self._store_data_in_state(
                 app_state,
-                chat_id,
-                message_id,
+                __metadata__.get("chat_id"),
+                __metadata__.get("message_id"),
                 "pipe_start_time",
                 event_emitter.start_time,
             )
@@ -3280,11 +3295,46 @@ class Pipe:
         app_state._state[key] = value
 
     @staticmethod
+    def _calculate_cost(token_count: int, pricing_tiers: list[dict]) -> float:
+        """
+        Calculates cost based on tiered pricing structure (in USD)
+        """
+        if not pricing_tiers or token_count <= 0:
+            return 0.0
+
+        total_cost = 0.0
+        remaining_tokens = token_count
+
+        for tier in pricing_tiers:
+            price_per_million = tier.get("price_per_million", 0.0)
+            tier_limit = tier.get("up_to_tokens")  # None means unlimited
+
+            if tier_limit is None:
+                # Last tier with no limit - use all remaining tokens
+                tokens_in_tier = remaining_tokens
+            else:
+                # Limited tier - use up to the tier limit
+                tokens_in_tier = min(remaining_tokens, tier_limit)
+
+            tier_cost = (tokens_in_tier / 1_000_000) * price_per_million
+            total_cost += tier_cost
+            remaining_tokens -= tokens_in_tier
+
+            if remaining_tokens <= 0:
+                break
+
+        return total_cost
+
     def _get_usage_data(
+        self,
         response: types.GenerateContentResponse,
+        app_state: State,
+        metadata: "Metadata",
     ) -> dict[str, Any] | None:
         """
-        Extracts and cleans usage data from a GenerateContentResponse object.
+        Extracts usage data from a GenerateContentResponse object.
+        Calculates and includes cost based on pricing from YAML configuration.
+        Adds cumulative tokens and cost if previous history data is available.
         Returns None if usage metadata is not present.
         """
         if not response.usage_metadata:
@@ -3293,27 +3343,131 @@ class Pipe:
             )
             return None
 
-        usage_data = response.usage_metadata.model_dump()
+        # Dump the raw token usage details, excluding any fields that are None.
+        token_details = response.usage_metadata.model_dump(exclude_none=True)
 
-        # 1. Rename the three core required fields.
-        usage_data["prompt_tokens"] = usage_data.pop("prompt_token_count")
-        usage_data["completion_tokens"] = usage_data.pop("candidates_token_count")
-        usage_data["total_tokens"] = usage_data.pop("total_token_count")
+        is_paid_api = metadata.get("is_paid_api", True)
+        model_id = metadata.get("canonical_model_id", "")
 
-        CORE_KEYS = {"prompt_tokens", "completion_tokens", "total_tokens"}
+        cost_details: dict[str, float] = {
+            "input_cost": 0.0,
+            "cache_cost": 0.0,
+            "output_cost": 0.0,
+            "image_output_cost": 0.0,
+            "total_cost": 0.0,
+        }
 
-        # 2. Remove auxiliary keys that have falsy values (None, empty list, etc.).
-        # We must iterate over a copy of keys to safely delete items from the dict.
-        for k in list(usage_data.keys()):
-            if k in CORE_KEYS:
-                continue
+        if not is_paid_api:
+            log.debug(
+                "Using free API, costs are not applicable and will be reported as 0."
+            )
+        else:
+            # For paid APIs, attempt to calculate cost.
+            try:
+                model_config = app_state._state.get("gemini_model_config", {})
+                if model_id in model_config:
+                    pricing = model_config[model_id].get("pricing", {})
 
-            # If the value is falsy (None, 0, empty list), remove the key.
-            # This retains non-core data (like modality counts) if it exists.
-            if not usage_data[k]:
-                del usage_data[k]
+                    if pricing:
+                        total_cost = input_cost = cache_cost = output_cost = (
+                            image_output_cost
+                        ) = 0.0
 
-        return usage_data
+                        # Calculate input cost (non-cached tokens)
+                        prompt_tokens = token_details.get("prompt_token_count", 0)
+                        cached_tokens = token_details.get(
+                            "cached_content_token_count", 0
+                        )
+                        non_cached_input_tokens = prompt_tokens - cached_tokens
+
+                        if non_cached_input_tokens > 0 and "input" in pricing:
+                            input_cost = self._calculate_cost(
+                                non_cached_input_tokens, pricing["input"]
+                            )
+                            total_cost += input_cost
+
+                        # Calculate cached input cost (if applicable)
+                        if cached_tokens > 0 and "caching" in pricing:
+                            cache_cost = self._calculate_cost(
+                                cached_tokens, pricing["caching"]
+                            )
+                            total_cost += cache_cost
+
+                        # Calculate output cost (image + text separately)
+                        completion_tokens = token_details.get(
+                            "candidates_token_count", 0
+                        )
+                        if completion_tokens > 0:
+                            # If there is an image generated, it would be in candidates_tokens_details
+                            candidates_details = token_details.get(
+                                "candidates_tokens_details", []
+                            )
+                            image_tokens = 0
+                            for detail in candidates_details or []:
+                                if detail.get("modality") == "IMAGE":
+                                    image_tokens += detail.get("token_count", 0)
+                            text_tokens = completion_tokens - image_tokens
+
+                            # Calculate text output cost
+                            if text_tokens > 0 and "output" in pricing:
+                                output_cost += self._calculate_cost(
+                                    text_tokens, pricing["output"]
+                                )
+
+                            # Calculate image output cost
+                            if image_tokens > 0 and "image_output" in pricing:
+                                image_output_cost += self._calculate_cost(
+                                    image_tokens, pricing["image_output"]
+                                )
+                            elif image_tokens > 0 and "output" in pricing:
+                                image_output_cost += self._calculate_cost(
+                                    image_tokens, pricing["output"]
+                                )
+
+                            total_cost += output_cost + image_output_cost
+
+                        cost_details = {
+                            "input_cost": round(input_cost, 6),
+                            "cache_cost": round(cache_cost, 6),
+                            "output_cost": round(output_cost, 6),
+                            "image_output_cost": round(image_output_cost, 6),
+                            "total_cost": round(total_cost, 6),
+                        }
+                        log.debug(
+                            f"Calculated cost for model {model_id}:",
+                            payload=cost_details,
+                        )
+                    else:
+                        log.debug(
+                            f"No pricing data found for model {model_id}. Cost details will be empty."
+                        )
+                else:
+                    log.debug(
+                        f"Model {model_id} not found in config. Cost details will be empty."
+                    )
+            except Exception as e:
+                log.warning(
+                    f"Failed to calculate cost: {e}. Cost details will be empty."
+                )
+
+        usage_payload = {
+            "token_details": token_details,
+            "cost_details": cost_details,
+        }
+
+        # --- Calculate and append cumulative usage ---
+        prev_tokens = metadata.get("cumulative_tokens")
+        prev_cost = metadata.get("cumulative_cost")
+
+        # Only add cumulative data if the chain is unbroken (previous data exists)
+        if prev_tokens is not None and prev_cost is not None:
+            current_tokens = token_details.get("total_token_count", 0)
+            current_cost = cost_details.get("total_cost", 0.0)
+
+            usage_payload["cumulative_token_count"] = prev_tokens + current_tokens
+            usage_payload["cumulative_total_cost"] = round(prev_cost + current_cost, 6)
+
+        return usage_payload
 
     # endregion 2.5 Post-processing
 

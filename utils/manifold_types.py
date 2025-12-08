@@ -288,8 +288,12 @@ class Metadata(TypedDict):
     safety_settings: list[types.SafetySetting]  # Added in `Filter.inlet`
     chat_control_params: dict[str, Any]  # Added in `Filter.inlet`
     merged_custom_params: dict[str, Any]  # Added in `Pipe.pipe`
+    is_paid_api: NotRequired[bool]  # Added in `Pipe.pipe`
     is_vertex_ai: NotRequired[bool]  # Added in `Pipe.pipe`
     canonical_model_id: NotRequired[str] # Added in `Filter.inlet`
+    cumulative_tokens: NotRequired[int | None]  # Added in `Pipe.pipe`
+    cumulative_cost: NotRequired[float | None]  # Added in `Pipe.pipe`
+
 
 # endregion `__metadata__`
 
@@ -407,6 +411,8 @@ class ChatMessageTD(TypedDict):
     sources: NotRequired[
         list[Source]
     ]  # Present in history.messages for assistant, not in top-level messages list
+    statusHistory: NotRequired[list[StatusEventData]] # assistant messages only
+    usage: NotRequired[dict[str, Any]]  # assistant messages only
 
     # Custom keys added by Gemini Manifold plugin
     gemini_parts: NotRequired[list[dict[str, Any]]]

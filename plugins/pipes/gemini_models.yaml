@@ -77,7 +77,7 @@ gemini-3-pro-image-preview:
         price_per_million: 12.00
     image_output:
       - up_to_tokens: null
-        price_per_million: 30.00
+        price_per_million: 120.00
 
 gemini-2.5-pro:
   description: "Our state-of-the-art thinking model, capable of reasoning over complex problems in code, math, and STEM."
