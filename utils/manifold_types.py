@@ -285,12 +285,14 @@ class Metadata(TypedDict):
     task_body: NotRequired[dict[str, Any] | None]
 
     # These are my own added custom keys, not used by Open WebUI.
-    safety_settings: list[types.SafetySetting]
-    is_paid_api: NotRequired[bool]
-    is_vertex_ai: NotRequired[bool]
-    canonical_model_id: NotRequired[str]
-    cumulative_tokens: NotRequired[int | None]
-    cumulative_cost: NotRequired[float | None]
+    safety_settings: list[types.SafetySetting]  # Added in `Filter.inlet`
+    chat_control_params: dict[str, Any]  # Added in `Filter.inlet`
+    merged_custom_params: dict[str, Any]  # Added in `Pipe.pipe`
+    is_paid_api: NotRequired[bool]  # Added in `Pipe.pipe`
+    is_vertex_ai: NotRequired[bool]  # Added in `Pipe.pipe`
+    canonical_model_id: NotRequired[str] # Added in `Filter.inlet`
+    cumulative_tokens: NotRequired[int | None]  # Added in `Pipe.pipe`
+    cumulative_cost: NotRequired[float | None]  # Added in `Pipe.pipe`
 
 
 # endregion `__metadata__`
