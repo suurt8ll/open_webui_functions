@@ -1922,7 +1922,7 @@ class Pipe:
         IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] | None | Literal[""] = Field(
             default=None,
             description="""Resolution for image generation (Gemini 3 Pro Image only).
-            Default value is None (use the admin's setting).""",
+            Default value is None (use the admin's setting). Possible values: 1K, 2K, 4K""",
         )
         IMAGE_ASPECT_RATIO: (
             Literal[
@@ -1942,7 +1942,7 @@ class Pipe:
         ) = Field(
             default=None,
             description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
-            Default value is None (use the admin's setting).""",
+            Default value is None (use the admin's setting). Possible values: 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9""",
         )
 
         @field_validator("THINKING_BUDGET", mode="after")
