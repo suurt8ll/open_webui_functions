@@ -1777,6 +1777,22 @@ class Pipe:
             description="""Resolution for image generation (Gemini 3 Pro Image only).
             Default value is 1K.""",
         )
+        IMAGE_ASPECT_RATIO: Literal[
+            "1:1",
+            "2:3",
+            "3:2",
+            "3:4",
+            "4:3",
+            "4:5",
+            "5:4",
+            "9:16",
+            "16:9",
+            "21:9",
+        ] = Field(
+            default="16:9",
+            description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
+            Default value is 16:9.""",
+        )
 
         @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
         @classmethod
@@ -1906,6 +1922,26 @@ class Pipe:
         IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] | None | Literal[""] = Field(
             default=None,
             description="""Resolution for image generation (Gemini 3 Pro Image only).
+            Default value is None (use the admin's setting).""",
+        )
+        IMAGE_ASPECT_RATIO: (
+            Literal[
+                "1:1",
+                "2:3",
+                "3:2",
+                "3:4",
+                "4:3",
+                "4:5",
+                "5:4",
+                "9:16",
+                "16:9",
+                "21:9",
+            ]
+            | None
+            | Literal[""]
+        ) = Field(
+            default=None,
+            description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
             Default value is None (use the admin's setting).""",
         )
 
@@ -2690,9 +2726,17 @@ class Pipe:
             gen_content_conf.response_modalities.append("IMAGE")
             if "gemini-3-pro-image" in model_id and valves.IMAGE_RESOLUTION:
                 log.debug(f"Setting image resolution to {valves.IMAGE_RESOLUTION}")
-                gen_content_conf.image_config = types.ImageConfig(
-                    image_size=valves.IMAGE_RESOLUTION
-                )
+                if not gen_content_conf.image_config:
+                    gen_content_conf.image_config = types.ImageConfig()
+                gen_content_conf.image_config.image_size = valves.IMAGE_RESOLUTION
+
+            if (
+                "gemini-3-pro-image" in model_id or "gemini-2.5-flash-image" in model_id
+            ) and valves.IMAGE_ASPECT_RATIO:
+                log.debug(f"Setting image aspect ratio to {valves.IMAGE_ASPECT_RATIO}")
+                if not gen_content_conf.image_config:
+                    gen_content_conf.image_config = types.ImageConfig()
+                gen_content_conf.image_config.aspect_ratio = valves.IMAGE_ASPECT_RATIO
 
         gen_content_conf.tools = []
 
