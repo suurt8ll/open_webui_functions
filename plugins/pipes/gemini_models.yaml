@@ -3,6 +3,41 @@
 # Source for pricing: https://ai.google.dev/gemini-api/docs/pricing
 # Prices are per 1 million tokens in USD.
 
+
+gemini-3-flash-preview:
+  description: "Our most intelligent model built for speed, combining frontier intelligence with superior search and grounding."
+  knowledge_cutoff: "2025-01"
+  latest_update: "2025-12"
+  supported_data_types:
+    inputs: [Text, Image, Video, Audio, PDF]
+    outputs: [Text]
+  tokens:
+    input: 1048576
+    output: 65536
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: true
+    code_execution: true
+    file_search: true
+    function_calling: true
+    grounding_google_maps: false
+    image_generation: false
+    live_api: false
+    search_grounding: true
+    structured_outputs: true
+    thinking: true
+    url_context: true
+  pricing:
+    input:
+      - up_to_tokens: null
+        price_per_million: 0.5
+    output:
+      - up_to_tokens: null
+        price_per_million: 3
+    caching:
+      - up_to_tokens: null
+        price_per_million: 0.05
 gemini-3-pro-preview:
   description: "The best model in the world for multimodal understanding, and our most powerful agentic and vibe-coding model yet."
   knowledge_cutoff: "2025-01"
