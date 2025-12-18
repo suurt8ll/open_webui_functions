@@ -1761,8 +1761,8 @@ class Pipe:
             "visible_timed",
         ] = Field(
             default="hidden_detailed",
-            description="""Control status display. (Default: hidden_detailed) • Options • disable: No status. 
-            • hidden_compact: Final success hidden, no thoughts. • hidden_detailed: Final success hidden, with thoughts. 
+            description="""Control status display. (Default: hidden_detailed) • Options • disable: No status.
+            • hidden_compact: Final success hidden, no thoughts. • hidden_detailed: Final success hidden, with thoughts.
             • visible: All status visible. • visible_timed: Visible with timestamps.""",
         )
         LOG_LEVEL: Literal[
@@ -1771,6 +1771,27 @@ class Pipe:
             default="INFO",
             description="""Select logging level. Use `docker logs -f open-webui` to view logs.
             Default value is INFO.""",
+        )
+        IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] = Field(
+            default="1K",
+            description="""Resolution for image generation (Gemini 3 Pro Image only).
+            Default value is 1K.""",
+        )
+        IMAGE_ASPECT_RATIO: Literal[
+            "1:1",
+            "2:3",
+            "3:2",
+            "3:4",
+            "4:3",
+            "4:5",
+            "5:4",
+            "9:16",
+            "16:9",
+            "21:9",
+        ] = Field(
+            default="16:9",
+            description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
+            Default value is 16:9.""",
         )
 
         @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
@@ -1895,8 +1916,33 @@ class Pipe:
             | None
         ) = Field(
             default=None,
-            description="""Override admin setting (leave empty to use default). 
+            description="""Override admin setting (leave empty to use default).
             Options: disable | hidden_compact | hidden_detailed | visible | visible_timed""",
+        )
+        IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] | None | Literal[""] = Field(
+            default=None,
+            description="""Resolution for image generation (Gemini 3 Pro Image only).
+            Default value is None (use the admin's setting). Possible values: 1K, 2K, 4K""",
+        )
+        IMAGE_ASPECT_RATIO: (
+            Literal[
+                "1:1",
+                "2:3",
+                "3:2",
+                "3:4",
+                "4:3",
+                "4:5",
+                "5:4",
+                "9:16",
+                "16:9",
+                "21:9",
+            ]
+            | None
+            | Literal[""]
+        ) = Field(
+            default=None,
+            description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
+            Default value is None (use the admin's setting). Possible values: 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9""",
         )
 
         @field_validator("THINKING_BUDGET", mode="after")
@@ -2106,6 +2152,15 @@ class Pipe:
 
         # Determine the request type to provide a more informative status message.
         is_streaming = features.get("stream", True)
+        if (
+            is_streaming
+            and valves.IMAGE_RESOLUTION in ["2K", "4K"]
+            and "gemini-3-pro-image" in model_id
+        ):
+            log.info(
+                f"Forcing non-streaming mode due to {valves.IMAGE_RESOLUTION} resolution setting."
+            )
+            is_streaming = False
         request_type_str = "streaming" if is_streaming else "non-streaming"
 
         # Emit a status update. EventEmitter handles formatting and timestamps.
@@ -2669,6 +2724,19 @@ class Pipe:
         gen_content_conf.response_modalities = ["TEXT"]
         if self._is_image_model(model_id, config):
             gen_content_conf.response_modalities.append("IMAGE")
+            if "gemini-3-pro-image" in model_id and valves.IMAGE_RESOLUTION:
+                log.debug(f"Setting image resolution to {valves.IMAGE_RESOLUTION}")
+                if not gen_content_conf.image_config:
+                    gen_content_conf.image_config = types.ImageConfig()
+                gen_content_conf.image_config.image_size = valves.IMAGE_RESOLUTION
+
+            if (
+                "gemini-3-pro-image" in model_id or "gemini-2.5-flash-image" in model_id
+            ) and valves.IMAGE_ASPECT_RATIO:
+                log.debug(f"Setting image aspect ratio to {valves.IMAGE_ASPECT_RATIO}")
+                if not gen_content_conf.image_config:
+                    gen_content_conf.image_config = types.ImageConfig()
+                gen_content_conf.image_config.aspect_ratio = valves.IMAGE_ASPECT_RATIO
 
         gen_content_conf.tools = []
 
