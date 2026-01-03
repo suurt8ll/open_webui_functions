@@ -2170,45 +2170,31 @@ class Pipe:
             )
         )
 
-        if is_streaming:
-            # Streaming response
-            response_stream: AsyncIterator[types.GenerateContentResponse] = (
-                await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
-            )
+        # Get a resilient stream (handles Free -> Paid fallback automatically).
+        # This replaces both the streaming and non-streaming blocks above.
+        response_stream = await self._get_resilient_response_stream(
+            valves=valves,
+            __user__=__user__,
+            gen_content_args=gen_content_args,
+            is_streaming=is_streaming,
+            __metadata__=__metadata__,
+            event_emitter=event_emitter,
+            model_config=model_config,
+        )
 
-            log.info(
-                "Streaming enabled. Returning AsyncGenerator from unified processor."
-            )
-            log.debug("pipe method has finished.")
-            return self._unified_response_processor(
-                response_stream,
-                __request__.app,
-                event_emitter,
-                __metadata__,
-            )
-        else:
-            # Non-streaming response.
-            # FIXME: Catch and handle any exceptions from the API call.
-            res = await client.aio.models.generate_content(**gen_content_args)
+        if response_stream is None:
+            error_msg = "API returned an empty response stream. The model did not generate any content."
+            raise ValueError(error_msg)
 
-            # Adapter: Create a simple, one-shot async generator that yields the
-            # single response object, making it behave like a stream.
-            async def single_item_stream(
-                response: types.GenerateContentResponse,
-            ) -> AsyncGenerator[types.GenerateContentResponse, None]:
-                yield response
+        log.info("Request successful. Passing stream to unified processor.")
+        log.debug("pipe method has finished.")
 
-            log.info(
-                "Streaming disabled. Adapting full response and returning "
-                "AsyncGenerator from unified processor."
-            )
-            log.debug("pipe method has finished.")
-            return self._unified_response_processor(
-                single_item_stream(res),
-                __request__.app,
-                event_emitter,
-                __metadata__,
-            )
+        return self._unified_response_processor(
+            response_stream,
+            __request__.app,
+            event_emitter,
+            __metadata__,
+        )
 
     # region 2. Helper methods inside the Pipe class
 
@@ -2845,6 +2831,214 @@ class Pipe:
     # endregion 2.3 GenerateContentConfig assembly
 
     # region 2.4 Model response processing
+
+    def _check_free_tier_eligibility(
+        self,
+        model_id: str,
+        model_config: dict,
+        features: dict,
+    ) -> bool:
+        """
+        Determines if the request is eligible for the Free Tier based on model config
+        and requested features (e.g., grounding).
+        """
+        # 1. Check if model is configured as having a free tier in YAML
+        if model_id not in model_config:
+            return False
+
+        pricing = model_config[model_id].get("pricing", {})
+        if not pricing.get("free_tier", False):
+            return False
+
+        # 2. Check for feature exclusions (e.g. Google Search is often Paid only)
+        excluded_features = pricing.get("excluded_features", [])
+
+        # Check Search
+        is_search_requested = features.get("google_search_tool") or features.get(
+            "google_search_retrieval"
+        )
+        if is_search_requested and "search_grounding" in excluded_features:
+            log.info(
+                f"Free Tier ineligible: Search requested but excluded for {model_id}."
+            )
+            return False
+
+        # Check Maps
+        # Note: We check the raw feature toggle presence here, assuming the toggle logic put it in features
+        if (
+            features.get("gemini_maps_grounding_toggle")
+            and "grounding_google_maps" in excluded_features
+        ):
+            log.info(
+                f"Free Tier ineligible: Maps requested but excluded for {model_id}."
+            )
+            return False
+
+        return True
+
+    async def _get_resilient_response_stream(
+        self,
+        valves: "Pipe.Valves",
+        __user__: "UserData",
+        gen_content_args: dict,
+        is_streaming: bool,
+        __metadata__: "Metadata",
+        event_emitter: EventEmitter,
+        model_config: dict,
+    ) -> AsyncIterator[types.GenerateContentResponse] | None:
+        """
+        Generates a stream of responses with automatic fallback logic.
+
+        1. Identifies if routing (Free -> Paid) is possible.
+        2. Tries Free Tier first.
+        3. If Free Tier fails on the FIRST chunk with a Quota/Permission error, switches to Paid.
+        4. Updates __metadata__['is_paid_api'] so cost calculation is accurate.
+        """
+
+        model_id = __metadata__.get("canonical_model_id")
+
+        # --- 1. Determine Routing Strategy ---
+
+        has_free_key = bool(valves.GEMINI_FREE_API_KEY)
+        has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
+        use_vertex = valves.USE_VERTEX_AI and valves.VERTEX_PROJECT
+
+        # Default execution: just use whatever keys are available in valves (Standard behavior)
+        # We only engage smart routing if we aren't using Vertex, have both keys (conceptually),
+        # or specifically have a Free key and want to try it.
+
+        try_free_first = False
+        allow_fallback = False
+
+        if use_vertex:
+            # Vertex is always paid/enterprise. No routing.
+            execution_order = ["vertex"]
+        elif has_free_key:
+            # Check eligibility
+            is_eligible = self._check_free_tier_eligibility(
+                model_id, model_config, __metadata__.get("features", {})  # type: ignore
+            )
+
+            if is_eligible:
+                execution_order = ["free"]
+                if has_paid_key:
+                    allow_fallback = True
+                    execution_order.append("paid")
+            else:
+                # Not eligible for free tier (e.g. search requested), go straight to paid if available
+                if has_paid_key:
+                    execution_order = ["paid"]
+                else:
+                    # User only has free key but requested paid feature.
+                    # We let it run on "free" so the API returns the proper error message to the user.
+                    execution_order = ["free"]
+        elif has_paid_key:
+            # Only paid key available
+            execution_order = ["paid"]
+        else:
+            # No keys? execution will likely fail in client creation, let standard flow handle it
+            execution_order = ["standard"]
+
+        log.debug(f"Routing strategy for {model_id}: {execution_order}")
+
+        # --- 2. Execution Loop ---
+
+        for attempt_idx, tier in enumerate(execution_order):
+            is_last_attempt = attempt_idx == len(execution_order) - 1
+
+            # Prepare a temporary valves object to force the specific client
+            # We copy valves to avoid mutating the object used elsewhere
+            current_valves = copy.copy(valves)
+
+            if tier == "free":
+                current_valves.GEMINI_PAID_API_KEY = None  # Force Free
+                log.info(f"Attempting execution on FREE Tier ({model_id})...")
+                # Metadata might have been set to True initially if user had both keys, reset to False for this attempt
+                __metadata__["is_paid_api"] = False
+            elif tier == "paid":
+                current_valves.GEMINI_FREE_API_KEY = None  # Force Paid
+                log.info(f"Attempting execution on PAID Tier ({model_id})...")
+                __metadata__["is_paid_api"] = True
+
+            # Get client for this tier
+            try:
+                client = self._get_user_client(current_valves, __user__["email"])
+            except Exception as e:
+                if not is_last_attempt:
+                    log.warning(
+                        f"Client creation failed for {tier}: {e}. Retrying with next tier."
+                    )
+                    continue
+                raise e
+
+            # Create the stream generator
+            try:
+                if is_streaming:
+                    # Note: generate_content_stream validates args but network request usually starts on iteration
+                    stream = await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
+                else:
+                    # For non-streaming, we await the full response here
+                    response = await client.aio.models.generate_content(
+                        **gen_content_args
+                    )
+
+                    # Create a fake stream adapter
+                    async def one_shot_iter():
+                        yield response
+
+                    stream = one_shot_iter()
+
+                # --- 3. The "Peek" Logic ---
+                # We must manually fetch the first chunk to catch early errors (429/403)
+                # If we return the stream immediately to the processor, we lose control over the fallback.
+
+                iterator = stream.__aiter__()
+
+                try:
+                    first_chunk = await iterator.__anext__()
+                except StopAsyncIteration:
+                    # Empty response? Yield nothing and finish.
+                    return
+
+                # If we got here, the request succeeded!
+                # Create a generator that yields the first chunk we peeked, then the rest.
+                async def reconstructed_stream():
+                    yield first_chunk
+                    async for chunk in iterator:
+                        yield chunk
+
+                return reconstructed_stream()
+
+            except Exception as e:
+                # Check if this is a retriable error
+                # We look for Google API errors (Quota or Permission)
+                is_quota_error = (
+                    "429" in str(e)
+                    or "403" in str(e)
+                    or (
+                        isinstance(e, genai_errors.ClientError) and e.code in [429, 403]
+                    )
+                )
+
+                should_retry = not is_last_attempt and tier == "free" and is_quota_error
+
+                if should_retry:
+                    warning_msg = f"Free Tier quota exceeded or restricted (Error: {e}). Switching to Paid API..."
+                    log.warning(warning_msg)
+                    asyncio.create_task(
+                        event_emitter.emit_status(
+                            "Free quota limit, switching to Paid API...", done=False
+                        )
+                    )
+                    continue  # Loop to "paid" tier
+                else:
+                    # If it's not retriable or we are out of options, raise it up
+                    log.error(f"Error during request execution (Tier: {tier}): {e}")
+                    raise e
+
+        # Should not be reachable
+        raise ValueError("Exhausted execution options without result.")
+
     async def _unified_response_processor(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
@@ -3245,7 +3439,6 @@ class Pipe:
 
     # endregion 2.4 Model response processing
 
-    # region 2.5 Post-processing
     # region 2.5 Post-processing
     async def _do_post_processing(
         self,
