@@ -2013,14 +2013,6 @@ class Pipe:
         # Check the version of the companion filter
         self._check_companion_filter_version(features)
 
-        # Apply settings from the user
-        valves: Pipe.Valves = self._get_merged_valves(
-            self.valves, __user__.get("valves"), __user__.get("email")
-        )
-
-        # Apply UI toggle overrides (Paid API & Vertex AI)
-        valves = self._apply_toggle_configurations(valves, __metadata__)
-
         # Retrieve model configuration from app state
         model_config = __request__.app.state._state.get("gemini_model_config")
         if model_config is None:
@@ -2065,54 +2057,76 @@ class Pipe:
             log.info(f'{__metadata__["task"]=}, disabling event emissions.')  # type: ignore
             __event_emitter__ = None
 
+        # 1. Capture the raw state of keys before any overrides
+        valves: Pipe.Valves = self._get_merged_valves(
+            self.valves, __user__.get("valves"), __user__.get("email")
+        )
+        has_free_key = bool(valves.GEMINI_FREE_API_KEY)
+        has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
+
+        # 2. Retrieve Toggle Statuses
+        vertex_available, vertex_toggled_on = self._get_toggleable_feature_status(
+            "gemini_vertex_ai_toggle", __metadata__
+        )
+        paid_toggle_available, paid_toggled_on = self._get_toggleable_feature_status(
+            "gemini_paid_api", __metadata__
+        )
+
+        # 3. Determine Execution Order
+        execution_order = []
+
+        # Priority 1: Vertex AI (If toggled on, it's the exclusive path)
+        if vertex_available and vertex_toggled_on and valves.VERTEX_PROJECT:
+            execution_order = ["vertex"]
+
+        # Priority 2: User explicitly toggled "Paid API" ON
+        elif paid_toggle_available and paid_toggled_on:
+            execution_order = ["paid"]
+
+        # Priority 3: Default Resilient Routing (Free -> Paid)
+        else:
+            if has_free_key:
+                # Check if the model/feature set is allowed on the free tier
+                is_eligible = self._check_free_tier_eligibility(
+                    model_id, model_config, features
+                )
+                if is_eligible:
+                    execution_order = ["free"]
+                    if has_paid_key:
+                        execution_order.append("paid")
+                else:
+                    # Not eligible for free (e.g. search requested), go straight to paid
+                    execution_order = ["paid"] if has_paid_key else ["free"]
+            elif has_paid_key:
+                execution_order = ["paid"]
+            else:
+                execution_order = ["standard"]
+
+        log.debug(f"Routing strategy for {model_id}: {execution_order}")
+
         event_emitter = EventEmitter(
             __event_emitter__,
             status_mode=valves.STATUS_EMISSION_BEHAVIOR,
         )
 
-        # --- Execution Strategy ---
-
-        has_free_key = bool(valves.GEMINI_FREE_API_KEY)
-        has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
-        use_vertex = valves.USE_VERTEX_AI and valves.VERTEX_PROJECT
-
-        # Determine routing strategy based on keys and eligibility
-        execution_order = []
-        if use_vertex:
-            execution_order = ["vertex"]
-        elif has_free_key:
-            is_eligible = self._check_free_tier_eligibility(
-                model_id, model_config, features
-            )
-            if is_eligible:
-                execution_order = ["free"]
-                if has_paid_key:
-                    execution_order.append("paid")
-            else:
-                execution_order = ["paid"] if has_paid_key else ["free"]
-        elif has_paid_key:
-            execution_order = ["paid"]
-        else:
-            # Fallback to standard flow (likely fail on client creation)
-            execution_order = ["standard"]
-
-        log.debug(f"Routing strategy for {model_id}: {execution_order}")
-
         # --- Execution Loop ---
-
         for attempt_idx, tier in enumerate(execution_order):
             is_last_attempt = attempt_idx == len(execution_order) - 1
 
-            # Prepare valves for this specific tier
+            # Create a "Tier-Specific" valves object for this attempt.
+            # We copy to ensure we don't pollute the original valves or metadata.
             current_valves = copy.copy(valves)
+
             if tier == "free":
                 current_valves.GEMINI_PAID_API_KEY = None
+                current_valves.USE_VERTEX_AI = False
                 __metadata__["is_paid_api"] = False
             elif tier == "paid":
                 current_valves.GEMINI_FREE_API_KEY = None
+                current_valves.USE_VERTEX_AI = False
                 __metadata__["is_paid_api"] = True
-            else:
-                # Vertex or Standard, just assume paid/enterprise for metadata
+            elif tier == "vertex":
+                current_valves.USE_VERTEX_AI = True
                 __metadata__["is_paid_api"] = True
 
             try:
@@ -4110,60 +4124,6 @@ class Pipe:
             )
 
         return (True, is_toggled_on)
-
-    def _apply_toggle_configurations(
-        self,
-        valves: "Pipe.Valves",
-        __metadata__: "Metadata",
-    ) -> "Pipe.Valves":
-        """
-        Applies logic for toggleable filters (Paid API, Vertex AI) to the valves.
-        Returns a modified Valves object.
-        """
-
-        # --- Logic for Gemini Paid API Toggle ---
-        is_paid_api_available, is_paid_api_toggled_on = (
-            self._get_toggleable_feature_status("gemini_paid_api", __metadata__)
-        )
-
-        if is_paid_api_available:
-            if is_paid_api_toggled_on:
-                # User has toggled ON the paid API filter. Prioritize paid key.
-                valves.GEMINI_FREE_API_KEY = None
-                log.info("Paid API toggle is enabled. Prioritizing paid Gemini key.")
-            else:
-                # User has toggled OFF the paid API filter. Prioritize free key.
-                valves.GEMINI_PAID_API_KEY = None
-                log.info(
-                    "Paid API toggle is available but disabled. Prioritizing free Gemini key."
-                )
-        else:
-            log.info(
-                "Paid API toggle not configured for this model. Defaulting to free key if available."
-            )
-
-        # --- Logic for Vertex AI Toggle ---
-        is_vertex_available, is_vertex_toggled_on = self._get_toggleable_feature_status(
-            "gemini_vertex_ai_toggle", __metadata__
-        )
-
-        # Only override valves if the toggle system is actually active/installed
-        if is_vertex_available:
-            if is_vertex_toggled_on:
-                # Toggle is ON: Ensure Vertex is enabled in valves (if credentials exist)
-                valves.USE_VERTEX_AI = True
-                log.info("Vertex AI toggle is enabled. Enforcing Vertex AI usage.")
-            else:
-                # Toggle is OFF: Force Vertex settings to disabled state
-                valves.USE_VERTEX_AI = False
-                valves.VERTEX_PROJECT = None
-                # Resetting location to default just in case, though strictly not necessary if disabled
-                valves.VERTEX_LOCATION = "global"
-                log.info(
-                    "Vertex AI toggle is disabled. Forcing standard Gemini Developer API."
-                )
-
-        return valves
 
     @staticmethod
     def _get_merged_valves(
