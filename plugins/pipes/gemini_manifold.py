@@ -2891,30 +2891,21 @@ class Pipe:
 
         1. Identifies if routing (Free -> Paid) is possible.
         2. Tries Free Tier first.
-        3. If Free Tier fails on the FIRST chunk with a Quota/Permission error, switches to Paid.
+        3. If Free Tier fails on the FIRST chunk with a Quota/Permission/Overload error, switches to Paid.
         4. Updates __metadata__['is_paid_api'] so cost calculation is accurate.
         """
 
         model_id = __metadata__.get("canonical_model_id")
 
         # --- 1. Determine Routing Strategy ---
-
         has_free_key = bool(valves.GEMINI_FREE_API_KEY)
         has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
         use_vertex = valves.USE_VERTEX_AI and valves.VERTEX_PROJECT
 
-        # Default execution: just use whatever keys are available in valves (Standard behavior)
-        # We only engage smart routing if we aren't using Vertex, have both keys (conceptually),
-        # or specifically have a Free key and want to try it.
-
-        try_free_first = False
-        allow_fallback = False
-
+        execution_order = []
         if use_vertex:
-            # Vertex is always paid/enterprise. No routing.
             execution_order = ["vertex"]
         elif has_free_key:
-            # Check eligibility
             is_eligible = self._check_free_tier_eligibility(
                 model_id, model_config, __metadata__.get("features", {})  # type: ignore
             )
@@ -2922,86 +2913,60 @@ class Pipe:
             if is_eligible:
                 execution_order = ["free"]
                 if has_paid_key:
-                    allow_fallback = True
                     execution_order.append("paid")
             else:
-                # Not eligible for free tier (e.g. search requested), go straight to paid if available
-                if has_paid_key:
-                    execution_order = ["paid"]
-                else:
-                    # User only has free key but requested paid feature.
-                    # We let it run on "free" so the API returns the proper error message to the user.
-                    execution_order = ["free"]
+                execution_order = ["paid"] if has_paid_key else ["free"]
         elif has_paid_key:
-            # Only paid key available
             execution_order = ["paid"]
         else:
-            # No keys? execution will likely fail in client creation, let standard flow handle it
             execution_order = ["standard"]
 
         log.debug(f"Routing strategy for {model_id}: {execution_order}")
 
         # --- 2. Execution Loop ---
-
         for attempt_idx, tier in enumerate(execution_order):
             is_last_attempt = attempt_idx == len(execution_order) - 1
-
-            # Prepare a temporary valves object to force the specific client
-            # We copy valves to avoid mutating the object used elsewhere
             current_valves = copy.copy(valves)
 
             if tier == "free":
-                current_valves.GEMINI_PAID_API_KEY = None  # Force Free
+                current_valves.GEMINI_PAID_API_KEY = None
                 log.info(f"Attempting execution on FREE Tier ({model_id})...")
-                # Metadata might have been set to True initially if user had both keys, reset to False for this attempt
                 __metadata__["is_paid_api"] = False
             elif tier == "paid":
-                current_valves.GEMINI_FREE_API_KEY = None  # Force Paid
+                current_valves.GEMINI_FREE_API_KEY = None
                 log.info(f"Attempting execution on PAID Tier ({model_id})...")
                 __metadata__["is_paid_api"] = True
 
-            # Get client for this tier
             try:
                 client = self._get_user_client(current_valves, __user__["email"])
             except Exception as e:
                 if not is_last_attempt:
-                    log.warning(
-                        f"Client creation failed for {tier}: {e}. Retrying with next tier."
-                    )
+                    log.warning(f"Client creation failed for {tier}: {e}. Retrying...")
                     continue
                 raise e
 
-            # Create the stream generator
             try:
                 if is_streaming:
-                    # Note: generate_content_stream validates args but network request usually starts on iteration
                     stream = await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
                 else:
-                    # For non-streaming, we await the full response here
                     response = await client.aio.models.generate_content(
                         **gen_content_args
                     )
 
-                    # Create a fake stream adapter
                     async def one_shot_iter():
                         yield response
 
                     stream = one_shot_iter()
 
                 # --- 3. The "Peek" Logic ---
-                # We must manually fetch the first chunk to catch early errors (429/403)
-                # If we return the stream immediately to the processor, we lose control over the fallback.
-
+                # We fetch the first chunk to catch early errors (429, 403, 503)
                 iterator = stream.__aiter__()
-
                 try:
                     first_chunk = await iterator.__anext__()
                 except StopAsyncIteration:
-                    # Empty response? Yield nothing and finish.
                     return
 
-                # If we got here, the request succeeded!
-                # Create a generator that yields the first chunk we peeked, then the rest.
+                # Success! Reconstruct the stream and return
                 async def reconstructed_stream():
                     yield first_chunk
                     async for chunk in iterator:
@@ -3010,33 +2975,44 @@ class Pipe:
                 return reconstructed_stream()
 
             except Exception as e:
-                # Check if this is a retriable error
-                # We look for Google API errors (Quota or Permission)
-                is_quota_error = (
-                    "429" in str(e)
-                    or "403" in str(e)
+                error_str = str(e).upper()
+
+                # Check for Quota (429), Permissions (403), or Overloaded/Unavailable (503)
+                is_fallback_eligible_error = (
+                    "429" in error_str
+                    or "403" in error_str
+                    or "503" in error_str
+                    or "UNAVAILABLE" in error_str
                     or (
                         isinstance(e, genai_errors.ClientError) and e.code in [429, 403]
                     )
+                    or (isinstance(e, genai_errors.ServerError) and e.code in [503])
                 )
 
-                should_retry = not is_last_attempt and tier == "free" and is_quota_error
+                should_retry = (
+                    not is_last_attempt
+                    and tier == "free"
+                    and is_fallback_eligible_error
+                )
 
                 if should_retry:
-                    warning_msg = f"Free Tier quota exceeded or restricted (Error: {e}). Switching to Paid API..."
-                    log.warning(warning_msg)
+                    reason = (
+                        "quota exceeded" if "429" in error_str else "model overloaded"
+                    )
+                    log.warning(
+                        f"Free Tier {reason} (Error: {e}). Switching to Paid API..."
+                    )
+
                     asyncio.create_task(
                         event_emitter.emit_status(
-                            "Free quota limit, switching to Paid API...", done=False
+                            f"Free Tier {reason}, switching to Paid API...", done=False
                         )
                     )
-                    continue  # Loop to "paid" tier
+                    continue
                 else:
-                    # If it's not retriable or we are out of options, raise it up
                     log.error(f"Error during request execution (Tier: {tier}): {e}")
                     raise e
 
-        # Should not be reachable
         raise ValueError("Exhausted execution options without result.")
 
     async def _unified_response_processor(
