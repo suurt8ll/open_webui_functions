@@ -1736,6 +1736,12 @@ class Pipe:
             If disabled, files are sent as raw bytes in the request.
             Default value is True.""",
         )
+        ENABLE_FREE_TIER_FALLBACK: bool = Field(
+            default=False,
+            description="""Automatically switch to the Paid API if a Free API request fails due to quota limits (429) or model overload (503).
+            Requires both Free and Paid API keys to be configured. 
+            Default value is False.""",
+        )
         PARSE_YOUTUBE_URLS: bool = Field(
             default=True,
             description="""Whether to parse YouTube URLs from user messages and provide them as context to the model.
@@ -1890,6 +1896,12 @@ class Pipe:
             default=None,
             description="""Override the default setting for using the Google Files API.
             Set to True to force use, False to disable.
+            Default is None (use the admin's setting).""",
+        )
+        ENABLE_FREE_TIER_FALLBACK: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Override the default setting for Free API fallback.
+            Set to True to enable automatic fallback to the Paid API, False to disable.
             Default is None (use the admin's setting).""",
         )
         PARSE_YOUTUBE_URLS: bool | None | Literal[""] = Field(
@@ -2086,13 +2098,13 @@ class Pipe:
         # Priority 3: Default Resilient Routing (Free -> Paid)
         else:
             if has_free_key:
-                # Check if the model/feature set is allowed on the free tier
                 is_eligible = self._check_free_tier_eligibility(
                     model_id, model_config, features
                 )
                 if is_eligible:
                     execution_order = ["free"]
-                    if has_paid_key:
+                    # Only append 'paid' to the sequence if the feature is enabled
+                    if valves.ENABLE_FREE_TIER_FALLBACK and has_paid_key:
                         execution_order.append("paid")
                 else:
                     # Not eligible for free (e.g. search requested), go straight to paid
