@@ -1736,6 +1736,12 @@ class Pipe:
             If disabled, files are sent as raw bytes in the request.
             Default value is True.""",
         )
+        ENABLE_FREE_TIER_FALLBACK: bool = Field(
+            default=False,
+            description="""Automatically switch to the Paid API if a Free API request fails due to quota limits (429) or model overload (503).
+            Requires both Free and Paid API keys to be configured. 
+            Default value is False.""",
+        )
         PARSE_YOUTUBE_URLS: bool = Field(
             default=True,
             description="""Whether to parse YouTube URLs from user messages and provide them as context to the model.
@@ -1892,6 +1898,12 @@ class Pipe:
             Set to True to force use, False to disable.
             Default is None (use the admin's setting).""",
         )
+        ENABLE_FREE_TIER_FALLBACK: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Override the default setting for Free API fallback.
+            Set to True to enable automatic fallback to the Paid API, False to disable.
+            Default is None (use the admin's setting).""",
+        )
         PARSE_YOUTUBE_URLS: bool | None | Literal[""] = Field(
             default=None,
             description="""Override the default setting for parsing YouTube URLs.
@@ -2008,24 +2020,12 @@ class Pipe:
             f"pipe method has been called. Gemini Manifold google_genai version is {VERSION}"
         )
         log.trace("__metadata__:", payload=__metadata__)
-        features = __metadata__.get("features", {}) or {}
+        features = __metadata__.get("features", {}) or cast("Features", {})
 
         # Check the version of the companion filter
         self._check_companion_filter_version(features)
 
-        # Apply settings from the user
-        valves: Pipe.Valves = self._get_merged_valves(
-            self.valves, __user__.get("valves"), __user__.get("email")
-        )
-
-        # Apply UI toggle overrides (Paid API & Vertex AI)
-        valves = self._apply_toggle_configurations(valves, __metadata__)
-
-        # Determine if a paid API (Vertex or Gemini Paid) is being used.
-        # This is used later to decide whether to calculate and display cost.
-        __metadata__["is_paid_api"] = not bool(valves.GEMINI_FREE_API_KEY)
-
-        # Retrieve model configuration from app state (loaded by companion filter)
+        # Retrieve model configuration from app state
         model_config = __request__.app.state._state.get("gemini_model_config")
         if model_config is None:
             error_msg = (
@@ -2034,7 +2034,6 @@ class Pipe:
             )
             log.error(error_msg)
             raise ValueError(error_msg)
-        log.debug(f"Retrieved model config from app state with {len(model_config)} model(s).")
 
         # Resolve custom parameters from both the model page (in `body`) and chat
         # controls (in `__metadata__`). Chat control settings take precedence.
@@ -2051,70 +2050,11 @@ class Pipe:
         }
         chat_control_params = __metadata__.get("chat_control_params", {})
 
-        # Merge parameters, with chat-level settings overriding model-level ones.
         merged_custom_params = model_page_params.copy()
         merged_custom_params.update(chat_control_params)
-
-        if merged_custom_params:
-            log.debug("Resolved custom parameters:", payload=merged_custom_params)
-
-        # Store the final merged params in metadata for later use.
         __metadata__["merged_custom_params"] = merged_custom_params
 
-        log.debug(
-            f"USE_VERTEX_AI: {valves.USE_VERTEX_AI}, VERTEX_PROJECT set: {bool(valves.VERTEX_PROJECT)},"
-            f" GEMINI_FREE_API_KEY set: {bool(valves.GEMINI_FREE_API_KEY)}, GEMINI_PAID_API_KEY set: {bool(valves.GEMINI_PAID_API_KEY)}"
-        )
-
-        log.debug(
-            f"Getting genai client (potentially cached) for user {__user__['email']}."
-        )
-        client = self._get_user_client(valves, __user__["email"])
-        __metadata__["is_vertex_ai"] = client.vertexai
-        # Determine the correct API name for logging and status messages.
-        api_name = "Vertex AI Gemini API" if client.vertexai else "Gemini Developer API"
-
-        if __metadata__.get("task"):
-            log.info(f'{__metadata__["task"]=}, disabling event emissions.')  # type: ignore
-            # Task model is not user facing, so we should not emit any events.
-            __event_emitter__ = None
-
-        # Initialize EventEmitter with the user's chosen status behavior.
-        # Start time is automatically captured inside __init__.
-        event_emitter = EventEmitter(
-            __event_emitter__,
-            status_mode=valves.STATUS_EMISSION_BEHAVIOR,
-        )
-
-        files_api_manager = FilesAPIManager(
-            client=client,
-            file_cache=self.file_content_cache,
-            id_hash_cache=self.file_id_to_hash_cache,
-            event_emitter=event_emitter,
-        )
-
-        # Check if user is chatting with an error model for some reason.
-        if "error" in __metadata__["model"]["id"]:
-            error_msg = f"There has been an error during model retrival phase: {str(__metadata__['model'])}"
-            raise ValueError(error_msg)
-
-        log.info(
-            "Converting Open WebUI's `body` dict into list of `Content` objects that `google-genai` understands."
-        )
-
-        builder = GeminiContentBuilder(
-            messages_body=body.get("messages"),
-            metadata_body=__metadata__,
-            user_data=__user__,
-            event_emitter=event_emitter,
-            valves=valves,
-            files_api_manager=files_api_manager,
-        )
-        asyncio.create_task(event_emitter.emit_status("Preparing request..."))
-        contents = await builder.build_contents()
-
         # Retrieve the canonical model ID parsed by the companion filter.
-        # This is expected to be a clean ID (no "gemini_manifold..." prefix, no "models/" prefix).
         model_id = __metadata__.get("canonical_model_id")
         if not model_id:
             error_msg = (
@@ -2124,91 +2064,133 @@ class Pipe:
             log.error(error_msg)
             raise ValueError(error_msg)
 
-        gen_content_conf = self._build_gen_content_config(
-            body, __metadata__, valves, model_config
-        )
-        gen_content_conf.system_instruction = builder.system_prompt
+        # Initialize EventEmitter
+        if __metadata__.get("task"):
+            log.info(f'{__metadata__["task"]=}, disabling event emissions.')  # type: ignore
+            __event_emitter__ = None
 
-        # Check for image generation capabilities using the clean ID.
-        is_image_model = self._is_image_model(model_id, model_config)
-        system_prompt_unsupported = is_image_model or "gemma" in model_id
-        if system_prompt_unsupported:
-            # TODO: append to user message instead.
-            if gen_content_conf.system_instruction:
-                gen_content_conf.system_instruction = None
-                log.warning(
-                    f"Model '{model_id}' does not support the system prompt message! Removing the system prompt."
+        # 1. Capture the raw state of keys before any overrides
+        valves: Pipe.Valves = self._get_merged_valves(
+            self.valves, __user__.get("valves"), __user__.get("email")
+        )
+        has_free_key = bool(valves.GEMINI_FREE_API_KEY)
+        has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
+
+        # 2. Retrieve Toggle Statuses
+        vertex_available, vertex_toggled_on = self._get_toggleable_feature_status(
+            "gemini_vertex_ai_toggle", __metadata__
+        )
+        paid_toggle_available, paid_toggled_on = self._get_toggleable_feature_status(
+            "gemini_paid_api", __metadata__
+        )
+
+        # 3. Determine Execution Order
+        execution_order = []
+
+        # Priority 1: Vertex AI (If toggled on, it's the exclusive path)
+        if vertex_available and vertex_toggled_on and valves.VERTEX_PROJECT:
+            execution_order = ["vertex"]
+
+        # Priority 2: User explicitly toggled "Paid API" ON
+        elif paid_toggle_available and paid_toggled_on:
+            execution_order = ["paid"]
+
+        # Priority 3: Default Resilient Routing (Free -> Paid)
+        else:
+            if has_free_key:
+                is_eligible = self._check_free_tier_eligibility(
+                    model_id, model_config, features
+                )
+                if is_eligible:
+                    execution_order = ["free"]
+                    # Only append 'paid' to the sequence if the feature is enabled
+                    if valves.ENABLE_FREE_TIER_FALLBACK and has_paid_key:
+                        execution_order.append("paid")
+                else:
+                    # Not eligible for free (e.g. search requested), go straight to paid
+                    execution_order = ["paid"] if has_paid_key else ["free"]
+            elif has_paid_key:
+                execution_order = ["paid"]
+            else:
+                execution_order = ["standard"]
+
+        log.debug(f"Routing strategy for {model_id}: {execution_order}")
+
+        event_emitter = EventEmitter(
+            __event_emitter__,
+            status_mode=valves.STATUS_EMISSION_BEHAVIOR,
+        )
+
+        # --- Execution Loop ---
+        for attempt_idx, tier in enumerate(execution_order):
+            is_last_attempt = attempt_idx == len(execution_order) - 1
+
+            # Create a "Tier-Specific" valves object for this attempt.
+            # We copy to ensure we don't pollute the original valves or metadata.
+            current_valves = copy.copy(valves)
+
+            if tier == "free":
+                current_valves.GEMINI_PAID_API_KEY = None
+                current_valves.USE_VERTEX_AI = False
+                __metadata__["is_paid_api"] = False
+            elif tier == "paid":
+                current_valves.GEMINI_FREE_API_KEY = None
+                current_valves.USE_VERTEX_AI = False
+                __metadata__["is_paid_api"] = True
+            elif tier == "vertex":
+                current_valves.USE_VERTEX_AI = True
+                __metadata__["is_paid_api"] = True
+
+            try:
+                log.info(f"Starting generation attempt on tier: {tier}")
+
+                # Execute the attempt. This encapsulates client creation,
+                # file uploads (scoped to key), and the API call.
+                return await self._execute_generation_attempt(
+                    tier=tier,
+                    valves=current_valves,
+                    body=body,
+                    __user__=__user__,
+                    __metadata__=__metadata__,
+                    __request__=__request__,
+                    event_emitter=event_emitter,
+                    model_config=model_config,
+                    features=features,
                 )
 
-        gen_content_args = {
-            "model": model_id,
-            "contents": contents,
-            "config": gen_content_conf,
-        }
-        log.debug(f"Passing these args to the {api_name}:", payload=gen_content_args)
+            except Exception as e:
+                # Error Handling & Routing
+                error_str = str(e).upper()
 
-        # Both streaming and non-streaming responses are now handled by the same
-        # unified processor, which returns an AsyncGenerator.
+                # We catch Quota (429), Permission (403), and Overload/Unavailable (503) errors.
+                # 503 is crucial for Free Tier which has strict load balancing.
+                is_fallback_eligible = (
+                    "429" in error_str
+                    or "403" in error_str
+                    or "503" in error_str
+                    or "UNAVAILABLE" in error_str
+                    or (isinstance(e, genai_errors.ClientError) and e.code in [429, 403])
+                    or (isinstance(e, genai_errors.ServerError) and e.code in [503])
+                )
 
-        # Determine the request type to provide a more informative status message.
-        is_streaming = features.get("stream", True)
-        if (
-            is_streaming
-            and valves.IMAGE_RESOLUTION in ["2K", "4K"]
-            and "gemini-3-pro-image" in model_id
-        ):
-            log.info(
-                f"Forcing non-streaming mode due to {valves.IMAGE_RESOLUTION} resolution setting."
-            )
-            is_streaming = False
-        request_type_str = "streaming" if is_streaming else "non-streaming"
+                should_retry = not is_last_attempt and tier == "free" and is_fallback_eligible
 
-        # Emit a status update. EventEmitter handles formatting and timestamps.
-        asyncio.create_task(
-            event_emitter.emit_status(
-                f"Sending {request_type_str} request to {api_name}..."
-            )
-        )
+                if should_retry:
+                    reason = "quota exceeded" if "429" in error_str else "model overloaded"
+                    log.warning(f"Free Tier {reason} (Error: {e}). Switching to Paid API...")
 
-        if is_streaming:
-            # Streaming response
-            response_stream: AsyncIterator[types.GenerateContentResponse] = (
-                await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
-            )
+                    asyncio.create_task(
+                        event_emitter.emit_status(
+                            f"Free Tier {reason}, switching to Paid API...", done=False
+                        )
+                    )
+                    continue 
 
-            log.info(
-                "Streaming enabled. Returning AsyncGenerator from unified processor."
-            )
-            log.debug("pipe method has finished.")
-            return self._unified_response_processor(
-                response_stream,
-                __request__.app,
-                event_emitter,
-                __metadata__,
-            )
-        else:
-            # Non-streaming response.
-            # FIXME: Catch and handle any exceptions from the API call.
-            res = await client.aio.models.generate_content(**gen_content_args)
+                # If we can't retry, re-raise the error to stop execution
+                log.error(f"Error during request execution (Tier: {tier}): {e}")
+                raise e
 
-            # Adapter: Create a simple, one-shot async generator that yields the
-            # single response object, making it behave like a stream.
-            async def single_item_stream(
-                response: types.GenerateContentResponse,
-            ) -> AsyncGenerator[types.GenerateContentResponse, None]:
-                yield response
-
-            log.info(
-                "Streaming disabled. Adapting full response and returning "
-                "AsyncGenerator from unified processor."
-            )
-            log.debug("pipe method has finished.")
-            return self._unified_response_processor(
-                single_item_stream(res),
-                __request__.app,
-                event_emitter,
-                __metadata__,
-            )
+        raise ValueError("Exhausted execution options without result.")
 
     # region 2. Helper methods inside the Pipe class
 
@@ -2372,7 +2354,7 @@ class Pipe:
                 )
             except GenaiApiError as e:
                 log.warning(
-                    f"Failed to initialize or retrieve models from Vertex AI: {e}"
+                    f"Failemodel_configd to initialize or retrieve models from Vertex AI: {e}"
                 )
             except Exception as e:
                 log.warning(
@@ -2845,6 +2827,317 @@ class Pipe:
     # endregion 2.3 GenerateContentConfig assembly
 
     # region 2.4 Model response processing
+
+    async def _execute_generation_attempt(
+        self,
+        tier: str,
+        valves: "Pipe.Valves",
+        body: "Body",
+        __user__: "UserData",
+        __metadata__: "Metadata",
+        __request__: Request,
+        event_emitter: EventEmitter,
+        model_config: dict,
+        features: "Features",
+    ) -> AsyncGenerator[dict | str, None] | str:
+        """
+        Executes a single generation attempt with a specific tier configuration.
+        Constructs a fresh client and file manager to ensure assets are
+        scoped to the correct API key/project.
+        """
+
+        # 1. Client Creation
+        client = self._get_user_client(valves, __user__["email"])
+        __metadata__["is_vertex_ai"] = client.vertexai
+        api_name = "Vertex AI Gemini API" if client.vertexai else "Gemini Developer API"
+
+        # 2. Files API Manager (Scoped to the current client)
+        files_api_manager = FilesAPIManager(
+            client=client,
+            file_cache=self.file_content_cache,
+            id_hash_cache=self.file_id_to_hash_cache,
+            event_emitter=event_emitter,
+        )
+
+        # 3. Content Builder (Re-uploads files if client changed)
+        builder = GeminiContentBuilder(
+            messages_body=body.get("messages"),
+            metadata_body=__metadata__,
+            user_data=__user__,
+            event_emitter=event_emitter,
+            valves=valves,
+            files_api_manager=files_api_manager,
+        )
+
+        asyncio.create_task(event_emitter.emit_status("Preparing request..."))
+        contents = await builder.build_contents()
+
+        # 4. Configuration Building
+        gen_content_conf = self._build_gen_content_config(
+            body, __metadata__, valves, model_config
+        )
+        gen_content_conf.system_instruction = builder.system_prompt
+
+        model_id = __metadata__["canonical_model_id"] # type: ignore
+
+        # Check for image/system prompt compatibility
+        is_image_model = self._is_image_model(model_id, model_config)
+        if (
+            is_image_model or "gemma" in model_id
+        ) and gen_content_conf.system_instruction:
+            gen_content_conf.system_instruction = None
+            log.warning(
+                f"Model '{model_id}' does not support system prompts. Removing."
+            )
+
+        gen_content_args = {
+            "model": model_id,
+            "contents": contents,
+            "config": gen_content_conf,
+        }
+        log.debug(
+            f"Passing args to {api_name} (Tier: {tier}):", payload=gen_content_args
+        )
+
+        # 5. Stream Setup
+        is_streaming = features.get("stream", True)
+        if (
+            is_streaming
+            and valves.IMAGE_RESOLUTION in ["2K", "4K"]
+            and "gemini-3-pro-image" in model_id
+        ):
+            log.info(
+                f"Forcing non-streaming mode due to {valves.IMAGE_RESOLUTION} resolution."
+            )
+            is_streaming = False
+
+        request_type_str = "streaming" if is_streaming else "non-streaming"
+        asyncio.create_task(
+            event_emitter.emit_status(
+                f"Sending {request_type_str} request to {api_name}..."
+            )
+        )
+
+        # 6. Execution & Peek Logic
+        # We manually fetch the first chunk to catch early errors (429/403/503)
+        # before returning the stream to the frontend.
+
+        if is_streaming:
+            stream = await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
+        else:
+            response = await client.aio.models.generate_content(**gen_content_args)
+
+            async def one_shot_iter():
+                yield response
+
+            stream = one_shot_iter()
+
+        iterator = stream.__aiter__()
+
+        try:
+            first_chunk = await iterator.__anext__()
+        except StopAsyncIteration:
+            # Empty response stream is a valid but weird state, treat as error to allow upper logic to decide
+            raise ValueError("API returned an empty response stream.")
+
+        # Success: Reconstruct the stream including the peeked chunk
+        async def reconstructed_stream():
+            yield first_chunk
+            async for chunk in iterator:
+                yield chunk
+
+        log.info(f"Request successful ({tier}). Passing stream to unified processor.")
+
+        return self._unified_response_processor(
+            reconstructed_stream(),
+            __request__.app,
+            event_emitter,
+            __metadata__,
+        )
+
+    def _check_free_tier_eligibility(
+        self,
+        model_id: str,
+        model_config: dict,
+        features: "Features",
+    ) -> bool:
+        """
+        Determines if the request is eligible for the Free Tier based on model config
+        and requested features (e.g., grounding).
+        """
+        # 1. Check if model is configured as having a free tier in YAML
+        if model_id not in model_config:
+            return False
+
+        pricing = model_config[model_id].get("pricing", {})
+        if not pricing.get("free_tier", False):
+            return False
+
+        # 2. Check for feature exclusions (e.g. Google Search is often Paid only)
+        excluded_features = pricing.get("excluded_features", [])
+
+        # Check Search
+        is_search_requested = features.get("google_search_tool") or features.get(
+            "google_search_retrieval"
+        )
+        if is_search_requested and "search_grounding" in excluded_features:
+            log.info(
+                f"Free Tier ineligible: Search requested but excluded for {model_id}."
+            )
+            return False
+
+        # Check Maps
+        # Note: We check the raw feature toggle presence here, assuming the toggle logic put it in features
+        if (
+            features.get("gemini_maps_grounding_toggle")
+            and "grounding_google_maps" in excluded_features
+        ):
+            log.info(
+                f"Free Tier ineligible: Maps requested but excluded for {model_id}."
+            )
+            return False
+
+        return True
+
+    async def _get_resilient_response_stream(
+        self,
+        valves: "Pipe.Valves",
+        __user__: "UserData",
+        gen_content_args: dict,
+        is_streaming: bool,
+        __metadata__: "Metadata",
+        event_emitter: EventEmitter,
+        model_config: dict,
+    ) -> AsyncIterator[types.GenerateContentResponse] | None:
+        """
+        Generates a stream of responses with automatic fallback logic.
+
+        1. Identifies if routing (Free -> Paid) is possible.
+        2. Tries Free Tier first.
+        3. If Free Tier fails on the FIRST chunk with a Quota/Permission/Overload error, switches to Paid.
+        4. Updates __metadata__['is_paid_api'] so cost calculation is accurate.
+        """
+
+        model_id = __metadata__.get("canonical_model_id")
+
+        # --- 1. Determine Routing Strategy ---
+        has_free_key = bool(valves.GEMINI_FREE_API_KEY)
+        has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
+        use_vertex = valves.USE_VERTEX_AI and valves.VERTEX_PROJECT
+
+        execution_order = []
+        if use_vertex:
+            execution_order = ["vertex"]
+        elif has_free_key:
+            is_eligible = self._check_free_tier_eligibility(
+                model_id, model_config, __metadata__.get("features", {})  # type: ignore
+            )
+
+            if is_eligible:
+                execution_order = ["free"]
+                if has_paid_key:
+                    execution_order.append("paid")
+            else:
+                execution_order = ["paid"] if has_paid_key else ["free"]
+        elif has_paid_key:
+            execution_order = ["paid"]
+        else:
+            execution_order = ["standard"]
+
+        log.debug(f"Routing strategy for {model_id}: {execution_order}")
+
+        # --- 2. Execution Loop ---
+        for attempt_idx, tier in enumerate(execution_order):
+            is_last_attempt = attempt_idx == len(execution_order) - 1
+            current_valves = copy.copy(valves)
+
+            if tier == "free":
+                current_valves.GEMINI_PAID_API_KEY = None
+                log.info(f"Attempting execution on FREE Tier ({model_id})...")
+                __metadata__["is_paid_api"] = False
+            elif tier == "paid":
+                current_valves.GEMINI_FREE_API_KEY = None
+                log.info(f"Attempting execution on PAID Tier ({model_id})...")
+                __metadata__["is_paid_api"] = True
+
+            try:
+                client = self._get_user_client(current_valves, __user__["email"])
+            except Exception as e:
+                if not is_last_attempt:
+                    log.warning(f"Client creation failed for {tier}: {e}. Retrying...")
+                    continue
+                raise e
+
+            try:
+                if is_streaming:
+                    stream = await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
+                else:
+                    response = await client.aio.models.generate_content(
+                        **gen_content_args
+                    )
+
+                    async def one_shot_iter():
+                        yield response
+
+                    stream = one_shot_iter()
+
+                # --- 3. The "Peek" Logic ---
+                # We fetch the first chunk to catch early errors (429, 403, 503)
+                iterator = stream.__aiter__()
+                try:
+                    first_chunk = await iterator.__anext__()
+                except StopAsyncIteration:
+                    return
+
+                # Success! Reconstruct the stream and return
+                async def reconstructed_stream():
+                    yield first_chunk
+                    async for chunk in iterator:
+                        yield chunk
+
+                return reconstructed_stream()
+
+            except Exception as e:
+                error_str = str(e).upper()
+
+                # Check for Quota (429), Permissions (403), or Overloaded/Unavailable (503)
+                is_fallback_eligible_error = (
+                    "429" in error_str
+                    or "403" in error_str
+                    or "503" in error_str
+                    or "UNAVAILABLE" in error_str
+                    or (
+                        isinstance(e, genai_errors.ClientError) and e.code in [429, 403]
+                    )
+                    or (isinstance(e, genai_errors.ServerError) and e.code in [503])
+                )
+
+                should_retry = (
+                    not is_last_attempt
+                    and tier == "free"
+                    and is_fallback_eligible_error
+                )
+
+                if should_retry:
+                    reason = (
+                        "quota exceeded" if "429" in error_str else "model overloaded"
+                    )
+                    log.warning(
+                        f"Free Tier {reason} (Error: {e}). Switching to Paid API..."
+                    )
+
+                    asyncio.create_task(
+                        event_emitter.emit_status(
+                            f"Free Tier {reason}, switching to Paid API...", done=False
+                        )
+                    )
+                    continue
+                else:
+                    log.error(f"Error during request execution (Tier: {tier}): {e}")
+                    raise e
+
+        raise ValueError("Exhausted execution options without result.")
+
     async def _unified_response_processor(
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
@@ -3245,7 +3538,6 @@ class Pipe:
 
     # endregion 2.4 Model response processing
 
-    # region 2.5 Post-processing
     # region 2.5 Post-processing
     async def _do_post_processing(
         self,
@@ -3844,60 +4136,6 @@ class Pipe:
             )
 
         return (True, is_toggled_on)
-
-    def _apply_toggle_configurations(
-        self,
-        valves: "Pipe.Valves",
-        __metadata__: "Metadata",
-    ) -> "Pipe.Valves":
-        """
-        Applies logic for toggleable filters (Paid API, Vertex AI) to the valves.
-        Returns a modified Valves object.
-        """
-
-        # --- Logic for Gemini Paid API Toggle ---
-        is_paid_api_available, is_paid_api_toggled_on = (
-            self._get_toggleable_feature_status("gemini_paid_api", __metadata__)
-        )
-
-        if is_paid_api_available:
-            if is_paid_api_toggled_on:
-                # User has toggled ON the paid API filter. Prioritize paid key.
-                valves.GEMINI_FREE_API_KEY = None
-                log.info("Paid API toggle is enabled. Prioritizing paid Gemini key.")
-            else:
-                # User has toggled OFF the paid API filter. Prioritize free key.
-                valves.GEMINI_PAID_API_KEY = None
-                log.info(
-                    "Paid API toggle is available but disabled. Prioritizing free Gemini key."
-                )
-        else:
-            log.info(
-                "Paid API toggle not configured for this model. Defaulting to free key if available."
-            )
-
-        # --- Logic for Vertex AI Toggle ---
-        is_vertex_available, is_vertex_toggled_on = self._get_toggleable_feature_status(
-            "gemini_vertex_ai_toggle", __metadata__
-        )
-
-        # Only override valves if the toggle system is actually active/installed
-        if is_vertex_available:
-            if is_vertex_toggled_on:
-                # Toggle is ON: Ensure Vertex is enabled in valves (if credentials exist)
-                valves.USE_VERTEX_AI = True
-                log.info("Vertex AI toggle is enabled. Enforcing Vertex AI usage.")
-            else:
-                # Toggle is OFF: Force Vertex settings to disabled state
-                valves.USE_VERTEX_AI = False
-                valves.VERTEX_PROJECT = None
-                # Resetting location to default just in case, though strictly not necessary if disabled
-                valves.VERTEX_LOCATION = "global"
-                log.info(
-                    "Vertex AI toggle is disabled. Forcing standard Gemini Developer API."
-                )
-
-        return valves
 
     @staticmethod
     def _get_merged_valves(
