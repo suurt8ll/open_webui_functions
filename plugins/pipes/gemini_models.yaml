@@ -81,6 +81,88 @@ gemini-3-pro-preview:
       - up_to_tokens: null
         price_per_million: 0.40
 
+gemini-3.1-pro-preview:
+  description: "Refines the performance and reliability of the Gemini 3 Pro series with better thinking, improved token efficiency, and more grounded, factually consistent responses. Optimized for software engineering and agentic workflows requiring precise tool usage and reliable multi-step execution."
+  knowledge_cutoff: "2025-01"
+  latest_update: "2026-02"
+  supported_data_types:
+    inputs: [Text, Image, Video, Audio, PDF]
+    outputs: [Text]
+  tokens:
+    input: 1048576
+    output: 65536
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: true
+    code_execution: true
+    file_search: true
+    function_calling: true
+    grounding_google_maps: false
+    image_generation: false
+    live_api: false
+    search_grounding: true
+    structured_outputs: true
+    thinking: true
+    url_context: true
+  pricing:
+    input:
+      - up_to_tokens: 200000
+        price_per_million: 2.00
+      - up_to_tokens: null
+        price_per_million: 4.00
+    output:
+      - up_to_tokens: 200000
+        price_per_million: 12.00
+      - up_to_tokens: null
+        price_per_million: 18.00
+    caching:
+      - up_to_tokens: 200000
+        price_per_million: 0.20
+      - up_to_tokens: null
+        price_per_million: 0.40
+
+gemini-3.1-pro-preview-customtools:
+  description: "Custom tools variant of Gemini 3.1 Pro Preview, optimized for agentic workflows that use custom tools and bash. Better at prioritizing custom tools such as view_file or search_code."
+  knowledge_cutoff: "2025-01"
+  latest_update: "2026-02"
+  supported_data_types:
+    inputs: [Text, Image, Video, Audio, PDF]
+    outputs: [Text]
+  tokens:
+    input: 1048576
+    output: 65536
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: true
+    code_execution: true
+    file_search: true
+    function_calling: true
+    grounding_google_maps: false
+    image_generation: false
+    live_api: false
+    search_grounding: true
+    structured_outputs: true
+    thinking: true
+    url_context: true
+  pricing:
+    input:
+      - up_to_tokens: 200000
+        price_per_million: 2.00
+      - up_to_tokens: null
+        price_per_million: 4.00
+    output:
+      - up_to_tokens: 200000
+        price_per_million: 12.00
+      - up_to_tokens: null
+        price_per_million: 18.00
+    caching:
+      - up_to_tokens: 200000
+        price_per_million: 0.20
+      - up_to_tokens: null
+        price_per_million: 0.40
+
 gemini-3-pro-image-preview:
   description: "Image generation model. Designed for professional asset production and complex instructions. Features real-world grounding using Google Search and can generate images up to 4K resolution."
   knowledge_cutoff: "2025-01"
