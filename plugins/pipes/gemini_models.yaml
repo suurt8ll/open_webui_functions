@@ -4,6 +4,41 @@
 # Prices are per 1 million tokens in USD.
 
 
+
+gemini-3.1-flash-image-preview:
+  description: "Designed for speed and efficiency, the Gemini 3.1 Flash Image generation model is effective for quick, interactive responses and high throughput."
+  knowledge_cutoff: "2025-01"
+  latest_update: "2026-02"
+  supported_data_types:
+    inputs: [Text, Image, PDF]
+    outputs: [Text, Image]
+  tokens:
+    input: 131072
+    output: 32768
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: false
+    code_execution: false
+    file_search: false
+    function_calling: false
+    grounding_google_maps: false
+    image_generation: true
+    live_api: false
+    search_grounding: true
+    structured_outputs: false
+    thinking: true
+    url_context: false
+  pricing:
+    input:
+      - up_to_tokens: null
+        price_per_million: 0.25
+    output:
+      - up_to_tokens: null
+        price_per_million: 1.50
+    image_output:
+      - up_to_tokens: null
+        price_per_million: 60.00
 gemini-3-flash-preview:
   description: "Our most intelligent model built for speed, combining frontier intelligence with superior search and grounding."
   knowledge_cutoff: "2025-01"
