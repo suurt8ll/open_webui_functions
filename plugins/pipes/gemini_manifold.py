@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 2.0.0
-requirements: google-genai==1.52.0
+requirements: google-genai==1.65.0
 """
 
 # I change these only when I make a release to avoid PR merge conflicts.
@@ -742,6 +742,7 @@ class GeminiContentBuilder:
         self.system_prompt, self.messages_body = self._extract_system_prompt(
             self.messages_body
         )
+        # FIXME: assistant messages now include thought too for some reason, they need to be removed.
         self.messages_db = self._fetch_and_validate_chat_history(
             metadata_body, user_data
         )
@@ -3810,6 +3811,7 @@ class Pipe:
                     f"Failed to calculate cost: {e}. Cost details will be empty."
                 )
 
+        # TODO: support OWUI usage dashboard by including input and output totals using a key that OWUI expects.
         usage_payload = {
             "token_details": token_details,
             "cost_details": cost_details,
