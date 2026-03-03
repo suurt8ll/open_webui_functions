@@ -5,6 +5,43 @@
 
 
 
+
+gemini-3.1-flash-lite-preview:
+  description: "Our most cost-efficient multimodal model, offering the fastest performance for high-frequency, lightweight tasks. Gemini 3.1 Flash-Lite is best for high-volume agentic tasks, simple data extraction, and extremely low-latency applications where budget and speed are the primary constraints."
+  knowledge_cutoff: "2025-01"
+  latest_update: "2026-03"
+  supported_data_types:
+    inputs: [Text, Image, Video, Audio, PDF]
+    outputs: [Text]
+  tokens:
+    input: 1048576
+    output: 65536
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: true
+    code_execution: true
+    file_search: true
+    function_calling: true
+    grounding_google_maps: false
+    image_generation: false
+    live_api: false
+    search_grounding: true
+    structured_outputs: true
+    thinking: true
+    url_context: true
+  pricing:
+    free_tier: true
+    excluded_features: [search_grounding]
+    input:
+      - up_to_tokens: null
+        price_per_million: 0.25
+    output:
+      - up_to_tokens: null
+        price_per_million: 1.50
+    caching:
+      - up_to_tokens: null
+        price_per_million: 0.025
 gemini-3.1-flash-image-preview:
   description: "Designed for speed and efficiency, the Gemini 3.1 Flash Image generation model is effective for quick, interactive responses and high throughput."
   knowledge_cutoff: "2025-01"
