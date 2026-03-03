@@ -742,7 +742,6 @@ class GeminiContentBuilder:
         self.system_prompt, self.messages_body = self._extract_system_prompt(
             self.messages_body
         )
-        # FIXME: assistant messages now include thought too for some reason, they need to be removed.
         self.messages_db = self._fetch_and_validate_chat_history(
             metadata_body, user_data
         )
@@ -1072,6 +1071,28 @@ class GeminiContentBuilder:
 
         return rehydrated_parts
 
+    def _pop_thoughts(self, content: str) -> tuple[str, list[str]]:
+        """
+        Identifies and removes thought blocks from the content.
+        
+        A thought is defined as text between <think> and </think>\n.
+        This method handles multiple thought blocks if they are peppered 
+        throughout the message.
+        
+        :param content: The raw message content from the assistant.
+        :return: A tuple containing (cleaned_content, list_of_extracted_thoughts).
+        """
+        # The pattern looks for the <​think> tag, captures everything inside (non-greedy),
+        # and matches the <​/think> tag plus a potential trailing newline.
+        # re.DOTALL allows the '.' character to match newlines within the capture group.
+        thought_pattern = re.compile(r"<think>(.*?)</think>\n?", re.DOTALL)
+
+        thoughts = thought_pattern.findall(content)
+        # Replace all occurrences with an empty string to get the "clean" content.
+        cleaned_content = thought_pattern.sub("", content)
+
+        return cleaned_content, thoughts
+
     async def _process_assistant_message(
         self,
         i: int,
@@ -1089,13 +1110,18 @@ class GeminiContentBuilder:
         original_content = message_db.get("original_content") if message_db else None
         current_content = message_body.get("content", "")
 
-        # Citations need to be stripped from the current content before comparison.
+        # 1. Pop thoughts out before any comparison or citation stripping.
+        # We store 'thoughts' for future use (e.g., adding to a metadata field).
+        current_content, thoughts = self._pop_thoughts(current_content)
+
+        # 2. Strip citations as before.
         if sources:
             current_content = self._remove_citation_markers(current_content, sources)
 
         # --- PATH 1: Restore from stored parts (ideal case) ---
         if gemini_parts and original_content is not None:
-            # Compare stripped versions to be robust against whitespace changes from the UI/backend.
+            # Now current_content has no thoughts and no citations, 
+            # making it directly comparable to original_content.
             if current_content.strip() == original_content.strip():
                 log.debug(
                     f"Reconstructing assistant message at index {i} from stored parts."
