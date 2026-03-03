@@ -3311,7 +3311,22 @@ class Pipe:
                 )
                 event_emitter.emit_toast(toast_msg, "info")
 
+            # Calculate usage data using the last received chunk.
+            # If the chunk contains usage metadata, we yield it so the backend persists it to DB.
+            if final_response_chunk and (
+                usage_data := self._get_usage_data(
+                    final_response_chunk,
+                    app.state,
+                    __metadata__,
+                    event_emitter.start_time,
+                )
+            ):
+                # Yielding this dictionary allows the OWUI proxy to catch and save usage.
+                yield {"usage": usage_data}
+
             if not error_occurred:
+                # 'data: [DONE]' should be the last thing yielded in a successful stream 
+                # to signify the protocol-level end of the OpenAI-compatible stream.
                 yield "data: [DONE]"
                 log.info("Response processing finished successfully!")
 
@@ -3632,19 +3647,6 @@ class Pipe:
 
         # TODO: Emit a toast message if url context retrieval was not successful.
 
-        # --- Emit usage and grounding data ---
-        # Attempt to emit token usage data even if the finish reason was problematic,
-        # as usage data might still be available.
-        if usage_data := self._get_usage_data(
-            model_response,
-            app_state,
-            __metadata__,
-        ):
-            # Inject the total processing time into the usage payload.
-            elapsed_time = time.monotonic() - event_emitter.start_time
-            usage_data["completion_time"] = round(elapsed_time, 2)
-            await event_emitter.emit_usage(usage_data)
-
         # --- Store grounding and timing data in state for the Filter ---
         if candidate and (grounding_metadata_obj := candidate.grounding_metadata):
             self._store_data_in_state(
@@ -3717,6 +3719,7 @@ class Pipe:
         response: types.GenerateContentResponse,
         app_state: State,
         metadata: "Metadata",
+        start_time: float,
     ) -> dict[str, Any] | None:
         """
         Extracts usage data from a GenerateContentResponse object.
@@ -3837,8 +3840,21 @@ class Pipe:
                     f"Failed to calculate cost: {e}. Cost details will be empty."
                 )
 
-        # TODO: support OWUI usage dashboard by including input and output totals using a key that OWUI expects.
+        # OWUI expects 'input_tokens' and 'output_tokens' at the top level of the usage dict 
+        # to populate the admin dashboard. 
+        # We aggregate Gemini's specific counts into these two categories.
+        input_tokens = (
+            token_details.get("prompt_token_count", 0) + 
+            token_details.get("tool_use_prompt_token_count", 0)
+        )
+        output_tokens = (
+            token_details.get("candidates_token_count", 0) + 
+            token_details.get("thoughts_token_count", 0)
+        )
+
         usage_payload = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
             "token_details": token_details,
             "cost_details": cost_details,
         }
@@ -3854,6 +3870,10 @@ class Pipe:
 
             usage_payload["cumulative_token_count"] = prev_tokens + current_tokens
             usage_payload["cumulative_total_cost"] = round(prev_cost + current_cost, 6)
+
+        # Include completion time
+        elapsed_time = time.monotonic() - start_time
+        usage_payload["completion_time"] = round(elapsed_time, 2)
 
         return usage_payload
 
