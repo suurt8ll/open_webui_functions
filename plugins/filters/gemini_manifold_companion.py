@@ -123,11 +123,6 @@ class Filter:
 
         canonical_model_name, is_manifold = self._get_model_name(body)
 
-        # Store the canonical model ID in metadata so the pipe doesn't need to re-parse it.
-        # This centralizes parsing logic and avoids repetition/inconsistency.
-        if is_manifold:
-            __metadata__["canonical_model_id"] = canonical_model_name
-
         # Exit early if we are filtering an unsupported model.
         if not is_manifold:
             log.debug(
@@ -896,7 +891,8 @@ class Filter:
             log.warning("Multiple candidates found, defaulting to first candidate.")
         return candidates[0]
 
-    def _get_model_name(self, body: "Body") -> tuple[str, bool]:
+    @staticmethod
+    def _get_model_name(body: "Body") -> tuple[str, bool]:
         """
         Extracts the effective and canonical model name from the request body.
 

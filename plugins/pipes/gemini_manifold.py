@@ -2082,14 +2082,8 @@ class Pipe:
         __metadata__["merged_custom_params"] = merged_custom_params
 
         # Retrieve the canonical model ID parsed by the companion filter.
-        model_id = __metadata__.get("canonical_model_id")
-        if not model_id:
-            error_msg = (
-                "FATAL: 'canonical_model_id' not found in metadata. "
-                "The Gemini Manifold Companion filter is required and must be active to parse the model ID."
-            )
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        model_id = self._get_model_name(body)
+        __metadata__["canonical_model_id"] = model_id
 
         # Initialize EventEmitter
         if __metadata__.get("task"):
@@ -2604,6 +2598,50 @@ class Pipe:
         return model_name.split("/")[-1]
 
     @staticmethod
+    def _get_model_name(body: "Body") -> str:
+        """
+        Extracts the canonical model name from the request body.
+
+        Handles standard model names and custom workspace models by prioritizing
+        the base_model_id found in metadata.
+
+        Args:
+            body: The request body dictionary.
+
+        Returns:
+            The canonical model name (prefix removed).
+        """
+        # 1. Get the initially requested model name from the top level
+        effective_model_name: str = body.get("model", "")
+        initial_model_name = effective_model_name
+        base_model_name = None
+
+        # 2. Check for a base model ID in the metadata for custom models
+        if metadata := body.get("metadata"):
+            # Safely navigate the nested structure: metadata -> model -> info -> base_model_id
+            base_model_name = (
+                metadata.get("model", {}).get("info", {}).get("base_model_id", None)
+            )
+            # If a base model ID is found, it overrides the initially requested name
+            if base_model_name:
+                effective_model_name = base_model_name
+
+        # 3. Create the canonical model name by removing the manifold prefix
+        canonical_model_name = effective_model_name.replace(
+            "gemini_manifold_google_genai.", ""
+        )
+
+        # 4. Log the relevant names for debugging purposes
+        log.debug(
+            f"Model Name Extraction: initial='{initial_model_name}', "
+            f"base='{base_model_name}', effective='{effective_model_name}', "
+            f"canonical='{canonical_model_name}'"
+        )
+
+        # 5. Return only the canonical name
+        return canonical_model_name
+
+    @staticmethod
     def _is_image_model(model_id: str, config: dict) -> bool:
         """Check if the model is an image generation model using provided config."""
         if model_id in config:
@@ -2977,7 +3015,7 @@ class Pipe:
 
         # If a high-resolution image is requested with the gemini-3-pro-image model,
         # the Google GenAI SDK's streaming method often raises a "chunk too big" error
-        # during the transfer of the generated image bytes. We avoid this by forcing 
+        # during the transfer of the generated image bytes. We avoid this by forcing
         # a non-streaming SDK call, while still yielding the result as a stream to OWUI.
         if (
             use_streaming_api
@@ -3002,7 +3040,7 @@ class Pipe:
         if use_streaming_api:
             stream = await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
         else:
-            # When we use the non-streaming SDK call, we wrap the single response 
+            # When we use the non-streaming SDK call, we wrap the single response
             # in an iterator so that our unified processor can still treat it like a stream.
             response = await client.aio.models.generate_content(**gen_content_args)
 
