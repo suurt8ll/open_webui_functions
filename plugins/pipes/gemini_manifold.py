@@ -6,17 +6,17 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 2.0.0
+version: 2.1.0
 requirements: google-genai==1.65.0
 """
 
 # I change these only when I make a release to avoid PR merge conflicts.
 # If you are making a PR then please do not change these values.
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 # This is the recommended version for the companion filter.
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
-RECOMMENDED_COMPANION_VERSION = "2.0.0"
+RECOMMENDED_COMPANION_VERSION = "2.1.0"
 
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
