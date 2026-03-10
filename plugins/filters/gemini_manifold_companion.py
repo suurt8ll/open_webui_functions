@@ -254,19 +254,6 @@ class Filter:
             )
             metadata_features["upload_documents"] = False
 
-        # The manifold pipe requires the backend to be in streaming mode to correctly
-        # process the AsyncGenerator it returns. We save the user's original
-        # streaming intent and then force the backend into streaming mode.
-
-        user_stream_intent = body.get("stream", True)
-
-        log.info(
-            f"Storing user's stream intent ({user_stream_intent}) into __metadata__. "
-            "Backend will be forced down the streaming path."
-        )
-        metadata_features["stream"] = user_stream_intent
-        body["stream"] = True
-
         # TODO: Filter out the citation markers here.
 
         log.debug("inlet method has finished.")

@@ -251,7 +251,6 @@ class Features(TypedDict):
     reason: NotRequired[bool]
     url_context: NotRequired[bool]
     google_maps_grounding: NotRequired[bool]
-    stream: NotRequired[bool]
     gemini_manifold_companion_version: NotRequired[str]
 
 
