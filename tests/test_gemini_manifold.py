@@ -611,7 +611,7 @@ async def test_paid_api_toggle_selects_correct_key(
         try:
             # We expect this to get quite far now with the fixed metadata
             await pipe.pipe(
-                body={"messages": []},
+                body={"model": model_id, "messages": []},
                 __user__={"email": "test@test.com"},
                 __request__=mock_request,
                 __event_emitter__=None,
