@@ -2039,7 +2039,7 @@ class Pipe:
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]] | None,
         __metadata__: "Metadata",
-    ) -> AsyncGenerator[dict | str, None] | str:
+    ) -> AsyncGenerator[dict | str, None] | dict:
 
         self._add_log_handler(self.valves.LOG_LEVEL)
 
@@ -2182,7 +2182,6 @@ class Pipe:
                     __request__=__request__,
                     event_emitter=event_emitter,
                     model_config=model_config,
-                    features=features,
                 )
 
             except Exception as e:
@@ -2855,6 +2854,51 @@ class Pipe:
 
     # region 2.4 Model response processing
 
+    async def _aggregate_to_dict(
+        self,
+        generator: AsyncGenerator[dict | str, None],
+    ) -> dict:
+        """
+        Consumes the unified response generator and aggregates the chunks into a
+        single OpenAI Chat Completion dictionary. This keeps our processing pipeline
+        unified while properly satisfying OWUI's non-streaming request expectations.
+        """
+        content = ""
+        reasoning_content = ""
+        usage = None
+
+        async for chunk in generator:
+            if isinstance(chunk, str):
+                # Skip string yields (like "data: [DONE]") used for streaming protocol
+                continue
+
+            if "choices" in chunk and chunk["choices"]:
+                delta = chunk["choices"][0].get("delta", {})
+                if "content" in delta and delta["content"]:
+                    content += delta["content"]
+                if "reasoning_content" in delta and delta["reasoning_content"]:
+                    reasoning_content += delta["reasoning_content"]
+
+            if "usage" in chunk:
+                usage = chunk["usage"]
+
+        # Only add the reasoning key if there was actually reasoning content
+        message: dict[str, str] = {
+            "role": "assistant",
+            "content": content,
+        }
+        if reasoning_content:
+            message["reasoning_content"] = reasoning_content
+
+        return {
+            "choices": [
+                {
+                    "message": message,
+                }
+            ],
+            "usage": usage or {},
+        }
+
     async def _execute_generation_attempt(
         self,
         tier: str,
@@ -2865,8 +2909,7 @@ class Pipe:
         __request__: Request,
         event_emitter: EventEmitter,
         model_config: dict,
-        features: "Features",
-    ) -> AsyncGenerator[dict | str, None] | str:
+    ) -> AsyncGenerator[dict | str, None] | dict:
         """
         Executes a single generation attempt with a specific tier configuration.
         Constructs a fresh client and file manager to ensure assets are
@@ -2927,31 +2970,40 @@ class Pipe:
         )
 
         # 5. Stream Setup
-        is_streaming = features.get("stream", True)
+        # 'is_streaming_request' tracks what Open WebUI expects to receive.
+        # 'use_streaming_api' tracks how we actually call the Google SDK.
+        is_streaming_request = body.get("stream", True)
+        use_streaming_api = is_streaming_request
+
+        # If a high-resolution image is requested with the gemini-3-pro-image model,
+        # the Google GenAI SDK's streaming method often raises a "chunk too big" error
+        # during the transfer of the generated image bytes. We avoid this by forcing 
+        # a non-streaming SDK call, while still yielding the result as a stream to OWUI.
         if (
-            is_streaming
+            use_streaming_api
             and valves.IMAGE_RESOLUTION in ["2K", "4K"]
+            # FIXME: Nano Banana 2 supports resolutions too now.
             and "gemini-3-pro-image" in model_id
         ):
             log.info(
-                f"Forcing non-streaming mode due to {valves.IMAGE_RESOLUTION} resolution."
+                f"Forcing non-streaming SDK call due to {valves.IMAGE_RESOLUTION} resolution "
+                "to avoid GenAI SDK 'chunk too big' errors."
             )
-            is_streaming = False
+            use_streaming_api = False
 
-        request_type_str = "streaming" if is_streaming else "non-streaming"
+        request_type_str = "streaming" if use_streaming_api else "non-streaming"
+        request_type_msg = f"Sending {request_type_str} request to {api_name}..."
+        log.info(request_type_msg)
         asyncio.create_task(
-            event_emitter.emit_status(
-                f"Sending {request_type_str} request to {api_name}..."
-            )
+            event_emitter.emit_status(request_type_msg)
         )
 
         # 6. Execution & Peek Logic
-        # We manually fetch the first chunk to catch early errors (429/403/503)
-        # before returning the stream to the frontend.
-
-        if is_streaming:
+        if use_streaming_api:
             stream = await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
         else:
+            # When we use the non-streaming SDK call, we wrap the single response 
+            # in an iterator so that our unified processor can still treat it like a stream.
             response = await client.aio.models.generate_content(**gen_content_args)
 
             async def one_shot_iter():
@@ -2964,7 +3016,6 @@ class Pipe:
         try:
             first_chunk = await iterator.__anext__()
         except StopAsyncIteration:
-            # Empty response stream is a valid but weird state, treat as error to allow upper logic to decide
             raise ValueError("API returned an empty response stream.")
 
         # Success: Reconstruct the stream including the peeked chunk
@@ -2975,12 +3026,19 @@ class Pipe:
 
         log.info(f"Request successful ({tier}). Passing stream to unified processor.")
 
-        return self._unified_response_processor(
+        processor = self._unified_response_processor(
             reconstructed_stream(),
             __request__.app,
             event_emitter,
             __metadata__,
         )
+
+        # If OWUI requested a stream, we return the AsyncGenerator.
+        # If OWUI requested a single object, we aggregate the chunks back into a dict.
+        if is_streaming_request:
+            return processor
+        else:
+            return await self._aggregate_to_dict(processor)
 
     def _check_free_tier_eligibility(
         self,
@@ -3222,6 +3280,7 @@ class Pipe:
                             in_think = True
 
                         # Attempt to extract a title from any text within a thought part.
+                        # TODO: refactor it to a helper method?
                         if isinstance(part.text, str):
                             try:
                                 title: str | None = None
@@ -3325,7 +3384,7 @@ class Pipe:
                 yield {"usage": usage_data}
 
             if not error_occurred:
-                # 'data: [DONE]' should be the last thing yielded in a successful stream 
+                # 'data: [DONE]' should be the last thing yielded in a successful stream
                 # to signify the protocol-level end of the OpenAI-compatible stream.
                 yield "data: [DONE]"
                 log.info("Response processing finished successfully!")
@@ -3378,10 +3437,10 @@ class Pipe:
         """
         Processes a single `types.Part` object and returns a payload dictionary
         for the Open WebUI stream, along with a count of tag substitutions.
-        The payload key is 'reasoning' for thought parts and 'content' for others.
+        The payload key is 'reasoning_content' for thought parts and 'content' for others.
         """
         # Determine the payload key based on whether the part is a thought.
-        key = "reasoning" if part.thought else "content"
+        key = "reasoning_content" if part.thought else "content"
         payload_content: str | None = None
         count: int = 0
 
@@ -3590,7 +3649,7 @@ class Pipe:
         *,
         stream_error_happened: bool = False,
     ):
-        """Handles emitting usage, grounding, and sources after the main response/stream is done."""
+        """Handles grounding and sources after the main response/stream is done."""
         log.info("Post-processing the model response.")
 
         if stream_error_happened:
@@ -3840,8 +3899,8 @@ class Pipe:
                     f"Failed to calculate cost: {e}. Cost details will be empty."
                 )
 
-        # OWUI expects 'input_tokens' and 'output_tokens' at the top level of the usage dict 
-        # to populate the admin dashboard. 
+        # OWUI expects 'input_tokens' and 'output_tokens' at the top level of the usage dict
+        # to populate the admin dashboard.
         # We aggregate Gemini's specific counts into these two categories.
         input_tokens = (
             token_details.get("prompt_token_count", 0) + 
@@ -3853,6 +3912,7 @@ class Pipe:
         )
 
         usage_payload = {
+            # FIXME: put these to the end of the payload
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "token_details": token_details,
