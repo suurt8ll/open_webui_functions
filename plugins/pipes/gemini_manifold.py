@@ -3407,35 +3407,25 @@ class Pipe:
                 # Yielding this dictionary allows the OWUI proxy to catch and save usage.
                 yield {"usage": usage_data}
 
+            storage_payload: dict[str, Any] = {}
+
             if not error_occurred:
                 # 'data: [DONE]' should be the last thing yielded in a successful stream
                 # to signify the protocol-level end of the OpenAI-compatible stream.
                 yield "data: [DONE]"
                 log.info("Response processing finished successfully!")
 
-            if not error_occurred and response_parts:
-                # Storing the complete list of response parts for Filter.outlet.
-                # The filter will serialize this and add it to the final message payload,
-                # allowing the frontend to store it in the database with the assistant's message.
-                self._store_data_in_state(
-                    app.state,
-                    __metadata__.get("chat_id"),
-                    __metadata__.get("message_id"),
-                    "response_parts",
-                    response_parts,
-                )
-                log.trace("Stored response parts in state for Filter.outlet.", payload=response_parts)
+                if response_parts:
+                    # Storing the complete list of response parts for Filter.outlet.
+                    # The filter will serialize this and add it to the final message payload,
+                    # allowing the frontend to store it in the database with the assistant's message.
+                    storage_payload["response_parts"] = response_parts
 
-            if not error_occurred and content_parts_text:
-                original_content = "".join(content_parts_text)
-                # FIXME: allow passing list of keys and values to store multiple items at once
-                self._store_data_in_state(
-                    app.state,
-                    __metadata__.get("chat_id"),
-                    __metadata__.get("message_id"),
-                    "original_content",
-                    original_content,
-                )
+                if content_parts_text:
+                    original_content = "".join(content_parts_text)
+                    storage_payload["original_content"] = original_content
+                
+            self._store_data_in_state(app.state, __metadata__, storage_payload)
 
             try:
                 await self._do_post_processing(
@@ -3731,41 +3721,45 @@ class Pipe:
         # TODO: Emit a toast message if url context retrieval was not successful.
 
         # --- Store grounding and timing data in state for the Filter ---
+        storage_payload: dict[str, Any] = {}
+
         if candidate and (grounding_metadata_obj := candidate.grounding_metadata):
-            self._store_data_in_state(
-                app_state,
-                __metadata__.get("chat_id"),
-                __metadata__.get("message_id"),
-                "grounding",
-                grounding_metadata_obj,
-            )
+            storage_payload["grounding"] = grounding_metadata_obj
 
         # Only store the start time if the user wants to see timestamps in the grounding display.
         # The filter will gracefully handle the absence of this key.
         if event_emitter.status_mode == "visible_timed":
-            self._store_data_in_state(
-                app_state,
-                __metadata__.get("chat_id"),
-                __metadata__.get("message_id"),
-                "pipe_start_time",
-                event_emitter.start_time,
-            )
+            storage_payload["pipe_start_time"] = event_emitter.start_time
+
+        self._store_data_in_state(app_state, __metadata__, storage_payload)
 
     @staticmethod
     def _store_data_in_state(
         app_state: State,
-        chat_id: str,
-        message_id: str,
-        key_suffix: str,
-        value: Any,
+        __metadata__: "Metadata",
+        data: dict[str, Any],
     ):
-        """Stores a value in the app state, namespaced by chat and message ID."""
-        # FIXME: don't store if we are a task model
-        key = f"{key_suffix}_{chat_id}_{message_id}"
-        log.debug(f"Storing data in app state with key '{key}'.")
-        # Using shared `request.app.state` to pass data to Filter.outlet.
-        # This is necessary because Pipe.pipe and Filter.outlet operate on different requests.
-        app_state._state[key] = value
+        """
+        Stores multiple values in the app state, namespaced by chat and message ID.
+        Exits early if this is a task model (e.g. title generation) to prevent 
+        state bloat and interference with the main chat's filter logic.
+        """
+        if __metadata__.get("task"):
+            return
+
+        chat_id = __metadata__.get("chat_id")
+        message_id = __metadata__.get("message_id")
+
+        if not chat_id or not message_id:
+            log.warning("Skipping state storage: chat_id or message_id missing from metadata.")
+            return
+
+        for key_suffix, value in data.items():
+            key = f"{key_suffix}_{chat_id}_{message_id}"
+            log.debug(f"Storing data in app state with key '{key}'.")
+            # Using shared `request.app.state` to pass data to Filter.outlet.
+            # This is necessary because Pipe.pipe and Filter.outlet operate on different requests.
+            app_state._state[key] = value
 
     @staticmethod
     def _calculate_cost(token_count: int, pricing_tiers: list[dict]) -> float:
