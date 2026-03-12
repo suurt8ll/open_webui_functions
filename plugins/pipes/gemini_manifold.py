@@ -2068,18 +2068,21 @@ class Pipe:
         model_id = self._get_model_name(body)
         __metadata__["canonical_model_id"] = model_id
 
-        if task_type := __metadata__.get("task"):
-            log.info(f'{task_type=}, disabling event emissions.')
-            __event_emitter__ = None
-            # FIXME: disable YouTube URL parsing
-            # FIXME: don't include non-image files in the context.
-            # TODO: disable tools. for now I assume that model will know to not use them even if enabled, but if that's not the case then this needs to be addressed. 
-            # TODO: use the structured outputs feature to ensure a valid json at all times?
-
         # 1. Capture the raw state of keys before any overrides
         valves: Pipe.Valves = self._get_merged_valves(
             self.valves, __user__.get("valves"), __user__.get("email")
         )
+
+        if task_type := __metadata__.get("task"):
+            log.info(f"{task_type=}, disabling event emissions and YouTube URL parsing.")
+            __event_emitter__ = None
+            # We disable YouTube parsing for task models to minimize latency and token costs, 
+            # as simple tasks like title or tag generation do not require video context.
+            valves.PARSE_YOUTUBE_URLS = False
+            # FIXME: don't include non-image files in the context.
+            # TODO: disable tools. for now I assume that model will know to not use them even if enabled, but if that's not the case then this needs to be addressed.
+            # TODO: use the structured outputs feature to ensure a valid json at all times?
+
         has_free_key = bool(valves.GEMINI_FREE_API_KEY)
         has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
 
