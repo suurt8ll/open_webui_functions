@@ -4,22 +4,25 @@ from google.genai import types
 
 # region `__files__` and `__metadata__.files`
 class FileContentDataTD(TypedDict):
-    content: str
+    # This can be 'completed' or a dictionary containing the content string
+    status: NotRequired[str]
+    content: NotRequired[str]
 
 
 class FileMetadataTD(TypedDict):
     name: str
     content_type: str
     size: int
-    data: dict[str, Any]  # Assuming this is always a dict, even if empty
-    collection_name: str
+    data: dict[str, Any]
+    collection_name: NotRequired[str]  # Only present for documents/RAG files
 
 
 class InnerFileDetailTD(TypedDict):
     id: str
     user_id: str
-    hash: str
+    hash: str | None  # Can be null for images
     filename: str
+    path: NotRequired[str]  # Only present for local filesystem files
     data: FileContentDataTD
     meta: FileMetadataTD
     created_at: int
@@ -27,16 +30,16 @@ class InnerFileDetailTD(TypedDict):
 
 
 class FileAttachmentTD(TypedDict):
-    type: str
+    type: str  # Usually "file"
     file: InnerFileDetailTD
     id: str
     url: str
     name: str
-    collection_name: str
     status: str
     size: int
     error: str
     itemId: str
+    content_type: str
 
 
 # endregion `__files__` and `__metadata__.files`
@@ -228,13 +231,6 @@ class MetadataModel(TypedDict):
     ollama: NotRequired[OllamaDetails]
 
 
-class MetadataVariables(TypedDict):
-    """Represents variables used in the prompt/request."""
-
-    # Keys are variable names (e.g., "{{USER_NAME}}"), values are strings
-    __dict__: dict[str, str]
-
-
 class Features(TypedDict):
     """Represents the enabled/disabled features for the request."""
 
@@ -274,7 +270,7 @@ class Metadata(TypedDict):
     tool_servers: list[Any]
     files: list[FileAttachmentTD] | None
     features: Features | None
-    variables: MetadataVariables
+    variables: dict[str, str] # Keys are variable names (e.g., "{{USER_NAME}}"), values are strings
     model: MetadataModel
     direct: bool
     params: MetadataParams

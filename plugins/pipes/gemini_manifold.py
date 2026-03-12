@@ -733,10 +733,12 @@ class GeminiContentBuilder:
         self.upload_documents = (metadata_body.get("features", {}) or {}).get(
             "upload_documents", False
         )
+        # Identify if this is a background task (title/tags/etc) to optimize context.
+        self.is_task = bool(metadata_body.get("task"))
         self.event_emitter = event_emitter
         self.valves = valves
         self.files_api_manager = files_api_manager
-        self.is_temp_chat = metadata_body.get("chat_id") == "local"
+        self.is_temp_chat = "local" in metadata_body.get("chat_id", "")
         self.vertexai = self.files_api_manager.client.vertexai
 
         self.system_prompt, self.messages_body = self._extract_system_prompt(
@@ -885,12 +887,9 @@ class GeminiContentBuilder:
 
         if role == "user":
             message = cast("UserMessage", message)
-            files = []
-            if self.messages_db:
-                message_db = self.messages_db[i]
-                if self.upload_documents:
-                    files = message_db.get("files", [])
-            parts = await self._process_user_message(message, files, status_queue)
+            # Logic for retrieving files is now handled inside _process_user_message
+            # to allow for finer control over which file types are included based on task mode.
+            parts = await self._process_user_message(i, message, status_queue)
             # Case 1: User content is completely empty (no text, no files).
             if not parts:
                 log.info(
@@ -963,39 +962,51 @@ class GeminiContentBuilder:
 
     async def _process_user_message(
         self,
+        i: int,
         message: "UserMessage",
-        files: list["FileAttachmentTD"],
         status_queue: asyncio.Queue,
     ) -> list[types.Part]:
         user_parts: list[types.Part] = []
         db_files_processed = False
 
         # PATH 1: Database is available (Normal Chat).
-        if self.messages_db and files:
-            db_files_processed = True
-            log.info(f"Processing {len(files)} files from the database concurrently.")
+        if self.messages_db:
+            message_db = self.messages_db[i]
+            files: list["FileAttachmentTD"] = message_db.get("files", [])
+            
+            if files:
+                db_files_processed = True
+                upload_tasks = []
+                
+                for file in files:
+                    content_type = file.get("content_type", "")
+                    # MIME types for images always start with 'image/' (e.g., image/png, image/jpeg)
+                    is_image = content_type.startswith("image/")
+                    
+                    # Optimization: Task models (titles, tags, etc.) skip heavy documents 
+                    # but keep images as they provide high context value for low token cost.
+                    should_include = is_image or (self.upload_documents and not self.is_task)
+                    
+                    if not should_include:
+                        log.debug(
+                            f"Skipping {content_type} '{file.get('id')}' "
+                            f"(is_task={self.is_task}, upload_documents={self.upload_documents})"
+                        )
+                        continue
 
-            upload_tasks = []
-            for file in files:
-                log.debug("Preparing DB file for concurrent upload:", payload=file)
-                uri = ""
-                if file.get("type") == "image":
-                    uri = file.get("url", "")
-                elif file.get("type") == "file":
-                    # Reconstruct the local API URI to be handled by our unified function
-                    uri = f"/api/v1/files/{file.get('id', '')}/content"
+                    # We always use the internal API endpoint to fetch file content from the DB.
+                    # Even for images, the 'url' field in the attachment object is often 
+                    # just the UUID, which isn't fetchable on its own.
+                    if file_id := file.get("id"):
+                        uri = f"/api/v1/files/{file_id}/content"
+                        upload_tasks.append(self._genai_part_from_uri(uri, status_queue))
+                    else:
+                        log.warning("Could not determine ID for file in DB.", payload=file)
 
-                if uri:
-                    # Create a coroutine for each file upload and add it to a list.
-                    upload_tasks.append(self._genai_part_from_uri(uri, status_queue))
-                else:
-                    log.warning("Could not determine URI for file in DB.", payload=file)
-
-            if upload_tasks:
-                # Run all upload tasks concurrently. asyncio.gather maintains the order of results.
-                results = await asyncio.gather(*upload_tasks)
-                # Filter out None results (from failed uploads) and add the successful parts to the list.
-                user_parts.extend(part for part in results if part)
+                if upload_tasks:
+                    log.info(f"Processing {len(upload_tasks)} file(s) from database.")
+                    results = await asyncio.gather(*upload_tasks)
+                    user_parts.extend(part for part in results if part)
 
         # Now, process the content from the message payload.
         user_content = message.get("content")
@@ -1021,6 +1032,7 @@ class GeminiContentBuilder:
                     )
 
             # PATH 2: Temporary Chat Image Handling.
+            # FIXME: this puts images to the end of the message, see if it matters where they are.
             elif c_type == "image_url" and not db_files_processed:
                 log.info("Processing image from payload (temporary chat mode).")
                 c = cast("ImageContent", c)
@@ -1120,7 +1132,7 @@ class GeminiContentBuilder:
 
         # --- PATH 1: Restore from stored parts (ideal case) ---
         if gemini_parts and original_content is not None:
-            # Now current_content has no thoughts and no citations, 
+            # Now current_content has no thoughts and no citations,
             # making it directly comparable to original_content.
             if current_content.strip() == original_content.strip():
                 log.debug(
@@ -2074,12 +2086,11 @@ class Pipe:
         )
 
         if task_type := __metadata__.get("task"):
-            log.info(f"{task_type=}, disabling event emissions and YouTube URL parsing.")
+            log.info(f"{task_type=}, disabling event emissions, YouTube URL parsing and document processing.")
             __event_emitter__ = None
             # We disable YouTube parsing for task models to minimize latency and token costs, 
             # as simple tasks like title or tag generation do not require video context.
             valves.PARSE_YOUTUBE_URLS = False
-            # FIXME: don't include non-image files in the context.
             # TODO: disable tools. for now I assume that model will know to not use them even if enabled, but if that's not the case then this needs to be addressed.
             # TODO: use the structured outputs feature to ensure a valid json at all times?
 
