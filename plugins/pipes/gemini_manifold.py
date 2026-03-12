@@ -2062,33 +2062,19 @@ class Pipe:
             log.error(error_msg)
             raise ValueError(error_msg)
 
-        # Resolve custom parameters from both the model page (in `body`) and chat
-        # controls (in `__metadata__`). Chat control settings take precedence.
-        known_body_keys = {
-            "stream",
-            "model",
-            "messages",
-            "files",
-            "options",
-            "stream_options",
-        }
-        model_page_params = {
-            key: value for key, value in body.items() if key not in known_body_keys
-        }
-        chat_control_params = __metadata__.get("chat_control_params", {})
-
-        merged_custom_params = model_page_params.copy()
-        merged_custom_params.update(chat_control_params)
+        merged_custom_params = self._resolve_custom_params(body, __metadata__)
         __metadata__["merged_custom_params"] = merged_custom_params
 
-        # Retrieve the canonical model ID parsed by the companion filter.
         model_id = self._get_model_name(body)
         __metadata__["canonical_model_id"] = model_id
 
-        # Initialize EventEmitter
-        if __metadata__.get("task"):
-            log.info(f'{__metadata__["task"]=}, disabling event emissions.')  # type: ignore
+        if task_type := __metadata__.get("task"):
+            log.info(f'{task_type=}, disabling event emissions.')
             __event_emitter__ = None
+            # FIXME: disable YouTube URL parsing
+            # FIXME: don't include non-image files in the context.
+            # TODO: disable tools. for now I assume that model will know to not use them even if enabled, but if that's not the case then this needs to be addressed. 
+            # TODO: use the structured outputs feature to ensure a valid json at all times?
 
         # 1. Capture the raw state of keys before any overrides
         valves: Pipe.Valves = self._get_merged_valves(
@@ -3774,6 +3760,7 @@ class Pipe:
         value: Any,
     ):
         """Stores a value in the app state, namespaced by chat and message ID."""
+        # FIXME: don't store if we are a task model
         key = f"{key_suffix}_{chat_id}_{message_id}"
         log.debug(f"Storing data in app state with key '{key}'.")
         # Using shared `request.app.state` to pass data to Filter.outlet.
@@ -4209,6 +4196,44 @@ class Pipe:
     # endregion 2.6 Logging
 
     # region 2.7 Utility helpers
+
+    def _resolve_custom_params(
+        self, body: "Body", __metadata__: "Metadata"
+    ) -> dict[str, Any]:
+        """
+        Resolves custom parameters from the model page and chat controls.
+        Chat control settings usually take precedence, but we ignore them
+        if this is a task model (e.g., generating titles or tags) to ensure
+        these independent calls aren't negatively affected by user chat settings.
+        """
+        known_body_keys = {
+            "stream",
+            "model",
+            "messages",
+            "files",
+            "options",
+            "stream_options",
+        }
+        merged_params = {
+            key: value for key, value in body.items() if key not in known_body_keys
+        }
+        log.debug("Model page parameters extracted from body:", payload=merged_params)
+
+        if __metadata__.get("task"):
+            log.debug(
+                f"Task model detected (task: {__metadata__.get('task')}). Ignoring chat control parameters."
+            )
+            return merged_params
+
+        chat_control_params = __metadata__.get("chat_control_params", {})
+        if chat_control_params:
+            log.debug(
+                "Chat control parameters extracted from metadata:",
+                payload=chat_control_params,
+            )
+            merged_params.update(chat_control_params)
+
+        return merged_params
 
     @staticmethod
     def _get_toggleable_feature_status(

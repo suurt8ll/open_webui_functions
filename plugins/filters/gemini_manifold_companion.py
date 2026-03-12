@@ -100,14 +100,18 @@ class Filter:
         log.success("Function has been initialized.")
         log.trace("Full self object:", payload=self.__dict__)
 
-    def inlet(self, body: "Body", __request__: Request, __metadata__: "Metadata") -> "Body":
+    def inlet(
+        self, body: "Body", __request__: Request, __metadata__: "Metadata"
+    ) -> "Body":
         """Modifies the incoming request payload before it's sent to the LLM. Operates on the `form_data` dictionary."""
 
         # Load and store model configuration in app state
         log.debug("Loading model configuration...")
         model_config = self._load_model_config(self.valves.MODEL_CONFIG_PATH)
         __request__.app.state._state["gemini_model_config"] = model_config
-        log.debug(f"Stored model config in app state with {len(model_config)} model(s).")
+        log.debug(
+            f"Stored model config in app state with {len(model_config)} model(s)."
+        )
 
         # Detect log level change inside self.valves
         if self.log_level != self.valves.LOG_LEVEL:
@@ -146,37 +150,10 @@ class Filter:
         metadata = body.get("metadata")
         metadata_features = metadata.get("features")
         if metadata_features is None:
-            metadata_features = cast(Features, {})
+            metadata_features = cast("Features", {})
             metadata["features"] = metadata_features
 
-        # Copy custom chat control parameters into metadata. This preserves them
-        # from being overwritten by model-level parameters, which OWUI merges
-        # before the request reaches the pipe. The pipe can then prioritize
-        # chat-specific settings over model-wide defaults.
-        chat_control_params: dict[str, Any] = {}
-        # Standard OWUI body keys. Any others are treated as custom chat parameters.
-        known_body_keys = {
-            "stream",
-            "model",
-            "messages",
-            "files",
-            "features",
-            "metadata",
-            "options",
-            "stream_options",
-        }
-
-        custom_param_keys: list[str] = []
-        for key in body.keys():
-            if key not in known_body_keys:
-                custom_param_keys.append(key)
-                chat_control_params[key] = body[key]
-
-        if custom_param_keys:
-            log.debug(
-                f"Found and preserved custom chat control parameters: {custom_param_keys}"
-            )
-        metadata["chat_control_params"] = chat_control_params
+        metadata["chat_control_params"] = self._extract_chat_control_params(body)
 
         # Add the companion version to the payload for the pipe to consume.
         metadata_features["gemini_manifold_companion_version"] = VERSION
@@ -826,6 +803,37 @@ class Filter:
     # endregion 1.5 Model capability checks
 
     # region 1.6 Utility helpers
+
+    def _extract_chat_control_params(self, body: "Body") -> dict[str, Any]:
+        """
+        Extracts custom parameters set at the chat level.
+        By storing these in metadata, we protect them from being overwritten
+        by model-level defaults during OWUI's pre-pipe merge phase. The pipe
+        can then prioritize these chat-specific settings over model-wide defaults.
+        """
+        chat_control_params: dict[str, Any] = {}
+        # Standard OWUI body keys. Any others are treated as custom chat parameters.
+        known_body_keys = {
+            "stream",
+            "model",
+            "messages",
+            "files",
+            "features",
+            "metadata",
+            "options",
+            "stream_options",
+        }
+
+        custom_param_keys = [key for key in body.keys() if key not in known_body_keys]
+        for key in custom_param_keys:
+            chat_control_params[key] = body[key]
+
+        if custom_param_keys:
+            log.debug(
+                f"Found and preserved custom chat control parameters: {custom_param_keys}"
+            )
+
+        return chat_control_params
 
     def _get_and_clear_data_from_state(
         self,
