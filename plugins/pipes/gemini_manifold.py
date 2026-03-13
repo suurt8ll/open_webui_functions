@@ -1781,6 +1781,20 @@ class Pipe:
             Requires both Free and Paid API keys to be configured. 
             Default value is False.""",
         )
+        TASK_MODEL_ROUTING: Literal[
+            "only_free",
+            "free_fallback",
+            "only_paid",
+            "match_main",
+        ] = Field(
+            default="match_main",
+            description="""Determines how task models (like title generation) are routed between Free and Paid APIs.
+            • only_free: Use only the Free API.
+            • free_fallback: Use Free API first, fallback to Paid on failure.
+            • only_paid: Bypass Free API and use Paid API directly (or Vertex if enabled).
+            • match_main: Follow the same logic as the main chat generation.
+            Default is match_main.""",
+        )
         PARSE_YOUTUBE_URLS: bool = Field(
             default=True,
             description="""Whether to parse YouTube URLs from user messages and provide them as context to the model.
@@ -1943,6 +1957,12 @@ class Pipe:
             Set to True to enable automatic fallback to the Paid API, False to disable.
             Default is None (use the admin's setting).""",
         )
+        TASK_MODEL_ROUTING: (
+            Literal["only_free", "free_fallback", "only_paid", "match_main", ""] | None
+        ) = Field(
+            default=None,
+            description="""Override the default routing strategy for task models.""",
+        )
         PARSE_YOUTUBE_URLS: bool | None | Literal[""] = Field(
             default=None,
             description="""Override the default setting for parsing YouTube URLs.
@@ -2065,13 +2085,13 @@ class Pipe:
         self._check_companion_filter_version(features)
 
         # Retrieve model configuration from app state
-        model_config = __request__.app.state._state.get("gemini_model_config")
+        model_config: dict[str, Any] = __request__.app.state._state.get("gemini_model_config")
+        # FIXME: be even more strict by requring the model id to be present in the config to proceed?
         if model_config is None:
             error_msg = (
-                "FATAL: Model configuration not found in app state. "
+                "FATAL: Gemini model configuration not found in app state. "
                 "Please ensure the Gemini Manifold Companion filter is installed and enabled."
             )
-            log.error(error_msg)
             raise ValueError(error_msg)
 
         merged_custom_params = self._resolve_custom_params(body, __metadata__)
@@ -2088,54 +2108,19 @@ class Pipe:
         if task_type := __metadata__.get("task"):
             log.info(f"{task_type=}, disabling event emissions, YouTube URL parsing and document processing.")
             __event_emitter__ = None
-            # We disable YouTube parsing for task models to minimize latency and token costs, 
+            # We disable YouTube parsing for task models to minimize latency and token costs,
             # as simple tasks like title or tag generation do not require video context.
             valves.PARSE_YOUTUBE_URLS = False
             # TODO: disable tools. for now I assume that model will know to not use them even if enabled, but if that's not the case then this needs to be addressed.
             # TODO: use the structured outputs feature to ensure a valid json at all times?
 
-        has_free_key = bool(valves.GEMINI_FREE_API_KEY)
-        has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
-
-        # 2. Retrieve Toggle Statuses
-        vertex_available, vertex_toggled_on = self._get_toggleable_feature_status(
-            "gemini_vertex_ai_toggle", __metadata__
-        )
-        paid_toggle_available, paid_toggled_on = self._get_toggleable_feature_status(
-            "gemini_paid_api", __metadata__
-        )
-
         # 3. Determine Execution Order
-        execution_order = []
-
-        # Priority 1: Vertex AI (If toggled on, it's the exclusive path)
-        if vertex_available and vertex_toggled_on and valves.VERTEX_PROJECT:
-            execution_order = ["vertex"]
-
-        # Priority 2: User explicitly toggled "Paid API" ON
-        elif paid_toggle_available and paid_toggled_on:
-            execution_order = ["paid"]
-
-        # Priority 3: Default Resilient Routing (Free -> Paid)
-        else:
-            if has_free_key:
-                is_eligible = self._check_free_tier_eligibility(
-                    model_id, model_config, features
-                )
-                if is_eligible:
-                    execution_order = ["free"]
-                    # Only append 'paid' to the sequence if the feature is enabled
-                    if valves.ENABLE_FREE_TIER_FALLBACK and has_paid_key:
-                        execution_order.append("paid")
-                else:
-                    # Not eligible for free (e.g. search requested), go straight to paid
-                    execution_order = ["paid"] if has_paid_key else ["free"]
-            elif has_paid_key:
-                execution_order = ["paid"]
-            else:
-                execution_order = ["standard"]
-
-        log.debug(f"Routing strategy for {model_id}: {execution_order}")
+        execution_order = self._determine_execution_order(
+            valves=valves,
+            __metadata__=__metadata__,
+            model_config=model_config,
+            features=features,
+        )
 
         event_emitter = EventEmitter(
             __event_emitter__,
@@ -2986,7 +2971,7 @@ class Pipe:
         )
         gen_content_conf.system_instruction = builder.system_prompt
 
-        model_id = __metadata__["canonical_model_id"] # type: ignore
+        model_id = __metadata__.get("canonical_model_id", "")
 
         # Check for image/system prompt compatibility
         is_image_model = self._is_image_model(model_id, model_config)
@@ -3438,7 +3423,7 @@ class Pipe:
                 if content_parts_text:
                     original_content = "".join(content_parts_text)
                     storage_payload["original_content"] = original_content
-                
+
             self._store_data_in_state(app.state, __metadata__, storage_payload)
 
             try:
@@ -4204,6 +4189,75 @@ class Pipe:
     # endregion 2.6 Logging
 
     # region 2.7 Utility helpers
+
+    def _determine_execution_order(
+        self,
+        valves: "Pipe.Valves",
+        __metadata__: "Metadata",
+        model_config: dict[str, Any],
+        features: "Features",
+    ) -> list[str]:
+        """
+        Calculates the sequence of execution tiers (free, paid, vertex, or standard).
+        Retreives feature toggle statuses from metadata to decide if routing should 
+        bypass the free tier or use Vertex AI.
+        """
+        model_id = __metadata__.get("canonical_model_id", "")
+        has_free_key = bool(valves.GEMINI_FREE_API_KEY)
+        has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
+        
+        # Retrieve Toggle Statuses
+        vertex_available, vertex_toggled_on = self._get_toggleable_feature_status(
+            "gemini_vertex_ai_toggle", __metadata__
+        )
+        paid_toggle_available, paid_toggled_on = self._get_toggleable_feature_status(
+            "gemini_paid_api", __metadata__
+        )
+
+        execution_order: list[str] = []
+        task_type = __metadata__.get("task")
+        routing_strategy = valves.TASK_MODEL_ROUTING if task_type else "match_main"
+
+        if routing_strategy == "only_free":
+            log.debug("Task model routing override: only_free")
+            execution_order = ["free"]
+        elif routing_strategy == "free_fallback":
+            log.debug("Task model routing override: free_fallback")
+            execution_order = ["free"]
+            if has_paid_key:
+                execution_order.append("paid")
+        elif routing_strategy == "only_paid":
+            log.debug("Task model routing override: only_paid")
+            if vertex_available and vertex_toggled_on and valves.VERTEX_PROJECT:
+                execution_order = ["vertex"]
+            elif has_paid_key:
+                execution_order = ["paid"]
+            else:
+                execution_order = ["standard"]
+        else:
+            # Default Routing Logic
+            if vertex_available and vertex_toggled_on and valves.VERTEX_PROJECT:
+                execution_order = ["vertex"]
+            elif paid_toggle_available and paid_toggled_on:
+                execution_order = ["paid"]
+            else:
+                if has_free_key:
+                    is_eligible = self._check_free_tier_eligibility(
+                        model_id, model_config, features
+                    )
+                    if is_eligible:
+                        execution_order = ["free"]
+                        if valves.ENABLE_FREE_TIER_FALLBACK and has_paid_key:
+                            execution_order.append("paid")
+                    else:
+                        execution_order = ["paid"] if has_paid_key else ["free"]
+                elif has_paid_key:
+                    execution_order = ["paid"]
+                else:
+                    execution_order = ["standard"]
+
+        log.debug(f"Routing strategy for {model_id}: {execution_order}")
+        return execution_order
 
     def _resolve_custom_params(
         self, body: "Body", __metadata__: "Metadata"
