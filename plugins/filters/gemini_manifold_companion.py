@@ -51,20 +51,65 @@ DEFAULT_MODEL_CONFIG_PATH = "https://raw.githubusercontent.com/suurt8ll/open_web
 DEFAULT_URL_TIMEOUT = aiohttp.ClientTimeout(total=10)  # 10 seconds total timeout
 
 
+class EventEmitter:
+    """Handles fire-and-forget event emissions for the plugin."""
+
+    def __init__(self, event_emitter: Callable[["Event"], Awaitable[None]], pipe_start_time: float | None):
+        self.event_emitter = event_emitter
+        self.pipe_start_time = pipe_start_time
+
+    def _emit(self, event: "Event") -> None:
+        async def emit_task():
+            try:
+                await self.event_emitter(event)
+                # FIXME: make the debug log message less verbose
+                log.debug("Emitted event:", payload=event)
+            except Exception:
+                log.exception("Error emitting event.")
+
+        asyncio.create_task(emit_task())
+
+    def emit_status(self, description: str, done: bool = False) -> None:
+        time_str = (
+            f" (+{(time.monotonic() - self.pipe_start_time):.2f}s)"
+            if self.pipe_start_time is not None
+            else ""
+        )
+        full_description = f"{description}{time_str}"
+
+        status_event: "StatusEvent" = {
+            "type": "status",
+            "data": {"description": full_description, "done": done},
+        }
+        self._emit(status_event)
+
+    def emit_grounding_queries(self, grounding_metadata: types.GroundingMetadata) -> None:
+        if not grounding_metadata.web_search_queries:
+            log.debug("Grounding metadata does not contain any search queries.")
+            return
+
+        status_event: "StatusEvent" = {
+            "type": "status",
+            "data": {
+                "action": "web_search_queries_generated",
+                "queries": grounding_metadata.web_search_queries,
+                "done": False,
+            },
+        }
+        self._emit(status_event)
+
+    def emit_sources(self, sources_list: list["Source"]) -> None:
+        event: "ChatCompletionEvent" = {
+            "type": "chat:completion",
+            "data": {"sources": sources_list},
+        }
+        self._emit(event)
+        log.info("Emitted sources event.")
+
+
 class Filter:
 
     class Valves(BaseModel):
-
-        SET_TEMP_TO_ZERO: bool = Field(
-            default=False,
-            description="""Decide if you want to set the temperature to 0 for grounded answers,
-            Google reccomends it in their docs.""",
-        )
-        GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD: float | None = Field(
-            default=None,
-            description="""See https://ai.google.dev/gemini-api/docs/grounding?lang=python#dynamic-threshold for more information.
-            Only supported for 1.0 and 1.5 models""",
-        )
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=False,
             description="""Whether to request relaxed safety filtering.
@@ -80,6 +125,18 @@ class Filter:
             description=f"""URL to the YAML file containing model definitions.
             Must be a publicly accessible URL (http:// or https://).
             Default value is '{DEFAULT_MODEL_CONFIG_PATH}'.""",
+        )
+        URL_RESOLVE_TIMEOUT: int = Field(
+            default=10,
+            description="Timeout in seconds for resolving a single source URL. Default is 10.",
+        )
+        URL_RESOLVE_MAX_RETRIES: int = Field(
+            default=3,
+            description="Maximum number of attempts to resolve a URL before giving up. Default is 3.",
+        )
+        URL_RESOLVE_BASE_DELAY: float = Field(
+            default=0.5,
+            description="Initial delay in seconds between retries, using exponential backoff. Default is 0.5.",
         )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
@@ -166,23 +223,11 @@ class Filter:
             )
             if web_search_enabled:
                 log.info(
-                    "Search feature is enabled, disabling it and adding custom feature called grounding_w_google_search."
+                    "Search feature is enabled, disabling it and adding custom feature called google_search_tool."
                 )
                 # Disable web_search
                 features["web_search"] = False
-                # Use "Google Search Retrieval" for 1.0 and 1.5 models and "Google Search as a Tool for >=2.0 models".
-                if "1.0" in canonical_model_name or "1.5" in canonical_model_name:
-                    metadata_features["google_search_retrieval"] = True
-                    metadata_features["google_search_retrieval_threshold"] = (
-                        self.valves.GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD
-                    )
-                else:
-                    metadata_features["google_search_tool"] = True
-                # Google suggest setting temperature to 0 if using grounding:
-                # https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-with-google-search#:~:text=For%20ideal%20results%2C%20use%20a%20temperature%20of%200.0.
-                if self.valves.SET_TEMP_TO_ZERO:
-                    log.info("Setting temperature to 0.")
-                    body["temperature"] = 0  # type: ignore
+                metadata_features["google_search_tool"] = True
         if is_code_exec_model:
             code_execution_enabled = (
                 features.get("code_interpreter", False)
@@ -267,6 +312,8 @@ class Filter:
             app_state, chat_id, message_id, "original_content"
         )
 
+        emitter = EventEmitter(__event_emitter__, pipe_start_time)
+
         if stored_metadata:
             log.info("Found grounding metadata, processing citations.")
             log.trace("Stored grounding metadata:", payload=stored_metadata)
@@ -299,6 +346,9 @@ class Filter:
                 else:
                     body["messages"][-1]["content"] = cited_text
 
+            # Emit status event with search queries before resolving URLs
+            emitter.emit_grounding_queries(stored_metadata)
+
             # Emit sources to the front-end.
             gs_supports = stored_metadata.grounding_supports
             gs_chunks = stored_metadata.grounding_chunks
@@ -306,17 +356,15 @@ class Filter:
                 await self._resolve_and_emit_sources(
                     grounding_chunks=gs_chunks,
                     supports=gs_supports,
-                    event_emitter=__event_emitter__,
-                    pipe_start_time=pipe_start_time,
+                    emitter=emitter,
+                )
+                emitter.emit_status(
+                    "This response was grounded with a Google tool", done=True
                 )
             else:
-                log.info(
-                    "Grounding metadata missing supports or chunks (checked in outlet); "
-                    "skipping source resolution and emission."
-                )
-
-            # Emit status event with search queries
-            await self._emit_status_event_w_queries(stored_metadata, __event_emitter__)
+                msg = "Grounding metadata was found but it's missing grounding supports or chunks. The response is likely not grounded."
+                log.info(msg)
+                emitter.emit_status(msg, done=True)
         else:
             log.info("No grounding metadata found in request state.")
 
@@ -329,7 +377,8 @@ class Filter:
             try:
                 # Use .model_dump() to create JSON-serializable dictionaries from the Pydantic models.
                 assistant_message["gemini_parts"] = [
-                    part.model_dump(mode="json", exclude_none=True) for part in response_parts
+                    part.model_dump(mode="json", exclude_none=True)
+                    for part in response_parts
                 ]
             except (IndexError, KeyError) as e:
                 log.exception(
@@ -456,16 +505,18 @@ class Filter:
         self,
         session: aiohttp.ClientSession,
         url: str,
-        timeout: aiohttp.ClientTimeout = DEFAULT_URL_TIMEOUT,
-        max_retries: int = 3,
-        base_delay: float = 0.5,
     ) -> tuple[str, bool]:
         """
-        Resolves a given URL using the provided aiohttp session, with multiple retries on failure.
+        Resolves a given URL using values from Valves.
         Returns the final URL and a boolean indicating success.
         """
         if not url:
             return "", False
+
+        timeout = aiohttp.ClientTimeout(total=self.valves.URL_RESOLVE_TIMEOUT)
+        max_retries = self.valves.URL_RESOLVE_MAX_RETRIES
+        base_delay = self.valves.URL_RESOLVE_BASE_DELAY
+
         for attempt in range(max_retries + 1):
             try:
                 async with session.get(
@@ -499,8 +550,7 @@ class Filter:
         self,
         grounding_chunks: list[types.GroundingChunk],
         supports: list[types.GroundingSupport],
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        pipe_start_time: float | None,
+        emitter: EventEmitter,
     ):
         """
         Resolves URLs in the background and emits a chat completion event
@@ -532,11 +582,7 @@ class Filter:
 
         if urls_to_resolve:
             num_urls = len(urls_to_resolve)
-            self._emit_status_update(
-                event_emitter,
-                f"Resolving {num_urls} source URLs...",
-                pipe_start_time,
-            )
+            emitter.emit_status(f"Resolving {num_urls} source URLs...")
 
             try:
                 log.info(f"Resolving {num_urls} source URLs...")
@@ -554,16 +600,12 @@ class Filter:
                     if success_count == num_urls
                     else f"Resolved {success_count}/{num_urls} URLs"
                 )
-                self._emit_status_update(
-                    event_emitter, final_status_msg, pipe_start_time, done=True
-                )
+                emitter.emit_status(final_status_msg, done=True)
 
             except Exception as e:
                 log.error(f"Error during URL resolution: {e}")
                 resolved_uris_map = {url: url for url in urls_to_resolve}
-                self._emit_status_update(
-                    event_emitter, "URL resolution failed", pipe_start_time, done=True
-                )
+                emitter.emit_status("URL resolution failed", done=True)
 
         source_metadatas_template: list["SourceMetadata"] = [
             {"source": None, "original_url": None, "supports": []}
@@ -644,49 +686,7 @@ class Filter:
                 }
             )
 
-        event: "ChatCompletionEvent" = {
-            "type": "chat:completion",
-            "data": {"sources": sources_list},
-        }
-        await event_emitter(event)
-        log.info("Emitted sources event.")
-        log.trace("ChatCompletionEvent:", payload=event)
-
-    async def _emit_status_event_w_queries(
-        self,
-        grounding_metadata: types.GroundingMetadata,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-    ) -> None:
-        """
-        Creates a StatusEvent with search URLs based on the web_search_queries
-        in the GroundingMetadata. This covers both Google Search and Google Maps grounding.
-        """
-        if not grounding_metadata.web_search_queries:
-            log.debug("Grounding metadata does not contain any search queries.")
-            return
-
-        search_queries = grounding_metadata.web_search_queries
-        if not search_queries:
-            log.debug("web_search_queries list is empty.")
-            return
-
-        # The queries are used for grounding, so we link them to a general Google search page.
-        google_search_urls = [
-            f"https://www.google.com/search?q={query}" for query in search_queries
-        ]
-
-        status_event_data: StatusEventData = {
-            "action": "web_search",
-            "description": "This response was grounded with a Google tool",
-            "urls": google_search_urls,
-        }
-        status_event: StatusEvent = {
-            "type": "status",
-            "data": status_event_data,
-        }
-        await event_emitter(status_event)
-        log.info("Emitted grounding queries.")
-        log.trace("StatusEvent:", payload=status_event)
+        emitter.emit_sources(sources_list)
 
     # endregion 1.1 Add citations
 
@@ -855,38 +855,6 @@ class Filter:
                     f"State key '{key}' was already gone before deletion attempt."
                 )
         return value
-
-    def _emit_status_update(
-        self,
-        event_emitter: Callable[["Event"], Awaitable[None]],
-        description: str,
-        pipe_start_time: float | None,
-        *,
-        done: bool = False,
-    ):
-        """Constructs and emits a status event in a non-blocking task."""
-
-        async def emit_task():
-            time_str = (
-                f" (+{(time.monotonic() - pipe_start_time):.2f}s)"
-                if pipe_start_time is not None
-                else ""
-            )
-            full_description = f"{description}{time_str}"
-
-            status_event: "StatusEvent" = {
-                "type": "status",
-                "data": {"description": full_description, "done": done},
-            }
-
-            try:
-                await event_emitter(status_event)
-                log.debug(f"Emitted status:", payload=status_event)
-            except Exception:
-                log.exception("Error emitting status.")
-
-        # Fire-and-forget the emission task.
-        asyncio.create_task(emit_task())
 
     def _get_first_candidate(
         self, candidates: list[types.Candidate] | None

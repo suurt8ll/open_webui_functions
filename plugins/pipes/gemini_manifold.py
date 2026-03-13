@@ -2782,14 +2782,6 @@ class Pipe:
                 gen_content_conf.tools.append(
                     types.Tool(google_search=types.GoogleSearch())
                 )
-        elif features.get("google_search_retrieval"):
-            log.info("Using grounding with Google Search Retrieval.")
-            gs = types.GoogleSearchRetrieval(
-                dynamic_retrieval_config=types.DynamicRetrievalConfig(
-                    dynamic_threshold=features.get("google_search_retrieval_threshold")
-                )
-            )
-            gen_content_conf.tools.append(types.Tool(google_search_retrieval=gs))
 
         # NB: It is not possible to use both Search and Code execution at the same time,
         # however, it can be changed later, so let's just handle it as a common error
@@ -3085,9 +3077,7 @@ class Pipe:
         excluded_features = pricing.get("excluded_features", [])
 
         # Check Search
-        is_search_requested = features.get("google_search_tool") or features.get(
-            "google_search_retrieval"
-        )
+        is_search_requested = features.get("google_search_tool")
         if is_search_requested and "search_grounding" in excluded_features:
             log.info(
                 f"Free Tier ineligible: Search requested but excluded for {model_id}."
