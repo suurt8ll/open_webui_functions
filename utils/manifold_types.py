@@ -103,13 +103,38 @@ class ChatCompletionEvent(TypedDict):
     data: ChatCompletionEventData
 
 
+class WebSearchItem(TypedDict):
+    link: str
+    title: NotRequired[str]
+
+
 class StatusEventData(TypedDict):
-    action: NotRequired[Literal["web_search", "knowledge_search"]]
-    description: str
+    # Specific actions found in StatusItem.svelte
+    action: NotRequired[
+        Literal[
+            "web_search",
+            "knowledge_search",
+            "queries_generated",
+            "web_search_queries_generated",
+            "sources_retrieved",
+        ]
+    ]
+    description: NotRequired[str]
     done: NotRequired[bool]
-    query: NotRequired[str]  # knowledge_search
-    urls: NotRequired[list[str]]  # web_search
     hidden: NotRequired[bool]
+
+    # Used by "knowledge_search" and "web_search" (for the top link)
+    query: NotRequired[str]
+
+    # Used by "queries_generated" and "web_search_queries_generated" (the gray chips)
+    queries: NotRequired[list[str]]
+
+    # Used by "web_search"
+    urls: NotRequired[list[str]]  # Basic mode
+    items: NotRequired[list[WebSearchItem]]  # Rich mode (Title + Favicon)
+
+    # Used by "sources_retrieved" and injected into description via {{count}}
+    count: NotRequired[int]
 
 
 class StatusEvent(TypedDict):
@@ -117,7 +142,20 @@ class StatusEvent(TypedDict):
     data: StatusEventData
 
 
-Event = ChatCompletionEvent | StatusEvent | NotificationEvent
+class SourceData(TypedDict):
+    source: dict  # The file or url object
+    document: list[str]  # The chunks of text
+    metadata: NotRequired[list[dict]]
+
+
+class CitationEvent(TypedDict):
+    # Backend get_event_emitter handles both "source" and "citation" types
+    type: Literal["source", "citation"]
+    data: SourceData
+
+
+# Refined Event Union
+Event = ChatCompletionEvent | StatusEvent | NotificationEvent | CitationEvent
 # endregion __event_emitter__
 
 
