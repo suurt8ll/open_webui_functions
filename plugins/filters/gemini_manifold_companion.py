@@ -110,12 +110,6 @@ class EventEmitter:
 class Filter:
 
     class Valves(BaseModel):
-
-        GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD: float | None = Field(
-            default=None,
-            description="""See https://ai.google.dev/gemini-api/docs/grounding?lang=python#dynamic-threshold for more information.
-            Only supported for 1.0 and 1.5 models""",
-        )
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=False,
             description="""Whether to request relaxed safety filtering.
@@ -217,18 +211,11 @@ class Filter:
             )
             if web_search_enabled:
                 log.info(
-                    "Search feature is enabled, disabling it and adding custom feature called grounding_w_google_search."
+                    "Search feature is enabled, disabling it and adding custom feature called google_search_tool."
                 )
                 # Disable web_search
                 features["web_search"] = False
-                # Use "Google Search Retrieval" for 1.0 and 1.5 models and "Google Search as a Tool for >=2.0 models".
-                if "1.0" in canonical_model_name or "1.5" in canonical_model_name:
-                    metadata_features["google_search_retrieval"] = True
-                    metadata_features["google_search_retrieval_threshold"] = (
-                        self.valves.GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD
-                    )
-                else:
-                    metadata_features["google_search_tool"] = True
+                metadata_features["google_search_tool"] = True
         if is_code_exec_model:
             code_execution_enabled = (
                 features.get("code_interpreter", False)

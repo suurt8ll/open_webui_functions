@@ -277,8 +277,6 @@ class Features(TypedDict):
     web_search: bool
 
     # These are my own custom fields, not used by Open WebUI.
-    google_search_retrieval: NotRequired[bool]
-    google_search_retrieval_threshold: NotRequired[float | None]
     google_search_tool: NotRequired[bool]
     google_code_execution: NotRequired[bool]
     upload_documents: NotRequired[bool]
