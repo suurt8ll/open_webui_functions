@@ -126,6 +126,18 @@ class Filter:
             Must be a publicly accessible URL (http:// or https://).
             Default value is '{DEFAULT_MODEL_CONFIG_PATH}'.""",
         )
+        URL_RESOLVE_TIMEOUT: int = Field(
+            default=10,
+            description="Timeout in seconds for resolving a single source URL. Default is 10.",
+        )
+        URL_RESOLVE_MAX_RETRIES: int = Field(
+            default=3,
+            description="Maximum number of attempts to resolve a URL before giving up. Default is 3.",
+        )
+        URL_RESOLVE_BASE_DELAY: float = Field(
+            default=0.5,
+            description="Initial delay in seconds between retries, using exponential backoff. Default is 0.5.",
+        )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
@@ -493,16 +505,18 @@ class Filter:
         self,
         session: aiohttp.ClientSession,
         url: str,
-        timeout: aiohttp.ClientTimeout = DEFAULT_URL_TIMEOUT,
-        max_retries: int = 3,
-        base_delay: float = 0.5,
     ) -> tuple[str, bool]:
         """
-        Resolves a given URL using the provided aiohttp session, with multiple retries on failure.
+        Resolves a given URL using values from Valves.
         Returns the final URL and a boolean indicating success.
         """
         if not url:
             return "", False
+
+        timeout = aiohttp.ClientTimeout(total=self.valves.URL_RESOLVE_TIMEOUT)
+        max_retries = self.valves.URL_RESOLVE_MAX_RETRIES
+        base_delay = self.valves.URL_RESOLVE_BASE_DELAY
+
         for attempt in range(max_retries + 1):
             try:
                 async with session.get(
