@@ -733,10 +733,12 @@ class GeminiContentBuilder:
         self.upload_documents = (metadata_body.get("features", {}) or {}).get(
             "upload_documents", False
         )
+        # Identify if this is a background task (title/tags/etc) to optimize context.
+        self.is_task = bool(metadata_body.get("task"))
         self.event_emitter = event_emitter
         self.valves = valves
         self.files_api_manager = files_api_manager
-        self.is_temp_chat = metadata_body.get("chat_id") == "local"
+        self.is_temp_chat = "local" in metadata_body.get("chat_id", "")
         self.vertexai = self.files_api_manager.client.vertexai
 
         self.system_prompt, self.messages_body = self._extract_system_prompt(
@@ -885,12 +887,9 @@ class GeminiContentBuilder:
 
         if role == "user":
             message = cast("UserMessage", message)
-            files = []
-            if self.messages_db:
-                message_db = self.messages_db[i]
-                if self.upload_documents:
-                    files = message_db.get("files", [])
-            parts = await self._process_user_message(message, files, status_queue)
+            # Logic for retrieving files is now handled inside _process_user_message
+            # to allow for finer control over which file types are included based on task mode.
+            parts = await self._process_user_message(i, message, status_queue)
             # Case 1: User content is completely empty (no text, no files).
             if not parts:
                 log.info(
@@ -963,39 +962,51 @@ class GeminiContentBuilder:
 
     async def _process_user_message(
         self,
+        i: int,
         message: "UserMessage",
-        files: list["FileAttachmentTD"],
         status_queue: asyncio.Queue,
     ) -> list[types.Part]:
         user_parts: list[types.Part] = []
         db_files_processed = False
 
         # PATH 1: Database is available (Normal Chat).
-        if self.messages_db and files:
-            db_files_processed = True
-            log.info(f"Processing {len(files)} files from the database concurrently.")
+        if self.messages_db:
+            message_db = self.messages_db[i]
+            files: list["FileAttachmentTD"] = message_db.get("files", [])
+            
+            if files:
+                db_files_processed = True
+                upload_tasks = []
+                
+                for file in files:
+                    content_type = file.get("content_type", "")
+                    # MIME types for images always start with 'image/' (e.g., image/png, image/jpeg)
+                    is_image = content_type.startswith("image/")
+                    
+                    # Optimization: Task models (titles, tags, etc.) skip heavy documents 
+                    # but keep images as they provide high context value for low token cost.
+                    should_include = is_image or (self.upload_documents and not self.is_task)
+                    
+                    if not should_include:
+                        log.debug(
+                            f"Skipping {content_type} '{file.get('id')}' "
+                            f"(is_task={self.is_task}, upload_documents={self.upload_documents})"
+                        )
+                        continue
 
-            upload_tasks = []
-            for file in files:
-                log.debug("Preparing DB file for concurrent upload:", payload=file)
-                uri = ""
-                if file.get("type") == "image":
-                    uri = file.get("url", "")
-                elif file.get("type") == "file":
-                    # Reconstruct the local API URI to be handled by our unified function
-                    uri = f"/api/v1/files/{file.get('id', '')}/content"
+                    # We always use the internal API endpoint to fetch file content from the DB.
+                    # Even for images, the 'url' field in the attachment object is often 
+                    # just the UUID, which isn't fetchable on its own.
+                    if file_id := file.get("id"):
+                        uri = f"/api/v1/files/{file_id}/content"
+                        upload_tasks.append(self._genai_part_from_uri(uri, status_queue))
+                    else:
+                        log.warning("Could not determine ID for file in DB.", payload=file)
 
-                if uri:
-                    # Create a coroutine for each file upload and add it to a list.
-                    upload_tasks.append(self._genai_part_from_uri(uri, status_queue))
-                else:
-                    log.warning("Could not determine URI for file in DB.", payload=file)
-
-            if upload_tasks:
-                # Run all upload tasks concurrently. asyncio.gather maintains the order of results.
-                results = await asyncio.gather(*upload_tasks)
-                # Filter out None results (from failed uploads) and add the successful parts to the list.
-                user_parts.extend(part for part in results if part)
+                if upload_tasks:
+                    log.info(f"Processing {len(upload_tasks)} file(s) from database.")
+                    results = await asyncio.gather(*upload_tasks)
+                    user_parts.extend(part for part in results if part)
 
         # Now, process the content from the message payload.
         user_content = message.get("content")
@@ -1021,6 +1032,7 @@ class GeminiContentBuilder:
                     )
 
             # PATH 2: Temporary Chat Image Handling.
+            # FIXME: this puts images to the end of the message, see if it matters where they are.
             elif c_type == "image_url" and not db_files_processed:
                 log.info("Processing image from payload (temporary chat mode).")
                 c = cast("ImageContent", c)
@@ -1120,7 +1132,7 @@ class GeminiContentBuilder:
 
         # --- PATH 1: Restore from stored parts (ideal case) ---
         if gemini_parts and original_content is not None:
-            # Now current_content has no thoughts and no citations, 
+            # Now current_content has no thoughts and no citations,
             # making it directly comparable to original_content.
             if current_content.strip() == original_content.strip():
                 log.debug(
@@ -1769,6 +1781,20 @@ class Pipe:
             Requires both Free and Paid API keys to be configured. 
             Default value is False.""",
         )
+        TASK_MODEL_ROUTING: Literal[
+            "only_free",
+            "free_fallback",
+            "only_paid",
+            "match_main",
+        ] = Field(
+            default="match_main",
+            description="""Determines how task models (like title generation) are routed between Free and Paid APIs.
+            • only_free: Use only the Free API.
+            • free_fallback: Use Free API first, fallback to Paid on failure.
+            • only_paid: Bypass Free API and use Paid API directly (or Vertex if enabled).
+            • match_main: Follow the same logic as the main chat generation.
+            Default is match_main.""",
+        )
         PARSE_YOUTUBE_URLS: bool = Field(
             default=True,
             description="""Whether to parse YouTube URLs from user messages and provide them as context to the model.
@@ -1931,6 +1957,12 @@ class Pipe:
             Set to True to enable automatic fallback to the Paid API, False to disable.
             Default is None (use the admin's setting).""",
         )
+        TASK_MODEL_ROUTING: (
+            Literal["only_free", "free_fallback", "only_paid", "match_main", ""] | None
+        ) = Field(
+            default=None,
+            description="""Override the default routing strategy for task models.""",
+        )
         PARSE_YOUTUBE_URLS: bool | None | Literal[""] = Field(
             default=None,
             description="""Override the default setting for parsing YouTube URLs.
@@ -2053,89 +2085,42 @@ class Pipe:
         self._check_companion_filter_version(features)
 
         # Retrieve model configuration from app state
-        model_config = __request__.app.state._state.get("gemini_model_config")
+        model_config: dict[str, Any] = __request__.app.state._state.get("gemini_model_config")
+        # FIXME: be even more strict by requring the model id to be present in the config to proceed?
         if model_config is None:
             error_msg = (
-                "FATAL: Model configuration not found in app state. "
+                "FATAL: Gemini model configuration not found in app state. "
                 "Please ensure the Gemini Manifold Companion filter is installed and enabled."
             )
-            log.error(error_msg)
             raise ValueError(error_msg)
 
-        # Resolve custom parameters from both the model page (in `body`) and chat
-        # controls (in `__metadata__`). Chat control settings take precedence.
-        known_body_keys = {
-            "stream",
-            "model",
-            "messages",
-            "files",
-            "options",
-            "stream_options",
-        }
-        model_page_params = {
-            key: value for key, value in body.items() if key not in known_body_keys
-        }
-        chat_control_params = __metadata__.get("chat_control_params", {})
-
-        merged_custom_params = model_page_params.copy()
-        merged_custom_params.update(chat_control_params)
+        merged_custom_params = self._resolve_custom_params(body, __metadata__)
         __metadata__["merged_custom_params"] = merged_custom_params
 
-        # Retrieve the canonical model ID parsed by the companion filter.
         model_id = self._get_model_name(body)
         __metadata__["canonical_model_id"] = model_id
-
-        # Initialize EventEmitter
-        if __metadata__.get("task"):
-            log.info(f'{__metadata__["task"]=}, disabling event emissions.')  # type: ignore
-            __event_emitter__ = None
 
         # 1. Capture the raw state of keys before any overrides
         valves: Pipe.Valves = self._get_merged_valves(
             self.valves, __user__.get("valves"), __user__.get("email")
         )
-        has_free_key = bool(valves.GEMINI_FREE_API_KEY)
-        has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
 
-        # 2. Retrieve Toggle Statuses
-        vertex_available, vertex_toggled_on = self._get_toggleable_feature_status(
-            "gemini_vertex_ai_toggle", __metadata__
-        )
-        paid_toggle_available, paid_toggled_on = self._get_toggleable_feature_status(
-            "gemini_paid_api", __metadata__
-        )
+        if task_type := __metadata__.get("task"):
+            log.info(f"{task_type=}, disabling event emissions, YouTube URL parsing and document processing.")
+            __event_emitter__ = None
+            # We disable YouTube parsing for task models to minimize latency and token costs,
+            # as simple tasks like title or tag generation do not require video context.
+            valves.PARSE_YOUTUBE_URLS = False
+            # TODO: disable tools. for now I assume that model will know to not use them even if enabled, but if that's not the case then this needs to be addressed.
+            # TODO: use the structured outputs feature to ensure a valid json at all times?
 
         # 3. Determine Execution Order
-        execution_order = []
-
-        # Priority 1: Vertex AI (If toggled on, it's the exclusive path)
-        if vertex_available and vertex_toggled_on and valves.VERTEX_PROJECT:
-            execution_order = ["vertex"]
-
-        # Priority 2: User explicitly toggled "Paid API" ON
-        elif paid_toggle_available and paid_toggled_on:
-            execution_order = ["paid"]
-
-        # Priority 3: Default Resilient Routing (Free -> Paid)
-        else:
-            if has_free_key:
-                is_eligible = self._check_free_tier_eligibility(
-                    model_id, model_config, features
-                )
-                if is_eligible:
-                    execution_order = ["free"]
-                    # Only append 'paid' to the sequence if the feature is enabled
-                    if valves.ENABLE_FREE_TIER_FALLBACK and has_paid_key:
-                        execution_order.append("paid")
-                else:
-                    # Not eligible for free (e.g. search requested), go straight to paid
-                    execution_order = ["paid"] if has_paid_key else ["free"]
-            elif has_paid_key:
-                execution_order = ["paid"]
-            else:
-                execution_order = ["standard"]
-
-        log.debug(f"Routing strategy for {model_id}: {execution_order}")
+        execution_order = self._determine_execution_order(
+            valves=valves,
+            __metadata__=__metadata__,
+            model_config=model_config,
+            features=features,
+        )
 
         event_emitter = EventEmitter(
             __event_emitter__,
@@ -2986,7 +2971,7 @@ class Pipe:
         )
         gen_content_conf.system_instruction = builder.system_prompt
 
-        model_id = __metadata__["canonical_model_id"] # type: ignore
+        model_id = __metadata__.get("canonical_model_id", "")
 
         # Check for image/system prompt compatibility
         is_image_model = self._is_image_model(model_id, model_config)
@@ -3421,35 +3406,25 @@ class Pipe:
                 # Yielding this dictionary allows the OWUI proxy to catch and save usage.
                 yield {"usage": usage_data}
 
+            storage_payload: dict[str, Any] = {}
+
             if not error_occurred:
                 # 'data: [DONE]' should be the last thing yielded in a successful stream
                 # to signify the protocol-level end of the OpenAI-compatible stream.
                 yield "data: [DONE]"
                 log.info("Response processing finished successfully!")
 
-            if not error_occurred and response_parts:
-                # Storing the complete list of response parts for Filter.outlet.
-                # The filter will serialize this and add it to the final message payload,
-                # allowing the frontend to store it in the database with the assistant's message.
-                self._store_data_in_state(
-                    app.state,
-                    __metadata__.get("chat_id"),
-                    __metadata__.get("message_id"),
-                    "response_parts",
-                    response_parts,
-                )
-                log.trace("Stored response parts in state for Filter.outlet.", payload=response_parts)
+                if response_parts:
+                    # Storing the complete list of response parts for Filter.outlet.
+                    # The filter will serialize this and add it to the final message payload,
+                    # allowing the frontend to store it in the database with the assistant's message.
+                    storage_payload["response_parts"] = response_parts
 
-            if not error_occurred and content_parts_text:
-                original_content = "".join(content_parts_text)
-                # FIXME: allow passing list of keys and values to store multiple items at once
-                self._store_data_in_state(
-                    app.state,
-                    __metadata__.get("chat_id"),
-                    __metadata__.get("message_id"),
-                    "original_content",
-                    original_content,
-                )
+                if content_parts_text:
+                    original_content = "".join(content_parts_text)
+                    storage_payload["original_content"] = original_content
+
+            self._store_data_in_state(app.state, __metadata__, storage_payload)
 
             try:
                 await self._do_post_processing(
@@ -3745,40 +3720,45 @@ class Pipe:
         # TODO: Emit a toast message if url context retrieval was not successful.
 
         # --- Store grounding and timing data in state for the Filter ---
+        storage_payload: dict[str, Any] = {}
+
         if candidate and (grounding_metadata_obj := candidate.grounding_metadata):
-            self._store_data_in_state(
-                app_state,
-                __metadata__.get("chat_id"),
-                __metadata__.get("message_id"),
-                "grounding",
-                grounding_metadata_obj,
-            )
+            storage_payload["grounding"] = grounding_metadata_obj
 
         # Only store the start time if the user wants to see timestamps in the grounding display.
         # The filter will gracefully handle the absence of this key.
         if event_emitter.status_mode == "visible_timed":
-            self._store_data_in_state(
-                app_state,
-                __metadata__.get("chat_id"),
-                __metadata__.get("message_id"),
-                "pipe_start_time",
-                event_emitter.start_time,
-            )
+            storage_payload["pipe_start_time"] = event_emitter.start_time
+
+        self._store_data_in_state(app_state, __metadata__, storage_payload)
 
     @staticmethod
     def _store_data_in_state(
         app_state: State,
-        chat_id: str,
-        message_id: str,
-        key_suffix: str,
-        value: Any,
+        __metadata__: "Metadata",
+        data: dict[str, Any],
     ):
-        """Stores a value in the app state, namespaced by chat and message ID."""
-        key = f"{key_suffix}_{chat_id}_{message_id}"
-        log.debug(f"Storing data in app state with key '{key}'.")
-        # Using shared `request.app.state` to pass data to Filter.outlet.
-        # This is necessary because Pipe.pipe and Filter.outlet operate on different requests.
-        app_state._state[key] = value
+        """
+        Stores multiple values in the app state, namespaced by chat and message ID.
+        Exits early if this is a task model (e.g. title generation) to prevent 
+        state bloat and interference with the main chat's filter logic.
+        """
+        if __metadata__.get("task"):
+            return
+
+        chat_id = __metadata__.get("chat_id")
+        message_id = __metadata__.get("message_id")
+
+        if not chat_id or not message_id:
+            log.warning("Skipping state storage: chat_id or message_id missing from metadata.")
+            return
+
+        for key_suffix, value in data.items():
+            key = f"{key_suffix}_{chat_id}_{message_id}"
+            log.debug(f"Storing data in app state with key '{key}'.")
+            # Using shared `request.app.state` to pass data to Filter.outlet.
+            # This is necessary because Pipe.pipe and Filter.outlet operate on different requests.
+            app_state._state[key] = value
 
     @staticmethod
     def _calculate_cost(token_count: int, pricing_tiers: list[dict]) -> float:
@@ -4209,6 +4189,113 @@ class Pipe:
     # endregion 2.6 Logging
 
     # region 2.7 Utility helpers
+
+    def _determine_execution_order(
+        self,
+        valves: "Pipe.Valves",
+        __metadata__: "Metadata",
+        model_config: dict[str, Any],
+        features: "Features",
+    ) -> list[str]:
+        """
+        Calculates the sequence of execution tiers (free, paid, vertex, or standard).
+        Retreives feature toggle statuses from metadata to decide if routing should 
+        bypass the free tier or use Vertex AI.
+        """
+        model_id = __metadata__.get("canonical_model_id", "")
+        has_free_key = bool(valves.GEMINI_FREE_API_KEY)
+        has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
+        
+        # Retrieve Toggle Statuses
+        vertex_available, vertex_toggled_on = self._get_toggleable_feature_status(
+            "gemini_vertex_ai_toggle", __metadata__
+        )
+        paid_toggle_available, paid_toggled_on = self._get_toggleable_feature_status(
+            "gemini_paid_api", __metadata__
+        )
+
+        execution_order: list[str] = []
+        task_type = __metadata__.get("task")
+        routing_strategy = valves.TASK_MODEL_ROUTING if task_type else "match_main"
+
+        if routing_strategy == "only_free":
+            log.debug("Task model routing override: only_free")
+            execution_order = ["free"]
+        elif routing_strategy == "free_fallback":
+            log.debug("Task model routing override: free_fallback")
+            execution_order = ["free"]
+            if has_paid_key:
+                execution_order.append("paid")
+        elif routing_strategy == "only_paid":
+            log.debug("Task model routing override: only_paid")
+            if vertex_available and vertex_toggled_on and valves.VERTEX_PROJECT:
+                execution_order = ["vertex"]
+            elif has_paid_key:
+                execution_order = ["paid"]
+            else:
+                execution_order = ["standard"]
+        else:
+            # Default Routing Logic
+            if vertex_available and vertex_toggled_on and valves.VERTEX_PROJECT:
+                execution_order = ["vertex"]
+            elif paid_toggle_available and paid_toggled_on:
+                execution_order = ["paid"]
+            else:
+                if has_free_key:
+                    is_eligible = self._check_free_tier_eligibility(
+                        model_id, model_config, features
+                    )
+                    if is_eligible:
+                        execution_order = ["free"]
+                        if valves.ENABLE_FREE_TIER_FALLBACK and has_paid_key:
+                            execution_order.append("paid")
+                    else:
+                        execution_order = ["paid"] if has_paid_key else ["free"]
+                elif has_paid_key:
+                    execution_order = ["paid"]
+                else:
+                    execution_order = ["standard"]
+
+        log.debug(f"Routing strategy for {model_id}: {execution_order}")
+        return execution_order
+
+    def _resolve_custom_params(
+        self, body: "Body", __metadata__: "Metadata"
+    ) -> dict[str, Any]:
+        """
+        Resolves custom parameters from the model page and chat controls.
+        Chat control settings usually take precedence, but we ignore them
+        if this is a task model (e.g., generating titles or tags) to ensure
+        these independent calls aren't negatively affected by user chat settings.
+        """
+        known_body_keys = {
+            "stream",
+            "model",
+            "messages",
+            "files",
+            "options",
+            "stream_options",
+        }
+        merged_params = {
+            key: value for key, value in body.items() if key not in known_body_keys
+        }
+        log.debug("Model page parameters extracted from body:", payload=merged_params)
+
+        if __metadata__.get("task"):
+            log.debug(
+                f"Task model detected (task: {__metadata__.get('task')}). Ignoring chat control parameters."
+            )
+            return merged_params
+
+        chat_control_params = __metadata__.get("chat_control_params", {})
+        if chat_control_params:
+            log.debug(
+                "Chat control parameters extracted from metadata:",
+                payload=chat_control_params,
+            )
+            merged_params.update(chat_control_params)
+
+        return merged_params
 
     @staticmethod
     def _get_toggleable_feature_status(
