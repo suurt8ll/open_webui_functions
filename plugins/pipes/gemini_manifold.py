@@ -1721,6 +1721,26 @@ class Pipe:
             description="""The Google Cloud region to use with Vertex AI.
             Default value is 'global'.""",
         )
+        ENABLE_FREE_TIER_FALLBACK: bool = Field(
+            default=False,
+            description="""Automatically switch to the Paid API if a Free API request fails due to quota limits (429) or model overload (503).
+            Requires both Free and Paid API keys to be configured. 
+            Default value is False.""",
+        )
+        TASK_MODEL_ROUTING: Literal[
+            "only_free",
+            "free_fallback",
+            "only_paid",
+            "match_main",
+        ] = Field(
+            default="match_main",
+            description="""Determines how task models (like title generation) are routed between Free and Paid APIs.
+            • only_free: Use only the Free API.
+            • free_fallback: Use Free API first, fallback to Paid on failure.
+            • only_paid: Bypass Free API and use Paid API directly (or Vertex if enabled).
+            • match_main: Follow the same logic as the main chat generation.
+            Default is match_main.""",
+        )
         MODEL_WHITELIST: str = Field(
             default="*",
             description="""Comma-separated list of allowed model names.
@@ -1774,26 +1794,6 @@ class Pipe:
             This provides caching and performance benefits, but can be disabled for privacy, cost, or compatibility reasons.
             If disabled, files are sent as raw bytes in the request.
             Default value is True.""",
-        )
-        ENABLE_FREE_TIER_FALLBACK: bool = Field(
-            default=False,
-            description="""Automatically switch to the Paid API if a Free API request fails due to quota limits (429) or model overload (503).
-            Requires both Free and Paid API keys to be configured. 
-            Default value is False.""",
-        )
-        TASK_MODEL_ROUTING: Literal[
-            "only_free",
-            "free_fallback",
-            "only_paid",
-            "match_main",
-        ] = Field(
-            default="match_main",
-            description="""Determines how task models (like title generation) are routed between Free and Paid APIs.
-            • only_free: Use only the Free API.
-            • free_fallback: Use Free API first, fallback to Paid on failure.
-            • only_paid: Bypass Free API and use Paid API directly (or Vertex if enabled).
-            • match_main: Follow the same logic as the main chat generation.
-            Default is match_main.""",
         )
         PARSE_YOUTUBE_URLS: bool = Field(
             default=True,
@@ -1921,6 +1921,19 @@ class Pipe:
             description="""The Google Cloud region to use with Vertex AI.
             Default value is None.""",
         )
+        ENABLE_FREE_TIER_FALLBACK: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Override the default setting for Free API fallback.
+            Set to True to enable automatic fallback to the Paid API, False to disable.
+            Default is None (use the admin's setting).""",
+        )
+        TASK_MODEL_ROUTING: (
+            Literal["only_free", "free_fallback", "only_paid", "match_main", ""] | None
+        ) = Field(
+            default=None,
+            description="""Override the default routing strategy for task models. 
+            Possible values: only_free | free_fallback | only_paid | match_main.""",
+        )
         THINKING_BUDGET: int | None | Literal[""] = Field(
             default=None,
             description="""Specifies the token budget for the model's internal thinking process,
@@ -1950,18 +1963,6 @@ class Pipe:
             description="""Override the default setting for using the Google Files API.
             Set to True to force use, False to disable.
             Default is None (use the admin's setting).""",
-        )
-        ENABLE_FREE_TIER_FALLBACK: bool | None | Literal[""] = Field(
-            default=None,
-            description="""Override the default setting for Free API fallback.
-            Set to True to enable automatic fallback to the Paid API, False to disable.
-            Default is None (use the admin's setting).""",
-        )
-        TASK_MODEL_ROUTING: (
-            Literal["only_free", "free_fallback", "only_paid", "match_main", ""] | None
-        ) = Field(
-            default=None,
-            description="""Override the default routing strategy for task models.""",
         )
         PARSE_YOUTUBE_URLS: bool | None | Literal[""] = Field(
             default=None,
@@ -4188,65 +4189,118 @@ class Pipe:
         features: "Features",
     ) -> list[str]:
         """
-        Calculates the sequence of execution tiers (free, paid, vertex, or standard).
-        Retreives feature toggle statuses from metadata to decide if routing should 
-        bypass the free tier or use Vertex AI.
+        Calculates the sequence of execution tiers (free, paid, vertex).
+        Returns an empty list if no valid routing configuration is found.
         """
         model_id = __metadata__.get("canonical_model_id", "")
         has_free_key = bool(valves.GEMINI_FREE_API_KEY)
         has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
-        
+
         # Retrieve Toggle Statuses
         vertex_available, vertex_toggled_on = self._get_toggleable_feature_status(
             "gemini_vertex_ai_toggle", __metadata__
         )
+        # Vertex is only viable if toggled on AND we have a project ID
+        can_use_vertex = (
+            vertex_available and vertex_toggled_on and bool(valves.VERTEX_PROJECT)
+        )
+
         paid_toggle_available, paid_toggled_on = self._get_toggleable_feature_status(
             "gemini_paid_api", __metadata__
         )
 
-        execution_order: list[str] = []
         task_type = __metadata__.get("task")
         routing_strategy = valves.TASK_MODEL_ROUTING if task_type else "match_main"
 
-        if routing_strategy == "only_free":
-            log.debug("Task model routing override: only_free")
-            execution_order = ["free"]
-        elif routing_strategy == "free_fallback":
-            log.debug("Task model routing override: free_fallback")
-            execution_order = ["free"]
-            if has_paid_key:
-                execution_order.append("paid")
-        elif routing_strategy == "only_paid":
-            log.debug("Task model routing override: only_paid")
-            if vertex_available and vertex_toggled_on and valves.VERTEX_PROJECT:
-                execution_order = ["vertex"]
-            elif has_paid_key:
-                execution_order = ["paid"]
-            else:
-                execution_order = ["standard"]
-        else:
-            # Default Routing Logic
-            if vertex_available and vertex_toggled_on and valves.VERTEX_PROJECT:
-                execution_order = ["vertex"]
-            elif paid_toggle_available and paid_toggled_on:
-                execution_order = ["paid"]
-            else:
+        is_free_eligible = self._check_free_tier_eligibility(
+            model_id, model_config, features
+        )
+
+        execution_order: list[str] = []
+
+        match routing_strategy:
+            case "only_free":
+                log.debug("Task model routing override: only_free")
                 if has_free_key:
-                    is_eligible = self._check_free_tier_eligibility(
-                        model_id, model_config, features
+                    if not is_free_eligible:
+                        log.warning(
+                            f"Task model '{model_id}' forced to 'only_free' but is ineligible. "
+                            "Expect an upstream API error."
+                        )
+                    execution_order = ["free"]
+                else:
+                    log.error(
+                        "Routing strategy 'only_free' requested, but no Free API Key is configured."
                     )
-                    if is_eligible:
-                        execution_order = ["free"]
-                        if valves.ENABLE_FREE_TIER_FALLBACK and has_paid_key:
-                            execution_order.append("paid")
-                    else:
-                        execution_order = ["paid"] if has_paid_key else ["free"]
+
+            case "free_fallback":
+                log.debug("Task model routing override: free_fallback")
+                # 1. Attempt Free if keys exist and model is eligible
+                if has_free_key and is_free_eligible:
+                    execution_order.append("free")
+
+                # 2. Add Paid fallbacks
+                if can_use_vertex:
+                    execution_order.append("vertex")
+                elif has_paid_key:
+                    execution_order.append("paid")
+
+                if not execution_order:
+                    log.warning(
+                        "Strategy 'free_fallback' could not find any viable tiers (check keys/eligibility)."
+                    )
+
+            case "only_paid":
+                log.debug("Task model routing override: only_paid")
+                if can_use_vertex:
+                    execution_order = ["vertex"]
                 elif has_paid_key:
                     execution_order = ["paid"]
                 else:
-                    execution_order = ["standard"]
+                    log.error(
+                        "Routing strategy 'only_paid' requested, but neither Vertex AI nor Paid API is configured."
+                    )
 
-        log.debug(f"Routing strategy for {model_id}: {execution_order}")
+            case _:
+                # Default Routing Logic ("match_main")
+                if can_use_vertex:
+                    execution_order = ["vertex"]
+                elif paid_toggle_available and paid_toggled_on:
+                    if has_paid_key:
+                        execution_order = ["paid"]
+                    else:
+                        log.error(
+                            "Paid API toggle is ON, but GEMINI_PAID_API_KEY is missing."
+                        )
+                else:
+                    # Logic for standard/un-toggled flow
+                    if has_free_key:
+                        if is_free_eligible:
+                            execution_order = ["free"]
+                            if valves.ENABLE_FREE_TIER_FALLBACK:
+                                if can_use_vertex:
+                                    execution_order.append("vertex")
+                                elif has_paid_key:
+                                    execution_order.append("paid")
+                        else:
+                            # If model isn't free-eligible, jump straight to paid tiers.
+                            # If no paid tier exists, we try free anyway to let the API return the specific error.
+                            if can_use_vertex:
+                                execution_order = ["vertex"]
+                            elif has_paid_key:
+                                execution_order = ["paid"]
+                            else:
+                                log.warning(
+                                    f"Model '{model_id}' is ineligible for free tier and no paid keys found."
+                                )
+                    elif can_use_vertex:
+                        execution_order = ["vertex"]
+                    elif has_paid_key:
+                        execution_order = ["paid"]
+
+        log.debug(
+            f"Routing strategy for {model_id} ({routing_strategy}): {execution_order}"
+        )
         return execution_order
 
     def _resolve_custom_params(
