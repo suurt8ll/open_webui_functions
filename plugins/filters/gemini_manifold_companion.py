@@ -111,11 +111,6 @@ class Filter:
 
     class Valves(BaseModel):
 
-        SET_TEMP_TO_ZERO: bool = Field(
-            default=False,
-            description="""Decide if you want to set the temperature to 0 for grounded answers,
-            Google reccomends it in their docs.""",
-        )
         GROUNDING_DYNAMIC_RETRIEVAL_THRESHOLD: float | None = Field(
             default=None,
             description="""See https://ai.google.dev/gemini-api/docs/grounding?lang=python#dynamic-threshold for more information.
@@ -234,11 +229,6 @@ class Filter:
                     )
                 else:
                     metadata_features["google_search_tool"] = True
-                # Google suggest setting temperature to 0 if using grounding:
-                # https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/ground-with-google-search#:~:text=For%20ideal%20results%2C%20use%20a%20temperature%20of%200.0.
-                if self.valves.SET_TEMP_TO_ZERO:
-                    log.info("Setting temperature to 0.")
-                    body["temperature"] = 0  # type: ignore
         if is_code_exec_model:
             code_execution_enabled = (
                 features.get("code_interpreter", False)
