@@ -2752,8 +2752,14 @@ class Pipe:
             safety_settings=safety_settings,
             thinking_config=thinking_conf,
         )
-
         gen_content_conf.response_modalities = ["TEXT"]
+
+        # Optimization: Task models (titles, tags, search queries) do not require tools.
+        # Disabling them here prevents unnecessary tool-use overhead and reduces latency.
+        if __metadata__.get("task"):
+            log.debug("Task model detected. Skipping tool configuration.")
+            return gen_content_conf
+
         if self._is_image_model(model_id, config):
             gen_content_conf.response_modalities.append("IMAGE")
             if "gemini-3-pro-image" in model_id and valves.IMAGE_RESOLUTION:
