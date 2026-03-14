@@ -371,9 +371,18 @@ class FunctionUpdater:
                 for path in self.config.filepaths:
                     await self._process_file(path, client)
 
+            # When the API is offline or its state is unknown, we poll frequently (1s)
+            # to reconnect as soon as it comes back up. Once available, we respect
+            # the user-configured interval to avoid unnecessary overhead.
+            current_interval = (
+                self.config.polling_interval
+                if self.api_state == ApiState.AVAILABLE
+                else 1
+            )
+
             try:
                 await asyncio.wait_for(
-                    self.shutdown_event.wait(), timeout=self.config.polling_interval
+                    self.shutdown_event.wait(), timeout=current_interval
                 )
             except asyncio.TimeoutError:
                 continue
