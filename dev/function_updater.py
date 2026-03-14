@@ -10,6 +10,7 @@ import aiofiles
 import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
+from watchfiles import awatch, Change
 
 # --- Configuration & State Management ---
 
@@ -46,11 +47,17 @@ def load_config() -> Config:
 
         env_vars[var] = value
 
+    # Convert paths to absolute paths immediately because watchfiles
+    # yields absolute paths when detecting changes.
+    raw_paths = [path.strip() for path in env_vars["FILEPATHS"].split(",")]
+    abs_paths = [os.path.abspath(path) for path in raw_paths]
+
     return Config(
         api_endpoint=env_vars["API_ENDPOINT"],
         api_key=env_vars["API_KEY"],
-        filepaths=[path.strip() for path in env_vars["FILEPATHS"].split(",")],
-        polling_interval=int(os.getenv("POLLING_INTERVAL", "5")),
+        filepaths=abs_paths,
+        # Default to 60 seconds now that we have instant file watching
+        polling_interval=int(os.getenv("POLLING_INTERVAL", "60")),
     )
 
 
@@ -68,7 +75,6 @@ async def file_hash(filename: str) -> str | None:
             while chunk := await file.read(4096):
                 hasher.update(chunk)
     except FileNotFoundError:
-        # This is handled separately in the main loop, so no need to log here.
         return None
     except Exception as e:
         logger.exception(f"Error reading file {filename}: {e}")
@@ -79,16 +85,12 @@ async def file_hash(filename: str) -> str | None:
 async def extract_metadata_from_file(filepath: str) -> dict[str, str]:
     """
     Extracts metadata from the first docstring in a Python file.
-
-    NOTE: This is a simple parser. For more complex scenarios, using `ast.get_docstring`
-          might be more robust, but this is sufficient for this utility's purpose.
     """
     metadata = {}
     try:
         async with aiofiles.open(filepath, "r", encoding="utf-8") as file:
             content = await file.read()
 
-        # A simple way to find the first module-level docstring
         if not content.strip().startswith('"""'):
             return {}
 
@@ -106,7 +108,6 @@ async def extract_metadata_from_file(filepath: str) -> dict[str, str]:
                 metadata[key.strip()] = value.strip()
 
     except FileNotFoundError:
-        # This is handled by the caller, no need to log here.
         pass
     except Exception as e:
         logger.warning(f"Metadata extraction error for {filepath}: {e}")
@@ -130,7 +131,6 @@ class OwuiApiClient:
     async def check_availability(self) -> bool:
         """Checks if the API is healthy and responsive."""
         try:
-            # The health endpoint is at the root, not under /api/v1
             async with self._session.get(
                 f"{self._root_url}/health", timeout=aiohttp.ClientTimeout(total=3)
             ) as response:
@@ -186,14 +186,14 @@ class OwuiApiClient:
         function_id: str,
         function_name: str,
         description: str,
-    ) -> None:
-        """Updates a remote function, or creates it if it doesn't exist."""
+    ) -> bool:
+        """Updates a remote function, or creates it if it doesn't exist. Returns True on success."""
         try:
             async with aiofiles.open(filepath, "r", encoding="utf-8") as file:
                 code_content = await file.read()
         except (IOError, OSError) as e:
             logger.error(f"Failed to read file {filepath} before update: {e}")
-            return
+            return False
 
         try:
             payload = {
@@ -210,20 +210,18 @@ class OwuiApiClient:
             ) as response:
                 response.raise_for_status()
                 logger.info(f"🔄 Updated function '{function_id}' from {filepath}")
+                return True
 
         except aiohttp.ClientResponseError as e:
-            if e.status in {400, 404}:  # Handle both 'Bad Request' and 'Not Found'
+            if e.status in {400, 404}:
                 logger.warning(
                     f"Function '{function_id}' not found or failed to update (Status: {e.status}). Attempting to create it."
                 )
                 try:
                     await self._create_function(
-                        filepath,
-                        function_id,
-                        function_name,
-                        description,
-                        code_content,
+                        filepath, function_id, function_name, description, code_content
                     )
+                    return True
                 except (aiohttp.ClientError, asyncio.TimeoutError) as create_err:
                     logger.error(f"Creation failed for {filepath}: {create_err}")
                 except Exception as create_exc:
@@ -238,6 +236,8 @@ class OwuiApiClient:
             )
         except Exception as e:
             logger.exception(f"Unexpected error updating function: {e}")
+
+        return False
 
 
 # --- Main Application ---
@@ -254,13 +254,15 @@ class FunctionUpdater:
             path: None for path in config.filepaths
         }
         self.missing_file_logged: set[str] = set()
+        # Prevents the watcher and poller from tripping over each other
+        self._process_lock = asyncio.Lock()
 
     async def _check_api_status(self, client: OwuiApiClient) -> None:
         """Checks API availability and updates the state, logging changes."""
         is_available = await client.check_availability()
         if is_available:
             if self.api_state != ApiState.AVAILABLE:
-                logger.info("API is available. Starting to process files...")
+                logger.info("API is available. Processing files...")
                 self.api_state = ApiState.AVAILABLE
         else:
             if self.api_state != ApiState.UNAVAILABLE:
@@ -269,45 +271,82 @@ class FunctionUpdater:
 
     async def _process_file(self, path: str, client: OwuiApiClient) -> None:
         """Processes a single file, checking for changes and updating if necessary."""
-        if not os.path.exists(path):
-            if path not in self.missing_file_logged:
-                logger.warning(f"File not found: {path}")
-                self.missing_file_logged.add(path)
-            return
+        async with self._process_lock:
+            if not os.path.exists(path):
+                if path not in self.missing_file_logged:
+                    logger.warning(f"File not found: {path}")
+                    self.missing_file_logged.add(path)
+                return
 
-        if path in self.missing_file_logged:
-            self.missing_file_logged.remove(path)
+            if path in self.missing_file_logged:
+                self.missing_file_logged.remove(path)
 
-        current_hash = await file_hash(path)
-        if not current_hash:
-            return
+            current_hash = await file_hash(path)
+            if not current_hash:
+                return
 
-        if current_hash == self.file_hashes.get(path):
-            return  # No change, skip processing
+            if current_hash == self.file_hashes.get(path):
+                return  # No change, skip processing
 
-        logger.debug(f"File change detected for {path}")
-        metadata = await extract_metadata_from_file(path)
-        function_id = metadata.get("id")
-        function_name = metadata.get("title")
-        description = metadata.get("description")
+            logger.debug(f"File change detected for {path}")
+            metadata = await extract_metadata_from_file(path)
+            function_id = metadata.get("id")
+            function_name = metadata.get("title")
+            description = metadata.get("description")
 
-        if not all([function_id, function_name, description]):
-            logger.warning(
-                f"Skipping {path}: Missing required metadata ('id', 'title', 'description')."
+            if not all([function_id, function_name, description]):
+                logger.warning(
+                    f"Skipping {path}: Missing required metadata ('id', 'title', 'description')."
+                )
+                return
+
+            # Assertions to satisfy the type checker after the 'all' check.
+            assert function_id is not None
+            assert function_name is not None
+            assert description is not None
+
+            # Attempt update. Only save the hash if the update succeeded.
+            # This ensures failed updates (e.g., API down) are retried later.
+            success = await client.update_or_create_function(
+                path, function_id, function_name, description
             )
-            return
 
-        # Assertions to satisfy the type checker after the 'all' check.
-        assert function_id is not None
-        assert function_name is not None
-        assert description is not None
+            if success:
+                self.file_hashes[path] = current_hash
 
-        # A file has changed, so we trigger an update.
-        await client.update_or_create_function(
-            path, function_id, function_name, description
-        )
-        # Only update the hash on successful processing to ensure retry on failure.
-        self.file_hashes[path] = current_hash
+    async def _watch_loop(self, client: OwuiApiClient) -> None:
+        """Instantly reacts to file changes using OS-level events."""
+        # Watch the parent directories of the target files
+        directories_to_watch = set(os.path.dirname(p) for p in self.config.filepaths)
+
+        logger.info(f"👀 Started file watcher on {len(self.config.filepaths)} files...")
+
+        # awatch yields a set of changes (ChangeType, FilePath)
+        async for changes in awatch(
+            *directories_to_watch, stop_event=self.shutdown_event
+        ):
+            for change_type, path in changes:
+                # Filter out files we don't care about
+                if path in self.config.filepaths and change_type != Change.deleted:
+                    await self._process_file(path, client)
+
+    async def _poll_loop(self, client: OwuiApiClient) -> None:
+        """A slow polling loop that acts as a fallback and sync mechanism."""
+        while not self.shutdown_event.is_set():
+            await self._check_api_status(client)
+
+            if self.api_state == ApiState.AVAILABLE:
+                for path in self.config.filepaths:
+                    await self._process_file(path, client)
+
+            try:
+                await asyncio.wait_for(
+                    self.shutdown_event.wait(), timeout=self.config.polling_interval
+                )
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
 
     async def run(self) -> None:
         """The main execution loop."""
@@ -315,29 +354,16 @@ class FunctionUpdater:
             api_client = OwuiApiClient(
                 session, self.config.api_endpoint, self.config.api_key
             )
-            while not self.shutdown_event.is_set():
-                await self._check_api_status(api_client)
 
-                if self.api_state == ApiState.AVAILABLE:
-                    # Use a TaskGroup for robust concurrent execution (Python 3.11+)
-                    try:
-                        async with asyncio.TaskGroup() as tg:
-                            for path in self.config.filepaths:
-                                tg.create_task(self._process_file(path, api_client))
-                    except Exception as e:
-                        logger.exception(
-                            f"An error occurred during file processing: {e}"
-                        )
-
-                try:
-                    # Use the shutdown event for a more responsive sleep
-                    await asyncio.wait_for(
-                        self.shutdown_event.wait(), timeout=self.config.polling_interval
-                    )
-                except asyncio.TimeoutError:
-                    continue  # This is the normal polling loop
-                except asyncio.CancelledError:
-                    break
+            # Use TaskGroup to run the instant watcher and the fallback poller simultaneously
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    tg.create_task(self._poll_loop(api_client))
+                    tg.create_task(self._watch_loop(api_client))
+            except Exception as e:
+                # Filter out CancelledError during normal shutdowns
+                if not isinstance(e, asyncio.CancelledError):
+                    logger.exception(f"An error occurred during execution: {e}")
 
 
 async def main_wrapper() -> None:
@@ -357,7 +383,6 @@ async def main_wrapper() -> None:
         updater = FunctionUpdater(config, shutdown_event)
         await updater.run()
     except ValueError as e:
-        # This catches configuration errors from load_config
         logger.critical(e)
     except asyncio.CancelledError:
         logger.info("Main task cancelled.")
