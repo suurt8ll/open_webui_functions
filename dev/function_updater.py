@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import os
 import signal
 from dataclasses import dataclass
@@ -250,12 +251,45 @@ class FunctionUpdater:
         self.config = config
         self.shutdown_event = shutdown_event
         self.api_state = ApiState.UNKNOWN
-        self.file_hashes: dict[str, str | None] = {
-            path: None for path in config.filepaths
-        }
         self.missing_file_logged: set[str] = set()
-        # Prevents the watcher and poller from tripping over each other
         self._process_lock = asyncio.Lock()
+
+        # State persistence setup
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        self._state_dir = os.path.join(current_dir, ".dev_state")
+        self._state_file = os.path.join(self._state_dir, "function_hashes.json")
+
+        self.file_hashes: dict[str, str | None] = self._load_state()
+
+        # Ensure all currently tracked files are in the hashes dictionary
+        # (Handles newly added files to .env since last run)
+        for path in config.filepaths:
+            if path not in self.file_hashes:
+                self.file_hashes[path] = None
+
+    def _load_state(self) -> dict[str, str | None]:
+        """Loads the previous file hashes from disk on startup."""
+        if os.path.exists(self._state_file):
+            try:
+                with open(self._state_file, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                    logger.info(f"💾 Loaded previous state from {self._state_file}")
+                    return state
+            except json.JSONDecodeError:
+                logger.warning("Corrupted state file found. Starting fresh.")
+            except Exception as e:
+                logger.warning(f"Failed to load state: {e}. Starting fresh.")
+        return {}
+
+    async def _save_state(self) -> None:
+        """Saves the current file hashes to disk asynchronously."""
+        try:
+            # Ensure the .dev_state directory exists
+            os.makedirs(self._state_dir, exist_ok=True)
+            async with aiofiles.open(self._state_file, "w", encoding="utf-8") as f:
+                await f.write(json.dumps(self.file_hashes, indent=2))
+        except Exception as e:
+            logger.error(f"Failed to save state to disk: {e}")
 
     async def _check_api_status(self, client: OwuiApiClient) -> None:
         """Checks API availability and updates the state, logging changes."""
@@ -300,33 +334,31 @@ class FunctionUpdater:
                 )
                 return
 
-            # Assertions to satisfy the type checker after the 'all' check.
             assert function_id is not None
             assert function_name is not None
             assert description is not None
 
             # Attempt update. Only save the hash if the update succeeded.
-            # This ensures failed updates (e.g., API down) are retried later.
             success = await client.update_or_create_function(
                 path, function_id, function_name, description
             )
 
             if success:
                 self.file_hashes[path] = current_hash
+                # Save state to disk immediately upon success. Because we are inside
+                # self._process_lock, this file write operation is race-condition safe.
+                await self._save_state()
 
     async def _watch_loop(self, client: OwuiApiClient) -> None:
         """Instantly reacts to file changes using OS-level events."""
-        # Watch the parent directories of the target files
         directories_to_watch = set(os.path.dirname(p) for p in self.config.filepaths)
 
         logger.info(f"👀 Started file watcher on {len(self.config.filepaths)} files...")
 
-        # awatch yields a set of changes (ChangeType, FilePath)
         async for changes in awatch(
             *directories_to_watch, stop_event=self.shutdown_event
         ):
             for change_type, path in changes:
-                # Filter out files we don't care about
                 if path in self.config.filepaths and change_type != Change.deleted:
                     await self._process_file(path, client)
 
@@ -355,13 +387,11 @@ class FunctionUpdater:
                 session, self.config.api_endpoint, self.config.api_key
             )
 
-            # Use TaskGroup to run the instant watcher and the fallback poller simultaneously
             try:
                 async with asyncio.TaskGroup() as tg:
                     tg.create_task(self._poll_loop(api_client))
                     tg.create_task(self._watch_loop(api_client))
             except Exception as e:
-                # Filter out CancelledError during normal shutdowns
                 if not isinstance(e, asyncio.CancelledError):
                     logger.exception(f"An error occurred during execution: {e}")
 
