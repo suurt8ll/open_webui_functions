@@ -13,6 +13,43 @@ The plugins are organized by type within the `plugins/` directory:
     -   `gemini_manifold_companion.py`: A companion filter for "Gemini Manifold google_genai" pipe providing enhanced functionality, such as Google Search grounding. See the [Detailed Documentation](docs/plugins/filters/gemini_manifold_companion.md) for more information.
     -   `system_prompt_injector.py`: Allows changing chat options like system prompt and temperature from the chatbox. It would pair nicely with Prompts feature Open WebUI offers.
 
+## Installation/Updating
+
+### Option 1: Manual (Copy-Paste)
+1. Open your Open WebUI instance and navigate to **Admin Panel** -> **Functions** -> **New Function** or click on a single one if you want to update it.
+2. Copy the entire content of the desired `.py` file from this repo and paste it into the editor.
+3. **CRITICAL:** Ensure the `id` field in the Open WebUI interface matches the `id` defined in the file's frontmatter (docstring). Some logic within these plugins depends on these IDs being exact.
+   
+   *Example from `gemini_manifold.py`:*
+   ```python
+   """
+   title: Gemini Manifold google_genai
+   id: gemini_manifold_google_genai
+   ...
+   """
+   ```
+
+### Option 2: Automated (One-Time Sync)
+Use the included utility script to automatically create/update multiple functions at once via the Open WebUI API.
+
+1. **Clone the repo:** `git clone https://github.com/suurt8ll/open_webui_functions.git`
+2. **Configure:** Copy `dev/.env.example` to `dev/.env.install`.
+   - Set `ONE_TIME_RUN=true`.
+   - Set `API_KEY`, [this doc page](https://docs.openwebui.com/reference/monitoring/#authentication-setup-for-api-key-) explains how to get it.
+   - List the files you want to install in `FILEPATHS`.
+   - Set `HOST`, `PORT` etc.
+3. **Setup Environment:**
+   ```bash
+   python3.11 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+4. **Run Sync:**
+   ```bash
+   python dev/function_updater.py --env dev/.env.install
+   ```
+The script will wait for a connection, sync the functions, and exit.
+
 ## Utilities
 
 The `utils/` directory contains shared code and utility modules used by the plugins:
