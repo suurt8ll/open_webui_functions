@@ -13,3 +13,4 @@ xxhash
 google-cloud-storage
 google-api-core
 pyyaml
+watchfiles
