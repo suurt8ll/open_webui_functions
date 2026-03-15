@@ -33,6 +33,7 @@ class Config:
     api_key: str
     filepaths: list[str]
     polling_interval: int
+    one_time_run: bool
 
 
 def load_config(env_path: str | None = None) -> Config:
@@ -63,11 +64,20 @@ def load_config(env_path: str | None = None) -> Config:
     # Clean empty strings from trailing commas
     abs_paths = [os.path.abspath(p) for p in raw_paths if p]
 
+    # Catch common truthy string values users might type in .env files
+    one_time_run = os.getenv("ONE_TIME_RUN", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+        "y",
+    )
+
     return Config(
         api_endpoint=api_endpoint,
         api_key=env_vars["API_KEY"],
         filepaths=abs_paths,
         polling_interval=int(os.getenv("POLLING_INTERVAL", "60")),
+        one_time_run=one_time_run,
     )
 
 
@@ -367,6 +377,11 @@ class FunctionUpdater:
 
     async def _watch_loop(self, client: OwuiApiClient) -> None:
         """Instantly reacts to file changes using OS-level events."""
+        # Bypassing the file watcher entirely saves OS-level resources and thread allocation
+        # since we won't be lingering around waiting for updates.
+        if self.config.one_time_run:
+            return
+
         directories_to_watch = set(os.path.dirname(p) for p in self.config.filepaths)
 
         logger.info(f"👀 Started file watcher on {len(self.config.filepaths)} files...")
@@ -386,6 +401,11 @@ class FunctionUpdater:
             if self.api_state == ApiState.AVAILABLE:
                 for path in self.config.filepaths:
                     await self._process_file(path, client)
+
+                if self.config.one_time_run:
+                    logger.info("One-time sync complete. Shutting down...")
+                    self.shutdown_event.set()
+                    break
 
             # When the API is offline or its state is unknown, we poll frequently (1s)
             # to reconnect as soon as it comes back up. Once available, we respect
