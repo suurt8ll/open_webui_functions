@@ -38,8 +38,6 @@ class Config:
 
 def load_config(env_path: str | None = None) -> Config:
     """Loads and validates required environment variables into a Config object."""
-    # We determine the base directory for resolving relative file paths.
-    # If a custom env file is used, we anchor paths to its location.
     if env_path:
         abs_env_path = os.path.abspath(env_path)
         if not os.path.isfile(abs_env_path):
@@ -60,14 +58,12 @@ def load_config(env_path: str | None = None) -> Config:
             raise ValueError(f"Missing environment variable: {var}")
         env_vars[var] = value
 
+    protocol = os.getenv("PROTOCOL", "http").lower()
     host = os.getenv("HOST", "127.0.0.1")
     port = os.getenv("PORT", "8080")
-    api_endpoint = f"http://{host}:{port}"
+    api_endpoint = f"{protocol}://{host}:{port}"
 
     raw_paths = [path.strip() for path in env_vars["FILEPATHS"].split(",")]
-
-    # Resolve relative paths against the base_dir determined above.
-    # os.path.join handles absolute paths in FILEPATHS correctly by ignoring base_dir.
     abs_paths = [os.path.abspath(os.path.join(base_dir, p)) for p in raw_paths if p]
 
     one_time_run = os.getenv("ONE_TIME_RUN", "false").lower() in (
