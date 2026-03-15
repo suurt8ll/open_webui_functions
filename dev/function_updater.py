@@ -257,12 +257,19 @@ class FunctionUpdater:
         # State persistence setup
         current_dir = os.path.dirname(os.path.abspath(__file__))
         self._state_dir = os.path.join(current_dir, ".dev_state")
-        self._state_file = os.path.join(self._state_dir, "function_hashes.json")
+
+        # We generate a unique suffix based on the endpoint and key. This prevents
+        # hash collisions or "false-positive" sync states when switching between
+        # different OWUI environments (e.g., local vs remote).
+        instance_id = hashlib.sha256(
+            f"{config.api_endpoint}{config.api_key}".encode()
+        ).hexdigest()[:8]
+
+        self._state_file = os.path.join(self._state_dir, f"hashes_{instance_id}.json")
 
         self.file_hashes: dict[str, str | None] = self._load_state()
 
         # Ensure all currently tracked files are in the hashes dictionary
-        # (Handles newly added files to .env since last run)
         for path in config.filepaths:
             if path not in self.file_hashes:
                 self.file_hashes[path] = None
