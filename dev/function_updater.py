@@ -38,12 +38,17 @@ class Config:
 
 def load_config(env_path: str | None = None) -> Config:
     """Loads and validates required environment variables into a Config object."""
+    # We determine the base directory for resolving relative file paths.
+    # If a custom env file is used, we anchor paths to its location.
     if env_path:
-        if not os.path.isfile(env_path):
-            raise ValueError(f"Custom .env file not found at: {env_path}")
-        load_dotenv(dotenv_path=env_path)
+        abs_env_path = os.path.abspath(env_path)
+        if not os.path.isfile(abs_env_path):
+            raise ValueError(f"Custom .env file not found at: {abs_env_path}")
+        load_dotenv(dotenv_path=abs_env_path)
+        base_dir = os.path.dirname(abs_env_path)
     else:
         load_dotenv()
+        base_dir = os.getcwd()
 
     required_vars = ["API_KEY", "FILEPATHS"]
     env_vars: dict[str, Any] = {}
@@ -55,16 +60,16 @@ def load_config(env_path: str | None = None) -> Config:
             raise ValueError(f"Missing environment variable: {var}")
         env_vars[var] = value
 
-    # Derive endpoint from network settings with standard defaults
     host = os.getenv("HOST", "127.0.0.1")
     port = os.getenv("PORT", "8080")
     api_endpoint = f"http://{host}:{port}"
 
     raw_paths = [path.strip() for path in env_vars["FILEPATHS"].split(",")]
-    # Clean empty strings from trailing commas
-    abs_paths = [os.path.abspath(p) for p in raw_paths if p]
 
-    # Catch common truthy string values users might type in .env files
+    # Resolve relative paths against the base_dir determined above.
+    # os.path.join handles absolute paths in FILEPATHS correctly by ignoring base_dir.
+    abs_paths = [os.path.abspath(os.path.join(base_dir, p)) for p in raw_paths if p]
+
     one_time_run = os.getenv("ONE_TIME_RUN", "false").lower() in (
         "true",
         "1",
