@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import hashlib
 import json
@@ -28,16 +29,22 @@ class ApiState(Enum):
 class Config:
     """Typed configuration loaded from environment variables."""
 
-    api_endpoint: str
+    api_endpoint: str  # Calculated from HOST and PORT
     api_key: str
     filepaths: list[str]
     polling_interval: int
 
 
-def load_config() -> Config:
+def load_config(env_path: str | None = None) -> Config:
     """Loads and validates required environment variables into a Config object."""
-    load_dotenv()
-    required_vars = ["API_ENDPOINT", "API_KEY", "FILEPATHS"]
+    if env_path:
+        if not os.path.isfile(env_path):
+            raise ValueError(f"Custom .env file not found at: {env_path}")
+        load_dotenv(dotenv_path=env_path)
+    else:
+        load_dotenv()
+
+    required_vars = ["API_KEY", "FILEPATHS"]
     env_vars: dict[str, Any] = {}
 
     for var in required_vars:
@@ -45,19 +52,21 @@ def load_config() -> Config:
         if not value:
             logger.critical(f"Missing required environment variable: {var}")
             raise ValueError(f"Missing environment variable: {var}")
-
         env_vars[var] = value
 
-    # Convert paths to absolute paths immediately because watchfiles
-    # yields absolute paths when detecting changes.
+    # Derive endpoint from network settings with standard defaults
+    host = os.getenv("HOST", "127.0.0.1")
+    port = os.getenv("PORT", "8080")
+    api_endpoint = f"http://{host}:{port}"
+
     raw_paths = [path.strip() for path in env_vars["FILEPATHS"].split(",")]
-    abs_paths = [os.path.abspath(path) for path in raw_paths]
+    # Clean empty strings from trailing commas
+    abs_paths = [os.path.abspath(p) for p in raw_paths if p]
 
     return Config(
-        api_endpoint=env_vars["API_ENDPOINT"],
+        api_endpoint=api_endpoint,
         api_key=env_vars["API_KEY"],
         filepaths=abs_paths,
-        # Default to 60 seconds now that we have instant file watching
         polling_interval=int(os.getenv("POLLING_INTERVAL", "60")),
     )
 
@@ -414,6 +423,10 @@ class FunctionUpdater:
 
 async def main_wrapper() -> None:
     """Sets up signal handling and runs the main application."""
+    parser = argparse.ArgumentParser(description="OWUI Function Updater Utility")
+    parser.add_argument("--env", type=str, help="Path to a custom .env file (optional)")
+    args = parser.parse_args()
+
     shutdown_event = asyncio.Event()
 
     def signal_handler(signum, frame):
@@ -425,7 +438,8 @@ async def main_wrapper() -> None:
         loop.add_signal_handler(sig, signal_handler, sig, None)
 
     try:
-        config = load_config()
+        # Pass the parsed env path to the config loader
+        config = load_config(args.env)
         updater = FunctionUpdater(config, shutdown_event)
         await updater.run()
     except ValueError as e:

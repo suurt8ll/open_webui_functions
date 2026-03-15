@@ -5,9 +5,40 @@
 # Prevent errors in a pipeline from being masked.
 set -euo pipefail
 
-# --- Configuration ---
-PYTHON_VERSION="3.11"  # Set your desired Python version here
-PORT="${PORT:-8080}"   # Default port, easily overridden via env var (e.g., PORT=8081 ./dev.sh)
+# --- Configuration & Argument Parsing ---
+
+# Default values if not provided via env file or environment
+PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
+HOST="${HOST:-127.0.0.1}"
+PORT="${PORT:-8080}"
+
+ENV_ARG=""
+ENV_FILE_PATH=""
+
+if [ $# -gt 0 ]; then
+    if [ -f "$1" ]; then
+        ENV_FILE_PATH=$(realpath "$1")
+        echo "Loading configuration from: $ENV_FILE_PATH"
+        
+        # 'set -a' (allexport) causes all variables defined or modified from 
+        # this point until 'set +a' to be automatically exported to the 
+        # environment. This is much cleaner than using xargs and properly 
+        # handles quoted values or special characters in your .env file.
+        set -a
+        source "$ENV_FILE_PATH"
+        set +a
+        
+        ENV_ARG="--env $ENV_FILE_PATH"
+    else
+        echo "ERROR: Configuration file '$1' not found." >&2
+        exit 1
+    fi
+fi
+
+# Re-evaluate variables in case they were loaded from the env file
+PYTHON_VERSION="${PYTHON_VERSION:-$PYTHON_VERSION}"
+HOST="${HOST:-$HOST}"
+PORT="${PORT:-$PORT}"
 
 # Project structure definition
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
@@ -263,21 +294,22 @@ SESSION_NAME="openwebui_dev"
 
 # --- Define Commands for Each tmux Window ---
 
-# 1. Unified OWUI Server Command (Backend serving built Frontend)
-# Note: OWUI automatically serves ../build relative to the backend directory
-BACKEND_START_COMMAND="uvicorn open_webui.main:app --port $PORT --host 127.0.0.1"
+# 1. Unified OWUI Server Command
+# We use the HOST and PORT determined by the env/defaults
+BACKEND_START_COMMAND="uvicorn open_webui.main:app --port $PORT --host $HOST"
 BACKEND_COMMAND="cd '$BACKEND_DIR' && \
                    echo 'Activating backend venv...' && \
                    . '$BACKEND_VENV_DIR/bin/activate' && \
-                   echo '--- Starting Open WebUI Server (Port: $PORT) ---' && \
+                   echo '--- Starting Open WebUI Server ($HOST:$PORT) ---' && \
                    exec $BACKEND_START_COMMAND"
 
 # 2. Function Updater Command
+# We pass the absolute path to the env file if one was provided to dev.sh
 UPDATER_COMMAND="cd '$SCRIPT_DIR' && \
                    echo 'Activating updater venv...' && \
                    . '$UPDATER_VENV_DIR/bin/activate' && \
                    echo '--- Starting Function Updater ---' && \
-                   exec python function_updater.py"
+                   exec python function_updater.py $ENV_ARG"
 
 # --- Create and Configure tmux Session ---
 
