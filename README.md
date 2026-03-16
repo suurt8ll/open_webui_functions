@@ -33,7 +33,7 @@ The plugins are organized by type within the `plugins/` directory:
 Use the included utility script to automatically create/update multiple functions at once via the Open WebUI API.
 
 1. **Clone the repo:** `git clone https://github.com/suurt8ll/open_webui_functions.git`
-2. **Configure:** Copy `dev/.env.example` to `dev/.env.install`.
+2. **Configure:** Copy `dev/.env.install.example` to `dev/.env.install`.
    - Set `ONE_TIME_RUN=true`.
    - Set `API_KEY`, [this doc page](https://docs.openwebui.com/reference/monitoring/#authentication-setup-for-api-key-) explains how to get it.
    - List the files you want to install in `FILEPATHS`.

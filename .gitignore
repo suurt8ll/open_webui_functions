@@ -1,5 +1,9 @@
+# Ignore all environment files
 .env*
+# Except the example templates
 !.env.example
+!.env.*.example
+
 .venv/
 .vscode/
 **/__pycache__/
