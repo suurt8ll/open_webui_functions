@@ -6,17 +6,26 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 2.1.0
+version: 2.2.0
 requirements: google-genai==1.65.0
 """
 
+# Changelog:
+# 2.2.0 - Compatibility with Open WebUI >= 0.9.0.
+#         Open WebUI converted `Chats`, `Files`, and `Functions` DB methods to `async`.
+#         All affected call sites are now awaited; `_fetch_and_validate_chat_history`,
+#         `_get_toggleable_feature_status`, `_build_gen_content_config`, and
+#         `_determine_execution_order` are now `async`. DB fetch and cumulative
+#         usage injection moved from `GeminiContentBuilder.__init__` into
+#         `build_contents()` since `__init__` cannot await.
+
 # I change these only when I make a release to avoid PR merge conflicts.
 # If you are making a PR then please do not change these values.
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 # This is the recommended version for the companion filter.
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
-RECOMMENDED_COMPANION_VERSION = "2.1.0"
+RECOMMENDED_COMPANION_VERSION = "2.2.0"
 
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
@@ -730,6 +739,8 @@ class GeminiContentBuilder:
         files_api_manager: "FilesAPIManager",
     ):
         self.messages_body = messages_body
+        self.metadata_body = metadata_body
+        self.user_data = user_data
         self.upload_documents = (metadata_body.get("features", {}) or {}).get(
             "upload_documents", False
         )
@@ -744,21 +755,24 @@ class GeminiContentBuilder:
         self.system_prompt, self.messages_body = self._extract_system_prompt(
             self.messages_body
         )
-        self.messages_db = self._fetch_and_validate_chat_history(
-            metadata_body, user_data
-        )
-
-        # Retrieve cumulative usage from the DB history and inject it into metadata.
-        # This will be picked up later when constructing the final usage payload.
-        c_tokens, c_cost = self._retrieve_previous_usage_data()
-        metadata_body["cumulative_tokens"] = c_tokens
-        metadata_body["cumulative_cost"] = c_cost
+        # messages_db and cumulative usage are populated asynchronously in build_contents().
+        self.messages_db: list["ChatMessageTD"] | None = None
 
     async def build_contents(self) -> list[types.Content]:
         """
         The main public method to generate the contents list by processing all
         message turns concurrently and using a self-configuring status manager.
         """
+        # Fetch chat history and cumulative usage from the DB (async APIs).
+        self.messages_db = await self._fetch_and_validate_chat_history(
+            self.metadata_body, self.user_data
+        )
+        # Retrieve cumulative usage from the DB history and inject it into metadata.
+        # This will be picked up later when constructing the final usage payload.
+        c_tokens, c_cost = self._retrieve_previous_usage_data()
+        self.metadata_body["cumulative_tokens"] = c_tokens
+        self.metadata_body["cumulative_cost"] = c_cost
+
         if not self.messages_db:
             warn_msg = (
                 "There was a problem retrieving the messages from the backend database. "
@@ -836,7 +850,7 @@ class GeminiContentBuilder:
         system_prompt: str | None = (system_message or {}).get("content")
         return system_prompt, remaining_messages  # type: ignore
 
-    def _fetch_and_validate_chat_history(
+    async def _fetch_and_validate_chat_history(
         self, metadata_body: "Metadata", user_data: "UserData"
     ) -> list["ChatMessageTD"] | None:
         """
@@ -845,7 +859,7 @@ class GeminiContentBuilder:
         """
         # 1. Fetch from database
         chat_id = metadata_body.get("chat_id", "")
-        if chat := Chats.get_chat_by_id_and_user_id(
+        if chat := await Chats.get_chat_by_id_and_user_id(
             id=chat_id, user_id=user_data["id"]
         ):
             chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
@@ -1535,10 +1549,9 @@ class GeminiContentBuilder:
             log.warning("file_id is empty. Cannot continue.")
             return None, None
 
-        # Run the synchronous, blocking database call in a separate thread
-        # to avoid blocking the main asyncio event loop.
+        # Await the async database call directly.
         try:
-            file_model = await asyncio.to_thread(Files.get_file_by_id, file_id)
+            file_model = await Files.get_file_by_id(file_id)
         except Exception as e:
             log.exception(
                 f"An unexpected error occurred during database call for file_id {file_id}: {e}"
@@ -2116,7 +2129,7 @@ class Pipe:
             # TODO: use the structured outputs feature to ensure a valid json at all times?
 
         # 3. Determine Execution Order
-        execution_order = self._determine_execution_order(
+        execution_order = await self._determine_execution_order(
             valves=valves,
             __metadata__=__metadata__,
             model_config=model_config,
@@ -2639,7 +2652,7 @@ class Pipe:
 
     # region 2.3 GenerateContentConfig assembly
 
-    def _build_gen_content_config(
+    async def _build_gen_content_config(
         self,
         body: "Body",
         __metadata__: "Metadata",
@@ -2725,7 +2738,7 @@ class Pipe:
                         )
 
             # Check if reasoning can be disabled via toggle, which overrides other settings.
-            is_avail, is_on = self._get_toggleable_feature_status(
+            is_avail, is_on = await self._get_toggleable_feature_status(
                 "gemini_reasoning_toggle", __metadata__
             )
             if is_avail and not is_on:
@@ -2799,7 +2812,7 @@ class Pipe:
             )
 
         # Determine if URL context tool should be enabled.
-        is_avail, is_on = self._get_toggleable_feature_status(
+        is_avail, is_on = await self._get_toggleable_feature_status(
             "gemini_url_context_toggle", __metadata__
         )
         enable_url_context = valves.ENABLE_URL_CONTEXT_TOOL  # Start with valve default.
@@ -2831,7 +2844,7 @@ class Pipe:
                 )
 
         # Determine if Google Maps grounding should be enabled.
-        is_avail, is_on = self._get_toggleable_feature_status(
+        is_avail, is_on = await self._get_toggleable_feature_status(
             "gemini_maps_grounding_toggle", __metadata__
         )
         if is_avail and is_on:
@@ -2965,7 +2978,7 @@ class Pipe:
         contents = await builder.build_contents()
 
         # 4. Configuration Building
-        gen_content_conf = self._build_gen_content_config(
+        gen_content_conf = await self._build_gen_content_config(
             body, __metadata__, valves, model_config
         )
         gen_content_conf.system_instruction = builder.system_prompt
@@ -3443,8 +3456,7 @@ class Pipe:
             return None
 
         log.debug("Adding the image file to the Open WebUI files database.")
-        file_item = await asyncio.to_thread(
-            Files.insert_new_file,
+        file_item = await Files.insert_new_file(
             __metadata__.get("user_id"),
             FileForm(
                 id=id,
@@ -4048,7 +4060,7 @@ class Pipe:
 
     # region 2.7 Utility helpers
 
-    def _determine_execution_order(
+    async def _determine_execution_order(
         self,
         valves: "Pipe.Valves",
         __metadata__: "Metadata",
@@ -4064,7 +4076,7 @@ class Pipe:
         has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
 
         # Retrieve Toggle Statuses
-        vertex_available, vertex_toggled_on = self._get_toggleable_feature_status(
+        vertex_available, vertex_toggled_on = await self._get_toggleable_feature_status(
             "gemini_vertex_ai_toggle", __metadata__
         )
         # Vertex is only viable if toggled on AND we have a project ID
@@ -4072,7 +4084,7 @@ class Pipe:
             vertex_available and vertex_toggled_on and bool(valves.VERTEX_PROJECT)
         )
 
-        paid_toggle_available, paid_toggled_on = self._get_toggleable_feature_status(
+        paid_toggle_available, paid_toggled_on = await self._get_toggleable_feature_status(
             "gemini_paid_api", __metadata__
         )
 
@@ -4209,7 +4221,7 @@ class Pipe:
         return merged_params
 
     @staticmethod
-    def _get_toggleable_feature_status(
+    async def _get_toggleable_feature_status(
         filter_id: str,
         __metadata__: "Metadata",
     ) -> tuple[bool, bool]:
@@ -4234,7 +4246,7 @@ class Pipe:
             - is_toggled_on: True if the user has the toggle ON in the UI for this request.
         """
         # 1. Check if the filter is installed
-        f = Functions.get_function_by_id(filter_id)
+        f = await Functions.get_function_by_id(filter_id)
         if not f:
             log.warning(
                 f"The '{filter_id}' filter is not installed. "

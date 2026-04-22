@@ -6,10 +6,18 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 2.1.0
+version: 2.2.0
 """
 
-VERSION = "2.1.0"
+# Changelog:
+# 2.2.0 - Compatibility with Open WebUI >= 0.9.0.
+#         Removed the sync `Functions.get_function_valves_by_id(...)` call from
+#         `Filter.__init__` (the method is now `async` upstream and raised at import
+#         time). Valves are now initialized with defaults; Open WebUI's filter
+#         pipeline injects the DB-backed valves onto the module instance before
+#         each `inlet`/`outlet`/`stream` invocation, so behavior is preserved.
+
+VERSION = "2.2.0"
 
 # This filter can detect that a feature like web search or code execution is enabled in the front-end,
 # set the feature back to False so Open WebUI does not run it's own logic and then
@@ -33,8 +41,6 @@ import pydantic_core
 import yaml
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal, TYPE_CHECKING, cast
-
-from open_webui.models.functions import Functions
 
 if TYPE_CHECKING:
     from loguru import Record
@@ -148,10 +154,8 @@ class Filter:
     # TODO: Support user settting through UserValves.
 
     def __init__(self):
-        # This hack makes the valves values available to the `__init__` method.
-        # TODO: Get the id from the frontmatter instead of hardcoding it.
-        valves = Functions.get_function_valves_by_id("gemini_manifold_companion")
-        self.valves = self.Valves(**(valves if valves else {}))
+        # Initialize valves with defaults; the framework injects DB values before each request.
+        self.valves = self.Valves()
         self.log_level = self.valves.LOG_LEVEL
         self._add_log_handler()
         log.success("Function has been initialized.")
