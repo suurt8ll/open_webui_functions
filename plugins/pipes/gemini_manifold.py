@@ -18,6 +18,14 @@ requirements: google-genai==1.65.0
 #         `_determine_execution_order` are now `async`. DB fetch and cumulative
 #         usage injection moved from `GeminiContentBuilder.__init__` into
 #         `build_contents()` since `__init__` cannot await.
+#         `_fetch_and_validate_chat_history` now performs soft alignment instead
+#         of strict length validation: short-circuits on empty/"local" chat ids,
+#         filters out system rows, strips trailing empty assistant placeholders,
+#         trims DB history when it exceeds the body length, and only returns
+#         `None` when the DB lags behind the body (common on the first message
+#         of a new chat). The missing-history branch in `build_contents` now
+#         logs quietly and falls back to the in-memory payload rather than
+#         surfacing a user-facing warning toast.
 
 # I change these only when I make a release to avoid PR merge conflicts.
 # If you are making a PR then please do not change these values.
@@ -739,8 +747,6 @@ class GeminiContentBuilder:
         files_api_manager: "FilesAPIManager",
     ):
         self.messages_body = messages_body
-        self.metadata_body = metadata_body
-        self.user_data = user_data
         self.upload_documents = (metadata_body.get("features", {}) or {}).get(
             "upload_documents", False
         )
@@ -755,8 +761,9 @@ class GeminiContentBuilder:
         self.system_prompt, self.messages_body = self._extract_system_prompt(
             self.messages_body
         )
-        # messages_db and cumulative usage are populated asynchronously in build_contents().
-        self.messages_db: list["ChatMessageTD"] | None = None
+        self.metadata_body = metadata_body
+        self.user_data = user_data
+        self.messages_db = None
 
     async def build_contents(self) -> list[types.Content]:
         """
@@ -774,12 +781,10 @@ class GeminiContentBuilder:
         self.metadata_body["cumulative_cost"] = c_cost
 
         if not self.messages_db:
-            warn_msg = (
-                "There was a problem retrieving the messages from the backend database. "
-                "Check the console for more details. "
-                "Citation filtering and file uploads will not be available."
+            log.info(
+                "Database history not ready or lengths mismatched. "
+                "Falling back to active memory payload."
             )
-            self.event_emitter.emit_toast(warn_msg, "warning")
 
         # 1. Set up and launch the status manager. It will activate itself if needed.
         status_manager = UploadStatusManager(self.event_emitter)
@@ -854,40 +859,46 @@ class GeminiContentBuilder:
         self, metadata_body: "Metadata", user_data: "UserData"
     ) -> list["ChatMessageTD"] | None:
         """
-        Fetches message history from the database and validates its length against the request body.
-        Returns the database messages or None if not found or if validation fails.
+        Fetches message history from the database and safely aligns its length against the request body.
         """
-        # 1. Fetch from database
         chat_id = metadata_body.get("chat_id", "")
+        if not chat_id or chat_id == "local":
+            return None
+
         if chat := await Chats.get_chat_by_id_and_user_id(
             id=chat_id, user_id=user_data["id"]
         ):
             chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
-            log.trace("Fetched messages from database:", payload=chat_content.get("messages"))
-            # Last message is the upcoming assistant response, at this point in the logic it's empty.
-            messages_db = chat_content.get("messages", [])[:-1]
-        else:
-            log.warning(
-                f"Chat {chat_id} not found. File handling (audio, video, PDF), citation filtering, "
-                "and high-fidelity assistant response restoration are unavailable."
-            )
-            return None
+            raw_messages_db = chat_content.get("messages", [])
 
-        # 2. Validate length against the current message body
-        if len(messages_db) != len(self.messages_body):
-            warn_msg = (
-                f"Messages in the body ({len(self.messages_body)}) and "
-                f"messages in the database ({len(messages_db)}) do not match. "
-                "This is likely due to a bug in Open WebUI. "
-                "File handling and high-fidelity response restoration will be disabled."
-            )
+            # 1. Filter out system messages
+            messages_db = [m for m in raw_messages_db if m.get("role") != "system"]
 
-            # TODO: Emit a toast to the user in the front-end.
-            log.warning(warn_msg)
-            # Invalidate the db messages if they don't match
-            return None
+            # 2. Strip trailing empty assistant placeholders
+            while (
+                len(messages_db) > len(self.messages_body)
+                and messages_db[-1].get("role") == "assistant"
+            ):
+                messages_db = messages_db[:-1]
 
-        return messages_db
+            # 3. Soft validation and alignment
+            body_len = len(self.messages_body)
+            db_len = len(messages_db)
+
+            if db_len != body_len:
+                log.debug(
+                    f"Message count mismatch. Body: {body_len}, DB: {db_len}. Auto-aligning."
+                )
+                if db_len > body_len:
+                    # DB has extra messages. Take the most recent matching ones.
+                    messages_db = messages_db[-body_len:]
+                else:
+                    # DB hasn't saved the latest user message yet (common on first message of a new chat).
+                    return None
+
+            return messages_db
+
+        return None
 
     async def _process_message_turn(
         self, i: int, message: "Message", status_queue: asyncio.Queue

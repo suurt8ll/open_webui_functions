@@ -42,6 +42,8 @@ import yaml
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal, TYPE_CHECKING, cast
 
+from open_webui.models.functions import Functions
+
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler  # type: ignore
