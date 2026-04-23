@@ -781,10 +781,12 @@ class GeminiContentBuilder:
         self.metadata_body["cumulative_cost"] = c_cost
 
         if not self.messages_db:
-            log.info(
+            warn_msg = (
                 "Database history not ready or lengths mismatched. "
                 "Falling back to active memory payload."
             )
+            log.warning(warn_msg)
+            self.event_emitter.emit_toast(warn_msg, "warning")
 
         # 1. Set up and launch the status manager. It will activate itself if needed.
         status_manager = UploadStatusManager(self.event_emitter)

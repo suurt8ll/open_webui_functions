@@ -12,7 +12,10 @@ mock_functions_module = MagicMock()
 mock_storage_module = MagicMock()
 mock_misc_module = MagicMock()
 
+# Use AsyncMock for async methods in Chats
 mock_chats_module.Chats = MagicMock()
+mock_chats_module.Chats.get_chat_by_id_and_user_id = AsyncMock()
+
 mock_files_module.FileForm = MagicMock()
 mock_files_module.Files = MagicMock()
 # Mock the return of get_function_by_id for toggle filter tests
