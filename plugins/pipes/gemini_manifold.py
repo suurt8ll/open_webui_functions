@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 2.2.0
-requirements: google-genai==1.65.0
+requirements: google-genai==1.74.0
 """
 
 # Changelog:
