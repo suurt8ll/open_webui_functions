@@ -848,14 +848,18 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
     # Mock the chat object returned by the DB
     mock_chat_from_db = MagicMock()
     mock_chat_from_db.chat = {
-        "messages": [
-            {
-                "role": "user",
-                "content": user_text_content,
-                "files": [{"id": pdf_file_id, "type": "file"}],
+        "history": {
+            "currentId": "f72886c4-5420-46ce-bb0b-b95286835d51",
+            "messages": {
+                "f72886c4-5420-46ce-bb0b-b95286835d51": {
+                    "id": "742262d1-ea16-41c5-9cf4-2e07006decf1",
+                    "parentId": None,
+                    "role": "user",
+                    "content": user_text_content,
+                    "files": [{"id": pdf_file_id, "type": "file"}],
+                },
             },
-            {"role": "assistant", "content": ""},
-        ]
+        }
     }
 
     # Mock the DB call and system prompt extraction

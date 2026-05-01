@@ -6,34 +6,17 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 2.2.0
+version: 2.1.0
 requirements: google-genai==1.74.0
 """
 
-# Changelog:
-# 2.2.0 - Compatibility with Open WebUI >= 0.9.0.
-#         Open WebUI converted `Chats`, `Files`, and `Functions` DB methods to `async`.
-#         All affected call sites are now awaited; `_fetch_and_validate_chat_history`,
-#         `_get_toggleable_feature_status`, `_build_gen_content_config`, and
-#         `_determine_execution_order` are now `async`. DB fetch and cumulative
-#         usage injection moved from `GeminiContentBuilder.__init__` into
-#         `build_contents()` since `__init__` cannot await.
-#         `_fetch_and_validate_chat_history` now performs soft alignment instead
-#         of strict length validation: short-circuits on empty/"local" chat ids,
-#         filters out system rows, strips trailing empty assistant placeholders,
-#         trims DB history when it exceeds the body length, and only returns
-#         `None` when the DB lags behind the body (common on the first message
-#         of a new chat). The missing-history branch in `build_contents` now
-#         logs quietly and falls back to the in-memory payload rather than
-#         surfacing a user-facing warning toast.
-
 # I change these only when I make a release to avoid PR merge conflicts.
 # If you are making a PR then please do not change these values.
-VERSION = "2.2.0"
+VERSION = "2.1.0"
 # This is the recommended version for the companion filter.
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
-RECOMMENDED_COMPANION_VERSION = "2.2.0"
+RECOMMENDED_COMPANION_VERSION = "2.1.0"
 
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
@@ -774,6 +757,7 @@ class GeminiContentBuilder:
         self.messages_db = await self._fetch_and_validate_chat_history(
             self.metadata_body, self.user_data
         )
+        log.debug("Database messages: ", payload=self.messages_db)
         # Retrieve cumulative usage from the DB history and inject it into metadata.
         # This will be picked up later when constructing the final usage payload.
         c_tokens, c_cost = self._retrieve_previous_usage_data()
@@ -861,46 +845,55 @@ class GeminiContentBuilder:
         self, metadata_body: "Metadata", user_data: "UserData"
     ) -> list["ChatMessageTD"] | None:
         """
-        Fetches message history from the database and safely aligns its length against the request body.
+        Reconstructs the active chat branch from history. Removes the trailing 
+        assistant placeholder and strictly validates that the DB history length 
+        matches the request body.
         """
         chat_id = metadata_body.get("chat_id", "")
         if not chat_id or chat_id == "local":
             return None
 
-        if chat := await Chats.get_chat_by_id_and_user_id(
+        chat = await Chats.get_chat_by_id_and_user_id(
             id=chat_id, user_id=user_data["id"]
-        ):
-            chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
-            raw_messages_db = chat_content.get("messages", [])
+        )
+        if not chat:
+            return None
 
-            # 1. Filter out system messages
-            messages_db = [m for m in raw_messages_db if m.get("role") != "system"]
+        chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
+        history_data = chat_content.get("history", {})
+        messages_dict = history_data.get("messages", {})
+        current_id = history_data.get("currentId")
 
-            # 2. Strip trailing empty assistant placeholders
-            while (
-                len(messages_db) > len(self.messages_body)
-                and messages_db[-1].get("role") == "assistant"
-            ):
-                messages_db = messages_db[:-1]
+        if not messages_dict or not current_id:
+            return None
 
-            # 3. Soft validation and alignment
-            body_len = len(self.messages_body)
-            db_len = len(messages_db)
+        # 1. Walk up the parentId chain to reconstruct the linear conversation branch.
+        messages_db: list["ChatMessageTD"] = []
+        curr_id = current_id
+        
+        while curr_id and curr_id in messages_dict:
+            msg = messages_dict[curr_id]
+            messages_db.insert(0, msg)
+            curr_id = msg.get("parentId")
 
-            if db_len != body_len:
-                log.debug(
-                    f"Message count mismatch. Body: {body_len}, DB: {db_len}. Auto-aligning."
-                )
-                if db_len > body_len:
-                    # DB has extra messages. Take the most recent matching ones.
-                    messages_db = messages_db[-body_len:]
-                else:
-                    # DB hasn't saved the latest user message yet (common on first message of a new chat).
-                    return None
+        # 2. Handle the trailing assistant placeholder.
+        # OWUI often inserts an empty assistant message entry for the turn currently 
+        # being processed. We remove it to align with the 'messages_body' which 
+        # only contains previous turns plus the current user message.
+        if messages_db and messages_db[-1].get("role") == "assistant":
+            messages_db.pop()
 
-            return messages_db
+        # 3. Strict validation.
+        # If the reconstructed history (minus placeholder) doesn't exactly match the 
+        # length of the request body (minus system prompt), we bail out. 
+        # This prevents misaligned metadata mapping.
+        if len(messages_db) != len(self.messages_body):
+            log.debug(
+                f"Strict length mismatch: DB={len(messages_db)}, Body={len(self.messages_body)}. Validation failed."
+            )
+            return None
 
-        return None
+        return messages_db
 
     async def _process_message_turn(
         self, i: int, message: "Message", status_queue: asyncio.Queue
@@ -1000,20 +993,20 @@ class GeminiContentBuilder:
         if self.messages_db:
             message_db = self.messages_db[i]
             files: list["FileAttachmentTD"] = message_db.get("files", [])
-            
+
             if files:
                 db_files_processed = True
                 upload_tasks = []
-                
+
                 for file in files:
                     content_type = file.get("content_type", "")
                     # MIME types for images always start with 'image/' (e.g., image/png, image/jpeg)
                     is_image = content_type.startswith("image/")
-                    
-                    # Optimization: Task models (titles, tags, etc.) skip heavy documents 
+
+                    # Optimization: Task models (titles, tags, etc.) skip heavy documents
                     # but keep images as they provide high context value for low token cost.
                     should_include = is_image or (self.upload_documents and not self.is_task)
-                    
+
                     if not should_include:
                         log.debug(
                             f"Skipping {content_type} '{file.get('id')}' "
@@ -1022,7 +1015,7 @@ class GeminiContentBuilder:
                         continue
 
                     # We always use the internal API endpoint to fetch file content from the DB.
-                    # Even for images, the 'url' field in the attachment object is often 
+                    # Even for images, the 'url' field in the attachment object is often
                     # just the UUID, which isn't fetchable on its own.
                     if file_id := file.get("id"):
                         uri = f"/api/v1/files/{file_id}/content"
@@ -3290,25 +3283,45 @@ class Pipe:
                 # Yielding this dictionary allows the OWUI proxy to catch and save usage.
                 yield {"usage": usage_data}
 
-            storage_payload: dict[str, Any] = {}
-
             if not error_occurred:
                 # 'data: [DONE]' should be the last thing yielded in a successful stream
                 # to signify the protocol-level end of the OpenAI-compatible stream.
                 yield "data: [DONE]"
                 log.info("Response processing finished successfully!")
 
-                if response_parts:
-                    # Storing the complete list of response parts for Filter.outlet.
-                    # The filter will serialize this and add it to the final message payload,
-                    # allowing the frontend to store it in the database with the assistant's message.
-                    storage_payload["response_parts"] = response_parts
+                # We manually upsert custom metadata to the database because Open WebUI
+                # does not have a native way to persist non-standard message keys
+                # through the standard pipe return/yield stream.
+                chat_id = __metadata__.get("chat_id")
+                message_id = __metadata__.get("message_id")
+                is_task = __metadata__.get("task")
 
-                if content_parts_text:
-                    original_content = "".join(content_parts_text)
-                    storage_payload["original_content"] = original_content
+                if chat_id and message_id and not is_task:
+                    db_payload = {}
 
-            self._store_data_in_state(app.state, __metadata__, storage_payload)
+                    if response_parts:
+                        db_payload["gemini_parts"] = [
+                            part.model_dump(mode="json", exclude_none=True)
+                            for part in response_parts
+                        ]
+
+                    if content_parts_text:
+                        db_payload["original_content"] = "".join(content_parts_text)
+
+                    if db_payload:
+                        try:
+                            # We call the backend model directly. This updates the JSON blob
+                            # in the 'chat' table, which the frontend uses as the source of truth.
+                            await Chats.upsert_message_to_chat_by_id_and_message_id(
+                                id=chat_id,
+                                message_id=message_id,
+                                message=db_payload,
+                            )
+                            log.debug(
+                                f"Successfully persisted Gemini metadata to message {message_id}"
+                            )
+                        except Exception as e:
+                            log.error(f"Failed to persist Gemini metadata to DB: {e}")
 
             try:
                 await self._do_post_processing(
