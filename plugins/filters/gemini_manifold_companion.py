@@ -6,18 +6,10 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 2.2.0
+version: 2.1.0
 """
 
-# Changelog:
-# 2.2.0 - Compatibility with Open WebUI >= 0.9.0.
-#         Removed the sync `Functions.get_function_valves_by_id(...)` call from
-#         `Filter.__init__` (the method is now `async` upstream and raised at import
-#         time). Valves are now initialized with defaults; Open WebUI's filter
-#         pipeline injects the DB-backed valves onto the module instance before
-#         each `inlet`/`outlet`/`stream` invocation, so behavior is preserved.
-
-VERSION = "2.2.0"
+VERSION = "2.1.0"
 
 # This filter can detect that a feature like web search or code execution is enabled in the front-end,
 # set the feature back to False so Open WebUI does not run it's own logic and then
@@ -311,12 +303,6 @@ class Filter:
         pipe_start_time: float | None = self._get_and_clear_data_from_state(
             app_state, chat_id, message_id, "pipe_start_time"
         )
-        response_parts: list[types.Part] | None = self._get_and_clear_data_from_state(
-            app_state, chat_id, message_id, "response_parts"
-        )
-        original_content: str | None = self._get_and_clear_data_from_state(
-            app_state, chat_id, message_id, "original_content"
-        )
 
         emitter = EventEmitter(__event_emitter__, pipe_start_time)
 
@@ -373,32 +359,6 @@ class Filter:
                 emitter.emit_status(msg, done=True)
         else:
             log.info("No grounding metadata found in request state.")
-
-        assistant_message = cast("AssistantMessage", body["messages"][-1])
-
-        if response_parts:
-            log.info(
-                f"Found {len(response_parts)} response parts, adding to final message."
-            )
-            try:
-                # Use .model_dump() to create JSON-serializable dictionaries from the Pydantic models.
-                assistant_message["gemini_parts"] = [
-                    part.model_dump(mode="json", exclude_none=True)
-                    for part in response_parts
-                ]
-            except (IndexError, KeyError) as e:
-                log.exception(
-                    f"Failed to inject response parts into the message body: {e}"
-                )
-
-        if original_content:
-            log.info("Found original content, adding to final message.")
-            try:
-                assistant_message["original_content"] = original_content
-            except (IndexError, KeyError) as e:
-                log.exception(
-                    f"Failed to inject original content into the message body: {e}"
-                )
 
         log.debug("outlet method has finished.")
         return body
