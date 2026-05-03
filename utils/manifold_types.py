@@ -143,9 +143,9 @@ class StatusEvent(TypedDict):
 
 
 class SourceData(TypedDict):
-    source: dict  # The file or url object
+    source: SourceSource  # The file or url object
     document: list[str]  # The chunks of text
-    metadata: NotRequired[list[dict]]
+    metadata: NotRequired[list[SourceMetadata]]
 
 
 class CitationEvent(TypedDict):
