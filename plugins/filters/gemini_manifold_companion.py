@@ -54,7 +54,7 @@ DEFAULT_URL_TIMEOUT = aiohttp.ClientTimeout(total=10)  # 10 seconds total timeou
 class EventEmitter:
     """
     A unified, thread-safe event emitter for Open WebUI plugins.
-    Uses an internal queue to guarantee ordered, non-blocking delivery of websocket events.
+    Uses internal queues to guarantee ordered, non-blocking delivery of websocket events.
     """
 
     def __init__(
@@ -68,18 +68,28 @@ class EventEmitter:
         self.start_time = time.monotonic()
 
         self._queue: asyncio.Queue["Event | None"] = asyncio.Queue()
-        if event_emitter is not None:
-            self._worker_task = asyncio.create_task(self._processing_loop())
-        else:
-            # Create a "dummy" task that is instantly done
-            self._worker_task = asyncio.create_task(asyncio.sleep(0))
+        self._toast_queue: asyncio.Queue["Event | None"] = asyncio.Queue()
 
-    async def _processing_loop(self):
-        """The background consumer that processes the queue in order."""
+        self._worker_task: asyncio.Task | None = None
+        self._toast_worker_task: asyncio.Task | None = None
+
+        # Only spawn background tasks if an emitter function is actually provided.
+        # This prevents dangling tasks and wasted resources when events are ignored.
+        if self._emitter is not None:
+            self._worker_task = asyncio.create_task(self._process_queue(self._queue))
+            self._toast_worker_task = asyncio.create_task(
+                self._process_queue(self._toast_queue)
+            )
+
+    async def _process_queue(self, queue: asyncio.Queue["Event | None"]) -> None:
+        """
+        A generic consumer for event queues.
+        Processes items sequentially until a None poison pill is encountered.
+        """
         while True:
-            event = await self._queue.get()
+            event = await queue.get()
             if event is None:
-                self._queue.task_done()
+                queue.task_done()
                 break
 
             if self._emitter:
@@ -88,24 +98,36 @@ class EventEmitter:
                 except Exception:
                     log.exception("Error in EventEmitter background worker")
 
-            self._queue.task_done()
+            queue.task_done()
 
-    def _enqueue(self, event: "Event") -> None:
-        """Pushes a new event into the ordered queue without blocking."""
+    def _enqueue(self, event: "Event", is_toast: bool = False) -> None:
+        """Pushes a new event into the appropriate queue without blocking."""
         if self._emitter is None:
             return
-        self._queue.put_nowait(event)
 
-    async def flush(self):
-        """Blocks until all currently queued events have been processed."""
-        await self._queue.join()
+        # Routing toast events to a dedicated queue ensures their relative ordering
+        # is maintained without being delayed by potentially blocking standard events.
+        target_queue = self._toast_queue if is_toast else self._queue
+        target_queue.put_nowait(event)
 
-    async def shutdown(self):
-        """Sends the poison pill and waits for the worker to finish."""
-        if self._worker_task.done():
-            return
-        self._queue.put_nowait(None)
-        await self._worker_task
+    async def flush(self) -> None:
+        """Blocks until all currently queued events across all queues have been processed."""
+        await asyncio.gather(self._queue.join(), self._toast_queue.join())
+
+    async def shutdown(self) -> None:
+        """Sends the poison pill to all active workers and waits for them to finish."""
+        tasks_to_await = []
+
+        if self._worker_task and not self._worker_task.done():
+            self._queue.put_nowait(None)
+            tasks_to_await.append(self._worker_task)
+
+        if self._toast_worker_task and not self._toast_worker_task.done():
+            self._toast_queue.put_nowait(None)
+            tasks_to_await.append(self._toast_worker_task)
+
+        if tasks_to_await:
+            await asyncio.gather(*tasks_to_await)
 
     def emit_toast(
         self,
@@ -116,7 +138,7 @@ class EventEmitter:
             "type": "notification",
             "data": {"type": type, "content": msg},
         }
-        self._enqueue(event)
+        self._enqueue(event, is_toast=True)
 
     def emit_status(
         self,
