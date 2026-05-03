@@ -55,6 +55,7 @@ class EventEmitter:
     """
     A unified, thread-safe event emitter for Open WebUI plugins.
     Uses internal queues to guarantee ordered, non-blocking delivery of websocket events.
+    Includes an idle timeout to prevent memory leaks from orphaned instances.
     """
 
     def __init__(
@@ -62,10 +63,15 @@ class EventEmitter:
         event_emitter: Callable[["Event"], Awaitable[None]] | None,
         *,
         status_mode: str = "visible",
+        idle_timeout: float = 3600.0,
     ):
         self._emitter = event_emitter
         self.status_mode = status_mode
         self.start_time = time.monotonic()
+
+        # Used by external garbage collection to detect dead instances
+        self.is_abandoned: bool = False
+        self._idle_timeout = idle_timeout
 
         self._queue: asyncio.Queue["Event | None"] = asyncio.Queue()
         self._toast_queue: asyncio.Queue["Event | None"] = asyncio.Queue()
@@ -73,8 +79,6 @@ class EventEmitter:
         self._worker_task: asyncio.Task | None = None
         self._toast_worker_task: asyncio.Task | None = None
 
-        # Only spawn background tasks if an emitter function is actually provided.
-        # This prevents dangling tasks and wasted resources when events are ignored.
         if self._emitter is not None:
             self._worker_task = asyncio.create_task(self._process_queue(self._queue))
             self._toast_worker_task = asyncio.create_task(
@@ -84,10 +88,20 @@ class EventEmitter:
     async def _process_queue(self, queue: asyncio.Queue["Event | None"]) -> None:
         """
         A generic consumer for event queues.
-        Processes items sequentially until a None poison pill is encountered.
+        Processes items sequentially until a None poison pill is encountered
+        or the idle timeout is reached.
         """
         while True:
-            event = await queue.get()
+            try:
+                # The timeout only applies to the waiting period for new events.
+                # If an event takes a long time to process below, it won't trigger this.
+                event = await asyncio.wait_for(queue.get(), timeout=self._idle_timeout)
+            except TimeoutError:
+                # If no events arrive within the timeout window, assume the parent
+                # request was unexpectedly dropped. Set the flag for external cleanup.
+                self.is_abandoned = True
+                break
+
             if event is None:
                 queue.task_done()
                 break
@@ -105,8 +119,6 @@ class EventEmitter:
         if self._emitter is None:
             return
 
-        # Routing toast events to a dedicated queue ensures their relative ordering
-        # is maintained without being delayed by potentially blocking standard events.
         target_queue = self._toast_queue if is_toast else self._queue
         target_queue.put_nowait(event)
 
@@ -180,7 +192,6 @@ class EventEmitter:
         error: str | None = None,
         usage: dict[str, Any] | None = None,
     ) -> None:
-        """Constructs and enqueues a chat completion event."""
         data: dict[str, Any] = {"done": done}
         if content is not None:
             data["content"] = content
@@ -196,13 +207,6 @@ class EventEmitter:
         self._enqueue(event)
 
     def emit_sources(self, source_data: "Source") -> None:
-        """
-        Emits a source/citation event.
-        Note: Per OWUI backend, 'source' events are persisted to the DB
-        and appended to the message's source list.
-        """
-        # OWUI backend handles both "source" and "citation" types identically.
-        # We wrap the Source object into the expected SourceData structure.
         event: "CitationEvent" = {
             "type": "source",
             "data": {
@@ -300,8 +304,16 @@ class Filter:
     ) -> "Body":
         """Modifies the incoming request payload before it's sent to the LLM. Operates on the `form_data` dictionary."""
 
-        emitter = EventEmitter(__event_emitter__, status_mode=self.valves.STATUS_EMISSION_BEHAVIOR)
         app_state: State = __request__.app.state
+
+        # Perform housekeeping before creating new state objects.
+        # This ensures that even if a pipe/filter pair crashes or hangs,
+        # the memory footprint doesn't grow indefinitely over time.
+        self._cleanup_event_emitters(app_state)
+
+        emitter = EventEmitter(
+            __event_emitter__, status_mode=self.valves.STATUS_EMISSION_BEHAVIOR
+        )
         self._store_data_in_state(
             app_state,
             __metadata__,
@@ -953,6 +965,30 @@ class Filter:
             )
 
         return chat_control_params
+
+    @staticmethod
+    def _cleanup_event_emitters(app_state: State) -> None:
+        """
+        Scans the FastAPI app state for abandoned EventEmitter instances and removes them.
+        This acts as a garbage collector for orphaned state data.
+        """
+        # We iterate over a copy of keys to avoid "dictionary changed size during iteration" errors.
+        # We specifically look for the namespaced emitter keys (gemini_event_emitter_<chat>_<msg>).
+        abandoned_keys = [
+            key
+            for key, value in app_state._state.items()
+            if key.startswith("gemini_event_emitter_")
+            and isinstance(value, EventEmitter)
+            and value.is_abandoned
+        ]
+
+        for key in abandoned_keys:
+            log.warning(
+                f"Garbage Collector: Removing abandoned EventEmitter from app state: {key}"
+            )
+            # Removing the reference allows the Python GC to reclaim the EventEmitter instance
+            # and its internal queue resources.
+            del app_state._state[key]
 
     @staticmethod
     def _store_data_in_state(
