@@ -78,6 +78,7 @@ from open_webui.utils.misc import pop_system_message
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler  # type: ignore
+    from plugins.filters.gemini_manifold_companion import EventEmitter
     # Imports custom type definitions (TypedDicts) for static analysis purposes (mypy/pylance).
     from utils.manifold_types import *
 
@@ -140,152 +141,6 @@ class FilesAPIError(Exception):
     pass
 
 
-class EventEmitter:
-    """A helper class to abstract web-socket event emissions to the front-end."""
-
-    def __init__(
-        self,
-        event_emitter: Callable[["Event"], Awaitable[None]] | None,
-        *,
-        status_mode: str = "visible",
-    ):
-        self.event_emitter = event_emitter
-        self.status_mode = status_mode
-        self.start_time = time.monotonic()
-
-    def emit_toast(
-        self,
-        msg: str,
-        toastType: Literal["info", "success", "warning", "error"] = "info",
-    ) -> None:
-        """Emits a toast notification to the front-end. This is a fire-and-forget operation."""
-        if not self.event_emitter:
-            return
-
-        event: "NotificationEvent" = {
-            "type": "notification",
-            "data": {"type": toastType, "content": msg},
-        }
-
-        log.debug(f"Emitting toast: '{msg}'")
-        log.trace("Toast payload:", payload=event)
-
-        async def send_toast():
-            try:
-                # Re-check in case the event loop runs this later and state has changed.
-                if self.event_emitter:
-                    await self.event_emitter(event)
-            except Exception:
-                log.exception("Error emitting toast notification.")
-
-        asyncio.create_task(send_toast())
-
-    async def emit_status(
-        self,
-        message: str,
-        done: bool = False,
-        hidden: bool = False,
-        *,
-        is_successful_finish: bool = False,
-        is_thought: bool = False,
-        indent_level: int = 0,
-    ) -> None:
-        """Emit status updates asynchronously based on the configured status_mode."""
-        if not self.event_emitter:
-            return
-
-        # Mode: Completely disabled
-        if self.status_mode == "disable":
-            return
-
-        # Mode: Hidden Compact - Hide thought titles/updates
-        if self.status_mode == "hidden_compact" and is_thought:
-            return
-
-        # Mode: Visible + Timestamps
-        if self.status_mode == "visible_timed":
-            elapsed = time.monotonic() - self.start_time
-            message = f"{message} (+{elapsed:.2f}s)"
-
-        # Determine if the final status should be hidden.
-        final_hidden = self.status_mode in ("hidden_compact", "hidden_detailed")
-        if is_successful_finish and final_hidden:
-            hidden = True
-
-        # Add indentation prefix if the final status will be visible.
-        if not final_hidden and indent_level > 0:
-            message = f"{'- ' * indent_level}{message}"
-
-        status_event: "StatusEvent" = {
-            "type": "status",
-            "data": {"description": message, "done": done, "hidden": hidden},
-        }
-
-        log.debug(f"Emitting status: '{message}'")
-        log.trace("Status payload:", payload=status_event)
-
-        try:
-            await self.event_emitter(status_event)
-        except Exception:
-            log.exception("Error emitting status.")
-
-    async def emit_completion(
-        self,
-        content: str | None = None,
-        done: bool = False,
-        error: str | None = None,
-        sources: list["Source"] | None = None,
-        usage: dict[str, Any] | None = None,
-    ) -> None:
-        """Constructs and emits completion event."""
-        if not self.event_emitter:
-            return
-
-        emission: "ChatCompletionEvent" = {
-            "type": "chat:completion",
-            "data": {"done": done},
-        }
-        parts = []
-        if content is not None:
-            emission["data"]["content"] = content
-            parts.append("content")
-        if error is not None:
-            emission["data"]["error"] = {"detail": error}
-            parts.append("error")
-        if sources is not None:
-            emission["data"]["sources"] = sources
-            parts.append("sources")
-        if usage is not None:
-            emission["data"]["usage"] = usage
-            parts.append("usage")
-
-        desc = f" with {', '.join(parts)}" if parts else ""
-        log.debug(f"Emitting completion: done={done}{desc}")
-        log.trace("Completion payload:", payload=emission)
-
-        try:
-            await self.event_emitter(emission)
-        except Exception:
-            log.exception("Error emitting completion.")
-
-    async def emit_usage(self, usage_data: dict[str, Any]) -> None:
-        """A wrapper around emit_completion to specifically emit usage data."""
-        await self.emit_completion(usage=usage_data)
-
-    async def emit_error(
-        self,
-        error_msg: str,
-        warning: bool = False,
-        exception: bool = True,
-    ) -> None:
-        """Emits an event to the front-end that causes it to display a nice red error message."""
-        if warning:
-            log.opt(depth=1, exception=False).warning(error_msg)
-        else:
-            log.opt(depth=1, exception=exception).error(error_msg)
-        await self.emit_completion(error=f"\n{error_msg}", done=True)
-
-
 class UploadStatusManager:
     """
     Manages and centralizes status updates for concurrent file uploads.
@@ -302,10 +157,9 @@ class UploadStatusManager:
 
     def __init__(
         self,
-        event_emitter: EventEmitter,
+        event_emitter: "EventEmitter",
     ):
         self.event_emitter = event_emitter
-        self.start_time = event_emitter.start_time
         self.queue = asyncio.Queue()
         self.total_uploads_expected = 0
         self.uploads_completed = 0
@@ -354,7 +208,7 @@ class UploadStatusManager:
             # Show "Uploading 1 of N..."
             message = f"Uploading file {self.uploads_completed + 1} of {self.total_uploads_expected}..."
 
-        await self.event_emitter.emit_status(message, done=is_done, indent_level=1)
+        self.event_emitter.emit_status(message, done=is_done, indent_level=1)
 
 
 class FilesAPIManager:
@@ -380,7 +234,7 @@ class FilesAPIManager:
         client: genai.Client,
         file_cache: SimpleMemoryCache,
         id_hash_cache: SimpleMemoryCache,
-        event_emitter: EventEmitter,
+        event_emitter: "EventEmitter",
     ):
         """
         Initializes the FilesAPIManager.
@@ -725,7 +579,7 @@ class GeminiContentBuilder:
         messages_body: list["Message"],
         metadata_body: "Metadata",
         user_data: "UserData",
-        event_emitter: EventEmitter,
+        event_emitter: "EventEmitter",
         valves: "Pipe.Valves",
         files_api_manager: "FilesAPIManager",
     ):
@@ -738,6 +592,7 @@ class GeminiContentBuilder:
         self.event_emitter = event_emitter
         self.valves = valves
         self.files_api_manager = files_api_manager
+        # FIXME: chat id could be `None`, leading to an iteration error.
         self.is_temp_chat = "local" in metadata_body.get("chat_id", "")
         self.vertexai = self.files_api_manager.client.vertexai
 
@@ -757,7 +612,7 @@ class GeminiContentBuilder:
         self.messages_db = await self._fetch_and_validate_chat_history(
             self.metadata_body, self.user_data
         )
-        log.debug("Database messages: ", payload=self.messages_db)
+        log.trace("Database messages: ", payload=self.messages_db)
         # Retrieve cumulative usage from the DB history and inject it into metadata.
         # This will be picked up later when constructing the final usage payload.
         c_tokens, c_cost = self._retrieve_previous_usage_data()
@@ -850,7 +705,7 @@ class GeminiContentBuilder:
         matches the request body.
         """
         chat_id = metadata_body.get("chat_id", "")
-        if not chat_id or chat_id == "local":
+        if not chat_id or "local" in chat_id:
             return None
 
         chat = await Chats.get_chat_by_id_and_user_id(
@@ -1831,18 +1686,6 @@ class Pipe:
             Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
             Default value is None.""",
         )
-        STATUS_EMISSION_BEHAVIOR: Literal[
-            "disable",
-            "hidden_compact",
-            "hidden_detailed",
-            "visible",
-            "visible_timed",
-        ] = Field(
-            default="hidden_detailed",
-            description="""Control status display. (Default: hidden_detailed) • Options • disable: No status.
-            • hidden_compact: Final success hidden, no thoughts. • hidden_detailed: Final success hidden, with thoughts.
-            • visible: All status visible. • visible_timed: Visible with timestamps.""",
-        )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
@@ -1995,21 +1838,6 @@ class Pipe:
             Overrides the admin setting. Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
             Default value is None.""",
         )
-        STATUS_EMISSION_BEHAVIOR: (
-            Literal[
-                "disable",
-                "hidden_compact",
-                "hidden_detailed",
-                "visible",
-                "visible_timed",
-                "",
-            ]
-            | None
-        ) = Field(
-            default=None,
-            description="""Override admin setting (leave empty to use default).
-            Options: disable | hidden_compact | hidden_detailed | visible | visible_timed""",
-        )
         IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] | None | Literal[""] = Field(
             default=None,
             description="""Resolution for image generation (Gemini 3 Pro Image only).
@@ -2105,7 +1933,8 @@ class Pipe:
         self._check_companion_filter_version(features)
 
         # Retrieve model configuration from app state
-        model_config: dict[str, Any] = __request__.app.state._state.get("gemini_model_config")
+        app_state: State = __request__.app.state
+        model_config: dict[str, Any] = app_state._state.get("gemini_model_config")
         # FIXME: be even more strict by requring the model id to be present in the config to proceed?
         if model_config is None:
             error_msg = (
@@ -2142,10 +1971,21 @@ class Pipe:
             features=features,
         )
 
-        event_emitter = EventEmitter(
-            __event_emitter__,
-            status_mode=valves.STATUS_EMISSION_BEHAVIOR,
+        log.debug(f"Chat ID: {__metadata__.get('chat_id')}, Message ID: {__metadata__.get('message_id')}")
+
+        # FIXME: might be None in some cases, needs handling
+        event_emitter: "EventEmitter" = self._get_and_clear_data_from_state(
+            app_state=app_state,
+            chat_id=__metadata__.get("chat_id"),
+            message_id=__metadata__.get("message_id"),
+            key_suffix="gemini_event_emitter",
+            clear_after_read=False
         )
+        if not event_emitter:
+            log.debug("No event emitter found in state for this request. Companion filter's inlet did not run? Event emissions will be disabled for this request.")
+            event_emitter = app_state._state.get("gemini_dummy_event_emitter")
+        if not event_emitter:
+            log.error("No event emitter available. This is unexpected as the dummy event emitter should always be present. Request will likely error out.")
 
         # --- Execution Loop ---
         for attempt_idx, tier in enumerate(execution_order):
@@ -2203,11 +2043,8 @@ class Pipe:
                 if should_retry:
                     reason = "quota exceeded" if "429" in error_str else "model overloaded"
                     log.warning(f"Free Tier {reason} (Error: {e}). Switching to Paid API...")
-
-                    asyncio.create_task(
-                        event_emitter.emit_status(
-                            f"Free Tier {reason}, switching to Paid API...", done=False
-                        )
+                    event_emitter.emit_status(
+                        f"Free Tier {reason}, switching to Paid API...", done=False
                     )
                     continue 
 
@@ -2948,7 +2785,7 @@ class Pipe:
         __user__: "UserData",
         __metadata__: "Metadata",
         __request__: Request,
-        event_emitter: EventEmitter,
+        event_emitter: "EventEmitter",
         model_config: dict,
     ) -> AsyncGenerator[dict | str, None] | dict:
         """
@@ -2980,7 +2817,7 @@ class Pipe:
             files_api_manager=files_api_manager,
         )
 
-        asyncio.create_task(event_emitter.emit_status("Preparing request..."))
+        event_emitter.emit_status("Preparing request...")
         contents = await builder.build_contents()
 
         # 4. Configuration Building
@@ -3035,9 +2872,7 @@ class Pipe:
         request_type_str = "streaming" if use_streaming_api else "non-streaming"
         request_type_msg = f"Sending {request_type_str} request to {api_name}..."
         log.info(request_type_msg)
-        asyncio.create_task(
-            event_emitter.emit_status(request_type_msg)
-        )
+        event_emitter.emit_status(request_type_msg)
 
         # 6. Execution & Peek Logic
         if use_streaming_api:
@@ -3127,7 +2962,7 @@ class Pipe:
         self,
         response_stream: AsyncIterator[types.GenerateContentResponse],
         app: FastAPI,
-        event_emitter: EventEmitter,
+        event_emitter: "EventEmitter",
         __metadata__: "Metadata",
     ) -> AsyncGenerator[dict | str, None]:
         """
@@ -3159,9 +2994,7 @@ class Pipe:
 
                 if not first_chunk_received:
                     # This is the first (and possibly only) chunk.
-                    asyncio.create_task(
-                        event_emitter.emit_status("Response received", done=True)
-                    )
+                    event_emitter.emit_status("Response received", done=True)
                     first_chunk_received = True
 
                 if not (parts := chunk.parts):
@@ -3201,14 +3034,12 @@ class Pipe:
                                     title = title.strip('"“”‘’').strip()
                                 if title and title != last_title:
                                     last_title = title
-                                    asyncio.create_task(
-                                        event_emitter.emit_status(
-                                            title,
-                                            done=False,
-                                            hidden=False,
-                                            is_thought=True,
-                                            indent_level=1,
-                                        )
+                                    event_emitter.emit_status(
+                                        title,
+                                        done=False,
+                                        hidden=False,
+                                        is_thought=True,
+                                        indent_level=1,
                                     )
                             except Exception:
                                 # Thought titles are a best-effort feature; failures should not break the stream.
@@ -3225,12 +3056,10 @@ class Pipe:
                         if has_content:
                             in_think = False
                             # Clear the last thought title when normal content begins.
-                            asyncio.create_task(
-                                event_emitter.emit_status(
-                                    "Thinking finished",
-                                    done=True,
-                                    is_thought=False,
-                                )
+                            event_emitter.emit_status(
+                                "Thinking finished",
+                                done=True,
+                                is_thought=False,
                             )
 
                     payload, count = await self._process_part(
@@ -3256,7 +3085,7 @@ class Pipe:
             error_occurred = True
             error_msg = f"Response processing ended with error: {e}"
             log.exception(error_msg)
-            await event_emitter.emit_error(error_msg)
+            event_emitter.emit_error(error_msg)
 
         finally:
             # The async for loop has completed, meaning we have received all data
@@ -3552,7 +3381,7 @@ class Pipe:
     async def _do_post_processing(
         self,
         model_response: types.GenerateContentResponse | None,
-        event_emitter: EventEmitter,
+        event_emitter: "EventEmitter",
         app_state: State,
         __metadata__: "Metadata",
         *,
@@ -3563,19 +3392,19 @@ class Pipe:
 
         if stream_error_happened:
             log.warning("Response processing failed due to stream error.")
-            await event_emitter.emit_status("Response failed [Stream Error]", done=True)
+            event_emitter.emit_status("Response failed [Stream Error]", done=True)
             return
 
         if not model_response:
             log.warning("Response processing skipped: Model response was empty.")
-            await event_emitter.emit_status(
+            event_emitter.emit_status(
                 "Response failed [Empty Response]", done=True
             )
             return
 
         if not (candidate := self._get_first_candidate(model_response.candidates)):
             log.warning("Response processing skipped: No candidates found.")
-            await event_emitter.emit_status(
+            event_emitter.emit_status(
                 "Response failed [No Candidates]", done=True
             )
             return
@@ -3607,7 +3436,7 @@ class Pipe:
 
         # For the most common success case (STOP), we don't need to show the reason.
         final_reason_str = "" if reason_name == "STOP" else f" [{reason_name}]"
-        await event_emitter.emit_status(
+        event_emitter.emit_status(
             f"{status_prefix}{final_reason_str}",
             done=True,
             is_successful_finish=is_normal_finish,
@@ -3615,16 +3444,10 @@ class Pipe:
 
         # TODO: Emit a toast message if url context retrieval was not successful.
 
-        # --- Store grounding and timing data in state for the Filter ---
         storage_payload: dict[str, Any] = {}
 
         if candidate and (grounding_metadata_obj := candidate.grounding_metadata):
             storage_payload["grounding"] = grounding_metadata_obj
-
-        # Only store the start time if the user wants to see timestamps in the grounding display.
-        # The filter will gracefully handle the absence of this key.
-        if event_emitter.status_mode == "visible_timed":
-            storage_payload["pipe_start_time"] = event_emitter.start_time
 
         self._store_data_in_state(app_state, __metadata__, storage_payload)
 
@@ -3639,6 +3462,7 @@ class Pipe:
         Exits early if this is a task model (e.g. title generation) to prevent 
         state bloat and interference with the main chat's filter logic.
         """
+        # TODO: code a separate dataclass that handles all stuff that I need to store in app state
         if __metadata__.get("task"):
             return
 
@@ -3655,6 +3479,38 @@ class Pipe:
             # Using shared `request.app.state` to pass data to Filter.outlet.
             # This is necessary because Pipe.pipe and Filter.outlet operate on different requests.
             app_state._state[key] = value
+
+    @staticmethod
+    def _get_and_clear_data_from_state(
+        app_state: State,
+        chat_id: str,
+        message_id: str,
+        key_suffix: str,
+        clear_after_read: bool,
+    ) -> Any | None:
+        """Retrieves data from the app state using a namespaced key.
+
+        Deletes the value only when clear_after_read is True.
+        """
+        key = f"{key_suffix}_{chat_id}_{message_id}"
+        value = getattr(app_state, key, None)
+        if value is None:
+            return None
+
+        if clear_after_read:
+            log.debug(f"Retrieved and cleared data from app state for key '{key}'.")
+            try:
+                delattr(app_state, key)
+            except AttributeError:
+                # This case is unlikely but handles a race condition where the attribute might already be gone.
+                log.warning(
+                    f"State key '{key}' was already gone before deletion attempt."
+                )
+        else:
+            log.debug(
+                f"Retrieved data from app state for key '{key}' without clearing it."
+            )
+        return value
 
     @staticmethod
     def _calculate_cost(token_count: int, pricing_tiers: list[dict]) -> float:

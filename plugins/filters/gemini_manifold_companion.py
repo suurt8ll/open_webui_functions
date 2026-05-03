@@ -52,59 +52,187 @@ DEFAULT_URL_TIMEOUT = aiohttp.ClientTimeout(total=10)  # 10 seconds total timeou
 
 
 class EventEmitter:
-    """Handles fire-and-forget event emissions for the plugin."""
+    """
+    A unified, thread-safe event emitter for Open WebUI plugins.
+    Uses internal queues to guarantee ordered, non-blocking delivery of websocket events.
+    Includes an idle timeout to prevent memory leaks from orphaned instances.
+    """
 
-    def __init__(self, event_emitter: Callable[["Event"], Awaitable[None]], pipe_start_time: float | None):
-        self.event_emitter = event_emitter
-        self.pipe_start_time = pipe_start_time
+    def __init__(
+        self,
+        event_emitter: Callable[["Event"], Awaitable[None]] | None,
+        *,
+        status_mode: str = "visible",
+        idle_timeout: float = 3600.0,
+    ):
+        self._emitter = event_emitter
+        self.status_mode = status_mode
+        self.start_time = time.monotonic()
 
-    def _emit(self, event: "Event") -> None:
-        async def emit_task():
+        # Used by external garbage collection to detect dead instances
+        self.is_abandoned: bool = False
+        self._idle_timeout = idle_timeout
+
+        self._queue: asyncio.Queue["Event | None"] = asyncio.Queue()
+        self._toast_queue: asyncio.Queue["Event | None"] = asyncio.Queue()
+
+        self._worker_task: asyncio.Task | None = None
+        self._toast_worker_task: asyncio.Task | None = None
+
+        if self._emitter is not None:
+            self._worker_task = asyncio.create_task(self._process_queue(self._queue))
+            self._toast_worker_task = asyncio.create_task(
+                self._process_queue(self._toast_queue)
+            )
+
+    async def _process_queue(self, queue: asyncio.Queue["Event | None"]) -> None:
+        """
+        A generic consumer for event queues.
+        Processes items sequentially until a None poison pill is encountered
+        or the idle timeout is reached.
+        """
+        while True:
             try:
-                await self.event_emitter(event)
-                # FIXME: make the debug log message less verbose
-                log.debug("Emitted event:", payload=event)
-            except Exception:
-                log.exception("Error emitting event.")
+                # The timeout only applies to the waiting period for new events.
+                # If an event takes a long time to process below, it won't trigger this.
+                event = await asyncio.wait_for(queue.get(), timeout=self._idle_timeout)
+            except TimeoutError:
+                # If no events arrive within the timeout window, assume the parent
+                # request was unexpectedly dropped. Set the flag for external cleanup.
+                self.is_abandoned = True
+                break
 
-        asyncio.create_task(emit_task())
+            if event is None:
+                queue.task_done()
+                break
 
-    def emit_status(self, description: str, done: bool = False) -> None:
-        time_str = (
-            f" (+{(time.monotonic() - self.pipe_start_time):.2f}s)"
-            if self.pipe_start_time is not None
-            else ""
-        )
-        full_description = f"{description}{time_str}"
+            if self._emitter:
+                try:
+                    await self._emitter(event)
+                except Exception:
+                    log.exception("Error in EventEmitter background worker")
 
-        status_event: "StatusEvent" = {
-            "type": "status",
-            "data": {"description": full_description, "done": done},
-        }
-        self._emit(status_event)
+            queue.task_done()
 
-    def emit_grounding_queries(self, grounding_metadata: types.GroundingMetadata) -> None:
-        if not grounding_metadata.web_search_queries:
-            log.debug("Grounding metadata does not contain any search queries.")
+    def _enqueue(self, event: "Event", is_toast: bool = False) -> None:
+        """Pushes a new event into the appropriate queue without blocking."""
+        if self._emitter is None:
             return
 
-        status_event: "StatusEvent" = {
+        target_queue = self._toast_queue if is_toast else self._queue
+        target_queue.put_nowait(event)
+
+    async def flush(self) -> None:
+        """Blocks until all currently queued events across all queues have been processed."""
+        await asyncio.gather(self._queue.join(), self._toast_queue.join())
+
+    async def shutdown(self) -> None:
+        """Sends the poison pill to all active workers and waits for them to finish."""
+        tasks_to_await = []
+
+        if self._worker_task and not self._worker_task.done():
+            self._queue.put_nowait(None)
+            tasks_to_await.append(self._worker_task)
+
+        if self._toast_worker_task and not self._toast_worker_task.done():
+            self._toast_queue.put_nowait(None)
+            tasks_to_await.append(self._toast_worker_task)
+
+        if tasks_to_await:
+            await asyncio.gather(*tasks_to_await)
+
+    def emit_toast(
+        self,
+        msg: str,
+        type: Literal["info", "success", "warning", "error"] = "info",
+    ) -> None:
+        event: "NotificationEvent" = {
+            "type": "notification",
+            "data": {"type": type, "content": msg},
+        }
+        self._enqueue(event, is_toast=True)
+
+    def emit_status(
+        self,
+        description: str,
+        done: bool = False,
+        hidden: bool = False,
+        *,
+        is_successful_finish: bool = False,
+        is_thought: bool = False,
+        indent_level: int = 0,
+    ) -> None:
+        if self.status_mode == "disable":
+            return
+        if self.status_mode == "hidden_compact" and is_thought:
+            return
+
+        if "visible_timed" in self.status_mode:
+            elapsed = time.monotonic() - self.start_time
+            description = f"{description} (+{elapsed:.2f}s)"
+
+        final_hidden = hidden or (
+            self.status_mode in ("hidden_compact", "hidden_detailed")
+            and is_successful_finish
+        )
+
+        if not final_hidden and indent_level > 0:
+            description = f"{'- ' * indent_level}{description}"
+
+        event: "StatusEvent" = {
+            "type": "status",
+            "data": {"description": description, "done": done, "hidden": final_hidden},
+        }
+        self._enqueue(event)
+
+    def emit_completion(
+        self,
+        content: str | None = None,
+        done: bool = False,
+        error: str | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> None:
+        data: dict[str, Any] = {"done": done}
+        if content is not None:
+            data["content"] = content
+        if error is not None:
+            data["error"] = {"detail": error}
+        if usage is not None:
+            data["usage"] = usage
+
+        event: "ChatCompletionEvent" = {
+            "type": "chat:completion",
+            "data": cast(Any, data),
+        }
+        self._enqueue(event)
+
+    def emit_sources(self, source_data: "Source") -> None:
+        event: "CitationEvent" = {
+            "type": "source",
+            "data": {
+                "source": source_data["source"],
+                "document": source_data["document"],
+                "metadata": source_data["metadata"],
+            },
+        }
+        self._enqueue(event)
+
+    def emit_error(self, error_msg: str, exception: bool = True) -> None:
+        log.opt(depth=1, exception=exception).error(error_msg)
+        self.emit_completion(error=f"\n{error_msg}", done=True)
+
+    def emit_grounding_queries(self, queries: list[str]) -> None:
+        if not queries:
+            return
+        event: "StatusEvent" = {
             "type": "status",
             "data": {
                 "action": "web_search_queries_generated",
-                "queries": grounding_metadata.web_search_queries,
+                "queries": queries,
                 "done": False,
             },
         }
-        self._emit(status_event)
-
-    def emit_sources(self, sources_list: list["Source"]) -> None:
-        event: "ChatCompletionEvent" = {
-            "type": "chat:completion",
-            "data": {"sources": sources_list},
-        }
-        self._emit(event)
-        log.info("Emitted sources event.")
+        self._enqueue(event)
 
 
 class Filter:
@@ -138,6 +266,18 @@ class Filter:
             default=0.5,
             description="Initial delay in seconds between retries, using exponential backoff. Default is 0.5.",
         )
+        STATUS_EMISSION_BEHAVIOR: Literal[
+            "disable",
+            "hidden_compact",
+            "hidden_detailed",
+            "visible",
+            "visible_timed",
+        ] = Field(
+            default="hidden_detailed",
+            description="""Control status display. (Default: hidden_detailed) • Options • disable: No status.
+            • hidden_compact: Final success hidden, no thoughts. • hidden_detailed: Final success hidden, with thoughts.
+            • visible: All status visible. • visible_timed: Visible with timestamps.""",
+        )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
@@ -156,14 +296,35 @@ class Filter:
         log.trace("Full self object:", payload=self.__dict__)
 
     def inlet(
-        self, body: "Body", __request__: Request, __metadata__: "Metadata"
+        self,
+        body: "Body",
+        __request__: Request,
+        __metadata__: "Metadata",
+        __event_emitter__: Callable[["Event"], Awaitable[None]],
     ) -> "Body":
         """Modifies the incoming request payload before it's sent to the LLM. Operates on the `form_data` dictionary."""
+
+        app_state: State = __request__.app.state
+
+        # Perform housekeeping before creating new state objects.
+        # This ensures that even if a pipe/filter pair crashes or hangs,
+        # the memory footprint doesn't grow indefinitely over time.
+        self._cleanup_event_emitters(app_state)
+
+        emitter = EventEmitter(
+            __event_emitter__, status_mode=self.valves.STATUS_EMISSION_BEHAVIOR
+        )
+        self._store_data_in_state(
+            app_state,
+            __metadata__,
+            {"gemini_event_emitter": emitter},
+        )
+        app_state._state["gemini_dummy_event_emitter"] = EventEmitter(None)
 
         # Load and store model configuration in app state
         log.debug("Loading model configuration...")
         model_config = self._load_model_config(self.valves.MODEL_CONFIG_PATH)
-        __request__.app.state._state["gemini_model_config"] = model_config
+        app_state._state["gemini_model_config"] = model_config
         log.debug(
             f"Stored model config in app state with {len(model_config)} model(s)."
         )
@@ -297,14 +458,13 @@ class Filter:
 
         stored_metadata: types.GroundingMetadata | None = (
             self._get_and_clear_data_from_state(
-                app_state, chat_id, message_id, "grounding"
+                app_state, chat_id, message_id, "grounding", True
             )
         )
-        pipe_start_time: float | None = self._get_and_clear_data_from_state(
-            app_state, chat_id, message_id, "pipe_start_time"
+        # FIXME: can this be None?
+        emitter: EventEmitter = self._get_and_clear_data_from_state(
+            app_state, chat_id, message_id, "gemini_event_emitter", True
         )
-
-        emitter = EventEmitter(__event_emitter__, pipe_start_time)
 
         if stored_metadata:
             log.info("Found grounding metadata, processing citations.")
@@ -339,7 +499,10 @@ class Filter:
                     body["messages"][-1]["content"] = cited_text
 
             # Emit status event with search queries before resolving URLs
-            emitter.emit_grounding_queries(stored_metadata)
+            if stored_metadata.web_search_queries:
+                emitter.emit_grounding_queries(stored_metadata.web_search_queries)
+            else:
+                log.debug("Grounding metadata does not contain any search queries.")
 
             # Emit sources to the front-end.
             gs_supports = stored_metadata.grounding_supports
@@ -652,7 +815,9 @@ class Filter:
                 }
             )
 
-        emitter.emit_sources(sources_list)
+        # TODO: emit sources as they come in, real time
+        for source in sources_list:
+            emitter.emit_sources(source)
 
     # endregion 1.1 Add citations
 
@@ -801,17 +966,78 @@ class Filter:
 
         return chat_control_params
 
+    @staticmethod
+    def _cleanup_event_emitters(app_state: State) -> None:
+        """
+        Scans the FastAPI app state for abandoned EventEmitter instances and removes them.
+        This acts as a garbage collector for orphaned state data.
+        """
+        # We iterate over a copy of keys to avoid "dictionary changed size during iteration" errors.
+        # We specifically look for the namespaced emitter keys (gemini_event_emitter_<chat>_<msg>).
+        abandoned_keys = [
+            key
+            for key, value in app_state._state.items()
+            if key.startswith("gemini_event_emitter_")
+            and isinstance(value, EventEmitter)
+            and value.is_abandoned
+        ]
+
+        for key in abandoned_keys:
+            log.warning(
+                f"Garbage Collector: Removing abandoned EventEmitter from app state: {key}"
+            )
+            # Removing the reference allows the Python GC to reclaim the EventEmitter instance
+            # and its internal queue resources.
+            del app_state._state[key]
+
+    @staticmethod
+    def _store_data_in_state(
+        app_state: State,
+        __metadata__: "Metadata",
+        data: dict[str, Any],
+    ):
+        """
+        Stores multiple values in the app state, namespaced by chat and message ID.
+        Exits early if this is a task model (e.g. title generation) to prevent
+        state bloat and interference with the main chat's filter logic.
+        """
+        if __metadata__.get("task"):
+            return
+
+        chat_id = __metadata__.get("chat_id")
+        message_id = __metadata__.get("message_id")
+
+        if not chat_id or not message_id:
+            log.warning(
+                "Skipping state storage: chat_id or message_id missing from metadata."
+            )
+            return
+
+        for key_suffix, value in data.items():
+            key = f"{key_suffix}_{chat_id}_{message_id}"
+            log.debug(f"Storing data in app state with key '{key}'.")
+            # Using shared `request.app.state` to pass data to Filter.outlet.
+            # This is necessary because Pipe.pipe and Filter.outlet operate on different requests.
+            app_state._state[key] = value
+
+    @staticmethod
     def _get_and_clear_data_from_state(
-        self,
         app_state: State,
         chat_id: str,
         message_id: str,
         key_suffix: str,
+        clear_after_read: bool,
     ) -> Any | None:
-        """Retrieves data from the app state using a namespaced key and then deletes it."""
+        """Retrieves data from the app state using a namespaced key.
+
+        Deletes the value only when clear_after_read is True.
+        """
         key = f"{key_suffix}_{chat_id}_{message_id}"
         value = getattr(app_state, key, None)
-        if value is not None:
+        if value is None:
+            return None
+
+        if clear_after_read:
             log.debug(f"Retrieved and cleared data from app state for key '{key}'.")
             try:
                 delattr(app_state, key)
@@ -820,6 +1046,10 @@ class Filter:
                 log.warning(
                     f"State key '{key}' was already gone before deletion attempt."
                 )
+        else:
+            log.debug(
+                f"Retrieved data from app state for key '{key}' without clearing it."
+            )
         return value
 
     def _get_first_candidate(
