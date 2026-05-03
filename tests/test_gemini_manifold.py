@@ -33,14 +33,12 @@ sys.modules["open_webui.storage.provider"] = mock_storage_module
 sys.modules["open_webui.utils.misc"] = mock_misc_module
 
 
-# --- Now, the import of your plugin should use the mocks ---
 from plugins.pipes.gemini_manifold import (
     Pipe,
-    EventEmitter,
     GeminiContentBuilder,
     types as gemini_types,
 )  # gemini_types is google.genai.types
-
+from plugins.filters.gemini_manifold_companion import EventEmitter
 
 # region Test Constants
 # General Users
