@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.10.1
+version: 0.11.0
 """
 
 # NB! This is work in progress and not yet fully featured.
@@ -39,7 +39,6 @@ from pydantic import BaseModel, Field
 from fastapi import Request
 import pydantic_core
 from open_webui.models.files import Files, FileForm
-from open_webui.models.functions import Functions
 from open_webui.storage.provider import Storage
 from loguru import logger
 
@@ -80,10 +79,13 @@ class Pipe:
 
     def __init__(self):
 
-        # This hack makes the valves values available to the `__init__` method.
-        # TODO: Get the id from the frontmatter instead of hardcoding it.
-        valves = Functions.get_function_valves_by_id("venice_image_generation")
-        self.valves = self.Valves(**(valves if valves else {}))
+        # Open WebUI >= 0.9.0 made `Functions.get_function_valves_by_id` async, so it
+        # cannot be awaited from this sync `__init__`. Initialize with defaults instead;
+        # Open WebUI's pipe pipeline assigns the DB-backed valves onto this instance
+        # (`pipe.valves = pipe.Valves(**configured)`) before every `pipes`/`pipe` call,
+        # so configured valves still take effect at runtime. The `pipes` method already
+        # detects LOG_LEVEL changes and reruns the logging setup once real valves land.
+        self.valves = self.Valves()
         self.log_level = self.valves.LOG_LEVEL
         self._add_log_handler()
 
@@ -221,7 +223,7 @@ class Pipe:
             # Decode the base64 image data
             image_data = base64.b64decode(base64_image)
             # FIXME make mime type dynamic
-            image_url = self._upload_image(
+            image_url = await self._upload_image(
                 image_data, "image/png", model, prompt, __user__["id"], __request__
             )
             return f"![Generated Image]({image_url})" if image_url else None
@@ -309,7 +311,7 @@ class Pipe:
             await self._emit_error(error_msg)
             return
 
-    def _upload_image(
+    async def _upload_image(
         self,
         image_data: bytes,
         mime_type: str,
@@ -344,21 +346,28 @@ class Pipe:
             log.error(f"Error checking Storage.upload_file signature: {e}")
             has_tags = False  # Default to old behavior
 
+        # `Storage.upload_file` remains synchronous upstream; run it in a thread so it
+        # doesn't block the event loop now that this method is async.
         try:
             # TODO: Remove this in the future.
             if has_tags:
                 # New version with tags support >=v0.6.6
-                contents, image_path = Storage.upload_file(image, imagename, tags={})
+                contents, image_path = await asyncio.to_thread(
+                    Storage.upload_file, image, imagename, tags={}
+                )
             else:
                 # Old version without tags <v0.6.5
-                contents, image_path = Storage.upload_file(image, imagename)  # type: ignore
+                contents, image_path = await asyncio.to_thread(
+                    Storage.upload_file, image, imagename  # type: ignore
+                )
         except Exception:
             error_msg = "Error occurred during upload to the storage provider."
             log.exception(error_msg)
             return None
         # Add the image file to files database.
+        # Open WebUI >= 0.9.0 made `Files.insert_new_file` async.
         log.info("Adding the image file to Open WebUI files database.")
-        file_item = Files.insert_new_file(
+        file_item = await Files.insert_new_file(
             user_id,
             FileForm(
                 id=id,
