@@ -1,4 +1,4 @@
-google-genai==1.74.0
+google-genai==2.8.0
 fastapi
 loguru
 pytest

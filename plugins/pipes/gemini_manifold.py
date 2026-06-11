@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 2.1.0
-requirements: google-genai==1.74.0
+requirements: google-genai==2.8.0
 """
 
 # I change these only when I make a release to avoid PR merge conflicts.
