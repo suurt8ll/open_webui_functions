@@ -52,7 +52,106 @@ if TYPE_CHECKING:
 log = logger.bind(auditable=False)
 
 
+class EventEmitter:
+    """
+    An asynchronous queue-based event emitter tailored for image generation models.
+    Guarantees in-order, non-blocking delivery of websocket status events to the Open WebUI frontend,
+    allowing tasks to dispatch events instantly without yielding or halting network cycles.
+    """
+
+    def __init__(
+        self,
+        event_emitter: Callable[["Event"], Awaitable[None]] | None,
+        verbosity: Literal["disabled", "visible", "visible_timed"] = "visible_timed",
+    ):
+        self._emitter = event_emitter
+        self.verbosity = verbosity
+        self.start_time = time.monotonic()
+
+        self._queue: asyncio.Queue["Event | None"] = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+
+        if self._emitter is not None:
+            self._worker_task = asyncio.create_task(self._process_queue())
+
+    async def _process_queue(self) -> None:
+        """
+        Sequentially consumes and processes events until a None poison pill is encountered.
+        This design guarantees that status updates and error details are delivered chronologically.
+        """
+        while True:
+            try:
+                event = await self._queue.get()
+            except asyncio.CancelledError:
+                break
+
+            if event is None:
+                self._queue.task_done()
+                break
+
+            if self._emitter:
+                try:
+                    await self._emitter(event)
+                except Exception:
+                    log.exception("Error processing event in emitter background worker")
+
+            self._queue.task_done()
+
+    def _enqueue(self, event: "Event") -> None:
+        if self._emitter is None:
+            return
+        self._queue.put_nowait(event)
+
+    async def shutdown(self) -> None:
+        """Gracefully halts the worker and waits for remaining events to drain."""
+        if self._worker_task and not self._worker_task.done():
+            self._queue.put_nowait(None)
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+
+    def emit_status(
+        self, description: str, done: bool = False, hidden: bool = False
+    ) -> None:
+        """
+        Sends status notifications to the frontend UI.
+        Supports disabled output, raw messages, and timed increments showing total execution length.
+        """
+        if self.verbosity == "disabled":
+            return
+
+        if self.verbosity == "visible_timed":
+            elapsed = time.monotonic() - self.start_time
+            description = f"{description} (+{elapsed:.2f}s)"
+
+        event: "StatusEvent" = {
+            "type": "status",
+            "data": {
+                "description": description,
+                "done": done,
+                "hidden": hidden,
+            },
+        }
+        self._enqueue(event)
+
+    def emit_completion_error(self, error_msg: str) -> None:
+        """
+        Directly delivers raw error messages into chat interface outputs to ensure
+        frontend rendering remains responsive and correctly terminates processing state.
+        """
+        event: "ChatCompletionEvent" = {
+            "type": "chat:completion",
+            "data": {
+                "done": True,
+                "error": {"detail": f"\n{error_msg}"},
+            },
+        }
+        self._enqueue(event)
+
+
 class Pipe:
+    # TODO: UserValves
     class Valves(BaseModel):
         VENICE_API_TOKEN: str | None = Field(
             default=None, description="Venice.ai API Token"
@@ -65,38 +164,32 @@ class Pipe:
             default=True,
             description="Whether to request models only on first load.",
         )
-        LOG_LEVEL: Literal[
-            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
-        ] = Field(
-            default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+        EMISSION_VERBOSITY: Literal["disabled", "visible", "visible_timed"] = Field(
+            default="visible_timed",
+            description="Control emission verbosity. 'disabled' silences status emissions, 'visible' displays standard status, 'visible_timed' appends duration metrics.",
         )
         USE_FILES_API: bool = Field(
             title="Use Files API",
             default=True,
             description="Save the image files using Open WebUI's API for files.",
         )
+        LOG_LEVEL: Literal[
+            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
+        ] = Field(
+            default="INFO",
+            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+        )
 
     def __init__(self):
-
-        # Open WebUI >= 0.9.0 made `Functions.get_function_valves_by_id` async, so it
-        # cannot be awaited from this sync `__init__`. Initialize with defaults instead;
-        # Open WebUI's pipe pipeline assigns the DB-backed valves onto this instance
-        # (`pipe.valves = pipe.Valves(**configured)`) before every `pipes`/`pipe` call,
-        # so configured valves still take effect at runtime. The `pipes` method already
-        # detects LOG_LEVEL changes and reruns the logging setup once real valves land.
         self.valves = self.Valves()
         self.log_level = self.valves.LOG_LEVEL
         self._add_log_handler()
-
         self.models: list["ModelData"] = []
 
         log.success("Function has been initialized.")
         log.trace("Full self object:", payload=self.__dict__)
 
     async def pipes(self) -> list["ModelData"]:
-
-        # Detect log level change inside self.valves
         if self.log_level != self.valves.LOG_LEVEL:
             log.info(
                 f"Detected log level change: {self.log_level=} and {self.valves.LOG_LEVEL=}. "
@@ -104,7 +197,6 @@ class Pipe:
             )
             self._add_log_handler()
 
-        # Return existing models if all conditions are met and no error models are present
         if (
             self.models
             and self.valves.CACHE_MODELS
@@ -126,109 +218,86 @@ class Pipe:
         __metadata__: dict[str, Any],
     ) -> str | None:
 
-        # TODO: [refac] Move __user__ to self like that also.
-        self.__event_emitter__ = __event_emitter__
-
-        if "error" in __metadata__["model"]["id"]:
-            error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
-            await self._emit_error(error_msg, exception=False)
-            return
-
-        if not self.valves.VENICE_API_TOKEN:
-            error_msg = "Missing VENICE_API_TOKEN in valves configuration."
-            await self._emit_error(error_msg, exception=False)
-            return
-
-        model = body.get("model", "").split(".", 1)[-1]
-        prompt = next(
-            (
-                msg["content"]
-                for msg in reversed(body["messages"])
-                if msg["role"] == "user"
-            ),
-            "",
+        # Instantiate our non-blocking queue emitter without tying it to the instance state
+        emitter = EventEmitter(
+            __event_emitter__, verbosity=self.valves.EMISSION_VERBOSITY
         )
 
-        if not prompt:
-            error_msg = "No prompt found in user message."
-            await self._emit_error(error_msg, exception=False)
-            return
-
-        # FIXME move these to the beginning.
-        if __task__ == "title_generation":
-            log.warning(
-                "Detected title generation task! I do not know how to handle this so I'm returning something generic."
-            )
-            return '{"title": "🖼️ Image Generation"}'
-        if __task__ == "tags_generation":
-            log.warning(
-                "Detected tag generation task! I do not know how to handle this so I'm returning an empty list."
-            )
-            return '{"tags": []}'
-
-        log.debug(f"Model: {model}, Prompt: {prompt}")
-
-        # FIXME [refac] Move it out of pipe for cleaner code?
-        async def timer_task(start_time: float):
-            """Counts up and emits status updates."""
-            try:
-                while True:
-                    elapsed_time = time.time() - start_time
-                    await __event_emitter__(
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": f"Generating image... Time elapsed: {elapsed_time:.2f}s",
-                                "done": False,
-                                "hidden": False,
-                            },
-                        }
-                    )
-                    await asyncio.sleep(1)  # Update every second
-            except asyncio.CancelledError:
-                log.debug("Timer task cancelled.")
-
-        start_time = time.time()
-        timer = asyncio.create_task(timer_task(start_time))
-
-        image_data = await self._generate_image(model, prompt)
-
-        timer.cancel()
         try:
-            await timer  # Ensure timer is fully cleaned up
-        except asyncio.CancelledError:
-            pass  # Expected, already handled
+            if "error" in __metadata__["model"]["id"]:
+                error_msg = f'There has been an error during model retrieval phase: {str(__metadata__["model"])}'
+                log.error(error_msg)
+                emitter.emit_completion_error(error_msg)
+                return
 
-        total_time = time.time() - start_time
-        success = image_data and image_data.get("images")
-        status_text = f"Image {'generated' if success else 'generation failed'} after {total_time:.2f}s"
+            if not self.valves.VENICE_API_TOKEN:
+                error_msg = "Missing VENICE_API_TOKEN in valves configuration."
+                log.error(error_msg)
+                emitter.emit_completion_error(error_msg)
+                return
 
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": status_text,
-                    "done": True,
-                    "hidden": False,
-                },
-            }
-        )
-        if not success:
-            return None
-
-        log.info("Image generated successfully!")
-        base64_image = image_data["images"][0]  # type: ignore
-
-        if self.valves.USE_FILES_API:
-            # Decode the base64 image data
-            image_data = base64.b64decode(base64_image)
-            # FIXME make mime type dynamic
-            image_url = await self._upload_image(
-                image_data, "image/png", model, prompt, __user__["id"], __request__
+            model = body.get("model", "").split(".", 1)[-1]
+            prompt = next(
+                (
+                    msg["content"]
+                    for msg in reversed(body["messages"])
+                    if msg["role"] == "user"
+                ),
+                "",
             )
-            return f"![Generated Image]({image_url})" if image_url else None
-        else:
-            return f"![Generated Image](data:image/png;base64,{base64_image})"
+
+            if not prompt:
+                error_msg = "No prompt found in user message."
+                log.error(error_msg)
+                emitter.emit_completion_error(error_msg)
+                return
+
+            if __task__ == "title_generation":
+                log.warning(
+                    "Detected title generation task! I do not know how to handle this so I'm returning something generic."
+                )
+                return '{"title": "🖼️ Image Generation"}'
+            if __task__ == "tags_generation":
+                log.warning(
+                    "Detected tag generation task! I do not know how to handle this so I'm returning an empty list."
+                )
+                return '{"tags": []}'
+
+            log.debug(f"Model: {model}, Prompt: {prompt}")
+
+            # Emit a single initial status with done=False.
+            # This triggers Open WebUI's frontend shimmer effect rather than spamming background tasks.
+            emitter.emit_status("Generating image...", done=False)
+
+            image_data = await self._generate_image(model, prompt, emitter)
+            success = image_data and image_data.get("images")
+
+            status_text = f"Image {'generated' if success else 'generation failed'}"
+            emitter.emit_status(status_text, done=True)
+
+            if not success:
+                return None
+
+            log.info("Image generated successfully!")
+            base64_image = image_data["images"][0]  # type: ignore
+
+            if self.valves.USE_FILES_API:
+                image_data_bytes = base64.b64decode(base64_image)
+                image_url = await self._upload_image(
+                    image_data_bytes,
+                    "image/png",
+                    model,
+                    prompt,
+                    __user__["id"],
+                    __request__,
+                )
+                return f"![Generated Image]({image_url})" if image_url else None
+            else:
+                return f"![Generated Image](data:image/png;base64,{base64_image})"
+
+        finally:
+            # Assures that the worker task is fully resolved and remaining queue processes are closed out.
+            await emitter.shutdown()
 
     # region 1. Helper methods inside the Pipe class
 
@@ -260,7 +329,6 @@ class Pipe:
     def _return_error_model(
         self, error_msg: str, warning: bool = False, exception: bool = True
     ) -> "ModelData":
-        """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
         if warning:
             log.opt(depth=1, exception=False).warning(error_msg)
         else:
@@ -275,7 +343,9 @@ class Pipe:
 
     # region 1.2 Image generation
 
-    async def _generate_image(self, model: str, prompt: str) -> dict | None:
+    async def _generate_image(
+        self, model: str, prompt: str, emitter: EventEmitter
+    ) -> dict | None:
         try:
             async with aiohttp.ClientSession() as session:
                 log.info(
@@ -287,12 +357,12 @@ class Pipe:
                     json={
                         "model": model,
                         "prompt": prompt,
-                        "width": self.valves.WIDTH,
-                        "height": self.valves.HEIGHT,
-                        "steps": self.valves.STEPS,
+                        #"width": self.valves.WIDTH,
+                        #"height": self.valves.HEIGHT,
+                        #"steps": self.valves.STEPS,
                         "hide_watermark": True,
                         "return_binary": False,
-                        "cfg_scale": self.valves.CFG_SCALE,
+                        #"cfg_scale": self.valves.CFG_SCALE,
                         "safe_mode": False,
                     },
                 ) as response:
@@ -300,16 +370,20 @@ class Pipe:
                         f"Received response from Venice.ai with status: {response.status}"
                     )
                     response.raise_for_status()
-                    return await response.json()
+                    response_json = await response.json()
+                    log.trace(f"Venice.ai response JSON:", payload=response_json)
+                    return response_json
 
         except aiohttp.ClientResponseError as e:
             error_msg = f"Image generation failed: {str(e)}"
-            await self._emit_error(error_msg)
-            return
+            log.error(error_msg)
+            emitter.emit_completion_error(error_msg)
+            return None
         except Exception as e:
             error_msg = f"Generation error: {str(e)}"
-            await self._emit_error(error_msg)
-            return
+            log.error(error_msg)
+            emitter.emit_completion_error(error_msg)
+            return None
 
     async def _upload_image(
         self,
@@ -320,13 +394,8 @@ class Pipe:
         user_id: str,
         __request__: Request,
     ) -> str | None:
-        """
-        Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
-        Returns the url to uploaded image.
-        """
         image_format = mimetypes.guess_extension(mime_type)
         id = str(uuid.uuid4())
-        # TODO: Better filename? Prompt as the filename?
         name = os.path.basename(f"generated-image{image_format}")
         imagename = f"{id}_{name}"
         image = io.BytesIO(image_data)
@@ -335,28 +404,21 @@ class Pipe:
             "prompt": prompt,
         }
 
-        # Upload the image to user configured storage provider.
         log.info("Uploading the model generated image to Open WebUI backend.")
         log.debug("Uploading to the configured storage provider.")
         try:
-            # Dynamically check if 'tags' parameter exists
             sig = inspect.signature(Storage.upload_file)
             has_tags = "tags" in sig.parameters
         except Exception as e:
             log.error(f"Error checking Storage.upload_file signature: {e}")
-            has_tags = False  # Default to old behavior
+            has_tags = False
 
-        # `Storage.upload_file` remains synchronous upstream; run it in a thread so it
-        # doesn't block the event loop now that this method is async.
         try:
-            # TODO: Remove this in the future.
             if has_tags:
-                # New version with tags support >=v0.6.6
                 contents, image_path = await asyncio.to_thread(
                     Storage.upload_file, image, imagename, tags={}
                 )
             else:
-                # Old version without tags <v0.6.5
                 contents, image_path = await asyncio.to_thread(
                     Storage.upload_file, image, imagename  # type: ignore
                 )
@@ -364,8 +426,7 @@ class Pipe:
             error_msg = "Error occurred during upload to the storage provider."
             log.exception(error_msg)
             return None
-        # Add the image file to files database.
-        # Open WebUI >= 0.9.0 made `Files.insert_new_file` async.
+
         log.info("Adding the image file to Open WebUI files database.")
         file_item = await Files.insert_new_file(
             user_id,
@@ -384,7 +445,7 @@ class Pipe:
         if not file_item:
             log.warning("Files.insert_new_file did not return anything.")
             return None
-        # Get the image url.
+
         image_url: str = __request__.app.url_path_for(
             "get_file_content_by_id", id=file_item.id
         )
@@ -392,28 +453,7 @@ class Pipe:
 
     # endregion 1.2 Image generation
 
-    # region 1.3 Event emissions
-
-    async def _emit_error(
-        self, error_msg: str, warning: bool = False, exception: bool = True
-    ) -> None:
-        """Emits an event to the front-end that causes it to display a nice red error message."""
-        error: "ChatCompletionEvent" = {
-            "type": "chat:completion",
-            "data": {
-                "done": True,
-                "error": {"detail": "\n" + error_msg},
-            },
-        }
-        if warning:
-            log.opt(depth=1, exception=False).warning(error_msg)
-        else:
-            log.opt(depth=1, exception=exception).error(error_msg)
-        await self.__event_emitter__(error)
-
-    # endregion 1.3 Event emissions
-
-    # region 1.4 Logging
+    # region 1.3 Logging
     def _is_flat_dict(self, data: Any) -> bool:
         """
         Checks if a dictionary contains only non-dict/non-list values (is one level deep).
@@ -639,6 +679,6 @@ class Pipe:
                 f"Added new handler to loguru for {__name__} with level {desired_level_name}."
             )
 
-    # endregion 1.4 Logging
+    # endregion 1.3 Logging
 
     # endregion 1. Helper methods inside the Pipe class
