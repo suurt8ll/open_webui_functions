@@ -35,7 +35,7 @@ from typing import (
     Literal,
     TYPE_CHECKING,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from fastapi import Request
 import pydantic_core
 from open_webui.models.files import Files, FileForm
@@ -50,6 +50,48 @@ if TYPE_CHECKING:
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
 log = logger.bind(auditable=False)
+
+
+class VeniceStepsConstraint(BaseModel):
+    """Represents min/max iteration bounds for image generation."""
+
+    default: int
+    max: int
+
+
+class VeniceConstraints(BaseModel):
+    """
+    Validation schema mapping Venice's constraints.
+    Some models omit resolutions or aspect ratios; these are mapped to optional list fields
+    to capture the physical capabilities of each model dynamically.
+    """
+
+    promptCharacterLimit: int
+    steps: VeniceStepsConstraint
+    widthHeightDivisor: int
+    aspectRatios: list[str] | None = None
+    defaultAspectRatio: str | None = None
+    resolutions: list[str] | None = None
+    defaultResolution: str | None = None
+
+
+class VeniceModelSpec(BaseModel):
+    """Houses human-readable metadata and operational bounds for Venice models."""
+
+    name: str
+    constraints: VeniceConstraints
+
+
+class VeniceImageModel(BaseModel):
+    """
+    Root validator matching Venice's payload schema.
+    Strictly asserts object type criteria to filter out non-image/non-model endpoints.
+    """
+
+    id: str
+    object: Literal["model"]
+    type: Literal["image"]
+    model_spec: VeniceModelSpec
 
 
 class EventEmitter:
@@ -311,14 +353,34 @@ class Pipe:
                     headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},
                 ) as response:
                     response.raise_for_status()
-                    raw_models = await response.json()
-                    raw_models = raw_models.get("data", [])
+                    raw_models_data = await response.json()
+                    raw_models = raw_models_data.get("data", [])
+
                     if not raw_models:
                         log.warning("Venice API returned no models.")
-                    return [
-                        {"id": model["id"], "name": model["id"], "description": None}
-                        for model in raw_models
-                    ]
+                        return []
+
+                    valid_models: list["ModelData"] = []
+                    for model_dict in raw_models:
+                        try:
+                            # Strict structural verification of the incoming Venice payload shape.
+                            # Protects against upstream API changes emitting unfeasible structures.
+                            validated = VeniceImageModel.model_validate(model_dict)
+                            valid_models.append(
+                                {
+                                    "id": validated.id,
+                                    "name": validated.model_spec.name,
+                                }
+                            )
+                        except ValidationError as e:
+                            # Log validation schema mismatches with precision details, omitting unviable endpoints.
+                            log.warning(
+                                f"Skipping malformed or unsupported Venice model schema with ID '{model_dict.get('id', 'UNKNOWN')}'. "
+                                f"Validation mismatch details: {e.errors()}"
+                            )
+
+                    return valid_models
+
         except aiohttp.ClientResponseError as e:
             error_msg = f"Error getting models: {str(e)}"
             return [self._return_error_model(error_msg)]
@@ -357,12 +419,12 @@ class Pipe:
                     json={
                         "model": model,
                         "prompt": prompt,
-                        #"width": self.valves.WIDTH,
-                        #"height": self.valves.HEIGHT,
-                        #"steps": self.valves.STEPS,
+                        # "width": self.valves.WIDTH,
+                        # "height": self.valves.HEIGHT,
+                        # "steps": self.valves.STEPS,
                         "hide_watermark": True,
                         "return_binary": False,
-                        #"cfg_scale": self.valves.CFG_SCALE,
+                        # "cfg_scale": self.valves.CFG_SCALE,
                         "safe_mode": False,
                     },
                 ) as response:
