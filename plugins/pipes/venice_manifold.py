@@ -59,11 +59,10 @@ class VeniceStepsConstraint(BaseModel):
     max: int
 
 
-class VeniceConstraints(BaseModel):
+class VeniceImageConstraints(BaseModel):
     """
-    Validation schema mapping Venice's constraints.
-    Some models omit resolutions or aspect ratios; these are mapped to optional list fields
-    to capture the physical capabilities of each model dynamically.
+    Validation schema mapping standard text-to-image constraints.
+    Some models omit resolutions or aspect ratios; these are mapped to optional fields.
     """
 
     promptCharacterLimit: int
@@ -75,23 +74,62 @@ class VeniceConstraints(BaseModel):
     defaultResolution: str | None = None
 
 
-class VeniceModelSpec(BaseModel):
-    """Houses human-readable metadata and operational bounds for Venice models."""
+class VeniceImageModelSpec(BaseModel):
+    """Houses human-readable metadata and operational bounds for text-to-image models."""
 
     name: str
-    constraints: VeniceConstraints
+    constraints: VeniceImageConstraints
 
 
 class VeniceImageModel(BaseModel):
     """
-    Root validator matching Venice's payload schema.
-    Strictly asserts object type criteria to filter out non-image/non-model endpoints.
+    Root validator matching Venice's standard text-to-image metadata schema.
+    We strictly assert the type criteria to enforce standard pipeline routing.
     """
 
     id: str
     object: Literal["model"]
     type: Literal["image"]
-    model_spec: VeniceModelSpec
+    model_spec: VeniceImageModelSpec
+
+
+class VeniceInpaintConstraints(BaseModel):
+    """
+    Validation schema mapping image editing/inpainting constraints.
+    Edit models process tasks differently and require aspect ratio support without raw step limits.
+    """
+
+    promptCharacterLimit: int
+    aspectRatios: list[str]  # Enforced as mandatory for inpaint models
+    defaultAspectRatio: str | None = None
+    resolutions: list[str] | None = None
+    defaultResolution: str | None = None
+    combineImages: bool | None = None
+    singleImageAspectRatio: bool | None = None
+
+
+class VeniceInpaintModelSpec(BaseModel):
+    """Houses human-readable metadata and operational bounds for image editing/inpainting models."""
+
+    name: str
+    constraints: VeniceInpaintConstraints
+
+
+class VeniceInpaintModel(BaseModel):
+    """
+    Root validator matching Venice's image editing metadata schema.
+    Asserts the type criteria to enforce editing pipeline routing.
+    """
+
+    id: str
+    object: Literal["model"]
+    type: Literal["inpaint"]
+    model_spec: VeniceInpaintModelSpec
+
+
+# A Type Alias representing either a standard or edit model.
+# Enables clean union handling across validation and payload steps.
+VeniceModel = VeniceImageModel | VeniceInpaintModel
 
 
 class EventEmitter:
@@ -249,7 +287,7 @@ class Pipe:
         self.valves = self.Valves()
         self.log_level = self.valves.LOG_LEVEL
         self._add_log_handler()
-        self.models: list[VeniceImageModel] = []
+        self.models: list[VeniceModel] = []
 
         log.success("Function has been initialized.")
         log.trace("Full self object:", payload=self.__dict__)
@@ -272,7 +310,7 @@ class Pipe:
             # Mapped response output strictly contains only what OWUI needs, omitting description payloads
             return [{"id": m.id, "name": m.model_spec.name} for m in self.models]
         except Exception as e:
-            log.exception("Retrieval of Venice image models failed.")
+            log.exception("Retrieval of Venice image/inpaint models failed.")
             return [self._return_error_model(str(e))]
 
     async def pipe(
@@ -311,27 +349,12 @@ class Pipe:
                 emitter.emit_completion_error(error_msg)
                 return
 
-            # Lookup target model's validated Pydantic definition
+            # Lookup target model's validated Pydantic definition (image vs inpaint schema)
             model_spec = next(
                 (m for m in self.models if m.id == selected_model_id), None
             )
             if not model_spec:
                 error_msg = f"Requested model '{selected_model_id}' was not found in the initialized Venice models list."
-                log.error(error_msg)
-                emitter.emit_completion_error(error_msg)
-                return
-
-            prompt = next(
-                (
-                    msg["content"]
-                    for msg in reversed(body["messages"])
-                    if msg["role"] == "user"
-                ),
-                "",
-            )
-
-            if not prompt:
-                error_msg = "No prompt found in user message."
                 log.error(error_msg)
                 emitter.emit_completion_error(error_msg)
                 return
@@ -347,30 +370,84 @@ class Pipe:
                 )
                 return '{"tags": []}'
 
-            log.debug(f"Target model parsed: {model_spec.id}, Prompt: {prompt}")
+            # Retrieve the final user message context that triggered the pipe sequence
+            last_user_message = next(
+                (
+                    msg
+                    for msg in reversed(body.get("messages", []))
+                    if msg.get("role") == "user"
+                ),
+                None,
+            )
 
-            # 1. Functional preparation (Clamping, Downscaling, Divisor Alignments)
+            if not last_user_message:
+                error_msg = "No user message found to process."
+                log.error(error_msg)
+                emitter.emit_completion_error(error_msg)
+                return
+
+            content = last_user_message.get("content")
+            if not content:
+                error_msg = "User message has empty or missing content."
+                log.error(error_msg)
+                emitter.emit_completion_error(error_msg)
+                return
+
+            # Extracts base64 attachments alongside text prompts dynamically
+            prompt, image_url = self._extract_media_from_message(content)
+
+            if not prompt:
+                error_msg = "No valid text prompt found in the user's message."
+                log.error(error_msg)
+                emitter.emit_completion_error(error_msg)
+                return
+
+            is_edit_model = model_spec.type == "inpaint"
+
+            # Enforces explicit content checks depending on target capabilities
+            if is_edit_model:
+                if not image_url:
+                    error_msg = f"Requested editing model '{selected_model_id}' requires an attached image, but none was provided."
+                    log.error(error_msg)
+                    emitter.emit_completion_error(error_msg)
+                    return
+                log.debug(
+                    f"Target edit model parsed: {model_spec.id}, Prompt: {prompt}, Image: [Present]"
+                )
+            else:
+                log.debug(
+                    f"Target generation model parsed: {model_spec.id}, Prompt: {prompt}"
+                )
+
+            # 1. Functional preparation (Clamping, Downscaling, Alignment, Formulations)
             emitter.emit_status("Preparing image parameters...", done=False)
-            payload = self._prepare_generation_payload(model_spec, prompt)
+            if is_edit_model:
+                payload = self._prepare_edit_payload(model_spec, prompt, image_url)
+                endpoint = "/image/edit"
+            else:
+                payload = self._prepare_generation_payload(model_spec, prompt)
+                endpoint = "/image/generate"
 
             # 2. Asynchronous API Execution
-            emitter.emit_status("Generating image...", done=False)
-            image_data = await self._generate_image(payload, emitter)
+            emitter.emit_status(
+                f"Processing {'edit' if is_edit_model else 'image'}...", done=False
+            )
+            image_data = await self._execute_venice_api(endpoint, payload, emitter)
 
             success = image_data and image_data.get("images")
 
-            status_text = f"Image {'generated' if success else 'generation failed'}"
+            status_text = f"Image {'processed' if success else 'failed'}"
             emitter.emit_status(status_text, done=True)
 
             if not success:
                 return None
 
-            log.info("Image generated successfully!")
-            base64_image = image_data["images"][0]  # type: ignore
+            log.info("Image request completed successfully!")
+            base64_image = image_data["images"][0]
 
             if self.valves.USE_FILES_API:
                 image_data_bytes = base64.b64decode(base64_image)
-                image_url = await self._upload_image(
+                uploaded_url = await self._upload_image(
                     image_data_bytes,
                     "image/png",
                     model_spec.id,
@@ -378,7 +455,7 @@ class Pipe:
                     __user__["id"],
                     __request__,
                 )
-                return f"![Generated Image]({image_url})" if image_url else None
+                return f"![Generated Image]({uploaded_url})" if uploaded_url else None
             else:
                 return f"![Generated Image](data:image/png;base64,{base64_image})"
 
@@ -389,14 +466,14 @@ class Pipe:
 
     # region 1.1 Model retrieval
 
-    async def _get_models(self) -> list[VeniceImageModel]:
+    async def _get_models(self) -> list[VeniceModel]:
         """
-        Retrieves and parses image models strictly utilizing Pydantic.
-        Invalid schemas are skipped and reported to prevent runtime errors in generation steps.
+        Retrieves and parses image and inpaint models strictly utilizing Pydantic.
+        Invalid schemas are skipped and reported to prevent runtime errors in subsequent steps.
         """
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                "https://api.venice.ai/api/v1/models?type=image",
+                "https://api.venice.ai/api/v1/models?type=all",
                 headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},
             ) as response:
                 response.raise_for_status()
@@ -407,16 +484,43 @@ class Pipe:
                     log.warning("Venice API returned no models.")
                     return []
 
-                valid_models: list[VeniceImageModel] = []
+                valid_models: list[VeniceModel] = []
                 for model_dict in raw_models:
-                    try:
-                        validated = VeniceImageModel.model_validate(model_dict)
-                        valid_models.append(validated)
-                    except ValidationError as e:
-                        log.warning(
-                            f"Skipping malformed Venice model object ID '{model_dict.get('id', 'UNKNOWN')}'. "
-                            f"Validation failed: {e.errors()}"
-                        )
+                    m_type = model_dict.get("type")
+                    if m_type == "image":
+                        try:
+                            validated = VeniceImageModel.model_validate(model_dict)
+                            valid_models.append(validated)
+                        except ValidationError as e:
+                            log.warning(
+                                f"Skipping malformed image model '{model_dict.get('id', 'UNKNOWN')}'. "
+                                f"Validation failed: {e.errors()}"
+                            )
+                    elif m_type == "inpaint":
+                        try:
+                            # Assert that the image editing model constraints possess valid aspect ratio options
+                            constraints = model_dict.get("model_spec", {}).get(
+                                "constraints", {}
+                            )
+                            if (
+                                "aspectRatios" not in constraints
+                                or not constraints["aspectRatios"]
+                            ):
+                                log.warning(
+                                    f"Skipping inpaint model '{model_dict.get('id')}': Missing or empty aspectRatios constraint."
+                                )
+                                continue
+
+                            validated = VeniceInpaintModel.model_validate(model_dict)
+                            valid_models.append(validated)
+                        except ValidationError as e:
+                            log.warning(
+                                f"Skipping malformed inpaint model '{model_dict.get('id', 'UNKNOWN')}'. "
+                                f"Validation failed: {e.errors()}"
+                            )
+                    else:
+                        # Silently skip other model schemas (e.g. text/chat APIs)
+                        continue
 
                 return valid_models
 
@@ -435,7 +539,50 @@ class Pipe:
 
     # endregion 1.1 Model retrieval
 
-    # region 1.2 Image generation
+    # region 1.2 Image generation & editing
+
+    def _extract_media_from_message(
+        self, content: Any
+    ) -> tuple[str | None, str | None]:
+        """
+        Parses text prompts and base64-encoded image components from user messages.
+        Supports standard raw string payloads and complex multimedia structure arrays.
+        """
+        if isinstance(content, str):
+            return content.strip() or None, None
+
+        if not isinstance(content, list):
+            return None, None
+
+        texts: list[str] = []
+        images: list[str] = []
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text":
+                text_val = block.get("text", "")
+                if isinstance(text_val, str) and text_val.strip():
+                    texts.append(text_val.strip())
+            elif block_type == "image_url":
+                img_url_obj = block.get("image_url")
+                if isinstance(img_url_obj, dict):
+                    img_url = img_url_obj.get("url")
+                    if isinstance(img_url, str) and img_url.strip():
+                        images.append(img_url.strip())
+
+        # Grab the latest occurrence of each block type to honor user directions
+        primary_text = texts[-1] if texts else None
+        primary_image = images[-1] if images else None
+
+        if len(texts) > 1 or len(images) > 1:
+            log.warning(
+                f"Detected multiple text/image objects in the last user message. "
+                f"Using the last available blocks (Texts: {len(texts)}, Images: {len(images)})."
+            )
+
+        return primary_text, primary_image
 
     def _prepare_generation_payload(
         self, model_spec: VeniceImageModel, prompt: str
@@ -470,7 +617,6 @@ class Pipe:
         if self.valves.STEPS is not None:
             max_steps = constraints.steps.max
             if self.valves.STEPS > max_steps:
-                # TODO: emit toast messages for warnings like this
                 log.warning(
                     f"Steps setting ({self.valves.STEPS}) exceeds maximum for model ({max_steps}). Clamping."
                 )
@@ -496,7 +642,7 @@ class Pipe:
             # Aspect Ratio check
             selected_ar = self.valves.ASPECT_RATIO
             if selected_ar:
-                if selected_ar in constraints.aspectRatios: # type: ignore
+                if selected_ar in constraints.aspectRatios:  # type: ignore
                     payload["aspect_ratio"] = selected_ar
                 else:
                     fallback_ar = constraints.defaultAspectRatio or "1:1"
@@ -574,39 +720,138 @@ class Pipe:
                 payload["width"] = user_width
                 payload["height"] = user_height
 
-        log.debug(f"Deterministic Venice payload built successfully: {payload}")
+        log.debug(f"Deterministic Venice payload built successfully:", payload=payload)
         return payload
 
-    async def _generate_image(
-        self, payload: dict[str, Any], emitter: EventEmitter
+    def _clean_image_payload(self, image_url: str) -> str:
+        """
+        Strips the data URI scheme prefix (e.g., 'data:image/png;base64,') from the input URL,
+        leaving only the raw base64 data as expected by Venice's edit API.
+        If it's a standard HTTP/HTTPS link, it's left unchanged.
+        """
+        if image_url.startswith("data:"):
+            if "," in image_url:
+                # Splits only at the first comma to separate metadata headers from actual content data
+                return image_url.split(",", 1)[1]
+        return image_url
+
+    def _prepare_edit_payload(
+        self, model_spec: VeniceInpaintModel, prompt: str, image_url: str
+    ) -> dict[str, Any]:
+        """
+        Builds and validates the JSON payload for Venice.ai's image editing API (/image/edit).
+        Ensures proper aspect ratio mapping and model specific configuration bounds.
+        """
+        constraints = model_spec.model_spec.constraints
+
+        payload: dict[str, Any] = {
+            "model": model_spec.id,
+            "prompt": prompt,
+            #"image": self._clean_image_payload(image_url),
+            "image": image_url,
+            "output_format": "png",  # Match standard text-to-image formats
+        }
+
+        if self.valves.SAFE_MODE is not None:
+            payload["safe_mode"] = self.valves.SAFE_MODE
+
+        # Aspect Ratio logic: Default to 'auto' fallback if none are declared or chosen
+        selected_ar = self.valves.ASPECT_RATIO
+        if selected_ar:
+            if selected_ar in constraints.aspectRatios:
+                payload["aspect_ratio"] = selected_ar
+            else:
+                fallback_ar = constraints.defaultAspectRatio or "auto"
+                log.warning(
+                    f"Requested aspect ratio '{selected_ar}' is unsupported by '{model_spec.id}'. "
+                    f"Reverting to default/fallback: '{fallback_ar}'."
+                )
+                payload["aspect_ratio"] = fallback_ar
+        else:
+            if constraints.defaultAspectRatio:
+                payload["aspect_ratio"] = constraints.defaultAspectRatio
+            else:
+                payload["aspect_ratio"] = "auto"
+
+        # Resolution validation mapping
+        if constraints.resolutions:
+            selected_res = self.valves.RESOLUTION
+            if selected_res:
+                if selected_res in constraints.resolutions:
+                    payload["resolution"] = selected_res
+                else:
+                    fallback_res = (
+                        constraints.defaultResolution or constraints.resolutions[0]
+                    )
+                    log.warning(
+                        f"Requested resolution tier '{selected_res}' is unsupported. "
+                        f"Reverting to default: '{fallback_res}'."
+                    )
+                    payload["resolution"] = fallback_res
+            else:
+                if constraints.defaultResolution:
+                    payload["resolution"] = constraints.defaultResolution
+
+        log.debug(f"Deterministic Venice edit payload built successfully:", payload=payload)
+        return payload
+
+    async def _execute_venice_api(
+        self,
+        endpoint: Literal["/image/generate", "/image/edit"],
+        payload: dict[str, Any],
+        emitter: EventEmitter,
     ) -> dict | None:
         """
-        Dispatches the prepared payload directly to the Venice.ai endpoint.
-        Handles status-reporting side-effects and standardizes connection errors.
+        Dispatches payloads directly to the specified Venice.ai endpoints.
+        Resolves non-200 responses directly to expose precise API validation errors inside OWUI.
+        Detects binary image outputs dynamically to bypass parser breaks and map streams to unified base64 payloads.
         """
         try:
             async with aiohttp.ClientSession() as session:
                 log.info(
-                    f"Sending image generation request to Venice.ai for model: {payload.get('model')}"
+                    f"Sending request to Venice.ai {endpoint} for model: {payload.get('model')}"
                 )
                 async with session.post(
-                    "https://api.venice.ai/api/v1/image/generate",
+                    f"https://api.venice.ai/api/v1{endpoint}",
                     headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},
                     json=payload,
                 ) as response:
                     log.info(
                         f"Received response from Venice.ai with status: {response.status}"
                     )
-                    response.raise_for_status()
+                    if response.status != 200:
+                        try:
+                            err_body = await response.json()
+                            error_detail = err_body.get("error", {}).get(
+                                "message", "Unknown Venice API error."
+                            )
+                        except Exception:
+                            error_detail = await response.text()
+                        error_msg = (
+                            f"Venice API Error ({response.status}): {error_detail}"
+                        )
+                        log.error(error_msg)
+                        emitter.emit_completion_error(error_msg)
+                        return None
+
+                    content_type = response.headers.get("Content-Type", "")
+
+                    # Venice inpainting / edit API returns raw binary image data rather than JSON.
+                    # We convert this stream to base64 representation to keep the downstream pipelines uniform.
+                    if content_type.startswith("image/"):
+                        image_bytes = await response.read()
+                        base64_str = base64.b64encode(image_bytes).decode("utf-8")
+                        return {"images": [base64_str]}
+
                     return await response.json()
 
         except aiohttp.ClientResponseError as e:
-            error_msg = f"Image generation failed: {str(e)}"
+            error_msg = f"API request failed: {str(e)}"
             log.error(error_msg)
             emitter.emit_completion_error(error_msg)
             return None
         except Exception as e:
-            error_msg = f"Generation error: {str(e)}"
+            error_msg = f"Network or execution error: {str(e)}"
             log.error(error_msg)
             emitter.emit_completion_error(error_msg)
             return None
@@ -677,7 +922,7 @@ class Pipe:
         )
         return image_url
 
-    # endregion 1.2 Image generation
+    # endregion 1.2 Image generation & editing
 
     # region 1.3 Logging
     def _is_flat_dict(self, data: Any) -> bool:
