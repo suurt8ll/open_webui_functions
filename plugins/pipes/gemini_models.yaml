@@ -5,6 +5,78 @@
 
 
 
+gemini-3.6-flash:
+  description: "Our most token-efficient Flash model, combining frontier intelligence with strong agentic, coding, and search performance while using significantly fewer output tokens than Gemini 3.5 Flash, at a lower price."
+  knowledge_cutoff: "2026-03"
+  latest_update: "2026-07"
+  supported_data_types:
+    inputs: [Text, Image, Video, Audio, PDF]
+    outputs: [Text]
+  tokens:
+    input: 1048576
+    output: 65536
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: true
+    code_execution: true
+    file_search: true
+    function_calling: true
+    grounding_google_maps: true
+    image_generation: false
+    live_api: false
+    search_grounding: true
+    structured_outputs: true
+    thinking: true
+    url_context: true
+  pricing:
+    free_tier: true
+    excluded_features: [search_grounding, grounding_google_maps]
+    input:
+      - up_to_tokens: null
+        price_per_million: 1.50
+    output:
+      - up_to_tokens: null
+        price_per_million: 7.50
+    caching:
+      - up_to_tokens: null
+        price_per_million: 0.15
+gemini-3.5-flash-lite:
+  description: "A high-efficiency, low-latency model with upgraded agentic capabilities, optimized for cost-effective, high-throughput workloads."
+  knowledge_cutoff: "2026-03"
+  latest_update: "2026-07"
+  supported_data_types:
+    inputs: [Text, Image, Video, Audio, PDF]
+    outputs: [Text]
+  tokens:
+    input: 1048576
+    output: 65536
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: true
+    code_execution: true
+    file_search: true
+    function_calling: true
+    grounding_google_maps: false
+    image_generation: false
+    live_api: false
+    search_grounding: true
+    structured_outputs: true
+    thinking: true
+    url_context: true
+  pricing:
+    free_tier: true
+    excluded_features: [search_grounding]
+    input:
+      - up_to_tokens: null
+        price_per_million: 0.30
+    output:
+      - up_to_tokens: null
+        price_per_million: 2.50
+    caching:
+      - up_to_tokens: null
+        price_per_million: 0.03
 gemini-3.5-flash:
   description: "Gemini 3.5 Flash provides sustained frontier-level intelligence optimized for real-world tasks at a higher speed and lower cost. Designed for the agentic era, it excels at sub-agent deployment, multi-step workflows, and long-horizon tasks at scale. This model is particularly effective for rapid agentic loops involving complex coding cycles and iterations."
   knowledge_cutoff: "2025-01"
