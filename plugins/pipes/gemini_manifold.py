@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 2.1.0
-requirements: google-genai==2.8.0
+requirements: google-genai==2.8.0, pikepdf
 """
 
 # I change these only when I make a release to avoid PR merge conflicts.
@@ -29,8 +29,6 @@ RECOMMENDED_COMPANION_VERSION = "2.1.0"
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
-from google.cloud import storage
-from google.api_core import exceptions
 
 import time
 import copy
@@ -54,6 +52,11 @@ import re
 import fnmatch
 import sys
 import difflib
+import os
+import shutil
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 from loguru import logger
 from fastapi import Request, FastAPI
 import pydantic_core
@@ -127,6 +130,41 @@ SPECIAL_TAGS_TO_DISABLE = [
     "|begin_of_solution|",
 ]
 ZWS = "\u200b"
+GEMINI_PDF_MAX_BYTES: Final = 50 * 1024 * 1024
+GEMINI_PDF_SAFE_TARGET_BYTES: Final = 48 * 1024 * 1024
+GEMINI_PDF_MAX_PAGES: Final = 1000
+GEMINI_PDF_MITIGATION_CACHE_TTL_SECONDS: Final = 6 * 60 * 60
+GEMINI_PDF_MITIGATION_CACHE_DIR_NAME: Final = "open_webui_gemini_pdf_mitigation"
+GEMINI_PDF_PROCESSING_CONCURRENCY: Final = 1
+
+
+@dataclass(frozen=True)
+class PreparedPDFPart:
+    path: str
+    size: int
+    start_page: int
+    end_page: int
+
+
+@dataclass(frozen=True)
+class PreparedPDFResult:
+    parts: list[PreparedPDFPart]
+    page_count: int
+    was_mitigated: bool
+
+
+@dataclass(frozen=True)
+class PDFMitigationOutcome:
+    original_hash: str
+    result: PreparedPDFResult
+
+
+@dataclass(frozen=True)
+class LocalFileSource:
+    file_bytes: bytes | None
+    file_path: str | None
+    mime_type: str
+    is_temp: bool = False
 
 
 class GenaiApiError(Exception):
@@ -139,6 +177,368 @@ class FilesAPIError(Exception):
     """Custom exception for errors during Files API operations."""
 
     pass
+
+
+class PDFProcessingError(Exception):
+    """Raised when a PDF cannot be prepared within Gemini API limits."""
+
+    pass
+
+
+class ContentBuildError(Exception):
+    """Raised when request content cannot be prepared for Gemini."""
+
+    pass
+
+
+class GeminiPDFProcessor:
+    """
+    Prepares PDFs for Gemini's per-document limits.
+
+    The processor keeps the PDF as a PDF. It removes page thumbnail entries and
+    saves with compressed streams/object streams, then splits by page range when
+    either the byte or page limit still requires it.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_bytes: int = GEMINI_PDF_MAX_BYTES,
+        target_bytes: int = GEMINI_PDF_SAFE_TARGET_BYTES,
+        max_pages: int = GEMINI_PDF_MAX_PAGES,
+    ):
+        self.max_bytes = max_bytes
+        self.target_bytes = min(target_bytes, max_bytes)
+        self.max_pages = max_pages
+
+    def prepare(self, file_bytes: bytes) -> tuple[list[bytes], int, bool]:
+        """
+        Backward-compatible byte API used by focused tests and raw fallback paths.
+        Production PDF mitigation uses prepare_to_directory() to avoid retaining
+        optimized/split chunks in memory.
+        """
+        pikepdf = self._get_pikepdf()
+        page_count = self._count_pages(pikepdf, file_bytes)
+
+        if len(file_bytes) <= self.max_bytes and page_count <= self.max_pages:
+            return [file_bytes], page_count, False
+
+        optimized_bytes = self._optimize_pdf(pikepdf, file_bytes)
+        optimized_page_count = self._count_pages(pikepdf, optimized_bytes)
+
+        if (
+            len(optimized_bytes) <= self.max_bytes
+            and optimized_page_count <= self.max_pages
+        ):
+            return [optimized_bytes], optimized_page_count, True
+
+        chunks = self._split_pdf(pikepdf, optimized_bytes)
+        return chunks, optimized_page_count, True
+
+    def prepare_to_directory(
+        self,
+        source_path: str,
+        output_dir: str,
+        *,
+        source_size: int | None = None,
+    ) -> PreparedPDFResult:
+        pikepdf = self._get_pikepdf()
+        source_size = (
+            source_size if source_size is not None else os.path.getsize(source_path)
+        )
+        page_count = self._count_pages_from_path(pikepdf, source_path)
+
+        if source_size <= self.max_bytes and page_count <= self.max_pages:
+            return PreparedPDFResult([], page_count, False)
+
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        if source_size <= self.max_bytes and page_count > self.max_pages:
+            parts = self._split_pdf_to_directory(
+                pikepdf,
+                source_path,
+                str(output_path),
+                source_size=source_size,
+                total_pages=page_count,
+            )
+            return PreparedPDFResult(parts, page_count, True)
+
+        optimized_path = str(output_path / "optimized.pdf")
+        self._optimize_pdf_to_path(pikepdf, source_path, optimized_path)
+        optimized_size = os.path.getsize(optimized_path)
+        optimized_page_count = self._count_pages_from_path(pikepdf, optimized_path)
+
+        if optimized_size <= self.max_bytes and optimized_page_count <= self.max_pages:
+            return PreparedPDFResult(
+                [
+                    PreparedPDFPart(
+                        path=optimized_path,
+                        size=optimized_size,
+                        start_page=1,
+                        end_page=optimized_page_count,
+                    )
+                ],
+                optimized_page_count,
+                True,
+            )
+
+        parts = self._split_pdf_to_directory(
+            pikepdf,
+            optimized_path,
+            str(output_path),
+            source_size=optimized_size,
+            total_pages=optimized_page_count,
+        )
+        if os.path.exists(optimized_path):
+            os.remove(optimized_path)
+        return PreparedPDFResult(parts, optimized_page_count, True)
+
+    @staticmethod
+    def _get_pikepdf() -> Any:
+        try:
+            import pikepdf
+        except ImportError as e:
+            raise PDFProcessingError(
+                "PDF mitigation requires the 'pikepdf' package. "
+                "Install the plugin requirements and try again."
+            ) from e
+        return pikepdf
+
+    @staticmethod
+    def _open_pdf(pikepdf: Any, file_bytes: bytes) -> Any:
+        try:
+            return pikepdf.open(io.BytesIO(file_bytes))
+        except Exception as e:
+            raise PDFProcessingError(f"Could not open PDF for processing: {e}") from e
+
+    def _count_pages(self, pikepdf: Any, file_bytes: bytes) -> int:
+        with self._open_pdf(pikepdf, file_bytes) as pdf:
+            return len(pdf.pages)
+
+    @staticmethod
+    def _open_pdf_path(pikepdf: Any, file_path: str) -> Any:
+        try:
+            return pikepdf.open(file_path)
+        except Exception as e:
+            raise PDFProcessingError(f"Could not open PDF for processing: {e}") from e
+
+    def _count_pages_from_path(self, pikepdf: Any, file_path: str) -> int:
+        with self._open_pdf_path(pikepdf, file_path) as pdf:
+            return len(pdf.pages)
+
+    def _optimize_pdf(self, pikepdf: Any, file_bytes: bytes) -> bytes:
+        with self._open_pdf(pikepdf, file_bytes) as pdf:
+            self._remove_page_thumbnails(pikepdf, pdf)
+            return self._save_pdf(pikepdf, pdf)
+
+    def _optimize_pdf_to_path(
+        self, pikepdf: Any, source_path: str, destination_path: str
+    ) -> None:
+        with self._open_pdf_path(pikepdf, source_path) as pdf:
+            self._remove_page_thumbnails(pikepdf, pdf)
+            self._save_pdf_to_path(pikepdf, pdf, destination_path)
+
+    @staticmethod
+    def _remove_page_thumbnails(pikepdf: Any, pdf: Any) -> int:
+        removed = 0
+        thumb_name = pikepdf.Name("/Thumb")
+        for page in pdf.pages:
+            if thumb_name in page.obj:
+                del page.obj[thumb_name]
+                removed += 1
+        return removed
+
+    @staticmethod
+    def _save_pdf(pikepdf: Any, pdf: Any) -> bytes:
+        buffer = io.BytesIO()
+        save_kwargs = {
+            "compress_streams": True,
+            "object_stream_mode": pikepdf.ObjectStreamMode.generate,
+            "recompress_flate": True,
+        }
+        try:
+            pdf.save(buffer, **save_kwargs)
+        except TypeError:
+            save_kwargs.pop("recompress_flate", None)
+            buffer = io.BytesIO()
+            pdf.save(buffer, **save_kwargs)
+        return buffer.getvalue()
+
+    @staticmethod
+    def _save_pdf_to_path(pikepdf: Any, pdf: Any, destination_path: str) -> None:
+        save_kwargs = {
+            "compress_streams": True,
+            "object_stream_mode": pikepdf.ObjectStreamMode.generate,
+            "recompress_flate": True,
+        }
+        try:
+            pdf.save(destination_path, **save_kwargs)
+        except TypeError:
+            save_kwargs.pop("recompress_flate", None)
+            pdf.save(destination_path, **save_kwargs)
+
+    def _split_pdf(self, pikepdf: Any, file_bytes: bytes) -> list[bytes]:
+        with self._open_pdf(pikepdf, file_bytes) as pdf:
+            total_pages = len(pdf.pages)
+            chunks: list[bytes] = []
+            start = 0
+
+            while start < total_pages:
+                remaining_pages = total_pages - start
+                high = min(self.max_pages, remaining_pages)
+                best_chunk: bytes | None = None
+                best_page_count = 0
+                low = 1
+
+                while low <= high:
+                    page_count = (low + high) // 2
+                    candidate = self._save_page_range(
+                        pikepdf, pdf, start, start + page_count
+                    )
+
+                    if len(candidate) <= self.target_bytes:
+                        best_chunk = candidate
+                        best_page_count = page_count
+                        low = page_count + 1
+                    else:
+                        high = page_count - 1
+
+                if best_chunk is None:
+                    single_page = self._save_page_range(pikepdf, pdf, start, start + 1)
+                    if len(single_page) > self.max_bytes:
+                        raise PDFProcessingError(
+                            "A single PDF page remains larger than Gemini's 50 MB "
+                            "per-document limit after compression. This PDF cannot "
+                            "be sent without lossy page/image downsampling."
+                        )
+                    best_chunk = single_page
+                    best_page_count = 1
+
+                chunks.append(best_chunk)
+                start += best_page_count
+
+        return chunks
+
+    def _split_pdf_to_directory(
+        self,
+        pikepdf: Any,
+        source_path: str,
+        output_dir: str,
+        *,
+        source_size: int,
+        total_pages: int,
+    ) -> list[PreparedPDFPart]:
+        with self._open_pdf_path(pikepdf, source_path) as pdf:
+            parts: list[PreparedPDFPart] = []
+            start = 0
+            average_page_bytes = max(1.0, source_size / max(1, total_pages))
+            estimated_pages = max(
+                1,
+                min(
+                    self.max_pages,
+                    int((self.target_bytes / average_page_bytes) * 0.92),
+                ),
+            )
+
+            while start < total_pages:
+                remaining_pages = total_pages - start
+                page_count = min(self.max_pages, estimated_pages, remaining_pages)
+
+                while True:
+                    part_number = len(parts) + 1
+                    start_page = start + 1
+                    end_page = start + page_count
+                    candidate_path = os.path.join(
+                        output_dir, f"part-{part_number:04d}.tmp.pdf"
+                    )
+                    self._save_page_range_to_path(
+                        pikepdf, pdf, start, start + page_count, candidate_path
+                    )
+                    candidate_size = os.path.getsize(candidate_path)
+
+                    if candidate_size <= self.target_bytes:
+                        final_path = os.path.join(
+                            output_dir,
+                            f"part-{part_number:04d}-pages-{start_page:06d}-{end_page:06d}.pdf",
+                        )
+                        os.replace(candidate_path, final_path)
+                        parts.append(
+                            PreparedPDFPart(
+                                path=final_path,
+                                size=candidate_size,
+                                start_page=start_page,
+                                end_page=end_page,
+                            )
+                        )
+                        start += page_count
+                        average_page_bytes = max(
+                            1.0,
+                            (
+                                (average_page_bytes * max(1, total_pages))
+                                + (candidate_size / page_count)
+                            )
+                            / (max(1, total_pages) + 1),
+                        )
+                        estimated_pages = max(
+                            1,
+                            min(
+                                self.max_pages,
+                                int((self.target_bytes / average_page_bytes) * 0.92),
+                            ),
+                        )
+                        break
+
+                    if page_count == 1:
+                        if candidate_size > self.max_bytes:
+                            raise PDFProcessingError(
+                                "A single PDF page remains larger than Gemini's 50 MB "
+                                "per-document limit after compression. This PDF cannot "
+                                "be sent without lossy page/image downsampling."
+                            )
+                        final_path = os.path.join(
+                            output_dir,
+                            f"part-{part_number:04d}-pages-{start_page:06d}-{end_page:06d}.pdf",
+                        )
+                        os.replace(candidate_path, final_path)
+                        parts.append(
+                            PreparedPDFPart(
+                                path=final_path,
+                                size=candidate_size,
+                                start_page=start_page,
+                                end_page=end_page,
+                            )
+                        )
+                        start += 1
+                        break
+
+                    next_count = int(
+                        page_count * (self.target_bytes / candidate_size) * 0.88
+                    )
+                    page_count = max(1, min(page_count - 1, next_count))
+
+        return parts
+
+    def _save_page_range(
+        self, pikepdf: Any, source_pdf: Any, start: int, stop: int
+    ) -> bytes:
+        chunk_pdf = pikepdf.Pdf.new()
+        chunk_pdf.pages.extend(source_pdf.pages[start:stop])
+        self._remove_page_thumbnails(pikepdf, chunk_pdf)
+        return self._save_pdf(pikepdf, chunk_pdf)
+
+    def _save_page_range_to_path(
+        self,
+        pikepdf: Any,
+        source_pdf: Any,
+        start: int,
+        stop: int,
+        destination_path: str,
+    ) -> None:
+        chunk_pdf = pikepdf.Pdf.new()
+        chunk_pdf.pages.extend(source_pdf.pages[start:stop])
+        self._remove_page_thumbnails(pikepdf, chunk_pdf)
+        self._save_pdf_to_path(pikepdf, chunk_pdf, destination_path)
 
 
 class UploadStatusManager:
@@ -447,6 +847,127 @@ class FilesAPIManager:
 
         return content_hash
 
+    async def get_or_upload_file_from_path(
+        self,
+        file_path: str,
+        mime_type: str,
+        *,
+        owui_file_id: str | None = None,
+        status_queue: asyncio.Queue | None = None,
+    ) -> types.File:
+        content_hash = await self._get_content_hash_from_path(file_path, owui_file_id)
+        file_cache_key = self._get_file_cache_key(content_hash)
+        cached_file: types.File | None = await self.file_cache.get(file_cache_key)
+        if cached_file:
+            log_id = f"OWUI ID: {owui_file_id}" if owui_file_id else "anonymous file"
+            log.debug(
+                f"Cache HIT for file hash {content_hash} ({log_id}). Returning immediately."
+            )
+            return cached_file
+
+        lock_key = self._get_lock_key(content_hash)
+        lock = self.upload_locks.setdefault(lock_key, asyncio.Lock())
+        if lock.locked():
+            log.debug(
+                f"Lock for key {lock_key} is held by another task. "
+                f"This call will now wait for the lock to be released."
+            )
+
+        async with lock:
+            cached_file = await self.file_cache.get(file_cache_key)
+            if cached_file:
+                log.debug(
+                    f"Cache HIT for file hash {content_hash} after acquiring lock. Returning."
+                )
+                return cached_file
+
+            deterministic_name = f"files/owui-{self.api_key_hash}-{content_hash}"
+            log.debug(
+                f"Cache MISS for hash {content_hash}. Attempting stateless recovery with GET: {deterministic_name}"
+            )
+
+            try:
+                file = await self.client.aio.files.get(name=deterministic_name)
+                if not file.name:
+                    raise FilesAPIError(
+                        f"Stateless recovery for {deterministic_name} returned a file without a name."
+                    )
+
+                log.debug(
+                    f"Stateless recovery successful for {deterministic_name}. File exists on server."
+                )
+                active_file = await self._poll_for_active_state(file.name, owui_file_id)
+
+                ttl_seconds = self._calculate_ttl(active_file.expiration_time)
+                await self.file_cache.set(file_cache_key, active_file, ttl=ttl_seconds)
+
+                return active_file
+            except genai_errors.ClientError as e:
+                if e.code == 403 or e.code == 404:
+                    log.info(
+                        f"File {deterministic_name} not found on server (received {e.code}). Proceeding to upload."
+                    )
+                    return await self._upload_and_process_file_from_path(
+                        content_hash,
+                        file_path,
+                        mime_type,
+                        deterministic_name,
+                        owui_file_id,
+                        status_queue,
+                    )
+                else:
+                    log.exception(
+                        f"An unhandled client error (code: {e.code}) occurred during stateless recovery for {deterministic_name}."
+                    )
+                    self.event_emitter.emit_toast(
+                        f"API error for file: {e.code}. Please check permissions.",
+                        "error",
+                    )
+                    raise FilesAPIError(
+                        f"Failed to check file status for {deterministic_name}: {e}"
+                    ) from e
+            except Exception as e:
+                log.exception(
+                    f"An unexpected error occurred during stateless recovery for {deterministic_name}."
+                )
+                self.event_emitter.emit_toast(
+                    "Unexpected error retrieving a file. Please try again.",
+                    "error",
+                )
+                raise FilesAPIError(
+                    f"Failed to check file status for {deterministic_name}: {e}"
+                ) from e
+            finally:
+                if lock_key in self.upload_locks:
+                    del self.upload_locks[lock_key]
+
+    async def _get_content_hash_from_path(
+        self, file_path: str, owui_file_id: str | None
+    ) -> str:
+        if owui_file_id:
+            cached_hash: str | None = await self.id_hash_cache.get(owui_file_id)
+            if cached_hash:
+                log.trace(f"Hash cache HIT for OWUI ID {owui_file_id}.")
+                return cached_hash
+
+        log.trace(
+            f"Hash cache MISS for OWUI ID {owui_file_id if owui_file_id else 'N/A'}. Computing hash from path."
+        )
+        content_hash = await asyncio.to_thread(self._hash_file_path, file_path)
+
+        if owui_file_id:
+            await self.id_hash_cache.set(owui_file_id, content_hash)
+
+        return content_hash
+
+    @staticmethod
+    def _hash_file_path(file_path: str) -> str:
+        digest = xxhash.xxh64()
+        with open(file_path, "rb") as file:
+            while chunk := file.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
     def _calculate_ttl(self, expiration_time: datetime | None) -> float | None:
         """Calculates the TTL in seconds from an expiration datetime."""
         if not expiration_time:
@@ -457,6 +978,76 @@ class FilesAPIManager:
             return 0
 
         return (expiration_time - now_utc).total_seconds()
+
+    @staticmethod
+    def _is_already_exists_error(error: Exception) -> bool:
+        if not isinstance(error, genai_errors.ClientError):
+            return False
+        return error.code == 409 or getattr(error, "status", "") == "ALREADY_EXISTS"
+
+    async def _cache_active_file(
+        self, content_hash: str, active_file: types.File
+    ) -> None:
+        ttl_seconds = self._calculate_ttl(active_file.expiration_time)
+        file_cache_key = self._get_file_cache_key(content_hash)
+        await self.file_cache.set(file_cache_key, active_file, ttl=ttl_seconds)
+        log.debug(
+            f"Cached file object for hash {content_hash} with TTL: {ttl_seconds}s."
+        )
+
+    async def _recover_after_upload_conflict(
+        self,
+        content_hash: str,
+        deterministic_name: str,
+        owui_file_id: str | None,
+        *,
+        attempts: int = 5,
+        retry_delay: float = 0.5,
+    ) -> types.File:
+        """
+        Recover when deterministic create reports ALREADY_EXISTS.
+
+        The Files API can reject create with 409 for a deterministic name even
+        after the preceding stateless GET did not return the file. Treat the
+        conflict as an idempotent success path by fetching the existing object,
+        allowing a short retry window for service-side consistency.
+        """
+        log.info(
+            f"Upload conflict for {deterministic_name}; attempting to reuse existing file."
+        )
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                file = await self.client.aio.files.get(name=deterministic_name)
+                if not file.name:
+                    raise FilesAPIError(
+                        f"Conflict recovery for {deterministic_name} returned a file without a name."
+                    )
+
+                if file.state == types.FileState.ACTIVE:
+                    active_file = file
+                else:
+                    active_file = await self._poll_for_active_state(
+                        file.name, owui_file_id
+                    )
+
+                await self._cache_active_file(content_hash, active_file)
+                return active_file
+            except FilesAPIError:
+                raise
+            except Exception as e:
+                last_error = e
+                if attempt == attempts:
+                    break
+                log.debug(
+                    f"Conflict recovery GET for {deterministic_name} failed "
+                    f"on attempt {attempt}/{attempts}; retrying."
+                )
+                await asyncio.sleep(retry_delay)
+
+        raise FilesAPIError(
+            f"Upload conflict recovery failed for {deterministic_name}: {last_error}"
+        ) from last_error
 
     async def _upload_and_process_file(
         self,
@@ -507,15 +1098,20 @@ class FilesAPIManager:
                 )
                 log.debug(f"File {active_file.name} is now ACTIVE.")
 
-            # Calculate TTL and set in the main file cache using the content hash as the key.
-            ttl_seconds = self._calculate_ttl(active_file.expiration_time)
-            file_cache_key = self._get_file_cache_key(content_hash)
-            await self.file_cache.set(file_cache_key, active_file, ttl=ttl_seconds)
-            log.debug(
-                f"Cached new file object for hash {content_hash} with TTL: {ttl_seconds}s."
-            )
+            await self._cache_active_file(content_hash, active_file)
 
             return active_file
+        except genai_errors.ClientError as e:
+            if self._is_already_exists_error(e):
+                return await self._recover_after_upload_conflict(
+                    content_hash, deterministic_name, owui_file_id
+                )
+            log.exception(f"File upload or processing failed for {deterministic_name}.")
+            self.event_emitter.emit_toast(
+                "Upload failed for a file. Please check connection and try again.",
+                "error",
+            )
+            raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
         except Exception as e:
             log.exception(f"File upload or processing failed for {deterministic_name}.")
             self.event_emitter.emit_toast(
@@ -526,6 +1122,77 @@ class FilesAPIManager:
         finally:
             # Report completion (success or failure) to the status manager.
             # This ensures the progress counter always advances.
+            if status_queue:
+                await status_queue.put(("COMPLETE_UPLOAD",))
+
+    async def _upload_and_process_file_from_path(
+        self,
+        content_hash: str,
+        file_path: str,
+        mime_type: str,
+        deterministic_name: str,
+        owui_file_id: str | None,
+        status_queue: asyncio.Queue | None = None,
+    ) -> types.File:
+        """Uploads a local file without first loading the full payload into memory."""
+
+        if status_queue:
+            await status_queue.put(("REGISTER_UPLOAD",))
+
+        log.info(f"Starting upload for {deterministic_name} from local path...")
+
+        try:
+            upload_config = types.UploadFileConfig(
+                name=deterministic_name, mime_type=mime_type
+            )
+            with open(file_path, "rb") as file_io:
+                uploaded_file = await self.client.aio.files.upload(
+                    file=file_io, config=upload_config
+                )
+            if not uploaded_file.name:
+                raise FilesAPIError(
+                    f"File upload for {deterministic_name} did not return a file name."
+                )
+
+            log.debug(f"{uploaded_file.name} uploaded.")
+            log.trace("Uploaded file details:", payload=uploaded_file)
+
+            if uploaded_file.state == types.FileState.ACTIVE:
+                log.debug(
+                    f"File {uploaded_file.name} is already ACTIVE. Skipping poll."
+                )
+                active_file = uploaded_file
+            else:
+                log.debug(
+                    f"{uploaded_file.name} uploaded with state {uploaded_file.state}. Polling for ACTIVE state."
+                )
+                active_file = await self._poll_for_active_state(
+                    uploaded_file.name, owui_file_id
+                )
+                log.debug(f"File {active_file.name} is now ACTIVE.")
+
+            await self._cache_active_file(content_hash, active_file)
+
+            return active_file
+        except genai_errors.ClientError as e:
+            if self._is_already_exists_error(e):
+                return await self._recover_after_upload_conflict(
+                    content_hash, deterministic_name, owui_file_id
+                )
+            log.exception(f"File upload or processing failed for {deterministic_name}.")
+            self.event_emitter.emit_toast(
+                "Upload failed for a file. Please check connection and try again.",
+                "error",
+            )
+            raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
+        except Exception as e:
+            log.exception(f"File upload or processing failed for {deterministic_name}.")
+            self.event_emitter.emit_toast(
+                "Upload failed for a file. Please check connection and try again.",
+                "error",
+            )
+            raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
+        finally:
             if status_queue:
                 await status_queue.put(("COMPLETE_UPLOAD",))
 
@@ -571,6 +1238,186 @@ class FilesAPIManager:
         )
 
 
+class PDFMitigationManager:
+    """Coordinates PDF source files, cache entries, and serialized processing."""
+
+    def __init__(
+        self,
+        *,
+        cache: SimpleMemoryCache | None = None,
+        processing_semaphore: asyncio.Semaphore | None = None,
+    ):
+        self.cache = cache or SimpleMemoryCache(serializer=NullSerializer())
+        self.locks: dict[str, asyncio.Lock] = {}
+        self.processing_semaphore = processing_semaphore or asyncio.Semaphore(
+            GEMINI_PDF_PROCESSING_CONCURRENCY
+        )
+
+    async def prepare(
+        self,
+        *,
+        file_bytes: bytes | None,
+        file_path: str | None,
+    ) -> PDFMitigationOutcome | None:
+        if file_path:
+            original_hash = await asyncio.to_thread(
+                FilesAPIManager._hash_file_path, file_path
+            )
+            return PDFMitigationOutcome(
+                original_hash=original_hash,
+                result=await self._get_or_prepare(
+                    file_path,
+                    original_hash,
+                    source_size=os.path.getsize(file_path),
+                ),
+            )
+
+        if not file_bytes:
+            return None
+
+        original_hash = xxhash.xxh64(file_bytes).hexdigest()
+        cached_result = await self._get_cached_result(original_hash)
+        if cached_result:
+            return PDFMitigationOutcome(
+                original_hash=original_hash,
+                result=cached_result,
+            )
+
+        source_path = self._write_temp_source(original_hash, file_bytes)
+        try:
+            result = await self._get_or_prepare(
+                source_path,
+                original_hash,
+                source_size=len(file_bytes),
+            )
+        finally:
+            self._remove_temp_source(source_path)
+
+        return PDFMitigationOutcome(original_hash=original_hash, result=result)
+
+    async def _get_or_prepare(
+        self,
+        source_path: str,
+        original_hash: str,
+        *,
+        source_size: int,
+    ) -> PreparedPDFResult:
+        cached_result = await self._get_cached_result(original_hash)
+        if cached_result:
+            return cached_result
+
+        log.debug(f"PDF mitigation cache MISS for source hash {original_hash}.")
+        lock = self.locks.setdefault(original_hash, asyncio.Lock())
+        async with lock:
+            cached_result = await self._get_cached_result(original_hash)
+            if cached_result:
+                log.debug(
+                    f"PDF mitigation cache HIT for source hash {original_hash} after lock."
+                )
+                return cached_result
+
+            cache_key = self._cache_key(original_hash)
+            cache_dir = self._cache_dir(original_hash)
+            self._cleanup_stale_cache_dirs()
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            processor = GeminiPDFProcessor()
+            async with self.processing_semaphore:
+                result = await asyncio.to_thread(
+                    processor.prepare_to_directory,
+                    source_path,
+                    str(cache_dir),
+                    source_size=source_size,
+                )
+
+            if result.was_mitigated:
+                await self.cache.set(
+                    cache_key,
+                    result,
+                    ttl=GEMINI_PDF_MITIGATION_CACHE_TTL_SECONDS,
+                )
+                log.debug(
+                    f"Cached PDF mitigation result for source hash {original_hash} "
+                    f"with {len(result.parts)} processed PDF(s)."
+                )
+            elif cache_dir.exists():
+                shutil.rmtree(cache_dir)
+
+            return result
+
+    async def _get_cached_result(self, original_hash: str) -> PreparedPDFResult | None:
+        cached_result = await self.cache.get(self._cache_key(original_hash))
+        if self._cached_result_is_valid(cached_result):
+            log.debug(f"PDF mitigation cache HIT for source hash {original_hash}.")
+            return cached_result
+        return None
+
+    @staticmethod
+    def _cache_key(original_hash: str) -> str:
+        return f"pdf_mitigation:{original_hash}"
+
+    @staticmethod
+    def _cached_result_is_valid(value: Any) -> bool:
+        if not isinstance(value, PreparedPDFResult):
+            return False
+        if not value.was_mitigated:
+            return True
+        return bool(value.parts) and all(
+            os.path.exists(part.path) for part in value.parts
+        )
+
+    @staticmethod
+    def _cache_root() -> Path:
+        return Path(tempfile.gettempdir()) / GEMINI_PDF_MITIGATION_CACHE_DIR_NAME
+
+    def _cache_dir(self, original_hash: str) -> Path:
+        return self._cache_root() / original_hash
+
+    def _cleanup_stale_cache_dirs(self) -> None:
+        cache_root = self._cache_root()
+        if not cache_root.exists():
+            return
+        cutoff = time.time() - GEMINI_PDF_MITIGATION_CACHE_TTL_SECONDS
+        for path in cache_root.iterdir():
+            try:
+                if path.is_dir() and path.stat().st_mtime < cutoff:
+                    shutil.rmtree(path)
+                elif (
+                    path.is_file()
+                    and path.name.startswith("source-")
+                    and path.stat().st_mtime < cutoff
+                ):
+                    path.unlink()
+            except Exception:
+                log.exception(
+                    f"Could not clean stale PDF mitigation cache path {path}."
+                )
+
+    @staticmethod
+    def _write_temp_source(original_hash: str, file_bytes: bytes) -> str:
+        temp_dir = PDFMitigationManager._cache_root()
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f"source-{original_hash}-",
+            suffix=".pdf",
+            dir=temp_dir,
+        )
+        with os.fdopen(fd, "wb") as file:
+            file.write(file_bytes)
+        return temp_path
+
+    @staticmethod
+    def _remove_temp_source(source_path: str) -> None:
+        try:
+            os.remove(source_path)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            log.exception(f"Could not remove temporary PDF source {source_path}.")
+
+
 class GeminiContentBuilder:
     """Builds a list of `google.genai.types.Content` objects from the OWUI's body payload."""
 
@@ -582,6 +1429,7 @@ class GeminiContentBuilder:
         event_emitter: "EventEmitter",
         valves: "Pipe.Valves",
         files_api_manager: "FilesAPIManager",
+        pdf_mitigation_manager: PDFMitigationManager,
     ):
         self.messages_body = messages_body
         self.upload_documents = (metadata_body.get("features", {}) or {}).get(
@@ -592,6 +1440,7 @@ class GeminiContentBuilder:
         self.event_emitter = event_emitter
         self.valves = valves
         self.files_api_manager = files_api_manager
+        self.pdf_mitigation_manager = pdf_mitigation_manager
         # FIXME: chat id could be `None`, leading to an iteration error.
         self.is_temp_chat = "local" in metadata_body.get("chat_id", "")
         self.vertexai = self.files_api_manager.client.vertexai
@@ -647,14 +1496,18 @@ class GeminiContentBuilder:
 
         # 5. Filter and assemble the final contents list.
         contents: list[types.Content] = []
+        content_errors: list[Exception] = []
         for i, res in enumerate(results):
             if isinstance(res, types.Content):
                 contents.append(res)
             elif isinstance(res, Exception):
+                content_errors.append(res)
                 log.error(
                     f"An error occurred while processing message {i} concurrently.",
                     payload=res,
                 )
+        if content_errors:
+            raise ContentBuildError(str(content_errors[0])) from content_errors[0]
         return contents
 
     def _retrieve_previous_usage_data(self) -> tuple[int | None, float | None]:
@@ -874,14 +1727,21 @@ class GeminiContentBuilder:
                     # just the UUID, which isn't fetchable on its own.
                     if file_id := file.get("id"):
                         uri = f"/api/v1/files/{file_id}/content"
-                        upload_tasks.append(self._genai_part_from_uri(uri, status_queue))
+                        upload_tasks.append(
+                            self._genai_parts_from_uri(
+                                uri,
+                                status_queue,
+                                source_name=file.get("name"),
+                            )
+                        )
                     else:
                         log.warning("Could not determine ID for file in DB.", payload=file)
 
                 if upload_tasks:
                     log.info(f"Processing {len(upload_tasks)} file(s) from database.")
                     results = await asyncio.gather(*upload_tasks)
-                    user_parts.extend(part for part in results if part)
+                    for result in results:
+                        user_parts.extend(result)
 
         # Now, process the content from the message payload.
         user_content = message.get("content")
@@ -912,8 +1772,9 @@ class GeminiContentBuilder:
                 log.info("Processing image from payload (temporary chat mode).")
                 c = cast("ImageContent", c)
                 if uri := c.get("image_url", {}).get("url"):
-                    if part := await self._genai_part_from_uri(uri, status_queue):
-                        user_parts.append(part)
+                    user_parts.extend(
+                        await self._genai_parts_from_uri(uri, status_queue)
+                    )
 
         return user_parts
 
@@ -1099,8 +1960,8 @@ class GeminiContentBuilder:
                 continue
 
             # Delegate all URI processing to the unified helper
-            if media_part := await self._genai_part_from_uri(uri, status_queue):
-                parts.append(media_part)
+            media_parts = await self._genai_parts_from_uri(uri, status_queue)
+            parts.extend(media_parts)
 
             last_pos = match.end()
 
@@ -1114,20 +1975,25 @@ class GeminiContentBuilder:
 
         return parts
 
-    async def _genai_part_from_uri(
-        self, uri: str, status_queue: asyncio.Queue
-    ) -> types.Part | None:
+    async def _genai_parts_from_uri(
+        self,
+        uri: str,
+        status_queue: asyncio.Queue,
+        source_name: str | None = None,
+    ) -> list[types.Part]:
         """
-        Processes any resource URI and returns a genai.types.Part.
+        Processes any resource URI and returns zero or more genai.types.Part objects.
         This is the central dispatcher for all media processing, handling data URIs,
         local API file paths, and YouTube URLs.
         """
         if not uri:
             log.warning("Received an empty URI, skipping.")
-            return None
+            return []
 
         try:
             file_bytes: bytes | None = None
+            file_path: str | None = None
+            is_temp_source = False
             mime_type: str | None = None
             owui_file_id: str | None = None
 
@@ -1142,37 +2008,207 @@ class GeminiContentBuilder:
                 log.info(f"Processing local API file URI: {uri}")
                 file_id = uri.split("/")[4]
                 owui_file_id = file_id
-                file_bytes, mime_type = await self._get_file_data(file_id)
+                source = await self._get_file_source(file_id)
+                if source:
+                    file_bytes = source.file_bytes
+                    file_path = source.file_path
+                    mime_type = source.mime_type
+                    is_temp_source = source.is_temp
             elif "youtube.com/" in uri or "youtu.be/" in uri:
                 log.info(f"Found YouTube URL: {uri}")
-                return self._genai_part_from_youtube_uri(uri)
+                part = self._genai_part_from_youtube_uri(uri)
+                return [part] if part else []
             # TODO: Google Cloud Storage bucket support.
             # elif uri.startswith("gs://"): ...
             else:
                 warn_msg = f"Unsupported URI: '{uri[:64]}...' Links must be to YouTube or a supported file type."
                 log.warning(warn_msg)
                 self.event_emitter.emit_toast(warn_msg, "warning")
-                return None
+                return []
 
             # Step 2: If we have bytes, create the Part using the modularized helper
-            if file_bytes and mime_type:
-                return await self._create_genai_part_from_file_data(
-                    file_bytes=file_bytes,
-                    mime_type=mime_type,
-                    owui_file_id=owui_file_id,
-                    status_queue=status_queue,
-                )
+            if mime_type and (file_bytes or file_path):
+                try:
+                    return await self._create_genai_parts_from_file_source(
+                        file_bytes=file_bytes,
+                        file_path=file_path,
+                        mime_type=mime_type,
+                        owui_file_id=owui_file_id,
+                        status_queue=status_queue,
+                        source_name=source_name,
+                    )
+                finally:
+                    if is_temp_source and file_path:
+                        try:
+                            os.remove(file_path)
+                        except FileNotFoundError:
+                            pass
+                        except Exception:
+                            log.exception(f"Could not remove temporary file {file_path}.")
 
-            return None  # Return None if bytes/mime_type could not be determined
+            return []  # Return empty if bytes/mime_type could not be determined
 
         except FilesAPIError as e:
             error_msg = f"Files API failed for URI '{uri[:64]}...': {e}"
             log.error(error_msg)
             self.event_emitter.emit_toast(error_msg, "error")
-            return None
+            return []
+        except PDFProcessingError as e:
+            error_msg = f"PDF processing failed for URI '{uri[:64]}...': {e}"
+            log.error(error_msg)
+            self.event_emitter.emit_toast(error_msg, "error")
+            raise ContentBuildError(error_msg) from e
         except Exception:
             log.exception(f"Error processing URI: {uri[:64]}[...]")
-            return None
+            return []
+
+    async def _genai_part_from_uri(
+        self, uri: str, status_queue: asyncio.Queue
+    ) -> types.Part | None:
+        """Compatibility wrapper for callers that only expect the first part."""
+        parts = await self._genai_parts_from_uri(uri, status_queue)
+        return parts[0] if parts else None
+
+    async def _create_genai_parts_from_file_data(
+        self,
+        file_bytes: bytes,
+        mime_type: str,
+        owui_file_id: str | None,
+        status_queue: asyncio.Queue,
+        force_raw: bool = False,
+        source_name: str | None = None,
+    ) -> list[types.Part]:
+        return await self._create_genai_parts_from_file_source(
+            file_bytes=file_bytes,
+            file_path=None,
+            mime_type=mime_type,
+            owui_file_id=owui_file_id,
+            status_queue=status_queue,
+            force_raw=force_raw,
+            source_name=source_name,
+        )
+
+    async def _create_genai_parts_from_file_source(
+        self,
+        *,
+        file_bytes: bytes | None,
+        file_path: str | None,
+        mime_type: str,
+        owui_file_id: str | None,
+        status_queue: asyncio.Queue,
+        force_raw: bool = False,
+        source_name: str | None = None,
+    ) -> list[types.Part]:
+        if (
+            mime_type == "application/pdf"
+            and self.valves.PDF_LIMIT_MITIGATION
+            and not force_raw
+        ):
+            outcome = await self.pdf_mitigation_manager.prepare(
+                file_bytes=file_bytes,
+                file_path=file_path,
+            )
+            if outcome is None:
+                return []
+
+            original_hash = outcome.original_hash
+            result = outcome.result
+            page_count = result.page_count
+            if result.was_mitigated:
+                pdf_label = source_name or owui_file_id or "attached PDF"
+                parts: list[types.Part] = []
+
+                if len(result.parts) > 1:
+                    parts.append(
+                        types.Part.from_text(
+                            text=self._pdf_split_instruction_text(
+                                pdf_label,
+                                result.parts,
+                                page_count,
+                            )
+                        )
+                    )
+                    self.event_emitter.emit_status(
+                        f"Optimized and split PDF into {len(result.parts)} parts.",
+                        done=True,
+                        indent_level=1,
+                    )
+                else:
+                    self.event_emitter.emit_status(
+                        "Optimized PDF to fit Gemini API limits.",
+                        done=True,
+                        indent_level=1,
+                    )
+
+                for i, pdf_part in enumerate(result.parts):
+                    synthetic_id = self._synthetic_pdf_part_id(
+                        owui_file_id, original_hash, i, len(result.parts)
+                    )
+                    parts.append(
+                        await self._create_genai_part_from_file_path(
+                            file_path=pdf_part.path,
+                            mime_type=mime_type,
+                            owui_file_id=synthetic_id,
+                            status_queue=status_queue,
+                            force_raw=force_raw,
+                        )
+                    )
+                return parts
+
+        if file_path:
+            return [
+                await self._create_genai_part_from_file_path(
+                    file_path=file_path,
+                    mime_type=mime_type,
+                    owui_file_id=owui_file_id,
+                    status_queue=status_queue,
+                    force_raw=force_raw,
+                )
+            ]
+
+        if not file_bytes:
+            return []
+
+        return [
+            await self._create_genai_part_from_file_data(
+                file_bytes=file_bytes,
+                mime_type=mime_type,
+                owui_file_id=owui_file_id,
+                status_queue=status_queue,
+                force_raw=force_raw,
+            )
+        ]
+
+    @staticmethod
+    def _pdf_split_instruction_text(
+        pdf_label: str,
+        parts: list[PreparedPDFPart],
+        page_count: int,
+    ) -> str:
+        page_map = "\n".join(
+            (
+                f"- PDF '{pdf_label}', attachment {i}: original document pages "
+                f"{part.start_page}-{part.end_page}"
+            )
+            for i, part in enumerate(parts, start=1)
+        )
+        return (
+            f"PDF '{pdf_label}' was optimized and split into {len(parts)} "
+            f"consecutive attachments ({page_count} pages total) to fit Gemini "
+            "API limits. Process the PDF parts in order as one original document. "
+            "When referencing or citing pages, use the original document page "
+            "numbers from this absolute page map; do not restart page numbering "
+            "at 1 for each attachment.\n"
+            f"{page_map}"
+        )
+
+    @staticmethod
+    def _synthetic_pdf_part_id(
+        owui_file_id: str | None, original_hash: str, index: int, total: int
+    ) -> str:
+        base_id = owui_file_id or "anonymous"
+        suffix = "optimized" if total == 1 else f"part-{index + 1:04d}-of-{total:04d}"
+        return f"{base_id}:pdf:{original_hash}:{suffix}"
 
     async def _create_genai_part_from_file_data(
         self,
@@ -1226,6 +2262,54 @@ class GeminiContentBuilder:
         else:
             log.info(f"Sending raw bytes because {reason}.")
             return types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+
+    async def _create_genai_part_from_file_path(
+        self,
+        file_path: str,
+        mime_type: str,
+        owui_file_id: str | None,
+        status_queue: asyncio.Queue,
+        force_raw: bool = False,
+    ) -> types.Part:
+        """
+        Creates a `types.Part` from a local path. Prefer this for large files so
+        hashing and Files API upload do not require a full in-memory byte copy.
+        """
+        use_files_api = True
+        reason = ""
+
+        if force_raw:
+            reason = "raw bytes are forced (e.g. for assistant history reconstruction)"
+            use_files_api = False
+        elif not self.valves.USE_FILES_API:
+            reason = "disabled by user setting (USE_FILES_API=False)"
+            use_files_api = False
+        elif self.vertexai:
+            reason = "the active client is configured for Vertex AI, which does not support the Files API"
+            use_files_api = False
+        elif self.is_temp_chat:
+            reason = "temporary chat mode is active"
+            use_files_api = False
+
+        if use_files_api:
+            log.info("Using Google Files API for local resource.")
+            gemini_file = await self.files_api_manager.get_or_upload_file_from_path(
+                file_path=file_path,
+                mime_type=mime_type,
+                owui_file_id=owui_file_id,
+                status_queue=status_queue,
+            )
+            return types.Part(
+                file_data=types.FileData(
+                    file_uri=gemini_file.uri,
+                    mime_type=gemini_file.mime_type,
+                )
+            )
+
+        log.info(f"Sending raw bytes because {reason}.")
+        async with aiofiles.open(file_path, "rb") as file:
+            file_bytes = await file.read()
+        return types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
 
     def _genai_part_from_youtube_uri(self, uri: str) -> types.Part | None:
         """Creates a Gemini Part from a YouTube URL, with optional video metadata.
@@ -1401,9 +2485,76 @@ class GeminiContentBuilder:
         return restored_text
 
     @staticmethod
+    async def _get_file_source(file_id: str) -> LocalFileSource | None:
+        """
+        Retrieves file metadata and resolves it through Open WebUI storage.
+
+        Open WebUI stores provider-specific paths in the database. Use
+        Storage.get_file() just like the Files API content route, so local, S3,
+        GCS, and Azure storage all resolve to a readable local path.
+        """
+        if not file_id:
+            log.warning("file_id is empty. Cannot continue.")
+            return None
+
+        try:
+            file_model = await Files.get_file_by_id(file_id)
+        except Exception as e:
+            log.exception(
+                f"An unexpected error occurred during database call for file_id {file_id}: {e}"
+            )
+            return None
+
+        if file_model is None:
+            log.warning(f"File {file_id} not found in the backend's database.")
+            return None
+
+        if not (file_path := file_model.path):
+            log.warning(
+                f"File {file_id} was found in the database but it lacks `path` field. Cannot Continue."
+            )
+            return None
+        if file_model.meta is None:
+            log.warning(
+                f"File {file_path} was found in the database but it lacks `meta` field. Cannot continue."
+            )
+            return None
+        if not (content_type := file_model.meta.get("content_type")):
+            log.warning(
+                f"File {file_path} was found in the database but it lacks `meta.content_type` field. Cannot continue."
+            )
+            return None
+
+        resolved_path = await GeminiContentBuilder._resolve_owui_storage_path(file_path)
+        if resolved_path:
+            return LocalFileSource(
+                file_bytes=None,
+                file_path=resolved_path,
+                mime_type=content_type,
+            )
+
+        log.warning(f"File {file_path} not found on disk.")
+        return LocalFileSource(file_bytes=None, file_path=None, mime_type=content_type)
+
+    @staticmethod
+    async def _resolve_owui_storage_path(file_path: str) -> str | None:
+        if os.path.exists(file_path):
+            return file_path
+
+        try:
+            resolved_path = await asyncio.to_thread(Storage.get_file, file_path)
+        except Exception:
+            log.exception(f"Open WebUI storage failed to resolve file path: {file_path}")
+            return None
+
+        if resolved_path and os.path.exists(resolved_path):
+            return resolved_path
+        return None
+
+    @staticmethod
     async def _get_file_data(file_id: str) -> tuple[bytes | None, str | None]:
         """
-        Asynchronously retrieves file metadata from the database and its content from disk.
+        Asynchronously retrieves file metadata from the database and its content.
         """
         # TODO: Emit toasts on unexpected conditions.
         if not file_id:
@@ -1441,43 +2592,20 @@ class GeminiContentBuilder:
             )
             return None, None
 
-        if file_path.startswith("gs://"):
-            try:
-                # Initialize the GCS client
-                storage_client = storage.Client()
+        resolved_path = await GeminiContentBuilder._resolve_owui_storage_path(file_path)
+        if not resolved_path:
+            log.warning(f"File {file_path} could not be resolved through Open WebUI storage.")
+            return None, content_type
 
-                # Parse the GCS path
-                # The path should be in the format "gs://bucket-name/object-name"
-                if len(file_path.split("/", 3)) < 4:
-                    raise ValueError(
-                        f"Invalid GCS path: '{file_path}'. "
-                        "Path must be in the format 'gs://bucket-name/object-name'."
-                    )
-
-                bucket_name, blob_name = file_path.removeprefix("gs://").split("/", 1)
-
-                # Get the bucket and blob (file object)
-                bucket = storage_client.bucket(bucket_name)
-                blob = bucket.blob(blob_name)
-
-                # Download the file's content as bytes
-                print(f"Reading from GCS: {file_path}")
-                return blob.download_as_bytes(), content_type
-            except exceptions.NotFound:
-                print(f"Error: GCS object not found at {file_path}")
-                raise
-            except Exception as e:
-                print(f"An error occurred while reading from GCS: {e}")
-                raise
         try:
-            async with aiofiles.open(file_path, "rb") as file:
+            async with aiofiles.open(resolved_path, "rb") as file:
                 file_data = await file.read()
             return file_data, content_type
         except FileNotFoundError:
-            log.exception(f"File {file_path} not found on disk.")
+            log.exception(f"File {resolved_path} not found on disk.")
             return None, content_type
         except Exception:
-            log.exception(f"Error processing file {file_path}")
+            log.exception(f"Error processing file {resolved_path}")
             return None, content_type
 
     @staticmethod
@@ -1669,6 +2797,13 @@ class Pipe:
             If disabled, files are sent as raw bytes in the request.
             Default value is True.""",
         )
+        PDF_LIMIT_MITIGATION: bool = Field(
+            default=True,
+            description="""Whether to automatically compress and split PDFs that exceed Gemini's PDF limits.
+            Gemini accepts PDFs up to 50 MiB or 1000 pages per document. When enabled, oversized PDFs are optimized
+            and split into ordered sub-documents before being sent to Gemini.
+            Default value is True.""",
+        )
         PARSE_YOUTUBE_URLS: bool = Field(
             default=True,
             description="""Whether to parse YouTube URLs from user messages and provide them as context to the model.
@@ -1826,6 +2961,11 @@ class Pipe:
             Set to True to force use, False to disable.
             Default is None (use the admin's setting).""",
         )
+        PDF_LIMIT_MITIGATION: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Override automatic PDF compression and splitting for oversized PDFs.
+            Default is None (use the admin's setting).""",
+        )
         PARSE_YOUTUBE_URLS: bool | None | Literal[""] = Field(
             default=None,
             description="""Override the default setting for parsing YouTube URLs.
@@ -1883,6 +3023,7 @@ class Pipe:
         self.valves = self.Valves()
         self.file_content_cache = SimpleMemoryCache(serializer=NullSerializer())
         self.file_id_to_hash_cache = SimpleMemoryCache(serializer=NullSerializer())
+        self.pdf_mitigation_manager = PDFMitigationManager()
         log.success("Function has been initialized.")
 
     async def pipes(self) -> list["ModelData"]:
@@ -2049,10 +3190,21 @@ class Pipe:
                     continue 
 
                 # If we can't retry, re-raise the error to stop execution
-                log.error(f"Error during request execution (Tier: {tier}): {e}")
-                raise e
+                error_msg = (
+                    f"Gemini request failed before a model response could be "
+                    f"generated: {e}"
+                )
+                log.exception(f"Error during request execution (Tier: {tier}): {e}")
+                event_emitter.emit_status("Request failed", done=True)
+                event_emitter.emit_toast(error_msg, "error")
+                if body.get("stream", False):
+                    return self._error_completion_stream(error_msg)
+                return self._error_completion_response(error_msg)
 
-        raise ValueError("Exhausted execution options without result.")
+        error_msg = "Exhausted execution options without result."
+        if body.get("stream", False):
+            return self._error_completion_stream(error_msg)
+        return self._error_completion_response(error_msg)
 
     # region 2. Helper methods inside the Pipe class
 
@@ -2427,6 +3579,27 @@ class Pipe:
             "name": "[gemini_manifold] " + error_msg,
             "description": error_msg,
         }
+
+    @staticmethod
+    def _error_completion_response(error_msg: str) -> dict[str, Any]:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": error_msg,
+                    }
+                }
+            ],
+            "usage": {},
+        }
+
+    @staticmethod
+    async def _error_completion_stream(
+        error_msg: str,
+    ) -> AsyncGenerator[dict | str, None]:
+        yield {"choices": [{"delta": {"content": error_msg}}]}
+        yield "data: [DONE]"
 
     @staticmethod
     def _strip_api_prefix(model_name: str) -> str:
@@ -2815,6 +3988,7 @@ class Pipe:
             event_emitter=event_emitter,
             valves=valves,
             files_api_manager=files_api_manager,
+            pdf_mitigation_manager=self.pdf_mitigation_manager,
         )
 
         event_emitter.emit_status("Preparing request...")
