@@ -1748,7 +1748,6 @@ class Pipe:
         and enforce policies, while still giving users the flexibility to tailor
         certain parameters, like their API key or model settings, for their own use.
         """
-        # FIXME: `Literal[""]` might not be necessary anymore
         GEMINI_FREE_API_KEY: str | None = Field(
             default=None,
             description="""Free Gemini Developer API key. If not provided, the admin's key may be used if permitted.""",
@@ -1762,7 +1761,7 @@ class Pipe:
             description="""The base URL for calling the Gemini API
             Default value is None.""",
         )
-        USE_VERTEX_AI: bool | None | Literal[""] = Field(
+        USE_VERTEX_AI: bool | None = Field(
             default=None,
             description="""Whether to use Google Cloud Vertex AI instead of the standard Gemini API.
             Default value is None.""",
@@ -1777,7 +1776,7 @@ class Pipe:
             description="""The Google Cloud region to use with Vertex AI.
             Default value is None.""",
         )
-        ENABLE_FREE_TIER_FALLBACK: bool | None | Literal[""] = Field(
+        ENABLE_FREE_TIER_FALLBACK: bool | None = Field(
             default=None,
             description="""Override the default setting for Free API fallback.
             Set to True to enable automatic fallback to the Paid API, False to disable.
@@ -1790,7 +1789,7 @@ class Pipe:
             description="""Override the default routing strategy for task models. 
             Possible values: only_free | free_fallback | only_paid | match_main.""",
         )
-        THINKING_BUDGET: int | None | Literal[""] = Field(
+        THINKING_BUDGET: int | None = Field(
             default=None,
             description="""Specifies the token budget for the model's internal thinking process,
             used for complex tasks like tool use. Applicable to Gemini 2.5 models.
@@ -1803,31 +1802,31 @@ class Pipe:
 
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more details.""",
         )
-        SHOW_THINKING_SUMMARY: bool | None | Literal[""] = Field(
+        SHOW_THINKING_SUMMARY: bool | None = Field(
             default=None,
             description="""Whether to show the thinking summary in the response.
             This is only applicable for Gemini 2.5 models.
             Default value is None.""",
         )
-        USE_FILES_API: bool | None | Literal[""] = Field(
+        USE_FILES_API: bool | None = Field(
             default=None,
             description="""Override the default setting for using the Google Files API.
             Set to True to force use, False to disable.
             Default is None (use the admin's setting).""",
         )
-        PARSE_YOUTUBE_URLS: bool | None | Literal[""] = Field(
+        PARSE_YOUTUBE_URLS: bool | None = Field(
             default=None,
             description="""Override the default setting for parsing YouTube URLs.
             Set to True to enable, False to disable.
             Default is None (use the admin's setting).""",
         )
-        MAPS_GROUNDING_COORDINATES: str | None | Literal[""] = Field(
+        MAPS_GROUNDING_COORDINATES: str | None = Field(
             default=None,
             description="""Optional latitude and longitude coordinates for location-aware results with Google Maps grounding.
             Overrides the admin setting. Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
             Default value is None.""",
         )
-        IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] | None | Literal[""] = Field(
+        IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] | None = Field(
             default=None,
             description="""Resolution for image generation (Gemini 3 Pro Image only).
             Default value is None (use the admin's setting). Possible values: 1K, 2K, 4K""",
@@ -1846,7 +1845,6 @@ class Pipe:
                 "21:9",
             ]
             | None
-            | Literal[""]
         ) = Field(
             default=None,
             description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
