@@ -1656,12 +1656,6 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is True.""",
         )
-        # FIXME: remove, toggle filter handles this now
-        ENABLE_URL_CONTEXT_TOOL: bool = Field(
-            default=False,
-            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
-            This tool is only compatible with specific models. Default value is False.""",
-        )
         USE_FILES_API: bool = Field(
             default=True,
             description="""Whether to use the Google Files API for uploading files.
@@ -1814,11 +1808,6 @@ class Pipe:
             description="""Whether to show the thinking summary in the response.
             This is only applicable for Gemini 2.5 models.
             Default value is None.""",
-        )
-        ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
-            default=None,
-            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
-            This tool is only compatible with specific models. Default value is None.""",
         )
         USE_FILES_API: bool | None | Literal[""] = Field(
             default=None,
@@ -2658,7 +2647,7 @@ class Pipe:
         is_avail, is_on = await self._get_toggleable_feature_status(
             "gemini_url_context_toggle", __metadata__
         )
-        enable_url_context = valves.ENABLE_URL_CONTEXT_TOOL  # Start with valve default.
+        enable_url_context = False
         if is_avail:
             # If the toggle filter is configured, it overrides the valve setting.
             enable_url_context = is_on
