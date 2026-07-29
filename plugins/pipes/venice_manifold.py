@@ -52,39 +52,127 @@ if TYPE_CHECKING:
 log = logger.bind(auditable=False)
 
 
+_SHARED_VALVE_DESCS = {
+    "HEIGHT": "Height of generated images in pixels.",
+    "WIDTH": "Width of generated images in pixels.",
+    "STEPS": "Number of inference and generation steps.",
+    "CFG_SCALE": "Classifier-Free Guidance (CFG) scale determining how closely the generation follows the prompt.",
+}
+
+_ADMIN_VALVE_DESCS = {
+    "VENICE_API_TOKEN": "Venice.ai API Token.",
+    "CACHE_MODELS": "Whether to request and cache available models only on initial load.",
+    "LOG_LEVEL": "Select logging verbosity level. View logs using `docker logs -f open-webui`.",
+    "USE_FILES_API": "Save generated image files using Open WebUI's file storage API.",
+}
+
+
+def _format_valve_desc(text: str, default: Any = None, is_user: bool = False) -> str:
+    """Formats Markdown descriptions for Valves and UserValves fields."""
+    text = text.strip()
+    if is_user:
+        return f"{text}\n\n*If not set, the admin's setting is used.*"
+    formatted_default = f"`{default}`" if default is not None else "`None`"
+    return f"{text}\n\n**Default:** {formatted_default}"
+
+
 class Pipe:
     class Valves(BaseModel):
         VENICE_API_TOKEN: str | None = Field(
-            default=None, description="Venice.ai API Token"
+            default=None,
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["VENICE_API_TOKEN"], default=None
+            ),
         )
-        HEIGHT: int = Field(default=1024, description="Image height")
-        WIDTH: int = Field(default=1024, description="Image width")
-        STEPS: int = Field(default=16, description="Image generation steps")
-        CFG_SCALE: int = Field(default=4, description="Image generation scale")
+        HEIGHT: int = Field(
+            default=1024,
+            description=_format_valve_desc(_SHARED_VALVE_DESCS["HEIGHT"], default=1024),
+        )
+        WIDTH: int = Field(
+            default=1024,
+            description=_format_valve_desc(_SHARED_VALVE_DESCS["WIDTH"], default=1024),
+        )
+        STEPS: int = Field(
+            default=16,
+            description=_format_valve_desc(_SHARED_VALVE_DESCS["STEPS"], default=16),
+        )
+        CFG_SCALE: float = Field(
+            default=4.0,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["CFG_SCALE"], default=4.0
+            ),
+        )
         CACHE_MODELS: bool = Field(
             default=True,
-            description="Whether to request models only on first load.",
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["CACHE_MODELS"], default=True
+            ),
         )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
             default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["LOG_LEVEL"], default="INFO"
+            ),
         )
         USE_FILES_API: bool = Field(
-            title="Use Files API",
             default=True,
-            description="Save the image files using Open WebUI's API for files.",
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["USE_FILES_API"], default=True
+            ),
         )
 
-    def __init__(self):
+    class UserValves(BaseModel):
+        HEIGHT: int | None = Field(
+            default=None,
+            description=_format_valve_desc(_SHARED_VALVE_DESCS["HEIGHT"], is_user=True),
+        )
+        WIDTH: int | None = Field(
+            default=None,
+            description=_format_valve_desc(_SHARED_VALVE_DESCS["WIDTH"], is_user=True),
+        )
+        STEPS: int | None = Field(
+            default=None,
+            description=_format_valve_desc(_SHARED_VALVE_DESCS["STEPS"], is_user=True),
+        )
+        CFG_SCALE: float | None = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["CFG_SCALE"], is_user=True
+            ),
+        )
 
-        # Open WebUI >= 0.9.0 made `Functions.get_function_valves_by_id` async, so it
-        # cannot be awaited from this sync `__init__`. Initialize with defaults instead;
-        # Open WebUI's pipe pipeline assigns the DB-backed valves onto this instance
-        # (`pipe.valves = pipe.Valves(**configured)`) before every `pipes`/`pipe` call,
-        # so configured valves still take effect at runtime. The `pipes` method already
-        # detects LOG_LEVEL changes and reruns the logging setup once real valves land.
+    @staticmethod
+    def _get_merged_valves(
+        default_valves: "Pipe.Valves",
+        user_valves: "Pipe.UserValves | dict[str, Any] | None",
+    ) -> "Pipe.Valves":
+        """Merges UserValves into a base Valves configuration.
+
+        If a field in UserValves is not None or an empty string, it overrides
+        the corresponding field in default_valves.
+        """
+        if user_valves is None:
+            return default_valves.model_copy(deep=True)
+
+        merged_data = default_valves.model_dump()
+
+        if isinstance(user_valves, dict):
+            for field_name, user_value in user_valves.items():
+                if user_value is not None and user_value != "":
+                    if field_name in merged_data:
+                        merged_data[field_name] = user_value
+        else:
+            for field_name in Pipe.UserValves.model_fields:
+                user_value = getattr(user_valves, field_name)
+                if user_value is not None and user_value != "":
+                    if field_name in merged_data:
+                        merged_data[field_name] = user_value
+
+        return Pipe.Valves(**merged_data)
+
+    def __init__(self):
         self.valves = self.Valves()
         self.log_level = self.valves.LOG_LEVEL
         self._add_log_handler()
@@ -95,16 +183,14 @@ class Pipe:
         log.trace("Full self object:", payload=self.__dict__)
 
     async def pipes(self) -> list["ModelData"]:
-
-        # Detect log level change inside self.valves
         if self.log_level != self.valves.LOG_LEVEL:
             log.info(
                 f"Detected log level change: {self.log_level=} and {self.valves.LOG_LEVEL=}. "
                 "Running the logging setup again."
             )
+            self.log_level = self.valves.LOG_LEVEL
             self._add_log_handler()
 
-        # Return existing models if all conditions are met and no error models are present
         if (
             self.models
             and self.valves.CACHE_MODELS
@@ -126,7 +212,10 @@ class Pipe:
         __metadata__: dict[str, Any],
     ) -> str | None:
 
-        # TODO: [refac] Move __user__ to self like that also.
+        user_valves = __user__.get("valves") if isinstance(__user__, dict) else None
+        valves = self._get_merged_valves(self.valves, user_valves)
+
+        # FIXME: Bad idea, every chat turn has it's own unique emitter and using old one would lead to very weird behaviour.
         self.__event_emitter__ = __event_emitter__
 
         if "error" in __metadata__["model"]["id"]:
@@ -134,7 +223,7 @@ class Pipe:
             await self._emit_error(error_msg, exception=False)
             return
 
-        if not self.valves.VENICE_API_TOKEN:
+        if not valves.VENICE_API_TOKEN:
             error_msg = "Missing VENICE_API_TOKEN in valves configuration."
             await self._emit_error(error_msg, exception=False)
             return
@@ -191,7 +280,7 @@ class Pipe:
         start_time = time.time()
         timer = asyncio.create_task(timer_task(start_time))
 
-        image_data = await self._generate_image(model, prompt)
+        image_data = await self._generate_image(model, prompt, valves)
 
         timer.cancel()
         try:
@@ -219,7 +308,7 @@ class Pipe:
         log.info("Image generated successfully!")
         base64_image = image_data["images"][0]  # type: ignore
 
-        if self.valves.USE_FILES_API:
+        if valves.USE_FILES_API:
             # Decode the base64 image data
             image_data = base64.b64decode(base64_image)
             # FIXME make mime type dynamic
@@ -275,7 +364,7 @@ class Pipe:
 
     # region 1.2 Image generation
 
-    async def _generate_image(self, model: str, prompt: str) -> dict | None:
+    async def _generate_image(self, model: str, prompt: str, valves: "Pipe.Valves") -> dict | None:
         try:
             async with aiohttp.ClientSession() as session:
                 log.info(
@@ -283,16 +372,16 @@ class Pipe:
                 )
                 async with session.post(
                     "https://api.venice.ai/api/v1/image/generate",
-                    headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},
+                    headers={"Authorization": f"Bearer {valves.VENICE_API_TOKEN}"},
                     json={
                         "model": model,
                         "prompt": prompt,
-                        "width": self.valves.WIDTH,
-                        "height": self.valves.HEIGHT,
-                        "steps": self.valves.STEPS,
+                        "width": valves.WIDTH,
+                        "height": valves.HEIGHT,
+                        "steps": valves.STEPS,
                         "hide_watermark": True,
                         "return_binary": False,
-                        "cfg_scale": self.valves.CFG_SCALE,
+                        "cfg_scale": valves.CFG_SCALE,
                         "safe_mode": False,
                     },
                 ) as response:

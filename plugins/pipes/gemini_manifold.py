@@ -725,22 +725,22 @@ class GeminiContentBuilder:
         # 1. Walk up the parentId chain to reconstruct the linear conversation branch.
         messages_db: list["ChatMessageTD"] = []
         curr_id = current_id
-        
+
         while curr_id and curr_id in messages_dict:
             msg = messages_dict[curr_id]
             messages_db.insert(0, msg)
             curr_id = msg.get("parentId")
 
         # 2. Handle the trailing assistant placeholder.
-        # OWUI often inserts an empty assistant message entry for the turn currently 
-        # being processed. We remove it to align with the 'messages_body' which 
+        # OWUI often inserts an empty assistant message entry for the turn currently
+        # being processed. We remove it to align with the 'messages_body' which
         # only contains previous turns plus the current user message.
         if messages_db and messages_db[-1].get("role") == "assistant":
             messages_db.pop()
 
         # 3. Strict validation.
-        # If the reconstructed history (minus placeholder) doesn't exactly match the 
-        # length of the request body (minus system prompt), we bail out. 
+        # If the reconstructed history (minus placeholder) doesn't exactly match the
+        # length of the request body (minus system prompt), we bail out.
         # This prevents misaligned metadata mapping.
         if len(messages_db) != len(self.messages_body):
             log.debug(
@@ -1525,6 +1525,83 @@ class GeminiContentBuilder:
         return text
 
 
+_SHARED_VALVE_DESCS = {
+    "GEMINI_FREE_API_KEY": "Free Gemini Developer API key.",
+    "GEMINI_PAID_API_KEY": "Paid Gemini Developer API key.",
+    "GEMINI_API_BASE_URL": "Custom base URL for calling the Gemini API.",
+    "USE_VERTEX_AI": (
+        "Whether to use Google Cloud Vertex AI instead of the standard Gemini API.\n\n"
+        "*Requires `VERTEX_PROJECT` to be set.*"
+    ),
+    "VERTEX_PROJECT": "Google Cloud project ID to use with Vertex AI.",
+    "VERTEX_LOCATION": "Google Cloud region/location for Vertex AI (e.g., `global`, `us-central1`).",
+    "ENABLE_FREE_TIER_FALLBACK": (
+        "Automatically switch to the Paid API if a Free API request fails due to quota limits (`429`) or model overload (`503`).\n\n"
+        "*Requires both Free and Paid API keys to be configured.*"
+    ),
+    "TASK_MODEL_ROUTING": (
+        "Determines API routing strategy for task models (e.g. title generation):\n"
+        "- `only_free`: Use only the Free API.\n"
+        "- `free_fallback`: Try Free API first, fallback to Paid on failure.\n"
+        "- `only_paid`: Bypass Free API and use Paid API directly (or Vertex AI if enabled).\n"
+        "- `match_main`: Follow the same routing logic as the main chat generation."
+    ),
+    "THINKING_BUDGET": (
+        "Token budget for internal model thinking (Gemini 2.5 and 3 models).\n"
+        "Set to `-1` to allow dynamic/automatic budget control.\n\n"
+        "**Valid Token Ranges:**\n"
+        "- **Pro models:** `128` to `32,768`\n"
+        "- **Flash and Lite models:** `0` to `24,576` (`0` disables thinking)\n\n"
+        "For details, see [Vertex AI Thinking Docs](https://cloud.google.com/vertex-ai/generative-ai/docs/thinking)."
+    ),
+    "SHOW_THINKING_SUMMARY": "Whether to display the thinking process summary in responses (Gemini 2.5 and 3 models).",
+    "USE_FILES_API": (
+        "Whether to use the Google Files API for uploading files (enables caching and performance benefits).\n\n"
+        "If disabled, raw file bytes are sent directly in request payloads."
+    ),
+    "PARSE_YOUTUBE_URLS": (
+        "Whether to parse YouTube video URLs from user messages and provide content as context.\n\n"
+        "If disabled, YouTube links are treated as plain text."
+    ),
+    "MAPS_GROUNDING_COORDINATES": (
+        "Latitude and longitude coordinates for location-aware Google Maps grounding.\n\n"
+        "Expected format: `latitude,longitude` (e.g., `40.7128,-74.0060`)."
+    ),
+    "IMAGE_RESOLUTION": "Output resolution for generated images (Gemini 3 Pro Image only).",
+    "IMAGE_ASPECT_RATIO": "Aspect ratio for image generation (Gemini 3 Pro Image & 2.5 Flash Image).",
+}
+
+_ADMIN_VALVE_DESCS = {
+    "USER_MUST_PROVIDE_AUTH_CONFIG": (
+        "Require all users (including admins) to provide their own authentication credentials via `UserValves`.\n\n"
+        "Setting this to `True` prevents non-whitelisted users from using Vertex AI."
+    ),
+    "AUTH_WHITELIST": (
+        "Comma-separated list of user email addresses allowed to bypass `USER_MUST_PROVIDE_AUTH_CONFIG` and use default system credentials."
+    ),
+    "MODEL_WHITELIST": (
+        "Comma-separated list of allowed model names.\n\n"
+        "Supports `fnmatch` wildcard patterns: `*`, `?`, `[seq]`, `[!seq]`."
+    ),
+    "MODEL_BLACKLIST": (
+        "Comma-separated list of blacklisted model names.\n\n"
+        "Supports `fnmatch` wildcard patterns: `*`, `?`, `[seq]`, `[!seq]`."
+    ),
+    "CACHE_MODELS": "Whether to cache available models on startup and refresh only when whitelist or blacklist rules change.",
+    "USE_ENTERPRISE_SEARCH": "Enable Enterprise Search tool allowing models to fetch and ground content from specified web URLs.",
+    "LOG_LEVEL": "Logging verbosity level. View logs using `docker logs -f open-webui`.",
+}
+
+
+def _format_valve_desc(text: str, default: Any = None, is_user: bool = False) -> str:
+    """Formats Markdown descriptions for Valves and UserValves fields."""
+    text = text.strip()
+    if is_user:
+        return f"{text}\n\n*If not set, the admin's setting is used.*"
+    formatted_default = f"`{default}`" if default is not None else "`None`"
+    return f"{text}\n\n**Default:** {formatted_default}"
+
+
 class Pipe:
 
     @staticmethod
@@ -1554,52 +1631,59 @@ class Pipe:
         return v
 
     class Valves(BaseModel):
-        # FIXME: docstrings don't get markdown rendered in the admin UI currently. rewrite docstrings accordingly.
         GEMINI_FREE_API_KEY: str | None = Field(
-            default=None, description="Free Gemini Developer API key."
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["GEMINI_FREE_API_KEY"], default=None
+            ),
         )
         GEMINI_PAID_API_KEY: str | None = Field(
-            default=None, description="Paid Gemini Developer API key."
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["GEMINI_PAID_API_KEY"], default=None
+            ),
         )
         USER_MUST_PROVIDE_AUTH_CONFIG: bool = Field(
             default=False,
-            description="""Whether to require users (including admins) to provide their own authentication configuration.
-            User can provide these through UserValves. Setting this to True will disallow users from using Vertex AI.
-            Default value is False.""",
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["USER_MUST_PROVIDE_AUTH_CONFIG"], default=False
+            ),
         )
         AUTH_WHITELIST: str | None = Field(
             default=None,
-            description="""Comma separated list of user emails that are allowed to bypass USER_MUST_PROVIDE_AUTH_CONFIG and use the default authentication configuration.
-            Default value is None (no users are whitelisted).""",
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["AUTH_WHITELIST"], default=None
+            ),
         )
         GEMINI_API_BASE_URL: str | None = Field(
             default=None,
-            description="""The base URL for calling the Gemini API.
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["GEMINI_API_BASE_URL"], default=None
+            ),
         )
-        # FIXME: assume the user wants Vertex if they set VERTEX_PROJECT, removing the need for this valve.
         USE_VERTEX_AI: bool = Field(
             default=False,
-            description="""Whether to use Google Cloud Vertex AI instead of the standard Gemini API.
-            If VERTEX_PROJECT is not set then the plugin will use the Gemini Developer API.
-            Default value is False.
-            Users can opt out of this by setting USE_VERTEX_AI to False in their UserValves.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["USE_VERTEX_AI"], default=False
+            ),
         )
         VERTEX_PROJECT: str | None = Field(
             default=None,
-            description="""The Google Cloud project ID to use with Vertex AI.
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["VERTEX_PROJECT"], default=None
+            ),
         )
         VERTEX_LOCATION: str = Field(
             default="global",
-            description="""The Google Cloud region to use with Vertex AI.
-            Default value is 'global'.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["VERTEX_LOCATION"], default="global"
+            ),
         )
         ENABLE_FREE_TIER_FALLBACK: bool = Field(
             default=False,
-            description="""Automatically switch to the Paid API if a Free API request fails due to quota limits (429) or model overload (503).
-            Requires both Free and Paid API keys to be configured. 
-            Default value is False.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["ENABLE_FREE_TIER_FALLBACK"], default=False
+            ),
         )
         TASK_MODEL_ROUTING: Literal[
             "only_free",
@@ -1608,95 +1692,79 @@ class Pipe:
             "match_main",
         ] = Field(
             default="match_main",
-            description="""Determines how task models (like title generation) are routed between Free and Paid APIs.
-            • only_free: Use only the Free API.
-            • free_fallback: Use Free API first, fallback to Paid on failure.
-            • only_paid: Bypass Free API and use Paid API directly (or Vertex if enabled).
-            • match_main: Follow the same logic as the main chat generation.
-            Default is match_main.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["TASK_MODEL_ROUTING"], default="match_main"
+            ),
         )
         MODEL_WHITELIST: str = Field(
             default="*",
-            description="""Comma-separated list of allowed model names.
-            Supports `fnmatch` patterns: *, ?, [seq], [!seq].
-            Default value is * (all models allowed).""",
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["MODEL_WHITELIST"], default="*"
+            ),
         )
         MODEL_BLACKLIST: str | None = Field(
             default=None,
-            description="""Comma-separated list of blacklisted model names.
-            Supports `fnmatch` patterns: *, ?, [seq], [!seq].
-            Default value is None (no blacklist).""",
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["MODEL_BLACKLIST"], default=None
+            ),
         )
         CACHE_MODELS: bool = Field(
             default=True,
-            description="""Whether to request models only on first load and when white- or blacklist changes.
-            Default value is True.""",
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["CACHE_MODELS"], default=True
+            ),
         )
         THINKING_BUDGET: int = Field(
             default=8192,
             ge=-1,
-            # The widest possible range is 0 (for Lite/Flash) to 32768 (for Pro).
-            # -1 is used for dynamic thinking budget.
-            # Model-specific constraints are detailed in the description.
             le=32768,
-            description="""Specifies the token budget for the model's internal thinking process,
-            used for complex tasks like tool use. Applicable to Gemini 2.5 models.
-            Default value is 8192. If you want the model to control the thinking budget when using the API, set the thinking budget to -1.
-
-            The valid token range depends on the specific model tier:
-            - **Pro models**: Must be a value between 128 and 32,768.
-            - **Flash and Lite models**: A value between 0 and 24,576. For these
-              models, a value of 0 disables the thinking feature.
-
-            See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more details.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["THINKING_BUDGET"], default=8192
+            ),
         )
         SHOW_THINKING_SUMMARY: bool = Field(
             default=True,
-            description="""Whether to show the thinking summary in the response.
-            This is only applicable for Gemini 2.5 models.
-            Default value is True.""",
-        )
-        # FIXME: remove, toggle filter handles this now
-        ENABLE_URL_CONTEXT_TOOL: bool = Field(
-            default=False,
-            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
-            This tool is only compatible with specific models. Default value is False.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["SHOW_THINKING_SUMMARY"], default=True
+            ),
         )
         USE_FILES_API: bool = Field(
             default=True,
-            description="""Whether to use the Google Files API for uploading files.
-            This provides caching and performance benefits, but can be disabled for privacy, cost, or compatibility reasons.
-            If disabled, files are sent as raw bytes in the request.
-            Default value is True.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["USE_FILES_API"], default=True
+            ),
         )
         PARSE_YOUTUBE_URLS: bool = Field(
             default=True,
-            description="""Whether to parse YouTube URLs from user messages and provide them as context to the model.
-            If disabled, YouTube links are treated as plain text.
-            This is only applicable for models that support video.
-            Default value is True.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["PARSE_YOUTUBE_URLS"], default=True
+            ),
         )
         USE_ENTERPRISE_SEARCH: bool = Field(
             default=False,
-            description="""Enable the Enterprise Search tool to allow the model to fetch and use content from provided URLs. """,
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["USE_ENTERPRISE_SEARCH"], default=False
+            ),
         )
         MAPS_GROUNDING_COORDINATES: str | None = Field(
             default=None,
-            description="""Optional latitude and longitude coordinates for location-aware results with Google Maps grounding.
-            Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["MAPS_GROUNDING_COORDINATES"], default=None
+            ),
         )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
             default="INFO",
-            description="""Select logging level. Use `docker logs -f open-webui` to view logs.
-            Default value is INFO.""",
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["LOG_LEVEL"], default="INFO"
+            ),
         )
         IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] = Field(
             default="1K",
-            description="""Resolution for image generation (Gemini 3 Pro Image only).
-            Default value is 1K.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["IMAGE_RESOLUTION"], default="1K"
+            ),
         )
         IMAGE_ASPECT_RATIO: Literal[
             "1:1",
@@ -1711,8 +1779,9 @@ class Pipe:
             "21:9",
         ] = Field(
             default="16:9",
-            description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
-            Default value is 16:9.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["IMAGE_ASPECT_RATIO"], default="16:9"
+            ),
         )
 
         @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
@@ -1721,127 +1790,91 @@ class Pipe:
             return Pipe._validate_coordinates_format(v)
 
     class UserValves(BaseModel):
-        """Defines user-specific settings that can override the default `Valves`.
-
-        The `UserValves` class provides a mechanism for individual users to customize
-        their Gemini API settings for each request. This system is designed as a
-        practical workaround for backend/frontend limitations, enabling per-user
-        configurations.
-
-        Think of the main `Valves` as the global, admin-configured template for the
-        plugin. `UserValves` acts as a user-provided "overlay" or "patch" that
-        is applied on top of that template at runtime.
-
-        How it works:
-        1.  **Default Behavior:** At the start of a request, the system merges the
-            user's `UserValves` with the admin's `Valves`. If a field in
-            `UserValves` has a value (i.e., is not `None` or an empty string `""`),
-            it overrides the corresponding value from the main `Valves`. If a
-            field is `None` or `""`, the admin's default is used.
-
-        2.  **Special Authentication Logic:** A critical exception exists to enforce
-            security and usage policies. If the admin sets `USER_MUST_PROVIDE_AUTH_CONFIG`
-            to `True` in the main `Valves`, the merging logic changes for any user
-            not on the `AUTH_WHITELIST`:
-            - The user's `GEMINI_API_KEY` is taken directly from their `UserValves`,
-              bypassing the admin's key entirely.
-            - The ability to use the admin-configured Vertex AI is disabled
-              (`USE_VERTEX_AI` is forced to `False`).
-            This ensures that when required, users must use their own credentials
-            and cannot fall back on the shared, system-level authentication.
-
-        This two-tiered configuration allows administrators to set sensible defaults
-        and enforce policies, while still giving users the flexibility to tailor
-        certain parameters, like their API key or model settings, for their own use.
-        """
-        # FIXME: `Literal[""]` might not be necessary anymore
         GEMINI_FREE_API_KEY: str | None = Field(
             default=None,
-            description="""Free Gemini Developer API key. If not provided, the admin's key may be used if permitted.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["GEMINI_FREE_API_KEY"], is_user=True
+            ),
         )
         GEMINI_PAID_API_KEY: str | None = Field(
             default=None,
-            description="""Paid Gemini Developer API key. If not provided, the admin's key may be used if permitted.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["GEMINI_PAID_API_KEY"], is_user=True
+            ),
         )
         GEMINI_API_BASE_URL: str | None = Field(
             default=None,
-            description="""The base URL for calling the Gemini API
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["GEMINI_API_BASE_URL"], is_user=True
+            ),
         )
-        USE_VERTEX_AI: bool | None | Literal[""] = Field(
+        USE_VERTEX_AI: bool | None = Field(
             default=None,
-            description="""Whether to use Google Cloud Vertex AI instead of the standard Gemini API.
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["USE_VERTEX_AI"], is_user=True
+            ),
         )
         VERTEX_PROJECT: str | None = Field(
             default=None,
-            description="""The Google Cloud project ID to use with Vertex AI.
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["VERTEX_PROJECT"], is_user=True
+            ),
         )
         VERTEX_LOCATION: str | None = Field(
             default=None,
-            description="""The Google Cloud region to use with Vertex AI.
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["VERTEX_LOCATION"], is_user=True
+            ),
         )
-        ENABLE_FREE_TIER_FALLBACK: bool | None | Literal[""] = Field(
+        ENABLE_FREE_TIER_FALLBACK: bool | None = Field(
             default=None,
-            description="""Override the default setting for Free API fallback.
-            Set to True to enable automatic fallback to the Paid API, False to disable.
-            Default is None (use the admin's setting).""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["ENABLE_FREE_TIER_FALLBACK"], is_user=True
+            ),
         )
         TASK_MODEL_ROUTING: (
             Literal["only_free", "free_fallback", "only_paid", "match_main", ""] | None
         ) = Field(
             default=None,
-            description="""Override the default routing strategy for task models. 
-            Possible values: only_free | free_fallback | only_paid | match_main.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["TASK_MODEL_ROUTING"], is_user=True
+            ),
         )
-        THINKING_BUDGET: int | None | Literal[""] = Field(
+        THINKING_BUDGET: int | None = Field(
             default=None,
-            description="""Specifies the token budget for the model's internal thinking process,
-            used for complex tasks like tool use. Applicable to Gemini 2.5 models.
-            Default value is None. If you want the model to control the thinking budget when using the API, set the thinking budget to -1.
-
-            The valid token range depends on the specific model tier:
-            - **Pro models**: Must be a value between 128 and 32,768.
-            - **Flash and Lite models**: A value between 0 and 24,576. For these
-              models, a value of 0 disables the thinking feature.
-
-            See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more details.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["THINKING_BUDGET"], is_user=True
+            ),
         )
-        SHOW_THINKING_SUMMARY: bool | None | Literal[""] = Field(
+        SHOW_THINKING_SUMMARY: bool | None = Field(
             default=None,
-            description="""Whether to show the thinking summary in the response.
-            This is only applicable for Gemini 2.5 models.
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["SHOW_THINKING_SUMMARY"], is_user=True
+            ),
         )
-        ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
+        USE_FILES_API: bool | None = Field(
             default=None,
-            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
-            This tool is only compatible with specific models. Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["USE_FILES_API"], is_user=True
+            ),
         )
-        USE_FILES_API: bool | None | Literal[""] = Field(
+        PARSE_YOUTUBE_URLS: bool | None = Field(
             default=None,
-            description="""Override the default setting for using the Google Files API.
-            Set to True to force use, False to disable.
-            Default is None (use the admin's setting).""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["PARSE_YOUTUBE_URLS"], is_user=True
+            ),
         )
-        PARSE_YOUTUBE_URLS: bool | None | Literal[""] = Field(
+        MAPS_GROUNDING_COORDINATES: str | None = Field(
             default=None,
-            description="""Override the default setting for parsing YouTube URLs.
-            Set to True to enable, False to disable.
-            Default is None (use the admin's setting).""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["MAPS_GROUNDING_COORDINATES"], is_user=True
+            ),
         )
-        MAPS_GROUNDING_COORDINATES: str | None | Literal[""] = Field(
+        IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] | None = Field(
             default=None,
-            description="""Optional latitude and longitude coordinates for location-aware results with Google Maps grounding.
-            Overrides the admin setting. Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
-            Default value is None.""",
-        )
-        IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] | None | Literal[""] = Field(
-            default=None,
-            description="""Resolution for image generation (Gemini 3 Pro Image only).
-            Default value is None (use the admin's setting). Possible values: 1K, 2K, 4K""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["IMAGE_RESOLUTION"], is_user=True
+            ),
         )
         IMAGE_ASPECT_RATIO: (
             Literal[
@@ -1857,11 +1890,11 @@ class Pipe:
                 "21:9",
             ]
             | None
-            | Literal[""]
         ) = Field(
             default=None,
-            description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
-            Default value is None (use the admin's setting). Possible values: 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["IMAGE_ASPECT_RATIO"], is_user=True
+            ),
         )
 
         @field_validator("THINKING_BUDGET", mode="after")
@@ -2658,7 +2691,7 @@ class Pipe:
         is_avail, is_on = await self._get_toggleable_feature_status(
             "gemini_url_context_toggle", __metadata__
         )
-        enable_url_context = valves.ENABLE_URL_CONTEXT_TOOL  # Start with valve default.
+        enable_url_context = False
         if is_avail:
             # If the toggle filter is configured, it overrides the valve setting.
             enable_url_context = is_on
