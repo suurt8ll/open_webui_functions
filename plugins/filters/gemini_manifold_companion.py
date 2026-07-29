@@ -390,13 +390,8 @@ class Filter:
         )
 
     def __init__(self):
-        # Initialize valves with defaults; the framework injects DB values before each request.
         self.valves = self.Valves()
-        self.log_level = self.valves.LOG_LEVEL
-        # FIXME: Skip this here because LOG_LEVEL is always INFO anyways?
-        self._add_log_handler()
         log.success("Function has been initialized.")
-        log.trace("Full self object:", payload=self.__dict__)
 
     def inlet(
         self,
@@ -407,6 +402,12 @@ class Filter:
         __user__: dict[str, Any] | None = None,
     ) -> "Body":
         """Modifies the incoming request payload before it's sent to the LLM. Operates on the `form_data` dictionary."""
+
+        self._add_log_handler()
+
+        log.debug(
+            f"inlet method has been called. Gemini Manifold Companion version is {VERSION}"
+        )
 
         user_valves = __user__.get("valves") if isinstance(__user__, dict) else None
         valves = self._get_merged_valves(self.valves, user_valves)
@@ -434,19 +435,6 @@ class Filter:
         app_state._state["gemini_model_config"] = model_config
         log.debug(
             f"Stored model config in app state with {len(model_config)} model(s)."
-        )
-
-        # Detect log level change inside admin valves
-        if self.log_level != valves.LOG_LEVEL:
-            log.info(
-                f"Detected log level change: {self.log_level=} and {valves.LOG_LEVEL=}. "
-                "Running the logging setup again."
-            )
-            self.log_level = valves.LOG_LEVEL
-            self._add_log_handler()
-
-        log.debug(
-            f"inlet method has been called. Gemini Manifold Companion version is {VERSION}"
         )
 
         canonical_model_name, is_manifold = self._get_model_name(body)
