@@ -34,8 +34,6 @@ import yaml
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal, TYPE_CHECKING, cast
 
-from open_webui.models.functions import Functions
-
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler  # type: ignore
@@ -43,12 +41,6 @@ if TYPE_CHECKING:
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
-
-DEFAULT_MODEL_CONFIG_PATH = "https://raw.githubusercontent.com/suurt8ll/open_webui_functions/master/plugins/pipes/gemini_models.yaml"
-
-# Default timeout for URL resolution
-# TODO: Move to Pipe.Valves.
-DEFAULT_URL_TIMEOUT = aiohttp.ClientTimeout(total=10)  # 10 seconds total timeout
 
 
 class EventEmitter:
@@ -235,36 +227,91 @@ class EventEmitter:
         self._enqueue(event)
 
 
+_SHARED_VALVE_DESCS = {
+    "USE_PERMISSIVE_SAFETY": (
+        "Whether to request relaxed safety filtering for Gemini models."
+    ),
+    "BYPASS_BACKEND_RAG": (
+        "Bypass Open WebUI's built-in RAG processing and pass documents directly to the Gemini API.\n\n"
+        "*Note: Temporary chats (`local`) cannot bypass RAG and will fallback to default RAG.*"
+    ),
+    "MODEL_CONFIG_PATH": (
+        "Publicly accessible URL (`http://` or `https://`) to the YAML file containing model definitions and capabilities."
+    ),
+    "URL_RESOLVE_TIMEOUT": (
+        "Timeout in seconds for resolving grounding source web URLs."
+    ),
+    "URL_RESOLVE_MAX_RETRIES": (
+        "Maximum number of retry attempts to resolve grounding URLs before giving up."
+    ),
+    "URL_RESOLVE_BASE_DELAY": (
+        "Initial delay in seconds between retries when resolving grounding URLs (uses exponential backoff)."
+    ),
+    "STATUS_EMISSION_BEHAVIOR": (
+        "Controls status message visibility and detail level in the chat interface:\n"
+        "- `disable`: Suppress all status messages.\n"
+        "- `hidden_compact`: Hide final completion status; hide thinking details.\n"
+        "- `hidden_detailed`: Hide final completion status; include detailed thinking steps.\n"
+        "- `visible`: Show all status messages.\n"
+        "- `visible_timed`: Show all status messages with execution timestamps."
+    ),
+}
+
+_ADMIN_VALVE_DESCS = {
+    "LOG_LEVEL": (
+        "Select logging verbosity level. View logs using `docker logs -f open-webui`."
+    ),
+}
+
+
+def _format_valve_desc(text: str, default: Any = None, is_user: bool = False) -> str:
+    """Formats Markdown descriptions for Valves and UserValves fields."""
+    text = text.strip()
+    if is_user:
+        return f"{text}\n\n*If not set, the admin's setting is used.*"
+    formatted_default = f"`{default}`" if default is not None else "`None`"
+    return f"{text}\n\n**Default:** {formatted_default}"
+
+
 class Filter:
 
     class Valves(BaseModel):
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=False,
-            description="""Whether to request relaxed safety filtering.
-            Default value is False.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["USE_PERMISSIVE_SAFETY"], default=False
+            ),
         )
         BYPASS_BACKEND_RAG: bool = Field(
             default=True,
-            description="""Decide if you want ot bypass Open WebUI's RAG and send your documents directly to Google API.
-            Default value is True.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["BYPASS_BACKEND_RAG"], default=True
+            ),
         )
         MODEL_CONFIG_PATH: str = Field(
-            default=DEFAULT_MODEL_CONFIG_PATH,
-            description=f"""URL to the YAML file containing model definitions.
-            Must be a publicly accessible URL (http:// or https://).
-            Default value is '{DEFAULT_MODEL_CONFIG_PATH}'.""",
+            default="https://raw.githubusercontent.com/suurt8ll/open_webui_functions/master/plugins/pipes/gemini_models.yaml",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["MODEL_CONFIG_PATH"],
+                default="https://raw.githubusercontent.com/suurt8ll/open_webui_functions/master/plugins/pipes/gemini_models.yaml",
+            ),
         )
         URL_RESOLVE_TIMEOUT: int = Field(
             default=10,
-            description="Timeout in seconds for resolving a single source URL. Default is 10.",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["URL_RESOLVE_TIMEOUT"], default=10
+            ),
         )
         URL_RESOLVE_MAX_RETRIES: int = Field(
             default=3,
-            description="Maximum number of attempts to resolve a URL before giving up. Default is 3.",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["URL_RESOLVE_MAX_RETRIES"], default=3
+            ),
         )
         URL_RESOLVE_BASE_DELAY: float = Field(
             default=0.5,
-            description="Initial delay in seconds between retries, using exponential backoff. Default is 0.5.",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["URL_RESOLVE_BASE_DELAY"], default=0.5
+            ),
         )
         STATUS_EMISSION_BEHAVIOR: Literal[
             "disable",
@@ -274,23 +321,79 @@ class Filter:
             "visible_timed",
         ] = Field(
             default="hidden_detailed",
-            description="""Control status display. (Default: hidden_detailed) • Options • disable: No status.
-            • hidden_compact: Final success hidden, no thoughts. • hidden_detailed: Final success hidden, with thoughts.
-            • visible: All status visible. • visible_timed: Visible with timestamps.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["STATUS_EMISSION_BEHAVIOR"],
+                default="hidden_detailed",
+            ),
         )
         LOG_LEVEL: Literal[
             "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
         ] = Field(
             default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["LOG_LEVEL"], default="INFO"
+            ),
         )
 
-    # TODO: Support user settting through UserValves.
+    class UserValves(BaseModel):
+        USE_PERMISSIVE_SAFETY: bool | None = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["USE_PERMISSIVE_SAFETY"], is_user=True
+            ),
+        )
+        BYPASS_BACKEND_RAG: bool | None = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["BYPASS_BACKEND_RAG"], is_user=True
+            ),
+        )
+        MODEL_CONFIG_PATH: str | None = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["MODEL_CONFIG_PATH"], is_user=True
+            ),
+        )
+        URL_RESOLVE_TIMEOUT: int | None = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["URL_RESOLVE_TIMEOUT"], is_user=True
+            ),
+        )
+        URL_RESOLVE_MAX_RETRIES: int | None = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["URL_RESOLVE_MAX_RETRIES"], is_user=True
+            ),
+        )
+        URL_RESOLVE_BASE_DELAY: float | None = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["URL_RESOLVE_BASE_DELAY"], is_user=True
+            ),
+        )
+        STATUS_EMISSION_BEHAVIOR: (
+            Literal[
+                "disable",
+                "hidden_compact",
+                "hidden_detailed",
+                "visible",
+                "visible_timed",
+                "",
+            ]
+            | None
+        ) = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["STATUS_EMISSION_BEHAVIOR"], is_user=True
+            ),
+        )
 
     def __init__(self):
         # Initialize valves with defaults; the framework injects DB values before each request.
         self.valves = self.Valves()
         self.log_level = self.valves.LOG_LEVEL
+        # FIXME: Skip this here because LOG_LEVEL is always INFO anyways?
         self._add_log_handler()
         log.success("Function has been initialized.")
         log.trace("Full self object:", payload=self.__dict__)
@@ -301,8 +404,12 @@ class Filter:
         __request__: Request,
         __metadata__: "Metadata",
         __event_emitter__: Callable[["Event"], Awaitable[None]],
+        __user__: dict[str, Any] | None = None,
     ) -> "Body":
         """Modifies the incoming request payload before it's sent to the LLM. Operates on the `form_data` dictionary."""
+
+        user_valves = __user__.get("valves") if isinstance(__user__, dict) else None
+        valves = self._get_merged_valves(self.valves, user_valves)
 
         app_state: State = __request__.app.state
 
@@ -312,7 +419,7 @@ class Filter:
         self._cleanup_event_emitters(app_state)
 
         emitter = EventEmitter(
-            __event_emitter__, status_mode=self.valves.STATUS_EMISSION_BEHAVIOR
+            __event_emitter__, status_mode=valves.STATUS_EMISSION_BEHAVIOR
         )
         self._store_data_in_state(
             app_state,
@@ -323,18 +430,19 @@ class Filter:
 
         # Load and store model configuration in app state
         log.debug("Loading model configuration...")
-        model_config = self._load_model_config(self.valves.MODEL_CONFIG_PATH)
+        model_config = self._load_model_config(valves.MODEL_CONFIG_PATH)
         app_state._state["gemini_model_config"] = model_config
         log.debug(
             f"Stored model config in app state with {len(model_config)} model(s)."
         )
 
-        # Detect log level change inside self.valves
-        if self.log_level != self.valves.LOG_LEVEL:
+        # Detect log level change inside admin valves
+        if self.log_level != valves.LOG_LEVEL:
             log.info(
-                f"Detected log level change: {self.log_level=} and {self.valves.LOG_LEVEL=}. "
+                f"Detected log level change: {self.log_level=} and {valves.LOG_LEVEL=}. "
                 "Running the logging setup again."
             )
+            self.log_level = valves.LOG_LEVEL
             self._add_log_handler()
 
         log.debug(
@@ -400,12 +508,12 @@ class Filter:
                 # Disable code_interpreter
                 features["code_interpreter"] = False
                 metadata_features["google_code_execution"] = True
-        if self.valves.USE_PERMISSIVE_SAFETY:
+        if valves.USE_PERMISSIVE_SAFETY:
             log.info("Adding permissive safety settings to body.metadata")
             metadata["safety_settings"] = self._get_permissive_safety_settings(
                 canonical_model_name
             )
-        if self.valves.BYPASS_BACKEND_RAG:
+        if valves.BYPASS_BACKEND_RAG:
             if __metadata__["chat_id"] == "local":
                 # TODO toast notification
                 log.warning(
@@ -445,10 +553,14 @@ class Filter:
         __request__: Request,
         __metadata__: dict[str, Any],
         __event_emitter__: Callable[["Event"], Awaitable[None]],
+        __user__: dict[str, Any] | None = None,
     ) -> "Body":
         """Modifies the complete response payload after it's received from the LLM. Operates on the final `body` dictionary."""
 
         log.debug("outlet method has been called.")
+
+        user_valves = __user__.get("valves") if isinstance(__user__, dict) else None
+        valves = self._get_merged_valves(self.valves, user_valves)
 
         chat_id: str = __metadata__.get("chat_id", "")
         message_id: str = __metadata__.get("message_id", "")
@@ -512,6 +624,7 @@ class Filter:
                     grounding_chunks=gs_chunks,
                     supports=gs_supports,
                     emitter=emitter,
+                    valves=valves,
                 )
                 emitter.emit_status(
                     "This response was grounded with a Google tool", done=True
@@ -631,9 +744,7 @@ class Filter:
         return final_result_str
 
     async def _resolve_url(
-        self,
-        session: aiohttp.ClientSession,
-        url: str,
+        self, session: aiohttp.ClientSession, url: str, valves: "Filter.Valves"
     ) -> tuple[str, bool]:
         """
         Resolves a given URL using values from Valves.
@@ -642,9 +753,9 @@ class Filter:
         if not url:
             return "", False
 
-        timeout = aiohttp.ClientTimeout(total=self.valves.URL_RESOLVE_TIMEOUT)
-        max_retries = self.valves.URL_RESOLVE_MAX_RETRIES
-        base_delay = self.valves.URL_RESOLVE_BASE_DELAY
+        timeout = aiohttp.ClientTimeout(total=valves.URL_RESOLVE_TIMEOUT)
+        max_retries = valves.URL_RESOLVE_MAX_RETRIES
+        base_delay = valves.URL_RESOLVE_BASE_DELAY
 
         for attempt in range(max_retries + 1):
             try:
@@ -680,6 +791,7 @@ class Filter:
         grounding_chunks: list[types.GroundingChunk],
         supports: list[types.GroundingSupport],
         emitter: EventEmitter,
+        valves: "Filter.Valves",
     ):
         """
         Resolves URLs in the background and emits a chat completion event
@@ -716,7 +828,10 @@ class Filter:
             try:
                 log.info(f"Resolving {num_urls} source URLs...")
                 async with aiohttp.ClientSession() as session:
-                    tasks = [self._resolve_url(session, url) for url in urls_to_resolve]
+                    tasks = [
+                        self._resolve_url(session, url, valves)
+                        for url in urls_to_resolve
+                    ]
                     results = await asyncio.gather(*tasks)
                 log.info("URL resolution completed.")
 
@@ -882,7 +997,7 @@ class Filter:
     @functools.lru_cache(maxsize=1)
     def _load_model_config(config_path: str) -> dict:
         """Loads the model configuration from a URL.
-        
+
         Uses LRU cache to avoid reloading the same configuration repeatedly.
         Cache is tied to the config_path argument.
         """
@@ -891,14 +1006,20 @@ class Filter:
             return {}
 
         try:
-            if not (config_path.startswith("http://") or config_path.startswith("https://")):
-                log.error(f"MODEL_CONFIG_PATH must be a URL (http:// or https://), got: {config_path}")
+            if not (
+                config_path.startswith("http://") or config_path.startswith("https://")
+            ):
+                log.error(
+                    f"MODEL_CONFIG_PATH must be a URL (http:// or https://), got: {config_path}"
+                )
                 return {}
 
             log.debug(f"Loading model configuration from: {config_path}")
             with urllib.request.urlopen(config_path) as response:
                 config = yaml.safe_load(response.read())
-                log.success(f"Successfully loaded model configuration with {len(config)} model(s).")
+                log.success(
+                    f"Successfully loaded model configuration with {len(config)} model(s)."
+                )
                 return config
         except Exception as e:
             log.error(f"Failed to load model config from {config_path}: {e}")
@@ -911,17 +1032,19 @@ class Filter:
     @staticmethod
     def _check_model_capability(model_id: str, config: dict, capability: str) -> bool:
         """Check if a model supports a specific capability based on YAML config.
-        
+
         Args:
             model_id: The canonical model id (without prefixes)
             config: The loaded YAML configuration dict
             capability: The capability to check (e.g., "search_grounding", "code_execution")
-            
+
         Returns:
             True if the model supports the capability, False otherwise
         """
         if model_id not in config:
-            log.debug(f"Model '{model_id}' not found in config, capability '{capability}' check returns False.")
+            log.debug(
+                f"Model '{model_id}' not found in config, capability '{capability}' check returns False."
+            )
             return False
 
         model_config = config[model_id]
@@ -934,6 +1057,35 @@ class Filter:
     # endregion 1.5 Model capability checks
 
     # region 1.6 Utility helpers
+
+    @staticmethod
+    def _get_merged_valves(
+        default_valves: "Filter.Valves",
+        user_valves: "Filter.UserValves | dict[str, Any] | None",
+    ) -> "Filter.Valves":
+        """Merges UserValves into a base Valves configuration.
+
+        If a field in UserValves is not None or an empty string, it overrides
+        the corresponding field in default_valves.
+        """
+        if user_valves is None:
+            return default_valves.model_copy(deep=True)
+
+        merged_data = default_valves.model_dump()
+
+        if isinstance(user_valves, dict):
+            for field_name, user_value in user_valves.items():
+                if user_value is not None and user_value != "":
+                    if field_name in merged_data:
+                        merged_data[field_name] = user_value
+        else:
+            for field_name in Filter.UserValves.model_fields:
+                user_value = getattr(user_valves, field_name)
+                if user_value is not None and user_value != "":
+                    if field_name in merged_data:
+                        merged_data[field_name] = user_value
+
+        return Filter.Valves(**merged_data)
 
     def _extract_chat_control_params(self, body: "Body") -> dict[str, Any]:
         """
