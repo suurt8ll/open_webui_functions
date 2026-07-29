@@ -85,8 +85,6 @@ def mock_pipe_valves_data():
         "SHOW_THINKING_SUMMARY": True,
         "USE_FILES_API": True,
         "THINKING_MODEL_PATTERN": r"gemini-2.5",
-        "LOG_LEVEL": "INFO",
-        "ENABLE_URL_CONTEXT_TOOL": False,
     }
 
 
@@ -101,11 +99,7 @@ async def pipe_instance_fixture(mock_pipe_valves_data):
     with patch(
         "plugins.pipes.gemini_manifold.genai.Client",
         return_value=mock_gemini_client_actual_instance,
-    ) as MockedGenAIClientConstructor, patch.object(
-        Pipe, "_add_log_handler", MagicMock()
-    ), patch(
-        "sys.stdout", MagicMock()
-    ):
+    ) as MockedGenAIClientConstructor:
         pipe = Pipe()
         # Initialize with base data from mock_pipe_valves_data
         pipe.valves = Pipe.Valves(**mock_pipe_valves_data)
@@ -133,11 +127,7 @@ def test_pipe_initialization_with_api_key_prefers_free(mock_pipe_valves_data):
     with patch(
         "plugins.pipes.gemini_manifold.genai.Client",
         return_value=mock_gemini_client_instance,
-    ) as MockedGenAIClientConstructor, patch.object(
-        Pipe, "_add_log_handler", MagicMock()
-    ), patch(
-        "sys.stdout", MagicMock()
-    ):
+    ) as MockedGenAIClientConstructor:
         try:
             pipe_instance = Pipe()
             pipe_instance.valves = Pipe.Valves(**mock_pipe_valves_data)
@@ -170,11 +160,7 @@ def test_get_user_client_no_auth_provided_raises_error(mock_pipe_valves_data):
 
     with patch(
         "plugins.pipes.gemini_manifold.genai.Client"
-    ) as MockedGenAIClientConstructor, patch.object(
-        Pipe, "_add_log_handler", MagicMock()
-    ), patch(
-        "sys.stdout", MagicMock()
-    ):
+    ) as MockedGenAIClientConstructor:
         pipe_instance = Pipe()
         pipe_instance.valves = Pipe.Valves(**mock_pipe_valves_data)
 

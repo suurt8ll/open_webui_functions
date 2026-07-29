@@ -34,7 +34,6 @@ from google.api_core import exceptions
 
 import time
 import copy
-import json
 from urllib.parse import urlparse, parse_qs
 import xxhash
 import asyncio
@@ -52,7 +51,6 @@ import uuid
 import base64
 import re
 import fnmatch
-import sys
 import difflib
 from loguru import logger
 from fastapi import Request, FastAPI
@@ -76,8 +74,6 @@ from open_webui.utils.misc import pop_system_message
 
 # This block is skipped at runtime.
 if TYPE_CHECKING:
-    from loguru import Record
-    from loguru._handler import Handler  # type: ignore
     from plugins.filters.gemini_manifold_companion import EventEmitter
     # Imports custom type definitions (TypedDicts) for static analysis purposes (mypy/pylance).
     from utils.manifold_types import *
@@ -1589,7 +1585,6 @@ _ADMIN_VALVE_DESCS = {
     ),
     "CACHE_MODELS": "Whether to cache available models on startup and refresh only when whitelist or blacklist rules change.",
     "USE_ENTERPRISE_SEARCH": "Enable Enterprise Search tool allowing models to fetch and ground content from specified web URLs.",
-    "LOG_LEVEL": "Logging verbosity level. View logs using `docker logs -f open-webui`.",
 }
 
 
@@ -1752,14 +1747,6 @@ class Pipe:
                 _SHARED_VALVE_DESCS["MAPS_GROUNDING_COORDINATES"], default=None
             ),
         )
-        LOG_LEVEL: Literal[
-            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
-        ] = Field(
-            default="INFO",
-            description=_format_valve_desc(
-                _ADMIN_VALVE_DESCS["LOG_LEVEL"], default="INFO"
-            ),
-        )
         IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] = Field(
             default="1K",
             description=_format_valve_desc(
@@ -1920,7 +1907,6 @@ class Pipe:
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
-        self._add_log_handler(self.valves.LOG_LEVEL)
         log.debug("pipes method has been called.")
 
         # Clear cache if caching is disabled
@@ -1954,8 +1940,6 @@ class Pipe:
         __metadata__: "Metadata",
     ) -> AsyncGenerator[dict | str, None] | dict:
 
-        self._add_log_handler(self.valves.LOG_LEVEL)
-
         log.debug(
             f"pipe method has been called. Gemini Manifold google_genai version is {VERSION}"
         )
@@ -1967,7 +1951,7 @@ class Pipe:
 
         # Retrieve model configuration from app state
         app_state: State = __request__.app.state
-        model_config: dict[str, Any] = app_state._state.get("gemini_model_config")
+        model_config: dict[str, Any] | None = app_state._state.get("gemini_model_config")
         # FIXME: be even more strict by requring the model id to be present in the config to proceed?
         if model_config is None:
             error_msg = (
@@ -2087,9 +2071,9 @@ class Pipe:
 
         raise ValueError("Exhausted execution options without result.")
 
-    # region 2. Helper methods inside the Pipe class
+    # region 1. Helper methods inside the Pipe class
 
-    # region 2.1 Client initialization
+    # region 1.1 Client initialization
     @staticmethod
     @cache
     def _get_or_create_genai_client(
@@ -2180,9 +2164,9 @@ class Pipe:
         ]
         return [getattr(source_valves, attr, None) for attr in ATTRS]
 
-    # endregion 2.1 Client initialization
+    # endregion 1.1 Client initialization
 
-    # region 2.2 Model retrival from Google API
+    # region 1.2 Model retrival from Google API
     @cached()  # aiocache.cached for async method
     async def _get_genai_models(
         self,
@@ -2524,9 +2508,9 @@ class Pipe:
 
         return False
 
-    # endregion 2.2 Model retrival from Google API
+    # endregion 1.2 Model retrival from Google API
 
-    # region 2.3 GenerateContentConfig assembly
+    # region 1.3 GenerateContentConfig assembly
 
     async def _build_gen_content_config(
         self,
@@ -2761,9 +2745,9 @@ class Pipe:
 
         return gen_content_conf
 
-    # endregion 2.3 GenerateContentConfig assembly
+    # endregion 1.3 GenerateContentConfig assembly
 
-    # region 2.4 Model response processing
+    # region 1.4 Model response processing
 
     async def _aggregate_to_dict(
         self,
@@ -3408,9 +3392,9 @@ class Pipe:
         else:
             return None
 
-    # endregion 2.4 Model response processing
+    # endregion 1.4 Model response processing
 
-    # region 2.5 Post-processing
+    # region 1.5 Post-processing
     async def _do_post_processing(
         self,
         model_response: types.GenerateContentResponse | None,
@@ -3740,240 +3724,9 @@ class Pipe:
 
         return usage_payload
 
-    # endregion 2.5 Post-processing
+    # endregion 1.5 Post-processing
 
-    # region 2.6 Logging
-    # TODO: Move to a separate plugin that does not have any Open WebUI funcitonlity and is only imported by this plugin.
-
-    def _is_flat_dict(self, data: Any) -> bool:
-        """
-        Checks if a dictionary contains only non-dict/non-list values (is one level deep).
-        """
-        if not isinstance(data, dict):
-            return False
-        return not any(isinstance(value, (dict, list)) for value in data.values())
-
-    def _truncate_long_strings(
-        self, data: Any, max_len: int, truncation_marker: str, truncation_enabled: bool
-    ) -> Any:
-        """
-        Recursively traverses a data structure (dicts, lists) and truncates
-        long string values. Creates copies to avoid modifying original data.
-
-        Args:
-            data: The data structure (dict, list, str, int, float, bool, None) to process.
-            max_len: The maximum allowed length for string values.
-            truncation_marker: The string to append to truncated values.
-            truncation_enabled: Whether truncation is enabled.
-
-        Returns:
-            A potentially new data structure with long strings truncated.
-        """
-        if not truncation_enabled or max_len <= len(truncation_marker):
-            # If truncation is disabled or max_len is too small, return original
-            # Make a copy only if it's a mutable type we might otherwise modify
-            if isinstance(data, (dict, list)):
-                return copy.deepcopy(data)  # Ensure deep copy for nested structures
-            return data  # Primitives are immutable
-
-        if isinstance(data, str):
-            if len(data) > max_len:
-                return data[: max_len - len(truncation_marker)] + truncation_marker
-            return data  # Return original string if not truncated
-        elif isinstance(data, dict):
-            # Process dictionary items, creating a new dict
-            return {
-                k: self._truncate_long_strings(
-                    v, max_len, truncation_marker, truncation_enabled
-                )
-                for k, v in data.items()
-            }
-        elif isinstance(data, list):
-            # Process list items, creating a new list
-            return [
-                self._truncate_long_strings(
-                    item, max_len, truncation_marker, truncation_enabled
-                )
-                for item in data
-            ]
-        else:
-            # Return non-string, non-container types as is (they are immutable)
-            return data
-
-    def plugin_stdout_format(self, record: "Record") -> str:
-        """
-        Custom format function for the plugin's logs.
-        Serializes and truncates data passed under the 'payload' key in extra.
-        """
-
-        # Configuration Keys
-        LOG_OPTIONS_PREFIX = "_log_"
-        TRUNCATION_ENABLED_KEY = f"{LOG_OPTIONS_PREFIX}truncation_enabled"
-        MAX_LENGTH_KEY = f"{LOG_OPTIONS_PREFIX}max_length"
-        TRUNCATION_MARKER_KEY = f"{LOG_OPTIONS_PREFIX}truncation_marker"
-        DATA_KEY = "payload"
-
-        original_extra = record["extra"]
-        # Extract the data intended for serialization using the chosen key
-        data_to_process = original_extra.get(DATA_KEY)
-
-        serialized_data_json = ""
-        if data_to_process is not None:
-            try:
-                serializable_data = pydantic_core.to_jsonable_python(
-                    data_to_process, serialize_unknown=True, exclude_none=True
-                )
-
-                # Determine truncation settings
-                truncation_enabled = original_extra.get(TRUNCATION_ENABLED_KEY, True)
-                max_length = original_extra.get(MAX_LENGTH_KEY, 256)
-                truncation_marker = original_extra.get(TRUNCATION_MARKER_KEY, "[...]")
-
-                # If max_length was explicitly provided, force truncation enabled
-                if MAX_LENGTH_KEY in original_extra:
-                    truncation_enabled = True
-
-                # Truncate long strings
-                truncated_data = self._truncate_long_strings(
-                    serializable_data,
-                    max_length,
-                    truncation_marker,
-                    truncation_enabled,
-                )
-
-                # Serialize the (potentially truncated) data
-                if self._is_flat_dict(truncated_data) and not isinstance(
-                    truncated_data, list
-                ):
-                    json_string = json.dumps(
-                        truncated_data, separators=(",", ":"), default=str
-                    )
-                    # Add a simple prefix if it's compact
-                    serialized_data_json = " - " + json_string
-                else:
-                    json_string = json.dumps(truncated_data, indent=2, default=str)
-                    # Prepend with newline for readability
-                    serialized_data_json = "\n" + json_string
-
-            except (TypeError, ValueError) as e:  # Catch specific serialization errors
-                serialized_data_json = f" - {{Serialization Error: {e}}}"
-            except (
-                Exception
-            ) as e:  # Catch any other unexpected errors during processing
-                serialized_data_json = f" - {{Processing Error: {e}}}"
-
-        # Add the final JSON string (or error message) back into the record
-        record["extra"]["_plugin_serialized_data"] = serialized_data_json
-
-        # Base template
-        base_template = (
-            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-            "<level>{level: <8}</level> | "
-            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-            "<level>{message}</level>"
-        )
-
-        # Append the serialized data
-        base_template += "{extra[_plugin_serialized_data]}"
-        # Append the exception part
-        base_template += "\n{exception}"
-        # Return the format string template
-        return base_template.rstrip()
-
-    @cache
-    def _add_log_handler(self, log_level: str):
-        """
-        Adds or updates the loguru handler specifically for this plugin.
-        Includes logic for serializing and truncating extra data.
-        The handler is added only if the log_level has changed since the last call.
-        """
-
-        def plugin_filter(record: "Record"):
-            """Filter function to only allow logs from this plugin (based on module name)."""
-            return record["name"] == __name__
-
-        # Get the desired level name and number
-        desired_level_name = log_level
-        try:
-            # Use the public API to get level details
-            desired_level_info = log.level(desired_level_name)
-            desired_level_no = desired_level_info.no
-        except ValueError:
-            log.error(
-                f"Invalid LOG_LEVEL '{desired_level_name}' configured for plugin {__name__}. Cannot add/update handler."
-            )
-            return  # Stop processing if the level is invalid
-
-        # Access the internal state of the log
-        handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
-        handler_id_to_remove = None
-        found_correct_handler = False
-
-        for handler_id, handler in handlers.items():
-            existing_filter = handler._filter  # Access internal attribute
-
-            # Check if the filter matches our plugin_filter
-            # Comparing function objects directly can be fragile if they are recreated.
-            # Comparing by name and module is more robust for functions defined at module level.
-            is_our_filter = (
-                existing_filter is not None  # Make sure a filter is set
-                and hasattr(existing_filter, "__name__")
-                and existing_filter.__name__ == plugin_filter.__name__
-                and hasattr(existing_filter, "__module__")
-                and existing_filter.__module__ == plugin_filter.__module__
-            )
-
-            if is_our_filter:
-                existing_level_no = handler.levelno
-                log.trace(
-                    f"Found existing handler {handler_id} for {__name__} with level number {existing_level_no}."
-                )
-
-                # Check if the level matches the desired level
-                if existing_level_no == desired_level_no:
-                    log.debug(
-                        f"Handler {handler_id} for {__name__} already exists with the correct level '{desired_level_name}'."
-                    )
-                    found_correct_handler = True
-                    break  # Found the correct handler, no action needed
-                else:
-                    # Found our handler, but the level is wrong. Mark for removal.
-                    log.info(
-                        f"Handler {handler_id} for {__name__} found, but log level differs "
-                        f"(existing: {existing_level_no}, desired: {desired_level_no}). "
-                        f"Removing it to update."
-                    )
-                    handler_id_to_remove = handler_id
-                    break  # Found the handler to replace, stop searching
-
-        # Remove the old handler if marked for removal
-        if handler_id_to_remove is not None:
-            try:
-                log.remove(handler_id_to_remove)
-                log.debug(f"Removed handler {handler_id_to_remove} for {__name__}.")
-            except ValueError:
-                # This might happen if the handler was somehow removed between the check and now
-                log.warning(
-                    f"Could not remove handler {handler_id_to_remove} for {__name__}. It might have already been removed."
-                )
-                # If removal failed but we intended to remove, we should still proceed to add
-                # unless found_correct_handler is somehow True (which it shouldn't be if handler_id_to_remove was set).
-
-        # Add a new handler if no correct one was found OR if we just removed an incorrect one
-        if not found_correct_handler:
-            log.add(
-                sys.stdout,
-                level=desired_level_name,
-                format=self.plugin_stdout_format,
-                filter=plugin_filter,
-            )
-            log.debug(
-                f"Added new handler to loguru for {__name__} with level {desired_level_name}."
-            )
-
-    # endregion 2.6 Logging
-
-    # region 2.7 Utility helpers
+    # region 1.6 Utility helpers
 
     async def _determine_execution_order(
         self,
@@ -4329,6 +4082,6 @@ class Pipe:
                     f"Could not parse companion version string: '{companion_version}'. Version check skipped."
                 )
 
-    # endregion 2.7 Utility helpers
+    # endregion 1.6 Utility helpers
 
-    # endregion 2. Helper methods inside the Pipe class
+    # endregion 1. Helper methods inside the Pipe class
