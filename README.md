@@ -19,6 +19,7 @@ The plugins are organized by type within the `plugins/` directory:
 -   `plugins/pipes/`: Pipe plugins that integrate custom models and behaviors.
     -   `gemini_manifold.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/gemini_manifold_google_genai) | Provides support for Google's Gemini Studio API and Vertex AI. See the [Detailed Documentation](docs/plugins/pipes/gemini_manifold.md).
     -   `venice_manifold.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/venice_image_generation) | Enables image creation using any diffusion model offered by Venice.ai API.
+    -   `dynamic_plugin_log_manager.py`: Dynamically injects and manages Loguru handlers with custom formatting for Open WebUI plugins. See the [Detailed Documentation](docs/plugins/pipes/dynamic_plugin_log_manager.md).
 -   `plugins/filters/`: Filter plugins that modify request and response data.
     -   `gemini_manifold_companion.py`: A companion filter for the Gemini Manifold pipe providing enhanced functionality like Google Search grounding. See the [Detailed Documentation](docs/plugins/filters/gemini_manifold_companion.md).
     -   `system_prompt_injector.py`: Allows changing chat options like system prompt and temperature directly from the chatbox. Pairs well with the Open WebUI "Prompts" feature.

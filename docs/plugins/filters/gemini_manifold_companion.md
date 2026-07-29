@@ -36,7 +36,6 @@ The filter is configured via a "Valves" settings menu accessible by clicking the
     *   **Custom:** Allows specifying a custom threshold value. Consult the Google documentation for information on acceptable values and their impact. This setting is only supported for Gemini 1.0 and 1.5 models.
 *   **USE_PERMISSIVE_SAFETY:** *(Enabled/Disabled)* When enabled, the filter will add permissive safety settings to the request payload, potentially allowing the model to generate responses that might otherwise be blocked by default safety filters. Refer to Google's safety settings documentation for details.
 *   **BYPASS_BACKEND_RAG:** *(Enabled/Disabled)* When enabled, the filter intercepts document uploads, prevents Open WebUI's backend RAG from processing them, and signals the `gemini_manifold.py` pipe to handle the raw documents directly with the Gemini API. **Note: This feature is not supported in temporary ('local') chats.**
-*   **LOG_LEVEL:** *(TRACE/DEBUG/INFO/SUCCESS/WARNING/ERROR/CRITICAL)* Controls the logging verbosity of this specific filter. Use `docker logs -f open-webui` to view logs.
 
 ## Usage
 
