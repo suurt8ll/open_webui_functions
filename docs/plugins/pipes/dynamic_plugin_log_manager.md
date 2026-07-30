@@ -67,6 +67,7 @@ Add these to `extra` on the log call (or bind them once on the logger):
 | `_log_truncation_enabled` | `bool` | `True` | Set `False` to disable truncation |
 | `_log_max_length` | `int` | `256` | Truncation max length |
 | `_log_truncation_marker` | `str` | `[...]` | Suffix appended when truncated |
+| `_log_exclude_none` | `bool` | `True` | Determines if keys with `None` values will be shown in the dump. |
 
 Example:
 
