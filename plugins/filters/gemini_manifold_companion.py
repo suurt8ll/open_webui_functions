@@ -380,7 +380,7 @@ class Filter:
         __request__: Request,
         __metadata__: "Metadata",
         __event_emitter__: Callable[["Event"], Awaitable[None]],
-        __user__: dict[str, Any] | None = None,
+        __user__: "UserData",
     ) -> "Body":
         """Modifies the incoming request payload before it's sent to the LLM. Operates on the `form_data` dictionary."""
         log.debug(
@@ -519,7 +519,7 @@ class Filter:
         __request__: Request,
         __metadata__: dict[str, Any],
         __event_emitter__: Callable[["Event"], Awaitable[None]],
-        __user__: dict[str, Any] | None = None,
+        __user__: "UserData",
     ) -> "Body":
         """Modifies the complete response payload after it's received from the LLM. Operates on the final `body` dictionary."""
 
@@ -566,7 +566,10 @@ class Filter:
             )
 
             if cited_text:
-                content = body["messages"][-1]["content"]
+                target_msg = body["messages"][-1]
+                content = target_msg.get("content")
+
+                # 1. Update message content
                 if isinstance(content, list):
                     for item in content:
                         if item.get("type") == "text":
@@ -574,7 +577,22 @@ class Filter:
                             item["text"] = cited_text
                             break
                 else:
-                    body["messages"][-1]["content"] = cited_text
+                    target_msg["content"] = cited_text
+
+                # 2. Update message output array if present (used by UI for reasoning/structured models)
+                if "output" in target_msg and isinstance(target_msg["output"], list):
+                    for out_item in target_msg["output"]:
+                        if (
+                            isinstance(out_item, dict)
+                            and out_item.get("type") == "message"
+                        ):
+                            out_content = out_item.get("content")
+                            if isinstance(out_content, list):
+                                for sub_item in out_content:
+                                    if isinstance(sub_item, dict) and sub_item.get(
+                                        "type"
+                                    ) in ("output_text", "text"):
+                                        sub_item["text"] = cited_text
 
             # Emit status event with search queries before resolving URLs
             if stored_metadata.web_search_queries:
@@ -707,6 +725,9 @@ class Filter:
                 log.warning("Raw string is empty, cannot inject citation markers.")
 
         final_result_str = thought_prefix + processed_content_part_with_markers
+        log.trace(
+            "final_result_str:", payload=final_result_str, _log_truncation_enabled=False
+        )
         return final_result_str
 
     async def _resolve_url(
