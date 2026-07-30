@@ -256,10 +256,11 @@ _ADMIN_VALVE_DESCS = {}
 def _format_valve_desc(text: str, default: Any = None, is_user: bool = False) -> str:
     """Formats Markdown descriptions for Valves and UserValves fields."""
     text = text.strip()
+    sep = "\n\n---\n\n"
     if is_user:
-        return f"{text}\n\n*If not set, the admin's setting is used.*"
+        return f"{text}\n\n*If not set, the admin's setting is used.*{sep}"
     formatted_default = f"`{default}`" if default is not None else "`None`"
-    return f"{text}\n\n**Default:** {formatted_default}"
+    return f"{text}\n\n**Default:** {formatted_default}{sep}"
 
 
 class Filter:
