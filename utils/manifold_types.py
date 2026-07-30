@@ -355,20 +355,63 @@ class ImageContent(TypedDict):
 Content = TextContent | ImageContent  # Union of possible content types
 
 
+class OutputTextContent(TypedDict):
+    """Represents output text content blocks within model outputs."""
+
+    type: Literal["output_text", "text"]
+    text: str
+
+
+class ReasoningOutputItem(TypedDict):
+    """Represents reasoning / thinking output blocks."""
+
+    type: Literal["reasoning"]
+    id: NotRequired[str]
+    status: NotRequired[str]
+    start_tag: NotRequired[str]
+    end_tag: NotRequired[str]
+    attributes: NotRequired[dict[str, Any]]
+    content: list[OutputTextContent]
+    summary: NotRequired[str | None]
+    started_at: NotRequired[float]
+    ended_at: NotRequired[float]
+    duration: NotRequired[float]
+
+
+class MessageOutputItem(TypedDict):
+    """Represents message output blocks."""
+
+    type: Literal["message"]
+    id: NotRequired[str]
+    status: NotRequired[str]
+    role: NotRequired[Literal["assistant", "user", "system"]]
+    content: list[OutputTextContent]
+
+
+OutputItem = ReasoningOutputItem | MessageOutputItem
+
 class UserMessage(TypedDict):
     """Represents a message from the user."""
 
     role: Literal["user"]
-    content: (
-        str | list[Content]
-    )  # Content can be a simple string or a list of Content blocks
+    id: NotRequired[str]
+    content: str | list[Content]
+    timestamp: NotRequired[int]
+    info: NotRequired[dict[str, Any] | None]
 
 
 class AssistantMessage(TypedDict):
     """Represents a message from the assistant."""
 
     role: Literal["assistant"]
-    content: str  # Assistant messages typically have string content
+    id: NotRequired[str]
+    content: str  # I've never seen a non-string assistant message.
+    timestamp: NotRequired[int]
+    info: NotRequired[dict[str, Any] | None]
+    output: NotRequired[list[OutputItem]]
+    sources: NotRequired[list[Any]]
+    usage: NotRequired[dict[str, Any]]
+    originalContent: NotRequired[str]
     # This custom key is added by the Gemini Manifold companion filter to store the
     # raw structured response parts from the Gemini API for potential future use.
     # It is not part of the standard Open WebUI message format and will be ignored by the core system.
