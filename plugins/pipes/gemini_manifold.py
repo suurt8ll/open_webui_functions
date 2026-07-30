@@ -1926,7 +1926,8 @@ class Pipe:
             return [self._return_error_model(error_msg, exception=True)]
 
         log.info(f"Returning {len(filtered_models)} models to Open WebUI.")
-        log.debug("Model list:", payload=filtered_models, _log_truncation_enabled=False)
+        log.debug(f"Model list:", payload=[model["id"] for model in filtered_models])
+        log.trace("List of dicts that Pipe.pipes() will return:", payload=filtered_models, _log_truncation_enabled=False)
         log.debug("pipes method has finished.")
 
         return filtered_models

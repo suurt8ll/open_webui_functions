@@ -79,6 +79,7 @@ class Pipe:
         TRUNCATION_ENABLED_KEY = f"{LOG_OPTIONS_PREFIX}truncation_enabled"
         MAX_LENGTH_KEY = f"{LOG_OPTIONS_PREFIX}max_length"
         TRUNCATION_MARKER_KEY = f"{LOG_OPTIONS_PREFIX}truncation_marker"
+        EXCLUDE_NONE_KEY = f"{LOG_OPTIONS_PREFIX}exclude_none"
         DATA_KEY = "payload"
 
         original_extra = record["extra"]
@@ -87,8 +88,9 @@ class Pipe:
         serialized_data_json = ""
         if data_to_process is not None:
             try:
+                exclude_none = original_extra.get(EXCLUDE_NONE_KEY, True)
                 serializable_data = pydantic_core.to_jsonable_python(
-                    data_to_process, serialize_unknown=True
+                    data_to_process, serialize_unknown=True, exclude_none=exclude_none
                 )
 
                 truncation_enabled = original_extra.get(TRUNCATION_ENABLED_KEY, True)
