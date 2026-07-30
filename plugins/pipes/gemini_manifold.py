@@ -32,6 +32,7 @@ from google.genai import errors as genai_errors
 from google.cloud import storage
 from google.api_core import exceptions
 
+import json
 import time
 import copy
 from urllib.parse import urlparse, parse_qs
@@ -1542,13 +1543,10 @@ _SHARED_VALVE_DESCS = {
         "- `only_paid`: Bypass Free API and use Paid API directly (or Vertex AI if enabled).\n"
         "- `match_main`: Follow the same routing logic as the main chat generation."
     ),
-    "THINKING_BUDGET": (
-        "Token budget for internal model thinking (Gemini 2.5 and 3 models).\n"
-        "Set to `-1` to allow dynamic/automatic budget control.\n\n"
-        "**Valid Token Ranges:**\n"
-        "- **Pro models:** `128` to `32,768`\n"
-        "- **Flash and Lite models:** `0` to `24,576` (`0` disables thinking)\n\n"
-        "For details, see [Vertex AI Thinking Docs](https://cloud.google.com/vertex-ai/generative-ai/docs/thinking)."
+    "THINKING_CONFIG_RULES": (
+        "JSON string mapping model name regex patterns to default thinking budget (int) or thinking level (str: `MINIMAL`, `LOW`, `MEDIUM`, `HIGH`).\n\n"
+        "Determines thinking parameters per model. **Note that key order matters:** the first matching regex pattern is used, so place more specific patterns before broader catch-all patterns.\n\n"
+        "For details on backend defaults and model support, see [Google Cloud Thinking Docs](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/thinking#budget)."
     ),
     "SHOW_THINKING_SUMMARY": "Whether to display the thinking process summary in responses (Gemini 2.5 and 3 models).",
     "USE_FILES_API": (
@@ -1622,6 +1620,26 @@ class Pipe:
                 raise ValueError(
                     f"Invalid format for MAPS_GROUNDING_COORDINATES: '{v}'. "
                     f"Expected 'latitude,longitude' (e.g., '40.7128,-74.0060'). Original error: {e}"
+                )
+        return v
+
+    @staticmethod
+    def _validate_thinking_config_rules(v: str | None) -> str | None:
+        """Validates that THINKING_CONFIG_RULES is a valid JSON string mapping regex patterns to int or str."""
+        if v is not None and v.strip() != "":
+            try:
+                data = json.loads(v)
+                if not isinstance(data, dict):
+                    raise ValueError("Must be a JSON object (dict).")
+                for key, val in data.items():
+                    re.compile(key)
+                    if not isinstance(val, (int, str)):
+                        raise ValueError(
+                            f"Value for pattern '{key}' must be an int or str, got {type(val).__name__}."
+                        )
+            except Exception as e:
+                raise ValueError(
+                    f"Invalid JSON format or structure for THINKING_CONFIG_RULES: {e}"
                 )
         return v
 
@@ -1709,12 +1727,10 @@ class Pipe:
                 _ADMIN_VALVE_DESCS["CACHE_MODELS"], default=True
             ),
         )
-        THINKING_BUDGET: int = Field(
-            default=8192,
-            ge=-1,
-            le=32768,
+        THINKING_CONFIG_RULES: str = Field(
+            default='{"$a": 0}',
             description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["THINKING_BUDGET"], default=8192
+                _SHARED_VALVE_DESCS["THINKING_CONFIG_RULES"], default='{"$a": 0}'
             ),
         )
         SHOW_THINKING_SUMMARY: bool = Field(
@@ -1770,6 +1786,11 @@ class Pipe:
                 _SHARED_VALVE_DESCS["IMAGE_ASPECT_RATIO"], default="16:9"
             ),
         )
+
+        @field_validator("THINKING_CONFIG_RULES", mode="after")
+        @classmethod
+        def validate_thinking_config_rules(cls, v: str | None):
+            return Pipe._validate_thinking_config_rules(v)
 
         @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
         @classmethod
@@ -1827,10 +1848,10 @@ class Pipe:
                 _SHARED_VALVE_DESCS["TASK_MODEL_ROUTING"], is_user=True
             ),
         )
-        THINKING_BUDGET: int | None = Field(
+        THINKING_CONFIG_RULES: str | None = Field(
             default=None,
             description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["THINKING_BUDGET"], is_user=True
+                _SHARED_VALVE_DESCS["THINKING_CONFIG_RULES"], is_user=True
             ),
         )
         SHOW_THINKING_SUMMARY: bool | None = Field(
@@ -1884,15 +1905,10 @@ class Pipe:
             ),
         )
 
-        @field_validator("THINKING_BUDGET", mode="after")
+        @field_validator("THINKING_CONFIG_RULES", mode="after")
         @classmethod
-        def validate_thinking_budget_range(cls, v):
-            if v is not None and v != "":
-                if not (-1 <= v <= 32768):
-                    raise ValueError(
-                        "THINKING_BUDGET must be between -1 and 32768, inclusive."
-                    )
-            return v
+        def validate_thinking_config_rules(cls, v: str | None):
+            return Pipe._validate_thinking_config_rules(v)
 
         @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
         @classmethod
@@ -2168,6 +2184,7 @@ class Pipe:
     # endregion 1.1 Client initialization
 
     # region 1.2 Model retrival from Google API
+
     @cached()  # aiocache.cached for async method
     async def _get_genai_models(
         self,
@@ -2509,9 +2526,82 @@ class Pipe:
 
         return False
 
+    @staticmethod
+    def _parse_gemini_version(model_id: str) -> float:
+        """Extracts the Gemini model version number from model ID.
+
+        If not a Gemini model or version is missing, logs a warning and returns 3.0.
+        """
+        model_id_lower = model_id.lower()
+        if "gemini" in model_id_lower:
+            match = re.search(r"gemini-(\d+(?:\.\d+)?)", model_id_lower)
+            if match:
+                try:
+                    return float(match.group(1))
+                except ValueError:
+                    pass
+
+        log.warning(
+            f"Model '{model_id}' is either not a Gemini model or missing a standard version number. "
+            "Treating as Gemini 3+ model."
+        )
+        return 3.0
+
     # endregion 1.2 Model retrival from Google API
 
     # region 1.3 GenerateContentConfig assembly
+
+    @classmethod
+    def _resolve_valve_thinking_config(
+        cls, rules_json: str, model_id: str
+    ) -> tuple[int | None, str | None]:
+        """Evaluates THINKING_CONFIG_RULES regex patterns against model_id to determine default budget/level."""
+        if not rules_json or not rules_json.strip():
+            return None, None
+
+        try:
+            rules = json.loads(rules_json)
+            if not isinstance(rules, dict):
+                return None, None
+        except Exception as e:
+            log.warning(f"Failed to parse THINKING_CONFIG_RULES JSON: {e}")
+            return None, None
+
+        matching_hits: list[tuple[str, int | str]] = []
+        for pattern, val in rules.items():
+            try:
+                if re.search(pattern, model_id):
+                    matching_hits.append((pattern, val))
+            except re.error as e:
+                log.warning(
+                    f"Invalid regex pattern '{pattern}' in THINKING_CONFIG_RULES: {e}"
+                )
+
+        if not matching_hits:
+            return None, None
+
+        model_version = cls._parse_gemini_version(model_id)
+        is_under_v3 = model_version < 3.0
+
+        level_hits = [val for _, val in matching_hits if isinstance(val, str)]
+        budget_hits = [val for _, val in matching_hits if isinstance(val, int)]
+
+        if is_under_v3:
+            if budget_hits:
+                return budget_hits[0], None
+            elif level_hits:
+                log.warning(
+                    f"Model '{model_id}' (version {model_version}) is older than Gemini 3 and does not support thinking_level. "
+                    f"Regex hit specified level '{level_hits[0]}', but no budget rule hit. Falling back to API default."
+                )
+                return None, None
+        else:
+            if level_hits:
+                return None, level_hits[0]
+            elif budget_hits:
+                return budget_hits[0], None
+
+        return None, None
 
     async def _build_gen_content_config(
         self,
@@ -2526,7 +2616,7 @@ class Pipe:
 
         log.debug(
             "Features extracted from metadata (UI toggles and config):",
-            payload=features
+            payload=features,
         )
 
         safety_settings: list[types.SafetySetting] | None = __metadata__.get(
@@ -2538,24 +2628,25 @@ class Pipe:
         model_id: str = __metadata__.get("canonical_model_id", "")
         is_thinking_model = False
         if model_id in config:
-            is_thinking_model = config[model_id].get("capabilities", {}).get("thinking", False)
+            is_thinking_model = (
+                config[model_id].get("capabilities", {}).get("thinking", False)
+            )
 
         log.debug(
             f"Model '{model_id}' is classified as a reasoning model: {bool(is_thinking_model)}. "
         )
 
         if is_thinking_model:
-            # Start with the default thinking configuration from valves.
-            log.info(
-                f"Setting thinking config defaults: budget={valves.THINKING_BUDGET}, "
-                f"include_thoughts={valves.SHOW_THINKING_SUMMARY}."
+            # Precedence level 1 (lowest): Valves option
+            chosen_budget, chosen_level = self._resolve_valve_thinking_config(
+                valves.THINKING_CONFIG_RULES, model_id
             )
-            thinking_conf = types.ThinkingConfig(
-                thinking_budget=valves.THINKING_BUDGET,
-                include_thoughts=valves.SHOW_THINKING_SUMMARY,
+            log.info(
+                f"Resolved valve thinking config for model '{model_id}': "
+                f"budget={chosen_budget}, level={chosen_level}"
             )
 
-            # Override defaults with custom 'reasoning_effort' parameter if present.
+            # Precedence level 2 (medium): Merged params override
             merged_params = __metadata__.get("merged_custom_params", {})
             if reasoning_effort := merged_params.get("reasoning_effort"):
                 log.info(
@@ -2563,57 +2654,83 @@ class Pipe:
                 )
 
                 try:
-                    # Attempt to parse as a number (for thinking_budget).
                     budget = round(float(reasoning_effort))
                     log.info(
                         f"Interpreting `reasoning_effort` as a thinking budget: {budget}"
                     )
-                    thinking_conf.thinking_budget = budget
-                    thinking_conf.thinking_level = (
-                        None  # Budget and level are mutually exclusive.
-                    )
+                    chosen_budget = budget
+                    chosen_level = None
                 except (ValueError, TypeError):
-                    # If it's not a number, treat it as a thinking_level string.
                     if isinstance(reasoning_effort, str):
                         effort_level_str = reasoning_effort.upper()
-                        if effort_level_str in types.ThinkingLevel.__members__:
+                        valid_levels = {"MINIMAL", "LOW", "MEDIUM", "HIGH"}
+                        if effort_level_str in valid_levels:
                             log.info(
                                 f"Interpreting `reasoning_effort` as a thinking level: {effort_level_str}"
                             )
-                            thinking_conf.thinking_level = types.ThinkingLevel[
-                                effort_level_str
-                            ]
-                            thinking_conf.thinking_budget = (
-                                None  # Budget and level are mutually exclusive.
-                            )
+                            chosen_level = effort_level_str
+                            chosen_budget = None
                         else:
                             log.warning(
                                 f"Invalid `reasoning_effort` string value: '{reasoning_effort}'. "
-                                f"Valid values are {list(types.ThinkingLevel.__members__.keys())}. "
-                                "Falling back to valve defaults."
+                                f"Valid values are {sorted(valid_levels)}. "
+                                "Falling back to valve settings."
                             )
                     else:
                         log.warning(
                             f"Unsupported type for `reasoning_effort`: {type(reasoning_effort)}. "
-                            "Expected a number or string. Falling back to valve defaults."
+                            "Expected a number or string. Falling back to valve settings."
                         )
 
-            # Check if reasoning can be disabled via toggle, which overrides other settings.
+            # Precedence level 3 (highest): Toggle filter override
             is_avail, is_on = await self._get_toggleable_feature_status(
                 "gemini_reasoning_toggle", __metadata__
             )
             if is_avail and not is_on:
-                # This toggle is only applicable to flash/lite models, which support a budget of 0.
-                is_reasoning_toggleable = "flash" in model_id or "lite" in model_id
-                if is_reasoning_toggleable:
+                is_25_flash_or_lite = bool(
+                    re.search(
+                        r"gemini-2\.5-(?:flash|flash-lite)", model_id, re.IGNORECASE
+                    )
+                )
+                if is_25_flash_or_lite:
                     log.info(
-                        f"Model '{model_id}' supports disabling reasoning, and it is toggled OFF in the UI. "
+                        f"Model '{model_id}' is Gemini 2.5 Flash/Flash-Lite and reasoning toggle is OFF in UI. "
                         "Overwriting `thinking_budget` to 0 to disable reasoning."
                     )
-                    thinking_conf.thinking_budget = 0
-                    thinking_conf.thinking_level = (
-                        None  # Ensure level is cleared when budget is forced to 0.
+                    chosen_budget = 0
+                    chosen_level = None
+                else:
+                    log.info(
+                        f"Reasoning toggle is OFF in UI, but model '{model_id}' does not support disabling thinking. "
+                        "Ignoring toggle setting."
                     )
+
+            model_version = self._parse_gemini_version(model_id)
+            if model_version < 3.0 and chosen_level is not None:
+                log.warning(
+                    f"Model '{model_id}' (version {model_version}) does not support `thinking_level`. "
+                    f"Clearing requested thinking level '{chosen_level}'."
+                )
+                chosen_level = None
+
+            thinking_kwargs: dict[str, Any] = {
+                "include_thoughts": valves.SHOW_THINKING_SUMMARY
+            }
+
+            if chosen_level is not None:
+                if hasattr(types, "ThinkingLevel") and hasattr(
+                    types.ThinkingLevel, chosen_level
+                ):
+                    thinking_kwargs["thinking_level"] = types.ThinkingLevel[
+                        chosen_level
+                    ]
+                else:
+                    thinking_kwargs["thinking_level"] = chosen_level
+            elif chosen_budget is not None:
+                thinking_kwargs["thinking_budget"] = chosen_budget
+
+            thinking_conf = types.ThinkingConfig(**thinking_kwargs)
+            log.info("Final thinking config payload:", payload=thinking_conf)
 
         # TODO: Take defaults from the general front-end config.
         # system_instruction is intentionally left unset here. It will be set by the caller.
