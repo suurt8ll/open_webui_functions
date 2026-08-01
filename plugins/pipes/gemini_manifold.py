@@ -589,8 +589,14 @@ class GeminiContentBuilder:
         self.event_emitter = event_emitter
         self.valves = valves
         self.files_api_manager = files_api_manager
-        # FIXME: chat id could be `None`, leading to an iteration error.
-        self.is_temp_chat = "local" in metadata_body.get("chat_id", "")
+
+        chat_id = metadata_body.get("chat_id")
+        chat_id_str = chat_id if isinstance(chat_id, str) else ""
+        self.is_temp_chat = (
+            not chat_id_str
+            or "local" in chat_id_str
+            or "temporary" in chat_id_str
+        )
         self.vertexai = self.files_api_manager.client.vertexai
 
         self.system_prompt, self.messages_body = self._extract_system_prompt(
@@ -697,12 +703,15 @@ class GeminiContentBuilder:
         self, metadata_body: "Metadata", user_data: "UserData"
     ) -> list["ChatMessageTD"] | None:
         """
-        Reconstructs the active chat branch from history. Removes the trailing 
-        assistant placeholder and strictly validates that the DB history length 
+        Reconstructs the active chat branch from history. Removes the trailing
+        assistant placeholder and strictly validates that the DB history length
         matches the request body.
         """
-        chat_id = metadata_body.get("chat_id", "")
-        if not chat_id or "local" in chat_id:
+        if self.is_temp_chat:
+            return None
+
+        chat_id = metadata_body.get("chat_id")
+        if not chat_id:
             return None
 
         chat = await Chats.get_chat_by_id_and_user_id(
@@ -2006,21 +2015,35 @@ class Pipe:
             features=features,
         )
 
-        log.debug(f"Chat ID: {__metadata__.get('chat_id')}, Message ID: {__metadata__.get('message_id')}")
+        chat_id = __metadata__.get("chat_id")
+        message_id = __metadata__.get("message_id")
+        log.debug(f"Chat ID: {chat_id}, Message ID: {message_id}")
 
-        # FIXME: might be None in some cases, needs handling
-        event_emitter: "EventEmitter" = self._get_and_clear_data_from_state(
-            app_state=app_state,
-            chat_id=__metadata__.get("chat_id"),
-            message_id=__metadata__.get("message_id"),
-            key_suffix="gemini_event_emitter",
-            clear_after_read=False
+        
+        event_emitter: "EventEmitter | None" = (
+            self._get_and_clear_data_from_state(
+                app_state,
+                chat_id,
+                message_id,
+                key_suffix="gemini_event_emitter",
+                clear_after_read=False,
+            )
+            if chat_id and message_id
+            else None
         )
         if not event_emitter:
-            log.debug("No event emitter found in state for this request. Companion filter's inlet did not run? Event emissions will be disabled for this request.")
+            log.debug(
+                "No event emitter found in state for this request. Companion filter's inlet did not run? Event emissions will be disabled for this request."
+            )
+            # TODO: any better way how to do this that does not require a dummy empty emitter?
             event_emitter = app_state._state.get("gemini_dummy_event_emitter")
         if not event_emitter:
-            log.error("No event emitter available. This is unexpected as the dummy event emitter should always be present. Request will likely error out.")
+            # FIXME: one edgecase where it seems to happen is the very first model response that will also trigger a title, tag etc. task.
+            # The task goes off in parallel with the chat generation and this means that the companion filter has not yet ran which leads to the dummy emitter not being available.
+            # One potential hacky fix would be to sleep until filter runs and then try again.
+            raise ValueError(
+                "No event emitter available. This is unexpected as the dummy event emitter should always be present."
+            )
 
         # --- Execution Loop ---
         for attempt_idx, tier in enumerate(execution_order):

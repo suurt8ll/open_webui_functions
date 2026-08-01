@@ -438,7 +438,7 @@ class Filter:
         log.debug(f"body.features:", payload=features)
 
         # Ensure features field exists
-        metadata = body.get("metadata")
+        metadata = body.setdefault("metadata", cast("Metadata", {}))
         metadata_features = metadata.get("features")
         if metadata_features is None:
             metadata_features = cast("Features", {})
@@ -481,7 +481,12 @@ class Filter:
                 canonical_model_name
             )
         if valves.BYPASS_BACKEND_RAG:
-            if __metadata__["chat_id"] == "local":
+            chat_id = __metadata__.get("chat_id")
+            chat_id_str = chat_id if isinstance(chat_id, str) else ""
+            is_temp_chat = (
+                not chat_id_str or "temporary" in chat_id_str or "local" in chat_id_str
+            )
+            if is_temp_chat:
                 # TODO toast notification
                 log.warning(
                     "Bypassing Open WebUI's RAG is not possible for temporary chats. "
@@ -518,7 +523,7 @@ class Filter:
         self,
         body: "Body",
         __request__: Request,
-        __metadata__: dict[str, Any],
+        __metadata__: "Metadata",
         __event_emitter__: Callable[["Event"], Awaitable[None]],
         __user__: "UserData",
     ) -> "Body":
@@ -529,21 +534,40 @@ class Filter:
         user_valves = __user__.get("valves") if isinstance(__user__, dict) else None
         valves = self._get_merged_valves(self.valves, user_valves)
 
-        chat_id: str = __metadata__.get("chat_id", "")
-        message_id: str = __metadata__.get("message_id", "")
+        chat_id = __metadata__.get("chat_id", "")
+        message_id = __metadata__.get("message_id", "")
         app_state: State = __request__.app.state
 
         log.debug(f"Checking for attributes for message {message_id} in request state.")
-
         stored_metadata: types.GroundingMetadata | None = (
             self._get_and_clear_data_from_state(
                 app_state, chat_id, message_id, "grounding", True
             )
+            if chat_id and message_id
+            else None
         )
-        # FIXME: can this be None?
-        emitter: EventEmitter = self._get_and_clear_data_from_state(
-            app_state, chat_id, message_id, "gemini_event_emitter", True
+
+        event_emitter: "EventEmitter | None" = (
+            self._get_and_clear_data_from_state(
+                app_state,
+                chat_id,
+                message_id,
+                key_suffix="gemini_event_emitter",
+                clear_after_read=True,
+            )
+            if chat_id and message_id
+            else None
         )
+        if not event_emitter:
+            log.debug(
+                "No event emitter found in state for this request. Companion filter's inlet did not run? Event emissions will be disabled for this request."
+            )
+            # TODO: any better way how to do this that does not require a dummy empty emitter?
+            event_emitter = app_state._state.get("gemini_dummy_event_emitter")
+        if not event_emitter:
+            raise ValueError(
+                "No event emitter available. This is unexpected as the dummy event emitter should always be present."
+            )
 
         if stored_metadata:
             log.info("Found grounding metadata, processing citations.")
@@ -597,7 +621,7 @@ class Filter:
 
             # Emit status event with search queries before resolving URLs
             if stored_metadata.web_search_queries:
-                emitter.emit_grounding_queries(stored_metadata.web_search_queries)
+                event_emitter.emit_grounding_queries(stored_metadata.web_search_queries)
             else:
                 log.debug("Grounding metadata does not contain any search queries.")
 
@@ -608,16 +632,16 @@ class Filter:
                 await self._resolve_and_emit_sources(
                     grounding_chunks=gs_chunks,
                     supports=gs_supports,
-                    emitter=emitter,
+                    emitter=event_emitter,
                     valves=valves,
                 )
-                emitter.emit_status(
+                event_emitter.emit_status(
                     "This response was grounded with a Google tool", done=True
                 )
             else:
                 msg = "Grounding metadata was found but it's missing grounding supports or chunks. The response is likely not grounded."
                 log.info(msg)
-                emitter.emit_status(msg, done=True)
+                event_emitter.emit_status(msg, done=True)
         else:
             log.info("No grounding metadata found in request state.")
 
