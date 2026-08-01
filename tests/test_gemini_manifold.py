@@ -578,7 +578,10 @@ async def test_paid_api_toggle_selects_correct_key(
     # Mock the request app state which is now required early in pipe()
     mock_request = MagicMock()
     mock_request.app.state._state = {
-        "gemini_model_config": {model_id: {"pricing": {"free_tier": True}}}
+        "gemini_model_config": {
+            model_id: {"pricing": {"free_tier": True}},
+        },
+        "gemini_dummy_event_emitter": EventEmitter(None),
     }
 
     def mock_toggle_side_effect(filter_id, metadata):
@@ -601,7 +604,6 @@ async def test_paid_api_toggle_selects_correct_key(
                 body={"model": model_id, "messages": []},
                 __user__={"email": "test@test.com"},
                 __request__=mock_request,
-                __event_emitter__=None,
                 __metadata__=__metadata__,
             )
         except Exception:
