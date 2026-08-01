@@ -1963,7 +1963,6 @@ class Pipe:
         body: "Body",
         __user__: "UserData",
         __request__: Request,
-        __event_emitter__: Callable[["Event"], Awaitable[None]] | None,
         __metadata__: "Metadata",
     ) -> AsyncGenerator[dict | str, None] | dict:
 
@@ -1978,14 +1977,11 @@ class Pipe:
 
         # Retrieve model configuration from app state
         app_state: State = __request__.app.state
-        model_config: dict[str, Any] | None = app_state._state.get("gemini_model_config")
-        # FIXME: be even more strict by requring the model id to be present in the config to proceed?
-        if model_config is None:
-            error_msg = (
-                "FATAL: Gemini model configuration not found in app state. "
-                "Please ensure the Gemini Manifold Companion filter is installed and enabled."
-            )
-            raise ValueError(error_msg)
+        model_config: dict[str, Any] = await self._wait_for_state_value(
+            app_state,
+            key="gemini_model_config",
+            description="Gemini model configuration",
+        )
 
         merged_custom_params = self._resolve_custom_params(body, __metadata__)
         __metadata__["merged_custom_params"] = merged_custom_params
@@ -2000,7 +1996,6 @@ class Pipe:
 
         if task_type := __metadata__.get("task"):
             log.info(f"{task_type=}, disabling event emissions, YouTube URL parsing and document processing.")
-            __event_emitter__ = None
             # We disable YouTube parsing for task models to minimize latency and token costs,
             # as simple tasks like title or tag generation do not require video context.
             valves.PARSE_YOUTUBE_URLS = False
@@ -2019,31 +2014,12 @@ class Pipe:
         message_id = __metadata__.get("message_id")
         log.debug(f"Chat ID: {chat_id}, Message ID: {message_id}")
 
-        
-        event_emitter: "EventEmitter | None" = (
-            self._get_and_clear_data_from_state(
-                app_state,
-                chat_id,
-                message_id,
-                key_suffix="gemini_event_emitter",
-                clear_after_read=False,
-            )
-            if chat_id and message_id
-            else None
+        event_emitter = await self._get_event_emitter(
+            app_state=app_state,
+            chat_id=chat_id,
+            message_id=message_id,
+            is_task=bool(__metadata__.get("task")),
         )
-        if not event_emitter:
-            log.debug(
-                "No event emitter found in state for this request. Companion filter's inlet did not run? Event emissions will be disabled for this request."
-            )
-            # TODO: any better way how to do this that does not require a dummy empty emitter?
-            event_emitter = app_state._state.get("gemini_dummy_event_emitter")
-        if not event_emitter:
-            # FIXME: one edgecase where it seems to happen is the very first model response that will also trigger a title, tag etc. task.
-            # The task goes off in parallel with the chat generation and this means that the companion filter has not yet ran which leads to the dummy emitter not being available.
-            # One potential hacky fix would be to sleep until filter runs and then try again.
-            raise ValueError(
-                "No event emitter available. This is unexpected as the dummy event emitter should always be present."
-            )
 
         # --- Execution Loop ---
         for attempt_idx, tier in enumerate(execution_order):
@@ -3611,67 +3587,6 @@ class Pipe:
         self._store_data_in_state(app_state, __metadata__, storage_payload)
 
     @staticmethod
-    def _store_data_in_state(
-        app_state: State,
-        __metadata__: "Metadata",
-        data: dict[str, Any],
-    ):
-        """
-        Stores multiple values in the app state, namespaced by chat and message ID.
-        Exits early if this is a task model (e.g. title generation) to prevent 
-        state bloat and interference with the main chat's filter logic.
-        """
-        # TODO: code a separate dataclass that handles all stuff that I need to store in app state
-        if __metadata__.get("task"):
-            return
-
-        chat_id = __metadata__.get("chat_id")
-        message_id = __metadata__.get("message_id")
-
-        if not chat_id or not message_id:
-            log.warning("Skipping state storage: chat_id or message_id missing from metadata.")
-            return
-
-        for key_suffix, value in data.items():
-            key = f"{key_suffix}_{chat_id}_{message_id}"
-            log.debug(f"Storing data in app state with key '{key}'.")
-            # Using shared `request.app.state` to pass data to Filter.outlet.
-            # This is necessary because Pipe.pipe and Filter.outlet operate on different requests.
-            app_state._state[key] = value
-
-    @staticmethod
-    def _get_and_clear_data_from_state(
-        app_state: State,
-        chat_id: str,
-        message_id: str,
-        key_suffix: str,
-        clear_after_read: bool,
-    ) -> Any | None:
-        """Retrieves data from the app state using a namespaced key.
-
-        Deletes the value only when clear_after_read is True.
-        """
-        key = f"{key_suffix}_{chat_id}_{message_id}"
-        value = getattr(app_state, key, None)
-        if value is None:
-            return None
-
-        if clear_after_read:
-            log.debug(f"Retrieved and cleared data from app state for key '{key}'.")
-            try:
-                delattr(app_state, key)
-            except AttributeError:
-                # This case is unlikely but handles a race condition where the attribute might already be gone.
-                log.warning(
-                    f"State key '{key}' was already gone before deletion attempt."
-                )
-        else:
-            log.debug(
-                f"Retrieved data from app state for key '{key}' without clearing it."
-            )
-        return value
-
-    @staticmethod
     def _calculate_cost(token_count: int, pricing_tiers: list[dict]) -> float:
         """
         Calculates cost based on tiered pricing structure (in USD)
@@ -3868,7 +3783,144 @@ class Pipe:
 
     # endregion 1.5 Post-processing
 
-    # region 1.6 Utility helpers
+    # region 1.6 __request__.app.state
+
+    @staticmethod
+    def _store_data_in_state(
+        app_state: State,
+        __metadata__: "Metadata",
+        data: dict[str, Any],
+    ):
+        """
+        Stores multiple values in the app state, namespaced by chat and message ID.
+        Exits early if this is a task model (e.g. title generation) to prevent
+        state bloat and interference with the main chat's filter logic.
+        """
+        # TODO: code a separate dataclass that handles all stuff that I need to store in app state
+        if __metadata__.get("task"):
+            return
+
+        chat_id = __metadata__.get("chat_id")
+        message_id = __metadata__.get("message_id")
+
+        if not chat_id or not message_id:
+            log.warning(
+                "Skipping state storage: chat_id or message_id missing from metadata."
+            )
+            return
+
+        for key_suffix, value in data.items():
+            key = f"{key_suffix}_{chat_id}_{message_id}"
+            log.debug(f"Storing data in app state with key '{key}'.")
+            # Using shared `request.app.state` to pass data to Filter.outlet.
+            # This is necessary because Pipe.pipe and Filter.outlet operate on different requests.
+            app_state._state[key] = value
+
+    @staticmethod
+    def _get_and_clear_data_from_state(
+        app_state: State,
+        chat_id: str,
+        message_id: str,
+        key_suffix: str,
+        clear_after_read: bool,
+    ) -> Any | None:
+        """Retrieves data from the app state using a namespaced key.
+
+        Deletes the value only when clear_after_read is True.
+        """
+        key = f"{key_suffix}_{chat_id}_{message_id}"
+        value = getattr(app_state, key, None)
+        if value is None:
+            return None
+
+        if clear_after_read:
+            log.debug(f"Retrieved and cleared data from app state for key '{key}'.")
+            try:
+                delattr(app_state, key)
+            except AttributeError:
+                # This case is unlikely but handles a race condition where the attribute might already be gone.
+                log.warning(
+                    f"State key '{key}' was already gone before deletion attempt."
+                )
+        else:
+            log.debug(
+                f"Retrieved data from app state for key '{key}' without clearing it."
+            )
+        return value
+
+    async def _wait_for_state_value(
+        self,
+        app_state: State,
+        key: str,
+        timeout: float = 10.0,
+        poll_interval: float = 0.1,
+        description: str = "state value",
+    ) -> Any:
+        """Polls app state until the requested key is populated or timeout expires."""
+        if value := app_state._state.get(key):
+            return value
+
+        log.warning(
+            f"'{key}' not found in state ({description}). Waiting up to {timeout}s for companion filter inlet..."
+        )
+        start_time = time.monotonic()
+
+        while time.monotonic() - start_time < timeout:
+            await asyncio.sleep(poll_interval)
+            if value := app_state._state.get(key):
+                log.debug(
+                    f"'{key}' became available after {time.monotonic() - start_time:.2f}s."
+                )
+                return value
+
+        raise ValueError(
+            f"FATAL: '{key}' ({description}) not found in app state after {timeout}s timeout. "
+            "Please ensure the Gemini Manifold Companion filter is installed and enabled."
+        )
+
+    async def _get_event_emitter(
+        self,
+        app_state: State,
+        chat_id: str | None,
+        message_id: str | None,
+        is_task: bool,
+    ) -> "EventEmitter":
+        """Resolves the appropriate event emitter from app state for tasks or regular generation."""
+        if is_task:
+            return await self._wait_for_state_value(
+                app_state,
+                key="gemini_dummy_event_emitter",
+                description="dummy event emitter for task model",
+            )
+
+        event_emitter = (
+            self._get_and_clear_data_from_state(
+                app_state,
+                chat_id,
+                message_id,
+                key_suffix="gemini_event_emitter",
+                clear_after_read=False,
+            )
+            if chat_id and message_id
+            else None
+        )
+        if event_emitter is not None:
+            return event_emitter
+
+        log.warning(
+            "No event emitter found in state for this request. Companion filter's inlet did not run? "
+            "Falling back to dummy event emitter."
+        )
+        if dummy_emitter := app_state._state.get("gemini_dummy_event_emitter"):
+            return dummy_emitter
+
+        raise ValueError(
+            "Neither request event emitter nor dummy event emitter is available in app state."
+        )
+
+    # endregion 1.6 __request__.app.state
+
+    # region 1.7 Utility helpers
 
     async def _determine_execution_order(
         self,
@@ -4224,6 +4276,6 @@ class Pipe:
                     f"Could not parse companion version string: '{companion_version}'. Version check skipped."
                 )
 
-    # endregion 1.6 Utility helpers
+    # endregion 1.7 Utility helpers
 
     # endregion 1. Helper methods inside the Pipe class
