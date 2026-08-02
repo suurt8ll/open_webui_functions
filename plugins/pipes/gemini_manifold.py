@@ -1610,8 +1610,14 @@ _SHARED_VALVE_DESCS = {
         "Latitude and longitude coordinates for location-aware Google Maps grounding.\n\n"
         "Expected format: `latitude,longitude` (e.g., `40.7128,-74.0060`)."
     ),
-    "IMAGE_RESOLUTION": "Output resolution for generated images (Gemini 3 Pro Image only).",
-    "IMAGE_ASPECT_RATIO": "Aspect ratio for image generation (Gemini 3 Pro Image & 2.5 Flash Image).",
+    "IMAGE_RESOLUTION": (
+        "Output resolution for generated images.\n\n"
+        "If set to `None`, Google's backend uses its default value (typically `1K`)."
+    ),
+    "IMAGE_ASPECT_RATIO": (
+        "Aspect ratio for image generation.\n\n"
+        "If set to `None`, Google's backend uses its default value (matching aspect ratio for image editing, or `1:1` otherwise)."
+    ),
 }
 
 _ADMIN_VALVE_DESCS = {
@@ -1813,27 +1819,34 @@ class Pipe:
                 _SHARED_VALVE_DESCS["MAPS_GROUNDING_COORDINATES"], default=None
             ),
         )
-        IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] = Field(
-            default="1K",
+        IMAGE_RESOLUTION: Literal["0.5K", "1K", "2K", "4K"] | None = Field(
+            default=None,
             description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["IMAGE_RESOLUTION"], default="1K"
+                _SHARED_VALVE_DESCS["IMAGE_RESOLUTION"], default=None
             ),
         )
-        IMAGE_ASPECT_RATIO: Literal[
-            "1:1",
-            "2:3",
-            "3:2",
-            "3:4",
-            "4:3",
-            "4:5",
-            "5:4",
-            "9:16",
-            "16:9",
-            "21:9",
-        ] = Field(
-            default="16:9",
+        IMAGE_ASPECT_RATIO: (
+            Literal[
+                "1:1",
+                "1:4",
+                "1:8",
+                "2:3",
+                "3:2",
+                "3:4",
+                "4:1",
+                "4:3",
+                "4:5",
+                "5:4",
+                "8:1",
+                "9:16",
+                "16:9",
+                "21:9",
+            ]
+            | None
+        ) = Field(
+            default=None,
             description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["IMAGE_ASPECT_RATIO"], default="16:9"
+                _SHARED_VALVE_DESCS["IMAGE_ASPECT_RATIO"], default=None
             ),
         )
 
@@ -1928,7 +1941,7 @@ class Pipe:
                 _SHARED_VALVE_DESCS["MAPS_GROUNDING_COORDINATES"], is_user=True
             ),
         )
-        IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] | None = Field(
+        IMAGE_RESOLUTION: Literal["0.5K", "1K", "2K", "4K"] | None = Field(
             default=None,
             description=_format_valve_desc(
                 _SHARED_VALVE_DESCS["IMAGE_RESOLUTION"], is_user=True
@@ -1937,12 +1950,16 @@ class Pipe:
         IMAGE_ASPECT_RATIO: (
             Literal[
                 "1:1",
+                "1:4",
+                "1:8",
                 "2:3",
                 "3:2",
                 "3:4",
+                "4:1",
                 "4:3",
                 "4:5",
                 "5:4",
+                "8:1",
                 "9:16",
                 "16:9",
                 "21:9",
@@ -1951,7 +1968,7 @@ class Pipe:
         ) = Field(
             default=None,
             description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["IMAGE_ASPECT_RATIO"], is_user=True
+                _SHARED_VALVE_DESCS["IMAGE_ASPECT_RATIO"], default=None, is_user=True
             ),
         )
 
@@ -4118,6 +4135,7 @@ class Pipe:
                                 elif has_paid_key:
                                     execution_order.append("paid")
                         else:
+                            # FIXME: Does it make sense if paid tier fallback is explicitly blocked?
                             # If model isn't free-eligible, jump straight to paid tiers.
                             # If no paid tier exists, we try free anyway to let the API return the specific error.
                             if can_use_vertex:
