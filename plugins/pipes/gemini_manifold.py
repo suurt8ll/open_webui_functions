@@ -82,6 +82,14 @@ if TYPE_CHECKING:
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
 
+def _log_and_toast(
+    event_emitter: "EventEmitter",
+    msg: str,
+    level: Literal["info", "warning", "error"] = "warning",
+) -> None:
+    """Logs `msg` at the caller's stack location and mirrors it to the front-end as a toast."""
+    log.opt(depth=1).log(level, msg)
+    event_emitter.emit_toast(msg, level)
 
 # A mapping of finish reason names (str) to human-readable descriptions.
 # This allows handling of reasons that may not be defined in the current SDK version.
@@ -593,9 +601,7 @@ class GeminiContentBuilder:
         chat_id = metadata_body.get("chat_id")
         chat_id_str = chat_id if isinstance(chat_id, str) else ""
         self.is_temp_chat = (
-            not chat_id_str
-            or "local" in chat_id_str
-            or "temporary" in chat_id_str
+            not chat_id_str or "local" in chat_id_str or "temporary" in chat_id_str
         )
         self.vertexai = self.files_api_manager.client.vertexai
 
@@ -621,14 +627,6 @@ class GeminiContentBuilder:
         c_tokens, c_cost = self._retrieve_previous_usage_data()
         self.metadata_body["cumulative_tokens"] = c_tokens
         self.metadata_body["cumulative_cost"] = c_cost
-
-        if not self.messages_db:
-            warn_msg = (
-                "Database history not ready or lengths mismatched. "
-                "Falling back to active memory payload."
-            )
-            log.warning(warn_msg)
-            self.event_emitter.emit_toast(warn_msg, "warning")
 
         # 1. Set up and launch the status manager. It will activate itself if needed.
         status_manager = UploadStatusManager(self.event_emitter)
@@ -706,18 +704,36 @@ class GeminiContentBuilder:
         Reconstructs the active chat branch from history. Removes the trailing
         assistant placeholder and strictly validates that the DB history length
         matches the request body.
+
+        Every fallback to the active memory payload is logged and surfaced to the
+        user via a toast with a reason-specific message.
         """
         if self.is_temp_chat:
+            # Expected path, not a failure: temp chats have no DB history by design.
+            _log_and_toast(
+                self.event_emitter,
+                "Temporary chat detected; skipping database history fetch and using the active memory payload.",
+                "info",
+            )
             return None
 
         chat_id = metadata_body.get("chat_id")
         if not chat_id:
+            _log_and_toast(
+                self.event_emitter,
+                "No chat_id in metadata; cannot fetch database history. Using the active memory payload.",
+                "warning",
+            )
             return None
 
         chat = await Chats.get_chat_by_id_and_user_id(
             id=chat_id, user_id=user_data["id"]
         )
         if not chat:
+            _log_and_toast(
+                self.event_emitter,
+                f"Chat {chat_id} was not found in the database; using the active memory payload.",
+            )
             return None
 
         chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
@@ -726,6 +742,11 @@ class GeminiContentBuilder:
         current_id = history_data.get("currentId")
 
         if not messages_dict or not current_id:
+            _log_and_toast(
+                self.event_emitter,
+                "Chat history is empty or lacks a currentId; using the active memory payload.",
+                "warning",
+            )
             return None
 
         # 1. Walk up the parentId chain to reconstruct the linear conversation branch.
@@ -749,8 +770,11 @@ class GeminiContentBuilder:
         # length of the request body (minus system prompt), we bail out.
         # This prevents misaligned metadata mapping.
         if len(messages_db) != len(self.messages_body):
-            log.debug(
-                f"Strict length mismatch: DB={len(messages_db)}, Body={len(self.messages_body)}. Validation failed."
+            _log_and_toast(
+                self.event_emitter,
+                f"Strict length mismatch: DB={len(messages_db)}, Body={len(self.messages_body)}. "
+                "Using the active memory payload.",
+                "warning",
             )
             return None
 
@@ -773,14 +797,11 @@ class GeminiContentBuilder:
             parts = await self._process_user_message(i, message, status_queue)
             # Case 1: User content is completely empty (no text, no files).
             if not parts:
-                log.info(
-                    f"User message at index {i} is completely empty. "
-                    "Injecting a prompt to ask for clarification."
+                _log_and_toast(
+                    self.event_emitter,
+                    f"Your message #{i + 1} was completely empty. The assistant will ask for clarification.",
+                    "warning",
                 )
-                # Inform the user via a toast notification.
-                toast_msg = f"Your message #{i + 1} was empty. The assistant will ask for clarification."
-                self.event_emitter.emit_toast(toast_msg, "info")
-
                 clarification_prompt = (
                     "The user sent an empty message. Please ask the user for "
                     "clarification on what they would like to ask or discuss."
@@ -796,17 +817,12 @@ class GeminiContentBuilder:
                     # The user sent content (e.g., files) but no accompanying text.
                     if self.vertexai:
                         # Vertex AI requires a text part in multi-modal messages.
-                        log.info(
-                            f"User message at index {i} lacks a text component for Vertex AI. "
-                            "Adding default text prompt."
-                        )
-                        # Inform the user via a toast notification.
-                        toast_msg = (
+                        _log_and_toast(
+                            self.event_emitter,
                             f"For your message #{i + 1}, a default prompt was added as text is required "
-                            "for requests with attachments when using Vertex AI."
+                            "for requests with attachments when using Vertex AI.",
+                            "warning",
                         )
-                        self.event_emitter.emit_toast(toast_msg, "info")
-
                         default_prompt_text = (
                             "The user did not send any text message with the additional context. "
                             "Answer by summarizing the newly added context."
@@ -817,7 +833,7 @@ class GeminiContentBuilder:
                         parts.extend(default_text_parts)
                     else:
                         # Google Developer API allows no-text user content.
-                        log.info(
+                        log.debug(
                             f"User message at index {i} lacks a text component for Google Developer API. "
                             "Proceeding with non-text parts only."
                         )
@@ -831,9 +847,11 @@ class GeminiContentBuilder:
                 i, message, message_db, sources, status_queue
             )
         else:
-            warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
-            log.warning(warn_msg)
-            self.event_emitter.emit_toast(warn_msg, "warning")
+            _log_and_toast(
+                self.event_emitter,
+                f"Message {i} has an invalid role: {role}. Skipping to the next message.",
+                "warning",
+            )
             return None
 
         # Only create a Content object if there are parts to include.
@@ -866,7 +884,9 @@ class GeminiContentBuilder:
 
                     # Optimization: Task models (titles, tags, etc.) skip heavy documents
                     # but keep images as they provide high context value for low token cost.
-                    should_include = is_image or (self.upload_documents and not self.is_task)
+                    should_include = is_image or (
+                        self.upload_documents and not self.is_task
+                    )
 
                     if not should_include:
                         log.debug(
@@ -880,9 +900,16 @@ class GeminiContentBuilder:
                     # just the UUID, which isn't fetchable on its own.
                     if file_id := file.get("id"):
                         uri = f"/api/v1/files/{file_id}/content"
-                        upload_tasks.append(self._genai_part_from_uri(uri, status_queue))
+                        upload_tasks.append(
+                            self._genai_part_from_uri(uri, status_queue)
+                        )
                     else:
-                        log.warning("Could not determine ID for file in DB.", payload=file)
+                        _log_and_toast(
+                            self.event_emitter,
+                            f"Encountered a malformed file object in message #{i + 1} "
+                            "without an ID; it will not be injected into the model's context.",
+                            "warning",
+                        )
 
                 if upload_tasks:
                     log.info(f"Processing {len(upload_tasks)} file(s) from database.")
@@ -898,9 +925,12 @@ class GeminiContentBuilder:
         elif isinstance(user_content, list):
             user_content_list = user_content
         else:
-            warn_msg = "User message content is not a string or list, skipping."
-            log.warning(warn_msg)
-            self.event_emitter.emit_toast(warn_msg, "warning")
+            _log_and_toast(
+                self.event_emitter,
+                f"Message #{i + 1} has invalid content (not a string or list); "
+                "skipping the malformed content.",
+                "warning",
+            )
             return user_parts
 
         for c in user_content_list:
@@ -967,11 +997,11 @@ class GeminiContentBuilder:
     def _pop_thoughts(self, content: str) -> tuple[str, list[str]]:
         """
         Identifies and removes thought blocks from the content.
-        
+
         A thought is defined as text between <think> and </think>\n.
-        This method handles multiple thought blocks if they are peppered 
+        This method handles multiple thought blocks if they are peppered
         throughout the message.
-        
+
         :param content: The raw message content from the assistant.
         :return: A tuple containing (cleaned_content, list_of_extracted_thoughts).
         """
@@ -1023,13 +1053,22 @@ class GeminiContentBuilder:
                     return await self._rehydrate_assistant_parts(
                         gemini_parts, status_queue
                     )
-                except (pydantic_core.ValidationError, TypeError, ValueError):
-                    log.exception(
-                        f"Failed to reconstruct types.Part for message {i} from stored gemini_parts. "
-                        "Falling back to text processing."
+                except (pydantic_core.ValidationError, TypeError, ValueError) as exc:
+                    _log_and_toast(
+                        self.event_emitter,
+                        f"Failed to reconstruct assistant message #{i + 1} from stored data: {exc}. "
+                        "Falling back to plain text processing.",
+                        "warning",
                     )
             else:
                 # A meaningful edit was detected after accounting for whitespace.
+                _log_and_toast(
+                    self.event_emitter,
+                    f"An edit was detected in assistant message #{i + 1}. "
+                    "Using the edited text, which may affect model context for this turn.",
+                    "warning",
+                )
+
                 diff = difflib.unified_diff(
                     original_content.strip().splitlines(keepends=True),
                     current_content.strip().splitlines(keepends=True),
@@ -1037,24 +1076,15 @@ class GeminiContentBuilder:
                     tofile="current_content_stripped",
                 )
                 diff_str = "".join(diff)
-
                 log.warning(
-                    f"An edit was detected in assistant message at index {i}. The message will be "
-                    "reconstructed from the current edited text, and the original high-fidelity data "
-                    "from the database will be ignored for this turn.\n"
-                    f"--- Diff (on stripped content) ---\n{diff_str}"
-                )
-                self.event_emitter.emit_toast(
-                    f"An edit was detected in assistant message #{i + 1}. "
-                    "Using the edited text, which may affect model context for this turn.",
-                    "warning",
+                    f"Edited content diff for assistant message {i}:\n{diff_str}"
                 )
         elif message_db:
-            # Warn if the message was likely from another model (no-toast).
-            log.warning(
-                f"Assistant message at index {i} lacks 'gemini_parts' or 'original_content'. "
-                "This message was likely not generated by this plugin. "
-                "Falling back to processing its plain text content."
+            _log_and_toast(
+                self.event_emitter,
+                f"Assistant message #{i + 1} is missing stored high-fidelity data from the database. "
+                "Falling back to plain text reconstruction, which may affect model context for this turn.",
+                "warning",
             )
 
         # --- PATH 2: Fallback to processing text content ---
@@ -1099,8 +1129,10 @@ class GeminiContentBuilder:
                 uri = match.group(1)
 
             if not uri:
-                log.warning(
-                    f"Found unsupported URI format in text: {match.group(0)}. Skipping."
+                _log_and_toast(
+                    self.event_emitter,
+                    f"Failed to extract URI from match: {match.group(0)}. Skipping.",
+                    "warning",
                 )
                 continue
 
@@ -1155,9 +1187,11 @@ class GeminiContentBuilder:
             # TODO: Google Cloud Storage bucket support.
             # elif uri.startswith("gs://"): ...
             else:
-                warn_msg = f"Unsupported URI: '{uri[:64]}...' Links must be to YouTube or a supported file type."
-                log.warning(warn_msg)
-                self.event_emitter.emit_toast(warn_msg, "warning")
+                _log_and_toast(
+                    self.event_emitter,
+                    f"Unsupported URI: '{uri[:64]}...' Links must be to YouTube or a supported file type.",
+                    "warning",
+                )
                 return None
 
             # Step 2: If we have bytes, create the Part using the modularized helper
@@ -1172,12 +1206,18 @@ class GeminiContentBuilder:
             return None  # Return None if bytes/mime_type could not be determined
 
         except FilesAPIError as e:
-            error_msg = f"Files API failed for URI '{uri[:64]}...': {e}"
-            log.error(error_msg)
-            self.event_emitter.emit_toast(error_msg, "error")
+            _log_and_toast(
+                self.event_emitter,
+                f"Files API failed for URI '{uri[:64]}[...]': {e}",
+                "error",
+            )
             return None
-        except Exception:
-            log.exception(f"Error processing URI: {uri[:64]}[...]")
+        except Exception as e:
+            _log_and_toast(
+                self.event_emitter,
+                f"Error processing URI: {uri[:64]}[...]: {e}",
+                "error",
+            )
             return None
 
     async def _create_genai_part_from_file_data(
