@@ -254,7 +254,7 @@ gemini-3.1-flash-image:
     thinking: true
     url_context: false
   image_generation:
-    resolutions: ["0.5K", "1K", "2K", "4K"]
+    resolutions: ["512PX", "1K", "2K", "4K"]
     aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
   pricing:
     input:

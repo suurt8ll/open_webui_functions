@@ -1819,7 +1819,7 @@ class Pipe:
                 _SHARED_VALVE_DESCS["MAPS_GROUNDING_COORDINATES"], default=None
             ),
         )
-        IMAGE_RESOLUTION: Literal["0.5K", "1K", "2K", "4K"] | None = Field(
+        IMAGE_RESOLUTION: Literal["512PX", "1K", "2K", "4K"] | None = Field(
             default=None,
             description=_format_valve_desc(
                 _SHARED_VALVE_DESCS["IMAGE_RESOLUTION"], default=None
@@ -1941,7 +1941,7 @@ class Pipe:
                 _SHARED_VALVE_DESCS["MAPS_GROUNDING_COORDINATES"], is_user=True
             ),
         )
-        IMAGE_RESOLUTION: Literal["0.5K", "1K", "2K", "4K"] | None = Field(
+        IMAGE_RESOLUTION: Literal["512PX", "1K", "2K", "4K"] | None = Field(
             default=None,
             description=_format_valve_desc(
                 _SHARED_VALVE_DESCS["IMAGE_RESOLUTION"], is_user=True
