@@ -5,6 +5,40 @@
 
 
 
+gemini-3.1-flash-lite-image:
+  description: "Designed as the efficiency specialist of the image generation family, the Gemini 3.1 Flash Lite Image model is designed for ultra-low latency and cost-effective image generation and editing."
+  knowledge_cutoff: "2025-01"
+  latest_update: "2026-06"
+  supported_data_types:
+    inputs: [Text, Image]
+    outputs: [Text, Image]
+  tokens:
+    input: 65536
+    output: 4096
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: false
+    code_execution: false
+    file_search: false
+    function_calling: true
+    grounding_google_maps: false
+    image_generation: true
+    live_api: false
+    search_grounding: false
+    structured_outputs: false
+    thinking: true
+    url_context: false
+  pricing:
+    input:
+      - up_to_tokens: null
+        price_per_million: 0.25
+    output:
+      - up_to_tokens: null
+        price_per_million: 1.50
+    image_output:
+      - up_to_tokens: null
+        price_per_million: 30.00
 gemini-3.6-flash:
   description: "Our most token-efficient Flash model, combining frontier intelligence with strong agentic, coding, and search performance while using significantly fewer output tokens than Gemini 3.5 Flash, at a lower price."
   knowledge_cutoff: "2026-03"
