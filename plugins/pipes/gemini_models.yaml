@@ -24,14 +24,15 @@ gemini-3.1-flash-lite-image:
     file_search: false
     function_calling: true
     grounding_google_maps: false
-    image_generation:
-      resolutions: ["1K"]
-      aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
+    image_generation: true
     live_api: false
     search_grounding: false
     structured_outputs: false
     thinking: true
     url_context: false
+  image_generation:
+    resolutions: ["1K"]
+    aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
   pricing:
     input:
       - up_to_tokens: null
@@ -246,14 +247,15 @@ gemini-3.1-flash-image:
     file_search: false
     function_calling: false
     grounding_google_maps: false
-    image_generation:
-      resolutions: ["0.5K", "1K", "2K", "4K"]
-      aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
+    image_generation: true
     live_api: false
     search_grounding: true
     structured_outputs: false
     thinking: true
     url_context: false
+  image_generation:
+    resolutions: ["0.5K", "1K", "2K", "4K"]
+    aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
   pricing:
     input:
       - up_to_tokens: null
@@ -443,14 +445,15 @@ gemini-3-pro-image:
     file_search: false
     function_calling: false
     grounding_google_maps: false
-    image_generation:
-      resolutions: ["1K", "2K", "4K"]
-      aspect_ratios: ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
+    image_generation: true
     live_api: false
     search_grounding: true
     structured_outputs: true
     thinking: true
     url_context: false
+  image_generation:
+    resolutions: ["1K", "2K", "4K"]
+    aspect_ratios: ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
   pricing:
     input:
       - up_to_tokens: null
@@ -554,14 +557,15 @@ gemini-2.5-flash-image:
     file_search: false
     function_calling: false
     grounding_google_maps: false
-    image_generation:
-      resolutions: []
-      aspect_ratios: ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
+    image_generation: true
     live_api: false
     search_grounding: false
     structured_outputs: true
     thinking: false
     url_context: false
+  image_generation:
+    resolutions: []
+    aspect_ratios: ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
   pricing:
     input:
       - up_to_tokens: null
