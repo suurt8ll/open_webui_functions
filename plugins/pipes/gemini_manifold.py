@@ -88,7 +88,7 @@ def _log_and_toast(
     level: Literal["info", "warning", "error"] = "warning",
 ) -> None:
     """Logs `msg` at the caller's stack location and mirrors it to the front-end as a toast."""
-    log.opt(depth=1).log(level, msg)
+    log.opt(depth=1).log(level.upper(), msg)
     event_emitter.emit_toast(msg, level)
 
 # A mapping of finish reason names (str) to human-readable descriptions.
@@ -2649,6 +2649,7 @@ class Pipe:
         __metadata__: "Metadata",
         valves: "Valves",
         config: dict,
+        event_emitter: "EventEmitter",
     ) -> types.GenerateContentConfig:
         """Assembles the GenerateContentConfig for a Gemini API request."""
         features = __metadata__.get("features", {}) or {}
@@ -2793,19 +2794,62 @@ class Pipe:
 
         if self._is_image_model(model_id, config):
             gen_content_conf.response_modalities.append("IMAGE")
-            if "gemini-3-pro-image" in model_id and valves.IMAGE_RESOLUTION:
-                log.debug(f"Setting image resolution to {valves.IMAGE_RESOLUTION}")
-                if not gen_content_conf.image_config:
-                    gen_content_conf.image_config = types.ImageConfig()
-                gen_content_conf.image_config.image_size = valves.IMAGE_RESOLUTION
 
-            if (
-                "gemini-3-pro-image" in model_id or "gemini-2.5-flash-image" in model_id
-            ) and valves.IMAGE_ASPECT_RATIO:
+            image_cfg = config.get(model_id, {}).get("image_generation", {}) or {}
+            if not isinstance(image_cfg, dict):
+                image_cfg = {}
+
+            supported_resolutions = image_cfg.get("resolutions", []) or []
+            supported_aspect_ratios = image_cfg.get("aspect_ratios", []) or []
+
+            if not isinstance(supported_resolutions, list):
+                supported_resolutions = []
+            if not isinstance(supported_aspect_ratios, list):
+                supported_aspect_ratios = []
+
+            image_config_kwargs: dict[str, Any] = {}
+
+            # Missing/empty resolutions means the model doesn't support `image_size`.
+            if supported_resolutions and valves.IMAGE_RESOLUTION:
+                if valves.IMAGE_RESOLUTION not in supported_resolutions:
+                    warn_msg = (
+                        f"Valve IMAGE_RESOLUTION '{valves.IMAGE_RESOLUTION}' is not listed in "
+                        f"supported resolutions for '{model_id}': {supported_resolutions}. "
+                        "Using it anyway; the API will likely reject it."
+                    )
+                    _log_and_toast(event_emitter, warn_msg, level="warning")
+                else:
+                    log.debug(f"Setting image resolution to {valves.IMAGE_RESOLUTION}")
+
+                image_config_kwargs["image_size"] = valves.IMAGE_RESOLUTION
+            else:
+                log.debug(
+                    f"Model '{model_id}' does not declare supported image resolutions; "
+                    "skipping ImageConfig.image_size."
+                )
+
+            if not supported_aspect_ratios:
+                warn_msg = (
+                    f"Model '{model_id}' is an image model but "
+                    "`image_generation.aspect_ratios` is missing or empty. "
+                    "This config entry looks malformed; using the valve value anyway."
+                )
+                _log_and_toast(event_emitter, warn_msg, level="warning")
+            elif valves.IMAGE_ASPECT_RATIO not in supported_aspect_ratios:
+                warn_msg = (
+                    f"Valve IMAGE_ASPECT_RATIO '{valves.IMAGE_ASPECT_RATIO}' is not listed in "
+                    f"supported aspect ratios for '{model_id}': {supported_aspect_ratios}. "
+                    "Using it anyway; the API will likely reject it."
+                )
+                _log_and_toast(event_emitter, warn_msg, level="warning")
+            else:
                 log.debug(f"Setting image aspect ratio to {valves.IMAGE_ASPECT_RATIO}")
-                if not gen_content_conf.image_config:
-                    gen_content_conf.image_config = types.ImageConfig()
-                gen_content_conf.image_config.aspect_ratio = valves.IMAGE_ASPECT_RATIO
+
+            if valves.IMAGE_ASPECT_RATIO:
+                image_config_kwargs["aspect_ratio"] = valves.IMAGE_ASPECT_RATIO
+
+            if image_config_kwargs:
+                gen_content_conf.image_config = types.ImageConfig(**image_config_kwargs)
 
         gen_content_conf.tools = []
 
@@ -2997,7 +3041,7 @@ class Pipe:
 
         # 4. Configuration Building
         gen_content_conf = await self._build_gen_content_config(
-            body, __metadata__, valves, model_config
+            body, __metadata__, valves, model_config, event_emitter
         )
         gen_content_conf.system_instruction = builder.system_prompt
 
@@ -3028,15 +3072,12 @@ class Pipe:
         is_streaming_request = body.get("stream", True)
         use_streaming_api = is_streaming_request
 
-        # If a high-resolution image is requested with the gemini-3-pro-image model,
         # the Google GenAI SDK's streaming method often raises a "chunk too big" error
-        # during the transfer of the generated image bytes. We avoid this by forcing
+        # if a high-resolution image is requested. We avoid this by forcing
         # a non-streaming SDK call, while still yielding the result as a stream to OWUI.
         if (
             use_streaming_api
             and valves.IMAGE_RESOLUTION in ["2K", "4K"]
-            # FIXME: Nano Banana 2 supports resolutions too now.
-            and "gemini-3-pro-image" in model_id
         ):
             log.info(
                 f"Forcing non-streaming SDK call due to {valves.IMAGE_RESOLUTION} resolution "

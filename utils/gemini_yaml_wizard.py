@@ -5,7 +5,13 @@ from typing import Any
 
 # Constants
 # Assuming this script is in utils/, and we want to go up one level then into plugins/pipes
-TARGET_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'plugins', 'pipes', 'gemini_models.yaml')
+TARGET_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "plugins",
+    "pipes",
+    "gemini_models.yaml",
+)
+
 
 def get_input(prompt, default=None, required=True):
     """Get input from user with optional default and validation."""
@@ -24,13 +30,15 @@ def get_input(prompt, default=None, required=True):
         else:
             return user_input
 
+
 def get_list_input(prompt, default_list):
     """Get a list of items from user."""
     default_str = ", ".join(default_list)
     user_input = input(f"{prompt} [{default_str}]: ").strip()
     if not user_input:
         return default_list
-    return [item.strip() for item in user_input.split(',')]
+    return [item.strip() for item in user_input.split(",")]
+
 
 def get_bool_input(prompt, default=False):
     """Get boolean input."""
@@ -38,31 +46,47 @@ def get_bool_input(prompt, default=False):
     user_input = input(f"{prompt} ({default_str}): ").strip().lower()
     if not user_input:
         return default
-    return user_input.startswith('y')
+    return user_input.startswith("y")
+
 
 def generate_yaml_entry(data):
     """Generate YAML string for the model."""
-    # Helper to format lists
+
     def format_list(lst):
         return "[" + ", ".join(lst) + "]"
 
-    # Helper to format pricing
     def format_pricing_tier(tier):
-        up_to = tier['up_to_tokens']
+        up_to = tier["up_to_tokens"]
         if up_to is None:
             up_to = "null"
         return f"""      - up_to_tokens: {up_to}
         price_per_million: {tier['price_per_million']}"""
 
     pricing_section = "  pricing:\n"
-    if data['pricing'].get('free_tier'):
+    if data["pricing"].get("free_tier"):
         pricing_section += "    free_tier: true\n"
 
-    if data['pricing'].get('excluded_features'):
+    if data["pricing"].get("excluded_features"):
         pricing_section += f"    excluded_features: {format_list(data['pricing']['excluded_features'])}\n"
 
-    pricing_section += "    input:\n" + chr(10).join([format_pricing_tier(t) for t in data['pricing']['input']]) + "\n"
-    pricing_section += "    output:\n" + chr(10).join([format_pricing_tier(t) for t in data['pricing']['output']])
+    pricing_section += (
+        "    input:\n"
+        + chr(10).join([format_pricing_tier(t) for t in data["pricing"]["input"]])
+        + "\n"
+    )
+    pricing_section += "    output:\n" + chr(10).join(
+        [format_pricing_tier(t) for t in data["pricing"]["output"]]
+    )
+
+    img_gen = data["caps"]["image_generation"]
+    if not img_gen:
+        image_gen_yaml = "image_generation: false"
+    else:
+        res_quoted = [f'"{r}"' for r in img_gen.get("resolutions", [])]
+        ar_quoted = [f'"{ar}"' for ar in img_gen.get("aspect_ratios", [])]
+        image_gen_yaml = f"""image_generation:
+      resolutions: [{", ".join(res_quoted)}]
+      aspect_ratios: [{", ".join(ar_quoted)}]"""
 
     entry = f"""
 {data['model_id']}:
@@ -83,7 +107,7 @@ def generate_yaml_entry(data):
     file_search: {str(data['caps']['file_search']).lower()}
     function_calling: {str(data['caps']['function_calling']).lower()}
     grounding_google_maps: {str(data['caps']['grounding_google_maps']).lower()}
-    image_generation: {str(data['caps']['image_generation']).lower()}
+    {image_gen_yaml}
     live_api: {str(data['caps']['live_api']).lower()}
     search_grounding: {str(data['caps']['search_grounding']).lower()}
     structured_outputs: {str(data['caps']['structured_outputs']).lower()}
@@ -91,17 +115,18 @@ def generate_yaml_entry(data):
     url_context: {str(data['caps']['url_context']).lower()}
 {pricing_section}"""
 
-    if data['pricing'].get('caching'):
+    if data["pricing"].get("caching"):
         entry += f"""
     caching:
 {chr(10).join([format_pricing_tier(t) for t in data['pricing']['caching']])}"""
 
-    if data['pricing'].get('image_output'):
+    if data["pricing"].get("image_output"):
         entry += f"""
     image_output:
 {chr(10).join([format_pricing_tier(t) for t in data['pricing']['image_output']])}"""
 
     return entry + "\n"
+
 
 def main():
     print("--- Gemini Model Wizard ---")
@@ -111,21 +136,38 @@ def main():
         print("Error: Target file not found!")
         sys.exit(1)
 
-    # Collect Data
     model_id = get_input("Model ID (e.g., gemini-3-pro)")
     description = get_input("Description")
 
     today = datetime.date.today()
-    knowledge_cutoff = get_input("Knowledge Cutoff (YYYY-MM)", default=f"{today.year}-01")
-    latest_update = get_input("Latest Update (YYYY-MM)", default=f"{today.year}-{today.month:02d}")
+    knowledge_cutoff = get_input(
+        "Knowledge Cutoff (YYYY-MM)", default=f"{today.year}-01"
+    )
+    latest_update = get_input(
+        "Latest Update (YYYY-MM)", default=f"{today.year}-{today.month:02d}"
+    )
 
-    inputs = get_list_input("Supported Inputs", ["Text", "Image", "Video", "Audio", "PDF"])
+    inputs = get_list_input(
+        "Supported Inputs", ["Text", "Image", "Video", "Audio", "PDF"]
+    )
     outputs = get_list_input("Supported Outputs", ["Text"])
 
     input_tokens = get_input("Input Token Limit", default="1048576")
     output_tokens = get_input("Output Token Limit", default="8192")
 
     print("\n--- Capabilities ---")
+    image_gen_enabled = get_bool_input("Image Generation", False)
+    image_gen_val = False
+    if image_gen_enabled:
+        resolutions = get_list_input(
+            "Image Resolutions (comma separated, e.g. 1K, 2K, 4K or empty)", []
+        )
+        aspect_ratios = get_list_input(
+            "Image Aspect Ratios",
+            ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
+        )
+        image_gen_val = {"resolutions": resolutions, "aspect_ratios": aspect_ratios}
+
     caps = {
         "audio_generation": get_bool_input("Audio Generation", False),
         "batch_api": get_bool_input("Batch API", True),
@@ -134,7 +176,7 @@ def main():
         "file_search": get_bool_input("File Search", False),
         "function_calling": get_bool_input("Function Calling", True),
         "grounding_google_maps": get_bool_input("Grounding (Google Maps)", False),
-        "image_generation": get_bool_input("Image Generation", False),
+        "image_generation": image_gen_val,
         "live_api": get_bool_input("Live API", False),
         "search_grounding": get_bool_input("Search Grounding", False),
         "structured_outputs": get_bool_input("Structured Outputs", True),
@@ -146,15 +188,19 @@ def main():
     free_tier = get_bool_input("Free Tier Available", True)
     excluded_features = []
     if free_tier:
-        excluded_features = get_list_input("Excluded Features on Free Tier (e.g. search_grounding, grounding_google_maps)", [])
+        excluded_features = get_list_input(
+            "Excluded Features on Free Tier (e.g. search_grounding, grounding_google_maps)",
+            [],
+        )
 
-    # Simplified pricing input for wizard
     input_price = get_input("Input Price per Million (up to 128k/null)", default="0.10")
-    output_price = get_input("Output Price per Million (up to 128k/null)", default="0.40")
+    output_price = get_input(
+        "Output Price per Million (up to 128k/null)", default="0.40"
+    )
 
     pricing: dict[str, Any] = {
         "input": [{"up_to_tokens": None, "price_per_million": input_price}],
-        "output": [{"up_to_tokens": None, "price_per_million": output_price}]
+        "output": [{"up_to_tokens": None, "price_per_million": output_price}],
     }
 
     if free_tier:
@@ -162,17 +208,19 @@ def main():
         if excluded_features:
             pricing["excluded_features"] = excluded_features
 
-    if caps['caching']:
+    if caps["caching"]:
         try:
-            default_cache = str(float(input_price)/4)
+            default_cache = str(float(input_price) / 4)
         except ValueError:
             default_cache = "0.025"
         cache_price = get_input("Cached Input Price per Million", default=default_cache)
         pricing["caching"] = [{"up_to_tokens": None, "price_per_million": cache_price}]
 
-    if caps['image_generation']:
+    if caps["image_generation"]:
         img_price = get_input("Image Output Price per Million", default="30.00")
-        pricing["image_output"] = [{"up_to_tokens": None, "price_per_million": img_price}]
+        pricing["image_output"] = [
+            {"up_to_tokens": None, "price_per_million": img_price}
+        ]
 
     data = {
         "model_id": model_id,
@@ -184,7 +232,7 @@ def main():
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "caps": caps,
-        "pricing": pricing
+        "pricing": pricing,
     }
 
     new_entry = generate_yaml_entry(data)
@@ -196,26 +244,24 @@ def main():
         print("Aborted.")
         sys.exit(0)
 
-    # Read and Insert
-    with open(TARGET_FILE, 'r') as f:
+    with open(TARGET_FILE, "r") as f:
         lines = f.readlines()
 
-    # Find insertion point: After header comments
     insert_idx = 0
     for i, line in enumerate(lines):
-        if line.strip() and not line.strip().startswith('#'):
+        if line.strip() and not line.strip().startswith("#"):
             insert_idx = i
             break
     else:
-        # If no models found, append to end
         insert_idx = len(lines)
 
     lines.insert(insert_idx, new_entry)
 
-    with open(TARGET_FILE, 'w') as f:
+    with open(TARGET_FILE, "w") as f:
         f.writelines(lines)
 
     print(f"Successfully added {model_id} to {TARGET_FILE}")
+
 
 if __name__ == "__main__":
     main()
