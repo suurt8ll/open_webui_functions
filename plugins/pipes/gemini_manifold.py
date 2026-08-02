@@ -3050,6 +3050,7 @@ class Pipe:
         event_emitter.emit_status(request_type_msg)
 
         # 6. Execution & Peek Logic
+        api_request_start_time = time.monotonic()
         if use_streaming_api:
             stream = await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
         else:
@@ -3066,6 +3067,7 @@ class Pipe:
 
         try:
             first_chunk = await iterator.__anext__()
+            first_token_time = time.monotonic()
         except StopAsyncIteration:
             raise ValueError("API returned an empty response stream.")
 
@@ -3082,6 +3084,8 @@ class Pipe:
             __request__.app,
             event_emitter,
             __metadata__,
+            api_request_start_time=api_request_start_time,
+            first_token_time=first_token_time,
         )
 
         # If OWUI requested a stream, we return the AsyncGenerator.
@@ -3139,6 +3143,8 @@ class Pipe:
         app: FastAPI,
         event_emitter: "EventEmitter",
         __metadata__: "Metadata",
+        api_request_start_time: float | None = None,
+        first_token_time: float | None = None,
     ) -> AsyncGenerator[dict | str, None]:
         """
         Processes an async iterator of GenerateContentResponse objects, yielding
@@ -3282,6 +3288,8 @@ class Pipe:
                     app.state,
                     __metadata__,
                     event_emitter.start_time,
+                    api_request_start_time,
+                    first_token_time,
                 )
             ):
                 # Yielding this dictionary allows the OWUI proxy to catch and save usage.
@@ -3663,6 +3671,8 @@ class Pipe:
         app_state: State,
         metadata: "Metadata",
         start_time: float,
+        api_request_start_time: float | None = None,
+        first_token_time: float | None = None,
     ) -> dict[str, Any] | None:
         """
         Extracts usage data from a GenerateContentResponse object.
@@ -3783,22 +3793,14 @@ class Pipe:
                     f"Failed to calculate cost: {e}. Cost details will be empty."
                 )
 
-        # OWUI expects 'input_tokens' and 'output_tokens' at the top level of the usage dict
-        # to populate the admin dashboard.
-        # We aggregate Gemini's specific counts into these two categories.
-        input_tokens = (
-            token_details.get("prompt_token_count", 0) + 
-            token_details.get("tool_use_prompt_token_count", 0)
+        input_tokens = token_details.get("prompt_token_count", 0) + token_details.get(
+            "tool_use_prompt_token_count", 0
         )
-        output_tokens = (
-            token_details.get("candidates_token_count", 0) + 
-            token_details.get("thoughts_token_count", 0)
-        )
+        output_tokens = token_details.get(
+            "candidates_token_count", 0
+        ) + token_details.get("thoughts_token_count", 0)
 
         usage_payload = {
-            # FIXME: put these to the end of the payload
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
             "token_details": token_details,
             "cost_details": cost_details,
         }
@@ -3815,9 +3817,20 @@ class Pipe:
             usage_payload["cumulative_token_count"] = prev_tokens + current_tokens
             usage_payload["cumulative_total_cost"] = round(prev_cost + current_cost, 6)
 
-        # Include completion time
-        elapsed_time = time.monotonic() - start_time
-        usage_payload["completion_time"] = round(elapsed_time, 2)
+        now = time.monotonic()
+        if api_request_start_time is not None and first_token_time is not None:
+            usage_payload["time_to_first_token"] = round(
+                first_token_time - api_request_start_time, 2
+            )
+
+        if api_request_start_time is not None:
+            usage_payload["generation_time"] = round(now - api_request_start_time, 2)
+
+        usage_payload["completion_time"] = round(now - start_time, 2)
+
+        # Top-level token counts required by Open WebUI's admin dashboard
+        usage_payload["input_tokens"] = input_tokens
+        usage_payload["output_tokens"] = output_tokens
 
         return usage_payload
 
