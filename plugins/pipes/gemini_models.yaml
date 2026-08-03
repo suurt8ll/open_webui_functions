@@ -1,12 +1,13 @@
 # Gemini Model Definitions
 # Source for capabilities: https://ai.google.dev/gemini-api/docs/models
+# Source for aspect ratios: https://ai.google.dev/gemini-api/docs/image-generation#aspect_ratios_and_image_size
 # Source for pricing: https://ai.google.dev/gemini-api/docs/pricing
 # Prices are per 1 million tokens in USD.
 
 
 
 gemini-3.1-flash-lite-image:
-  description: "Designed as the efficiency specialist of the image generation family, the Gemini 3.1 Flash Lite Image model is designed for ultra-low latency and cost-effective image generation and editing."
+  description: "Our smallest and most cost effective image generation and editing model, built for at scale usage."
   knowledge_cutoff: "2025-01"
   latest_update: "2026-06"
   supported_data_types:
@@ -29,6 +30,9 @@ gemini-3.1-flash-lite-image:
     structured_outputs: false
     thinking: true
     url_context: false
+  image_generation:
+    resolutions: ["1K"]
+    aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
   pricing:
     input:
       - up_to_tokens: null
@@ -39,6 +43,7 @@ gemini-3.1-flash-lite-image:
     image_output:
       - up_to_tokens: null
         price_per_million: 30.00
+
 gemini-3.6-flash:
   description: "Our most token-efficient Flash model, combining frontier intelligence with strong agentic, coding, and search performance while using significantly fewer output tokens than Gemini 3.5 Flash, at a lower price."
   knowledge_cutoff: "2026-03"
@@ -75,6 +80,7 @@ gemini-3.6-flash:
     caching:
       - up_to_tokens: null
         price_per_million: 0.15
+
 gemini-3.5-flash-lite:
   description: "A high-efficiency, low-latency model with upgraded agentic capabilities, optimized for cost-effective, high-throughput workloads."
   knowledge_cutoff: "2026-03"
@@ -111,6 +117,7 @@ gemini-3.5-flash-lite:
     caching:
       - up_to_tokens: null
         price_per_million: 0.03
+
 gemini-3.5-flash:
   description: "Gemini 3.5 Flash provides sustained frontier-level intelligence optimized for real-world tasks at a higher speed and lower cost. Designed for the agentic era, it excels at sub-agent deployment, multi-step workflows, and long-horizon tasks at scale. This model is particularly effective for rapid agentic loops involving complex coding cycles and iterations."
   knowledge_cutoff: "2025-01"
@@ -147,6 +154,7 @@ gemini-3.5-flash:
     caching:
       - up_to_tokens: null
         price_per_million: 0.15
+
 gemini-3.1-flash-lite:
   description: "Gemini 3.1 Flash-Lite is a low-latency, cost-effective multimodal model optimized for high-frequency, lightweight tasks. The model supports text, image, video, audio, and PDF inputs, and is designed for high-volume agentic workflows, simple data extraction, and applications where latency and API cost are the primary constraints."
   knowledge_cutoff: "2025-01"
@@ -183,6 +191,7 @@ gemini-3.1-flash-lite:
     caching:
       - up_to_tokens: null
         price_per_million: 0.025
+
 gemini-3.1-flash-lite-preview:
   description: "Our most cost-efficient multimodal model, offering the fastest performance for high-frequency, lightweight tasks. Gemini 3.1 Flash-Lite is best for high-volume agentic tasks, simple data extraction, and extremely low-latency applications where budget and speed are the primary constraints."
   knowledge_cutoff: "2025-01"
@@ -219,8 +228,9 @@ gemini-3.1-flash-lite-preview:
     caching:
       - up_to_tokens: null
         price_per_million: 0.025
-gemini-3.1-flash-image-preview:
-  description: "Designed for speed and efficiency, the Gemini 3.1 Flash Image generation model is effective for quick, interactive responses and high throughput."
+
+gemini-3.1-flash-image:
+  description: "Pro-level visual intelligence with Flash-speed efficiency and reality-grounded generation capabilities."
   knowledge_cutoff: "2025-01"
   latest_update: "2026-02"
   supported_data_types:
@@ -243,6 +253,9 @@ gemini-3.1-flash-image-preview:
     structured_outputs: false
     thinking: true
     url_context: false
+  image_generation:
+    resolutions: ["512PX", "1K", "2K", "4K"]
+    aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
   pricing:
     input:
       - up_to_tokens: null
@@ -253,6 +266,7 @@ gemini-3.1-flash-image-preview:
     image_output:
       - up_to_tokens: null
         price_per_million: 60.00
+
 gemini-3-flash-preview:
   description: "Our most intelligent model built for speed, combining frontier intelligence with superior search and grounding."
   knowledge_cutoff: "2025-01"
@@ -289,6 +303,7 @@ gemini-3-flash-preview:
     caching:
       - up_to_tokens: null
         price_per_million: 0.05
+
 gemini-3-pro-preview:
   description: "The best model in the world for multimodal understanding, and our most powerful agentic and vibe-coding model yet."
   knowledge_cutoff: "2025-01"
@@ -412,8 +427,8 @@ gemini-3.1-pro-preview-customtools:
       - up_to_tokens: null
         price_per_million: 0.40
 
-gemini-3-pro-image-preview:
-  description: "Image generation model. Designed for professional asset production and complex instructions. Features real-world grounding using Google Search and can generate images up to 4K resolution."
+gemini-3-pro-image:
+  description: "State-of-the-art image generation and editing model."
   knowledge_cutoff: "2025-01"
   latest_update: "2025-11"
   supported_data_types:
@@ -436,6 +451,9 @@ gemini-3-pro-image-preview:
     structured_outputs: true
     thinking: true
     url_context: false
+  image_generation:
+    resolutions: ["1K", "2K", "4K"]
+    aspect_ratios: ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
   pricing:
     input:
       - up_to_tokens: null
@@ -522,9 +540,9 @@ gemini-2.5-flash:
         price_per_million: 2.50
 
 gemini-2.5-flash-image:
-  description: "Image generation model. Designed for speed and efficiency in image generation. Optimized for high-volume, low-latency tasks and generates images at 1024px resolution."
-  knowledge_cutoff: "2025-01"
-  latest_update: "2025-11"
+  description: "Our state-of-the-art image generation and editing model."
+  knowledge_cutoff: "2025-06"
+  latest_update: "2025-10"
   supported_data_types:
     inputs: [Text, Image]
     outputs: [Text, Image]
@@ -545,6 +563,9 @@ gemini-2.5-flash-image:
     structured_outputs: true
     thinking: false
     url_context: false
+  image_generation:
+    resolutions: []
+    aspect_ratios: ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
   pricing:
     input:
       - up_to_tokens: null
