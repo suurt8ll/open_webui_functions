@@ -100,8 +100,8 @@ import difflib
 from loguru import logger
 from fastapi import Request, FastAPI
 import pydantic_core
-from pydantic import BaseModel, Field, field_validator
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator
+from pydantic import BaseModel, Field, create_model, field_validator
 from typing import (
     Any,
     Final,
@@ -109,6 +109,8 @@ from typing import (
     Literal,
     TYPE_CHECKING,
     cast,
+    get_args,
+    get_origin,
 )
 
 from open_webui.models.chats import Chats
@@ -126,6 +128,7 @@ if TYPE_CHECKING:
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
 
+
 def _log_and_toast(
     event_emitter: "EventEmitter",
     msg: str,
@@ -135,9 +138,10 @@ def _log_and_toast(
     log.opt(depth=1).log(level.upper(), msg)
     event_emitter.emit_toast(msg, level)
 
+
 # A mapping of finish reason names (str) to human-readable descriptions.
 # This allows handling of reasons that may not be defined in the current SDK version.
-FINISH_REASON_DESCRIPTIONS: Final = {
+FINISH_REASON_DESCRIPTIONS: Final[dict[str, str]] = {
     "FINISH_REASON_UNSPECIFIED": "The reason for finishing is not specified.",
     "STOP": "Natural stopping point or stop sequence reached.",
     "MAX_TOKENS": "The maximum number of tokens was reached.",
@@ -160,10 +164,13 @@ FINISH_REASON_DESCRIPTIONS: Final = {
 }
 
 # Finish reasons that are considered normal and do not require user notification.
-NORMAL_REASONS: Final = {types.FinishReason.STOP, types.FinishReason.MAX_TOKENS}
+NORMAL_REASONS: Final[set[types.FinishReason]] = {
+    types.FinishReason.STOP,
+    types.FinishReason.MAX_TOKENS,
+}
 
 # These tags will be "disabled" in the response, meaning that they will not be parsed by the backend.
-SPECIAL_TAGS_TO_DISABLE = [
+SPECIAL_TAGS_TO_DISABLE: Final[list[str]] = [
     "details",
     "think",
     "thinking",
@@ -1615,16 +1622,26 @@ class GeminiContentBuilder:
         return text
 
 
-_SHARED_VALVE_DESCS = {
+_VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
+    # Auth & API Keys
     "GEMINI_FREE_API_KEY": "Free Gemini Developer API key.",
     "GEMINI_PAID_API_KEY": "Paid Gemini Developer API key.",
+    "USER_MUST_PROVIDE_AUTH_CONFIG": (
+        "Require all users (including admins) to provide their own authentication credentials via `UserValves`.\n\n"
+        "Setting this to `True` prevents non-whitelisted users from using Vertex AI."
+    ),
+    "AUTH_WHITELIST": (
+        "Comma-separated list of user email addresses allowed to bypass `USER_MUST_PROVIDE_AUTH_CONFIG` and use default system credentials."
+    ),
     "GEMINI_API_BASE_URL": "Custom base URL for calling the Gemini API.",
+    # Vertex AI
     "USE_VERTEX_AI": (
         "Whether to use Google Cloud Vertex AI instead of the standard Gemini API.\n\n"
         "*Requires `VERTEX_PROJECT` to be set.*"
     ),
     "VERTEX_PROJECT": "Google Cloud project ID to use with Vertex AI.",
     "VERTEX_LOCATION": "Google Cloud region/location for Vertex AI (e.g., `global`, `us-central1`).",
+    # Routing & Fallback
     "ENABLE_FREE_TIER_FALLBACK": (
         "Automatically switch to the Paid API if a Free API request fails due to quota limits (`429`) or model overload (`503`).\n\n"
         "*Requires both Free and Paid API keys to be configured.*"
@@ -1636,6 +1653,17 @@ _SHARED_VALVE_DESCS = {
         "- `only_paid`: Bypass Free API and use Paid API directly (or Vertex AI if enabled).\n"
         "- `match_main`: Follow the same routing logic as the main chat generation."
     ),
+    # Filtering & Cache
+    "MODEL_WHITELIST": (
+        "Comma-separated list of allowed model names.\n\n"
+        "Supports `fnmatch` wildcard patterns: `*`, `?`, `[seq]`, `[!seq]`."
+    ),
+    "MODEL_BLACKLIST": (
+        "Comma-separated list of blacklisted model names.\n\n"
+        "Supports `fnmatch` wildcard patterns: `*`, `?`, `[seq]`, `[!seq]`."
+    ),
+    "CACHE_MODELS": "Whether to cache available models on startup and refresh only when whitelist or blacklist rules change.",
+    # Features & Execution Parameters
     "THINKING_CONFIG_RULES": (
         "JSON string mapping model name regex patterns to default thinking budget (int) or thinking level (str: `MINIMAL`, `LOW`, `MEDIUM`, `HIGH`).\n\n"
         "Determines thinking parameters per model. **Note that key order matters:** the first matching regex pattern is used, so place more specific patterns before broader catch-all patterns.\n\n"
@@ -1650,6 +1678,7 @@ _SHARED_VALVE_DESCS = {
         "Whether to parse YouTube video URLs from user messages and provide content as context.\n\n"
         "If disabled, YouTube links are treated as plain text."
     ),
+    "USE_ENTERPRISE_SEARCH": "Enable Enterprise Search tool allowing models to fetch and ground content from specified web URLs.",
     "MAPS_GROUNDING_COORDINATES": (
         "Latitude and longitude coordinates for location-aware Google Maps grounding.\n\n"
         "Expected format: `latitude,longitude` (e.g., `40.7128,-74.0060`)."
@@ -1664,26 +1693,6 @@ _SHARED_VALVE_DESCS = {
     ),
 }
 
-_ADMIN_VALVE_DESCS = {
-    "USER_MUST_PROVIDE_AUTH_CONFIG": (
-        "Require all users (including admins) to provide their own authentication credentials via `UserValves`.\n\n"
-        "Setting this to `True` prevents non-whitelisted users from using Vertex AI."
-    ),
-    "AUTH_WHITELIST": (
-        "Comma-separated list of user email addresses allowed to bypass `USER_MUST_PROVIDE_AUTH_CONFIG` and use default system credentials."
-    ),
-    "MODEL_WHITELIST": (
-        "Comma-separated list of allowed model names.\n\n"
-        "Supports `fnmatch` wildcard patterns: `*`, `?`, `[seq]`, `[!seq]`."
-    ),
-    "MODEL_BLACKLIST": (
-        "Comma-separated list of blacklisted model names.\n\n"
-        "Supports `fnmatch` wildcard patterns: `*`, `?`, `[seq]`, `[!seq]`."
-    ),
-    "CACHE_MODELS": "Whether to cache available models on startup and refresh only when whitelist or blacklist rules change.",
-    "USE_ENTERPRISE_SEARCH": "Enable Enterprise Search tool allowing models to fetch and ground content from specified web URLs.",
-}
-
 
 def _format_valve_desc(text: str, default: Any = None, is_user: bool = False) -> str:
     """Formats Markdown descriptions for Valves and UserValves fields."""
@@ -1695,10 +1704,83 @@ def _format_valve_desc(text: str, default: Any = None, is_user: bool = False) ->
     return f"{text}\n\n**Default:** {formatted_default}{sep}"
 
 
-class Pipe:
+def _admin_field(name: str, default: Any = None, admin_section_start: bool = False) -> Any:
+    """Helper to construct a Pydantic Field with default value and formatted admin description."""
+    raw_desc = _VALVE_DESCRIPTIONS.get(name, "")
+    desc = _format_valve_desc(raw_desc, default=default)
+    if admin_section_start:
+        desc = f"{desc}### Admin-Only Options"
+    return Field(default=default, description=desc)
 
-    @staticmethod
-    def _validate_coordinates_format(v: str | None) -> str | None:
+
+class _SharedValves(BaseModel):
+    """Base model holding user-configurable options and shared field validators."""
+
+    GEMINI_FREE_API_KEY: str | None = _admin_field("GEMINI_FREE_API_KEY")
+    GEMINI_PAID_API_KEY: str | None = _admin_field("GEMINI_PAID_API_KEY")
+    GEMINI_API_BASE_URL: str | None = _admin_field("GEMINI_API_BASE_URL")
+    USE_VERTEX_AI: bool = _admin_field("USE_VERTEX_AI", False)
+    VERTEX_PROJECT: str | None = _admin_field("VERTEX_PROJECT")
+    VERTEX_LOCATION: str = _admin_field("VERTEX_LOCATION", "global")
+    ENABLE_FREE_TIER_FALLBACK: bool = _admin_field("ENABLE_FREE_TIER_FALLBACK", False)
+    TASK_MODEL_ROUTING: Literal[
+        "only_free",
+        "free_fallback",
+        "only_paid",
+        "match_main",
+    ] = _admin_field("TASK_MODEL_ROUTING", "match_main")
+    THINKING_CONFIG_RULES: str = _admin_field("THINKING_CONFIG_RULES", '{"$a": 0}')
+    SHOW_THINKING_SUMMARY: bool = _admin_field("SHOW_THINKING_SUMMARY", True)
+    USE_FILES_API: bool = _admin_field("USE_FILES_API", True)
+    PARSE_YOUTUBE_URLS: bool = _admin_field("PARSE_YOUTUBE_URLS", True)
+    MAPS_GROUNDING_COORDINATES: str | None = _admin_field("MAPS_GROUNDING_COORDINATES")
+    IMAGE_RESOLUTION: Literal["512PX", "1K", "2K", "4K"] | None = _admin_field(
+        "IMAGE_RESOLUTION"
+    )
+    IMAGE_ASPECT_RATIO: (
+        Literal[
+            "1:1",
+            "1:4",
+            "1:8",
+            "2:3",
+            "3:2",
+            "3:4",
+            "4:1",
+            "4:3",
+            "4:5",
+            "5:4",
+            "8:1",
+            "9:16",
+            "16:9",
+            "21:9",
+        ]
+        | None
+    ) = _admin_field("IMAGE_ASPECT_RATIO", admin_section_start=True)
+
+    @field_validator("THINKING_CONFIG_RULES", mode="after")
+    @classmethod
+    def validate_thinking_config_rules(cls, v: str | None):
+        """Validates that THINKING_CONFIG_RULES is a valid JSON string mapping regex patterns to int or str."""
+        if v is not None and v.strip() != "":
+            try:
+                data = json.loads(v)
+                if not isinstance(data, dict):
+                    raise ValueError("Must be a JSON object (dict).")
+                for key, val in data.items():
+                    re.compile(key)
+                    if not isinstance(val, (int, str)):
+                        raise ValueError(
+                            f"Value for pattern '{key}' must be an int or str, got {type(val).__name__}."
+                        )
+            except Exception as e:
+                raise ValueError(
+                    f"Invalid JSON format or structure for THINKING_CONFIG_RULES: {e}"
+                )
+        return v
+
+    @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
+    @classmethod
+    def validate_coordinates_format(cls, v: str | None):
         """Reusable validator for 'latitude,longitude' format."""
         if v is not None and v != "":
             try:
@@ -1723,308 +1805,43 @@ class Pipe:
                 )
         return v
 
-    @staticmethod
-    def _validate_thinking_config_rules(v: str | None) -> str | None:
-        """Validates that THINKING_CONFIG_RULES is a valid JSON string mapping regex patterns to int or str."""
-        if v is not None and v.strip() != "":
-            try:
-                data = json.loads(v)
-                if not isinstance(data, dict):
-                    raise ValueError("Must be a JSON object (dict).")
-                for key, val in data.items():
-                    re.compile(key)
-                    if not isinstance(val, (int, str)):
-                        raise ValueError(
-                            f"Value for pattern '{key}' must be an int or str, got {type(val).__name__}."
-                        )
-            except Exception as e:
-                raise ValueError(
-                    f"Invalid JSON format or structure for THINKING_CONFIG_RULES: {e}"
-                )
-        return v
 
-    class Valves(BaseModel):
-        GEMINI_FREE_API_KEY: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["GEMINI_FREE_API_KEY"], default=None
-            ),
-        )
-        GEMINI_PAID_API_KEY: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["GEMINI_PAID_API_KEY"], default=None
-            ),
-        )
-        USER_MUST_PROVIDE_AUTH_CONFIG: bool = Field(
-            default=False,
-            description=_format_valve_desc(
-                _ADMIN_VALVE_DESCS["USER_MUST_PROVIDE_AUTH_CONFIG"], default=False
-            ),
-        )
-        AUTH_WHITELIST: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _ADMIN_VALVE_DESCS["AUTH_WHITELIST"], default=None
-            ),
-        )
-        GEMINI_API_BASE_URL: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["GEMINI_API_BASE_URL"], default=None
-            ),
-        )
-        USE_VERTEX_AI: bool = Field(
-            default=False,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["USE_VERTEX_AI"], default=False
-            ),
-        )
-        VERTEX_PROJECT: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["VERTEX_PROJECT"], default=None
-            ),
-        )
-        VERTEX_LOCATION: str = Field(
-            default="global",
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["VERTEX_LOCATION"], default="global"
-            ),
-        )
-        ENABLE_FREE_TIER_FALLBACK: bool = Field(
-            default=False,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["ENABLE_FREE_TIER_FALLBACK"], default=False
-            ),
-        )
-        TASK_MODEL_ROUTING: Literal[
-            "only_free",
-            "free_fallback",
-            "only_paid",
-            "match_main",
-        ] = Field(
-            default="match_main",
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["TASK_MODEL_ROUTING"], default="match_main"
-            ),
-        )
-        MODEL_WHITELIST: str = Field(
-            default="*",
-            description=_format_valve_desc(
-                _ADMIN_VALVE_DESCS["MODEL_WHITELIST"], default="*"
-            ),
-        )
-        MODEL_BLACKLIST: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _ADMIN_VALVE_DESCS["MODEL_BLACKLIST"], default=None
-            ),
-        )
-        CACHE_MODELS: bool = Field(
-            default=True,
-            description=_format_valve_desc(
-                _ADMIN_VALVE_DESCS["CACHE_MODELS"], default=True
-            ),
-        )
-        THINKING_CONFIG_RULES: str = Field(
-            default='{"$a": 0}',
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["THINKING_CONFIG_RULES"], default='{"$a": 0}'
-            ),
-        )
-        SHOW_THINKING_SUMMARY: bool = Field(
-            default=True,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["SHOW_THINKING_SUMMARY"], default=True
-            ),
-        )
-        USE_FILES_API: bool = Field(
-            default=True,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["USE_FILES_API"], default=True
-            ),
-        )
-        PARSE_YOUTUBE_URLS: bool = Field(
-            default=True,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["PARSE_YOUTUBE_URLS"], default=True
-            ),
-        )
-        USE_ENTERPRISE_SEARCH: bool = Field(
-            default=False,
-            description=_format_valve_desc(
-                _ADMIN_VALVE_DESCS["USE_ENTERPRISE_SEARCH"], default=False
-            ),
-        )
-        MAPS_GROUNDING_COORDINATES: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["MAPS_GROUNDING_COORDINATES"], default=None
-            ),
-        )
-        IMAGE_RESOLUTION: Literal["512PX", "1K", "2K", "4K"] | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["IMAGE_RESOLUTION"], default=None
-            ),
-        )
-        IMAGE_ASPECT_RATIO: (
-            Literal[
-                "1:1",
-                "1:4",
-                "1:8",
-                "2:3",
-                "3:2",
-                "3:4",
-                "4:1",
-                "4:3",
-                "4:5",
-                "5:4",
-                "8:1",
-                "9:16",
-                "16:9",
-                "21:9",
-            ]
-            | None
-        ) = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["IMAGE_ASPECT_RATIO"], default=None
-            ),
-        )
+def _generate_user_valves(shared_cls: type[BaseModel]) -> type[BaseModel]:
+    """Generates Pipe.UserValves model from _SharedValves with Optional fields and user descriptions."""
+    fields: dict[str, Any] = {}
+    for name, field_info in shared_cls.model_fields.items():
+        raw_desc = _VALVE_DESCRIPTIONS.get(name, "")
+        user_desc = _format_valve_desc(raw_desc, is_user=True)
 
-        @field_validator("THINKING_CONFIG_RULES", mode="after")
-        @classmethod
-        def validate_thinking_config_rules(cls, v: str | None):
-            return Pipe._validate_thinking_config_rules(v)
+        ann = field_info.annotation
+        if get_origin(ann) is Literal:
+            args = get_args(ann)
+            user_ann = (
+                Literal[(*args, "")] | None if "" not in args else ann | None  # type: ignore[operator]
+            )
+        elif ann is not None:
+            user_ann = ann | None
+        else:
+            user_ann = Any
 
-        @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
-        @classmethod
-        def validate_coordinates_format(cls, v: str | None):
-            return Pipe._validate_coordinates_format(v)
+        fields[name] = (user_ann, Field(default=None, description=user_desc))
 
-    class UserValves(BaseModel):
-        GEMINI_FREE_API_KEY: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["GEMINI_FREE_API_KEY"], is_user=True
-            ),
-        )
-        GEMINI_PAID_API_KEY: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["GEMINI_PAID_API_KEY"], is_user=True
-            ),
-        )
-        GEMINI_API_BASE_URL: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["GEMINI_API_BASE_URL"], is_user=True
-            ),
-        )
-        USE_VERTEX_AI: bool | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["USE_VERTEX_AI"], is_user=True
-            ),
-        )
-        VERTEX_PROJECT: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["VERTEX_PROJECT"], is_user=True
-            ),
-        )
-        VERTEX_LOCATION: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["VERTEX_LOCATION"], is_user=True
-            ),
-        )
-        ENABLE_FREE_TIER_FALLBACK: bool | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["ENABLE_FREE_TIER_FALLBACK"], is_user=True
-            ),
-        )
-        TASK_MODEL_ROUTING: (
-            Literal["only_free", "free_fallback", "only_paid", "match_main", ""] | None
-        ) = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["TASK_MODEL_ROUTING"], is_user=True
-            ),
-        )
-        THINKING_CONFIG_RULES: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["THINKING_CONFIG_RULES"], is_user=True
-            ),
-        )
-        SHOW_THINKING_SUMMARY: bool | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["SHOW_THINKING_SUMMARY"], is_user=True
-            ),
-        )
-        USE_FILES_API: bool | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["USE_FILES_API"], is_user=True
-            ),
-        )
-        PARSE_YOUTUBE_URLS: bool | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["PARSE_YOUTUBE_URLS"], is_user=True
-            ),
-        )
-        MAPS_GROUNDING_COORDINATES: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["MAPS_GROUNDING_COORDINATES"], is_user=True
-            ),
-        )
-        IMAGE_RESOLUTION: Literal["512PX", "1K", "2K", "4K"] | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["IMAGE_RESOLUTION"], is_user=True
-            ),
-        )
-        IMAGE_ASPECT_RATIO: (
-            Literal[
-                "1:1",
-                "1:4",
-                "1:8",
-                "2:3",
-                "3:2",
-                "3:4",
-                "4:1",
-                "4:3",
-                "4:5",
-                "5:4",
-                "8:1",
-                "9:16",
-                "16:9",
-                "21:9",
-            ]
-            | None
-        ) = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["IMAGE_ASPECT_RATIO"], default=None, is_user=True
-            ),
-        )
+    return create_model("UserValves", __base__=shared_cls, **fields)  # type: ignore[call-overload]
 
-        @field_validator("THINKING_CONFIG_RULES", mode="after")
-        @classmethod
-        def validate_thinking_config_rules(cls, v: str | None):
-            return Pipe._validate_thinking_config_rules(v)
 
-        @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
-        @classmethod
-        def validate_coordinates_format(cls, v: str | None):
-            return Pipe._validate_coordinates_format(v)
+class Pipe:
+
+    class Valves(_SharedValves):
+        USER_MUST_PROVIDE_AUTH_CONFIG: bool = _admin_field(
+            "USER_MUST_PROVIDE_AUTH_CONFIG", False
+        )
+        AUTH_WHITELIST: str | None = _admin_field("AUTH_WHITELIST")
+        MODEL_WHITELIST: str = _admin_field("MODEL_WHITELIST", "*")
+        MODEL_BLACKLIST: str | None = _admin_field("MODEL_BLACKLIST")
+        CACHE_MODELS: bool = _admin_field("CACHE_MODELS", True)
+        USE_ENTERPRISE_SEARCH: bool = _admin_field("USE_ENTERPRISE_SEARCH", False)
+
+    UserValves = _generate_user_valves(_SharedValves)
 
     def __init__(self):
         self.valves = self.Valves()
@@ -2054,7 +1871,11 @@ class Pipe:
 
         log.info(f"Returning {len(filtered_models)} models to Open WebUI.")
         log.debug(f"Model list:", payload=[model["id"] for model in filtered_models])
-        log.trace("List of dicts that Pipe.pipes() will return:", payload=filtered_models, _log_truncation_enabled=False)
+        log.trace(
+            "List of dicts that Pipe.pipes() will return:",
+            payload=filtered_models,
+            _log_truncation_enabled=False,
+        )
         log.debug("pipes method has finished.")
 
         return filtered_models
@@ -2096,7 +1917,9 @@ class Pipe:
         )
 
         if task_type := __metadata__.get("task"):
-            log.info(f"{task_type=}, disabling event emissions, YouTube URL parsing and document processing.")
+            log.info(
+                f"{task_type=}, disabling event emissions, YouTube URL parsing and document processing."
+            )
             # We disable YouTube parsing for task models to minimize latency and token costs,
             # as simple tasks like title or tag generation do not require video context.
             valves.PARSE_YOUTUBE_URLS = False
@@ -2169,19 +1992,27 @@ class Pipe:
                     or "403" in error_str
                     or "503" in error_str
                     or "UNAVAILABLE" in error_str
-                    or (isinstance(e, genai_errors.ClientError) and e.code in [429, 403])
+                    or (
+                        isinstance(e, genai_errors.ClientError) and e.code in [429, 403]
+                    )
                     or (isinstance(e, genai_errors.ServerError) and e.code in [503])
                 )
 
-                should_retry = not is_last_attempt and tier == "free" and is_fallback_eligible
+                should_retry = (
+                    not is_last_attempt and tier == "free" and is_fallback_eligible
+                )
 
                 if should_retry:
-                    reason = "quota exceeded" if "429" in error_str else "model overloaded"
-                    log.warning(f"Free Tier {reason} (Error: {e}). Switching to Paid API...")
+                    reason = (
+                        "quota exceeded" if "429" in error_str else "model overloaded"
+                    )
+                    log.warning(
+                        f"Free Tier {reason} (Error: {e}). Switching to Paid API..."
+                    )
                     event_emitter.emit_status(
                         f"Free Tier {reason}, switching to Paid API...", done=False
                     )
-                    continue 
+                    continue
 
                 # If we can't retry, re-raise the error to stop execution
                 log.error(f"Error during request execution (Tier: {tier}): {e}")
@@ -2269,7 +2100,7 @@ class Pipe:
 
     @staticmethod
     def _prepare_client_args(
-        source_valves: "Pipe.Valves | Pipe.UserValves",
+        source_valves: "Pipe.Valves | _SharedValves",
     ) -> list[str | bool | None]:
         """Prepares arguments for _get_or_create_genai_client from source_valves."""
         ATTRS = [
@@ -2306,7 +2137,9 @@ class Pipe:
         all_raw_models: list[types.Model] = []
 
         # Condition for fetching from both sources
-        fetch_both = bool(use_vertex_ai and vertex_project and (free_api_key or paid_api_key))
+        fetch_both = bool(
+            use_vertex_ai and vertex_project and (free_api_key or paid_api_key)
+        )
 
         if fetch_both:
             log.info(
@@ -2623,7 +2456,9 @@ class Pipe:
     def _is_image_model(model_id: str, config: dict) -> bool:
         """Check if the model is an image generation model using provided config."""
         if model_id in config:
-            return config[model_id].get("capabilities", {}).get("image_generation", False)
+            return (
+                config[model_id].get("capabilities", {}).get("image_generation", False)
+            )
 
         return False
 
@@ -2947,7 +2782,9 @@ class Pipe:
             # Check capability from config
             is_compatible = False
             if model_id in config:
-                is_compatible = config[model_id].get("capabilities", {}).get("url_context", False)
+                is_compatible = (
+                    config[model_id].get("capabilities", {}).get("url_context", False)
+                )
 
             if is_compatible:
                 if is_vertex_ai and (len(gen_content_conf.tools) > 0):
@@ -2972,9 +2809,7 @@ class Pipe:
         )
         if is_avail and is_on:
             log.info("Enabling Google Maps grounding tool.")
-            gen_content_conf.tools.append(
-                types.Tool(google_maps=types.GoogleMaps())
-            )
+            gen_content_conf.tools.append(types.Tool(google_maps=types.GoogleMaps()))
 
             if valves.MAPS_GROUNDING_COORDINATES:
                 try:
@@ -3136,10 +2971,7 @@ class Pipe:
         # the Google GenAI SDK's streaming method often raises a "chunk too big" error
         # if a high-resolution image is requested. We avoid this by forcing
         # a non-streaming SDK call, while still yielding the result as a stream to OWUI.
-        if (
-            use_streaming_api
-            and valves.IMAGE_RESOLUTION in ["2K", "4K"]
-        ):
+        if use_streaming_api and valves.IMAGE_RESOLUTION in ["2K", "4K"]:
             log.info(
                 f"Forcing non-streaming SDK call due to {valves.IMAGE_RESOLUTION} resolution "
                 "to avoid GenAI SDK 'chunk too big' errors."
@@ -3271,7 +3103,10 @@ class Pipe:
             async for chunk in response_stream:
                 candidate = self._get_first_candidate(chunk.candidates)
                 content = candidate.content if candidate else None
-                log.trace(f"Processing response chunk #{chunk_counter}, first candidate's content:", payload=content)
+                log.trace(
+                    f"Processing response chunk #{chunk_counter}, first candidate's content:",
+                    payload=content,
+                )
                 chunk_counter += 1
                 final_response_chunk = chunk  # Keep the latest chunk for metadata
 
@@ -3614,9 +3449,7 @@ class Pipe:
             log.warning("Image upload to Open WebUI database likely failed.")
             return None
 
-        image_url: str = app.url_path_for(
-            "get_file_content_by_id", id=file_item.id
-        )
+        image_url: str = app.url_path_for("get_file_content_by_id", id=file_item.id)
         log.success("Image upload finished!")
         return image_url
 
@@ -3682,16 +3515,12 @@ class Pipe:
 
         if not model_response:
             log.warning("Response processing skipped: Model response was empty.")
-            event_emitter.emit_status(
-                "Response failed [Empty Response]", done=True
-            )
+            event_emitter.emit_status("Response failed [Empty Response]", done=True)
             return
 
         if not (candidate := self._get_first_candidate(model_response.candidates)):
             log.warning("Response processing skipped: No candidates found.")
-            event_emitter.emit_status(
-                "Response failed [No Candidates]", done=True
-            )
+            event_emitter.emit_status("Response failed [No Candidates]", done=True)
             return
 
         # --- Construct detailed finish reason message ---
@@ -4101,8 +3930,8 @@ class Pipe:
             vertex_available and vertex_toggled_on and bool(valves.VERTEX_PROJECT)
         )
 
-        paid_toggle_available, paid_toggled_on = await self._get_toggleable_feature_status(
-            "gemini_paid_api", __metadata__
+        paid_toggle_available, paid_toggled_on = (
+            await self._get_toggleable_feature_status("gemini_paid_api", __metadata__)
         )
 
         task_type = __metadata__.get("task")
@@ -4293,7 +4122,9 @@ class Pipe:
         if not is_enabled_for_model:
             # This is a configuration issue, not a user-facing warning. Debug is appropriate.
             model_id = __metadata__.get("model", {}).get("id", "Unknown")
-            log.debug(f"Filter '{filter_id}' is not enabled for model '{model_id}' and is not global.")
+            log.debug(
+                f"Filter '{filter_id}' is not enabled for model '{model_id}' and is not global."
+            )
             return (False, False)
 
         # 4. Check if the user has toggled the feature ON for this request
@@ -4314,7 +4145,7 @@ class Pipe:
     @staticmethod
     def _get_merged_valves(
         default_valves: "Pipe.Valves",
-        user_valves: "Pipe.UserValves | None",
+        user_valves: _SharedValves | None,
         user_email: str,
     ) -> "Pipe.Valves":
         """
