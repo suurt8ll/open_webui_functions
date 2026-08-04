@@ -10,6 +10,8 @@ version: 2.1.0
 requirements: google-genai==2.14.0
 """
 
+from __future__ import annotations
+
 # I change these only when I make a release to avoid PR merge conflicts.
 # If you are making a PR then please do not change these values.
 VERSION = "2.1.0"
@@ -101,7 +103,15 @@ from loguru import logger
 from fastapi import Request, FastAPI
 import pydantic_core
 from collections.abc import AsyncIterator
-from pydantic import BaseModel, Field, StrictInt, StrictStr, create_model, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    create_model,
+    field_validator,
+)
 from typing import (
     Any,
     Final,
@@ -636,8 +646,8 @@ class GeminiContentBuilder:
         metadata_body: "Metadata",
         user_data: "UserData",
         event_emitter: "EventEmitter",
-        valves: "Pipe.Valves",
-        files_api_manager: "FilesAPIManager",
+        options: ResolvedOptions,
+        files_api_manager: FilesAPIManager,
     ):
         self.messages_body = messages_body
         self.upload_documents = (metadata_body.get("features", {}) or {}).get(
@@ -646,7 +656,7 @@ class GeminiContentBuilder:
         # Identify if this is a background task (title/tags/etc) to optimize context.
         self.is_task = bool(metadata_body.get("task"))
         self.event_emitter = event_emitter
-        self.valves = valves
+        self.options = options
         self.files_api_manager = files_api_manager
 
         chat_id = metadata_body.get("chat_id")
@@ -1158,7 +1168,7 @@ class GeminiContentBuilder:
         # leaving YouTube URLs to be treated as plain text.
         markdown_part = r"!\[.*?\]\(([^)]+)\)"  # Group 1: Markdown URI
         youtube_part = r"(https?://(?:(?:www|music)\.)?youtube\.com/(?:watch\?v=|shorts/|live/)[^\s)]+|https?://youtu\.be/[^\s)]+)"  # Group 2: YouTube URL
-        if self.valves.PARSE_YOUTUBE_URLS:
+        if self.options.PARSE_YOUTUBE_URLS:
             pattern = re.compile(f"{markdown_part}|{youtube_part}")
             process_youtube = True
         else:
@@ -1296,7 +1306,7 @@ class GeminiContentBuilder:
         if force_raw:
             reason = "raw bytes are forced (e.g. for assistant history reconstruction)"
             use_files_api = False
-        elif not self.valves.USE_FILES_API:
+        elif not self.options.USE_FILES_API:
             reason = "disabled by user setting (USE_FILES_API=False)"
             use_files_api = False
         elif self.vertexai:
@@ -1621,6 +1631,7 @@ class GeminiContentBuilder:
         )
         return text
 
+# region Valves
 
 _VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
     # Auth & API Keys
@@ -1894,6 +1905,7 @@ def _generate_user_valves(shared_cls: type[BaseModel]) -> type[BaseModel]:
 
     return create_model("UserValves", __base__=shared_cls, **fields)  # type: ignore[call-overload]
 
+# endregion Valves
 
 class Pipe:
 
@@ -1954,32 +1966,30 @@ class Pipe:
         __metadata__: "Metadata",
     ) -> AsyncGenerator[dict | str, None] | dict:
 
+        # FIXME: emit closing status message if error happens
         log.debug(
             f"pipe method has been called. Gemini Manifold google_genai version is {VERSION}"
         )
         log.trace("__metadata__:", payload=__metadata__)
         features = __metadata__.get("features", {}) or cast("Features", {})
 
-        # Check the version of the companion filter
         self._check_companion_filter_version(features)
 
-        # Retrieve model configuration from app state
         app_state: State = __request__.app.state
         model_config: dict[str, Any] = await self._wait_for_state_value(
             app_state,
             key="gemini_model_config",
             description="Gemini model configuration",
         )
-
-        merged_custom_params = self._resolve_custom_params(body, __metadata__)
-        __metadata__["merged_custom_params"] = merged_custom_params
-
         model_id = self._get_model_name(body)
         __metadata__["canonical_model_id"] = model_id
 
-        # 1. Capture the raw state of keys before any overrides
-        valves: Pipe.Valves = self._get_merged_valves(
-            self.valves, __user__.get("valves"), __user__.get("email")
+        options = _resolve_options(
+            self.valves,
+            __user__.get("valves"),
+            __user__.get("email"),
+            body,
+            __metadata__,
         )
 
         if task_type := __metadata__.get("task"):
@@ -1988,16 +1998,15 @@ class Pipe:
             )
             # We disable YouTube parsing for task models to minimize latency and token costs,
             # as simple tasks like title or tag generation do not require video context.
-            valves.PARSE_YOUTUBE_URLS = False
+            options.PARSE_YOUTUBE_URLS = False
             # TODO: disable tools. for now I assume that model will know to not use them even if enabled, but if that's not the case then this needs to be addressed.
             # TODO: use the structured outputs feature to ensure a valid json at all times?
 
-        # 3. Determine Execution Order
         execution_order = await self._determine_execution_order(
-            valves=valves,
-            __metadata__=__metadata__,
-            model_config=model_config,
-            features=features,
+            options,
+            __metadata__,
+            model_config,
+            features,
         )
 
         chat_id = __metadata__.get("chat_id")
@@ -2011,24 +2020,23 @@ class Pipe:
             is_task=bool(__metadata__.get("task")),
         )
 
-        # --- Execution Loop ---
         for attempt_idx, tier in enumerate(execution_order):
             is_last_attempt = attempt_idx == len(execution_order) - 1
 
-            # Create a "Tier-Specific" valves object for this attempt.
-            # We copy to ensure we don't pollute the original valves or metadata.
-            current_valves = copy.copy(valves)
+            # Create a "Tier-Specific" options object for this attempt.
+            # We copy to ensure we don't pollute the original options or metadata.
+            current_options = copy.copy(options)
 
             if tier == "free":
-                current_valves.GEMINI_PAID_API_KEY = None
-                current_valves.USE_VERTEX_AI = False
+                current_options.GEMINI_PAID_API_KEY = None
+                current_options.USE_VERTEX_AI = False
                 __metadata__["is_paid_api"] = False
             elif tier == "paid":
-                current_valves.GEMINI_FREE_API_KEY = None
-                current_valves.USE_VERTEX_AI = False
+                current_options.GEMINI_FREE_API_KEY = None
+                current_options.USE_VERTEX_AI = False
                 __metadata__["is_paid_api"] = True
             elif tier == "vertex":
-                current_valves.USE_VERTEX_AI = True
+                current_options.USE_VERTEX_AI = True
                 __metadata__["is_paid_api"] = True
 
             try:
@@ -2038,7 +2046,7 @@ class Pipe:
                 # file uploads (scoped to key), and the API call.
                 return await self._execute_generation_attempt(
                     tier=tier,
-                    valves=current_valves,
+                    options=current_options,
                     body=body,
                     __user__=__user__,
                     __metadata__=__metadata__,
@@ -2048,7 +2056,6 @@ class Pipe:
                 )
 
             except Exception as e:
-                # Error Handling & Routing
                 error_str = str(e).upper()
 
                 # We catch Quota (429), Permission (403), and Overload/Unavailable (503) errors.
@@ -2140,23 +2147,23 @@ class Pipe:
         except Exception as e:
             raise GenaiApiError(f"{api} Genai client initialization failed: {e}") from e
 
-    def _get_user_client(self, valves: "Pipe.Valves", user_email: str) -> genai.Client:
+    def _get_user_client(self, options: ResolvedOptions, user_email: str) -> genai.Client:
         user_whitelist = (
-            valves.AUTH_WHITELIST.split(",") if valves.AUTH_WHITELIST else []
+            options.AUTH_WHITELIST.split(",") if options.AUTH_WHITELIST else []
         )
         log.debug(
             f"User whitelist: {user_whitelist}, user email: {user_email}, "
-            f"USER_MUST_PROVIDE_AUTH_CONFIG: {valves.USER_MUST_PROVIDE_AUTH_CONFIG}"
+            f"USER_MUST_PROVIDE_AUTH_CONFIG: {options.USER_MUST_PROVIDE_AUTH_CONFIG}"
         )
-        if valves.USER_MUST_PROVIDE_AUTH_CONFIG and user_email not in user_whitelist:
-            if not valves.GEMINI_FREE_API_KEY and not valves.GEMINI_PAID_API_KEY:
+        if options.USER_MUST_PROVIDE_AUTH_CONFIG and user_email not in user_whitelist:
+            if not options.GEMINI_FREE_API_KEY and not options.GEMINI_PAID_API_KEY:
                 error_msg = (
                     "User must provide their own authentication configuration. "
-                    "Please set GEMINI_FREE_API_KEY or GEMINI_PAID_API_KEY in your UserValves."
+                    "Please set GEMINI_FREE_API_KEY or GEMINI_PAID_API_KEY in UserValves, model parameters or chat parameters."
                 )
                 raise ValueError(error_msg)
         try:
-            client_args = self._prepare_client_args(valves)
+            client_args = self._prepare_client_args(options)
             client = self._get_or_create_genai_client(*client_args)
         except GenaiApiError as e:
             error_msg = f"Failed to initialize genai client for user {user_email}: {e}"
@@ -2166,7 +2173,7 @@ class Pipe:
 
     @staticmethod
     def _prepare_client_args(
-        source_valves: "Pipe.Valves | _SharedValves",
+        source_valves: Pipe.Valves | _SharedValves,
     ) -> list[str | bool | None]:
         """Prepares arguments for _get_or_create_genai_client from source_valves."""
         ATTRS = [
@@ -2554,7 +2561,7 @@ class Pipe:
     # region 1.3 GenerateContentConfig assembly
 
     @classmethod
-    def _resolve_valve_thinking_config(
+    def _resolve_thinking_config(
         cls, rules_val: int | str | None, model_id: str
     ) -> tuple[int | None, str | None]:
         """Evaluates THINKING_CONFIG_RULES (int, level str, or JSON regex dict) against model_id to determine default budget/level."""
@@ -2647,11 +2654,11 @@ class Pipe:
         self,
         body: "Body",
         __metadata__: "Metadata",
-        valves: "Valves",
+        options: ResolvedOptions,
         config: dict,
         event_emitter: "EventEmitter",
     ) -> types.GenerateContentConfig:
-        """Assembles the GenerateContentConfig for a Gemini API request."""
+        """Assembles the GenerateContentConfig for a Gemini API request using ResolvedOptions."""
         features = __metadata__.get("features", {}) or {}
         is_vertex_ai = __metadata__.get("is_vertex_ai", False)
 
@@ -2678,52 +2685,16 @@ class Pipe:
         )
 
         if is_thinking_model:
-            # Precedence level 1 (lowest): Valves option
-            chosen_budget, chosen_level = self._resolve_valve_thinking_config(
-                valves.THINKING_CONFIG_RULES, model_id
+            # Resolved THINKING_CONFIG_RULES from options hierarchy (Valves -> User Valves -> Model Params -> Chat Params)
+            chosen_budget, chosen_level = self._resolve_thinking_config(
+                options.THINKING_CONFIG_RULES, model_id
             )
             log.info(
-                f"Resolved valve thinking config for model '{model_id}': "
+                f"Resolved thinking config for model '{model_id}': "
                 f"budget={chosen_budget}, level={chosen_level}"
             )
 
-            # Precedence level 2 (medium): Merged params override
-            merged_params = __metadata__.get("merged_custom_params", {})
-            if reasoning_effort := merged_params.get("reasoning_effort"):
-                log.info(
-                    f"Found `reasoning_effort` custom parameter: '{reasoning_effort}'. Overriding valve settings."
-                )
-
-                try:
-                    budget = round(float(reasoning_effort))
-                    log.info(
-                        f"Interpreting `reasoning_effort` as a thinking budget: {budget}"
-                    )
-                    chosen_budget = budget
-                    chosen_level = None
-                except (ValueError, TypeError):
-                    if isinstance(reasoning_effort, str):
-                        effort_level_str = reasoning_effort.upper()
-                        valid_levels = {"MINIMAL", "LOW", "MEDIUM", "HIGH"}
-                        if effort_level_str in valid_levels:
-                            log.info(
-                                f"Interpreting `reasoning_effort` as a thinking level: {effort_level_str}"
-                            )
-                            chosen_level = effort_level_str
-                            chosen_budget = None
-                        else:
-                            log.warning(
-                                f"Invalid `reasoning_effort` string value: '{reasoning_effort}'. "
-                                f"Valid values are {sorted(valid_levels)}. "
-                                "Falling back to valve settings."
-                            )
-                    else:
-                        log.warning(
-                            f"Unsupported type for `reasoning_effort`: {type(reasoning_effort)}. "
-                            "Expected a number or string. Falling back to valve settings."
-                        )
-
-            # Precedence level 3 (highest): Toggle filter override
+            # Toggle filter override (gemini_reasoning_toggle in UI)
             is_avail, is_on = await self._get_toggleable_feature_status(
                 "gemini_reasoning_toggle", __metadata__
             )
@@ -2755,7 +2726,7 @@ class Pipe:
                 chosen_level = None
 
             thinking_kwargs: dict[str, Any] = {
-                "include_thoughts": valves.SHOW_THINKING_SUMMARY
+                "include_thoughts": options.SHOW_THINKING_SUMMARY
             }
 
             if chosen_level is not None:
@@ -2810,18 +2781,18 @@ class Pipe:
             image_config_kwargs: dict[str, Any] = {}
 
             # Missing/empty resolutions means the model doesn't support `image_size`.
-            if supported_resolutions and valves.IMAGE_RESOLUTION:
-                if valves.IMAGE_RESOLUTION not in supported_resolutions:
+            if supported_resolutions and options.IMAGE_RESOLUTION:
+                if options.IMAGE_RESOLUTION not in supported_resolutions:
                     warn_msg = (
-                        f"Valve IMAGE_RESOLUTION '{valves.IMAGE_RESOLUTION}' is not listed in "
+                        f"Option IMAGE_RESOLUTION '{options.IMAGE_RESOLUTION}' is not listed in "
                         f"supported resolutions for '{model_id}': {supported_resolutions}. "
                         "Using it anyway; the API will likely reject it."
                     )
                     _log_and_toast(event_emitter, warn_msg, level="warning")
                 else:
-                    log.debug(f"Setting image resolution to {valves.IMAGE_RESOLUTION}")
+                    log.debug(f"Setting image resolution to {options.IMAGE_RESOLUTION}")
 
-                image_config_kwargs["image_size"] = valves.IMAGE_RESOLUTION
+                image_config_kwargs["image_size"] = options.IMAGE_RESOLUTION
             else:
                 log.debug(
                     f"Model '{model_id}' does not declare supported image resolutions; "
@@ -2832,21 +2803,21 @@ class Pipe:
                 warn_msg = (
                     f"Model '{model_id}' is an image model but "
                     "`image_generation.aspect_ratios` is missing or empty. "
-                    "This config entry looks malformed; using the valve value anyway."
+                    "This config entry looks malformed; using the option value anyway."
                 )
                 _log_and_toast(event_emitter, warn_msg, level="warning")
-            elif valves.IMAGE_ASPECT_RATIO not in supported_aspect_ratios:
+            elif options.IMAGE_ASPECT_RATIO not in supported_aspect_ratios:
                 warn_msg = (
-                    f"Valve IMAGE_ASPECT_RATIO '{valves.IMAGE_ASPECT_RATIO}' is not listed in "
+                    f"Option IMAGE_ASPECT_RATIO '{options.IMAGE_ASPECT_RATIO}' is not listed in "
                     f"supported aspect ratios for '{model_id}': {supported_aspect_ratios}. "
                     "Using it anyway; the API will likely reject it."
                 )
                 _log_and_toast(event_emitter, warn_msg, level="warning")
             else:
-                log.debug(f"Setting image aspect ratio to {valves.IMAGE_ASPECT_RATIO}")
+                log.debug(f"Setting image aspect ratio to {options.IMAGE_ASPECT_RATIO}")
 
-            if valves.IMAGE_ASPECT_RATIO:
-                image_config_kwargs["aspect_ratio"] = valves.IMAGE_ASPECT_RATIO
+            if options.IMAGE_ASPECT_RATIO:
+                image_config_kwargs["aspect_ratio"] = options.IMAGE_ASPECT_RATIO
 
             if image_config_kwargs:
                 gen_content_conf.image_config = types.ImageConfig(**image_config_kwargs)
@@ -2854,7 +2825,7 @@ class Pipe:
         gen_content_conf.tools = []
 
         if features.get("google_search_tool"):
-            if valves.USE_ENTERPRISE_SEARCH and is_vertex_ai:
+            if options.USE_ENTERPRISE_SEARCH and is_vertex_ai:
                 log.info("Using grounding with Enterprise Web Search as a Tool.")
                 gen_content_conf.tools.append(
                     types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
@@ -2915,9 +2886,9 @@ class Pipe:
             log.info("Enabling Google Maps grounding tool.")
             gen_content_conf.tools.append(types.Tool(google_maps=types.GoogleMaps()))
 
-            if valves.MAPS_GROUNDING_COORDINATES:
+            if options.MAPS_GROUNDING_COORDINATES:
                 try:
-                    lat_str, lon_str = valves.MAPS_GROUNDING_COORDINATES.split(",")
+                    lat_str, lon_str = options.MAPS_GROUNDING_COORDINATES.split(",")
                     latitude = float(lat_str.strip())
                     longitude = float(lon_str.strip())
 
@@ -2942,7 +2913,7 @@ class Pipe:
                     # This should not happen due to the Pydantic validator, but it's good practice to be safe.
                     log.error(
                         "Failed to parse MAPS_GROUNDING_COORDINATES: "
-                        f"'{valves.MAPS_GROUNDING_COORDINATES}'. Error: {e}"
+                        f"'{options.MAPS_GROUNDING_COORDINATES}'. Error: {e}"
                     )
 
         return gen_content_conf
@@ -2999,7 +2970,7 @@ class Pipe:
     async def _execute_generation_attempt(
         self,
         tier: str,
-        valves: "Pipe.Valves",
+        options: ResolvedOptions,
         body: "Body",
         __user__: "UserData",
         __metadata__: "Metadata",
@@ -3014,7 +2985,7 @@ class Pipe:
         """
 
         # 1. Client Creation
-        client = self._get_user_client(valves, __user__["email"])
+        client = self._get_user_client(options, __user__["email"])
         __metadata__["is_vertex_ai"] = client.vertexai
         api_name = "Vertex AI Gemini API" if client.vertexai else "Gemini Developer API"
 
@@ -3032,7 +3003,7 @@ class Pipe:
             metadata_body=__metadata__,
             user_data=__user__,
             event_emitter=event_emitter,
-            valves=valves,
+            options=options,
             files_api_manager=files_api_manager,
         )
 
@@ -3041,7 +3012,7 @@ class Pipe:
 
         # 4. Configuration Building
         gen_content_conf = await self._build_gen_content_config(
-            body, __metadata__, valves, model_config, event_emitter
+            body, __metadata__, options, model_config, event_emitter
         )
         gen_content_conf.system_instruction = builder.system_prompt
 
@@ -3075,9 +3046,9 @@ class Pipe:
         # the Google GenAI SDK's streaming method often raises a "chunk too big" error
         # if a high-resolution image is requested. We avoid this by forcing
         # a non-streaming SDK call, while still yielding the result as a stream to OWUI.
-        if use_streaming_api and valves.IMAGE_RESOLUTION in ["2K", "4K"]:
+        if use_streaming_api and options.IMAGE_RESOLUTION in ["2K", "4K"]:
             log.info(
-                f"Forcing non-streaming SDK call due to {valves.IMAGE_RESOLUTION} resolution "
+                f"Forcing non-streaming SDK call due to {options.IMAGE_RESOLUTION} resolution "
                 "to avoid GenAI SDK 'chunk too big' errors."
             )
             use_streaming_api = False
@@ -4012,7 +3983,7 @@ class Pipe:
 
     async def _determine_execution_order(
         self,
-        valves: "Pipe.Valves",
+        options: ResolvedOptions,
         __metadata__: "Metadata",
         model_config: dict[str, Any],
         features: "Features",
@@ -4022,8 +3993,8 @@ class Pipe:
         Returns an empty list if no valid routing configuration is found.
         """
         model_id = __metadata__.get("canonical_model_id", "")
-        has_free_key = bool(valves.GEMINI_FREE_API_KEY)
-        has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
+        has_free_key = bool(options.GEMINI_FREE_API_KEY)
+        has_paid_key = bool(options.GEMINI_PAID_API_KEY)
 
         # Retrieve Toggle Statuses
         vertex_available, vertex_toggled_on = await self._get_toggleable_feature_status(
@@ -4031,7 +4002,7 @@ class Pipe:
         )
         # Vertex is only viable if toggled on AND we have a project ID
         can_use_vertex = (
-            vertex_available and vertex_toggled_on and bool(valves.VERTEX_PROJECT)
+            vertex_available and vertex_toggled_on and bool(options.VERTEX_PROJECT)
         )
 
         paid_toggle_available, paid_toggled_on = (
@@ -4039,7 +4010,7 @@ class Pipe:
         )
 
         task_type = __metadata__.get("task")
-        routing_strategy = valves.TASK_MODEL_ROUTING if task_type else "match_main"
+        routing_strategy = options.TASK_MODEL_ROUTING if task_type else "match_main"
 
         is_free_eligible = self._check_free_tier_eligibility(
             model_id, model_config, features
@@ -4106,7 +4077,7 @@ class Pipe:
                     if has_free_key:
                         if is_free_eligible:
                             execution_order = ["free"]
-                            if valves.ENABLE_FREE_TIER_FALLBACK:
+                            if options.ENABLE_FREE_TIER_FALLBACK:
                                 if can_use_vertex:
                                     execution_order.append("vertex")
                                 elif has_paid_key:
@@ -4132,44 +4103,6 @@ class Pipe:
             f"Routing strategy for {model_id} ({routing_strategy}): {execution_order}"
         )
         return execution_order
-
-    def _resolve_custom_params(
-        self, body: "Body", __metadata__: "Metadata"
-    ) -> dict[str, Any]:
-        """
-        Resolves custom parameters from the model page and chat controls.
-        Chat control settings usually take precedence, but we ignore them
-        if this is a task model (e.g., generating titles or tags) to ensure
-        these independent calls aren't negatively affected by user chat settings.
-        """
-        known_body_keys = {
-            "stream",
-            "model",
-            "messages",
-            "files",
-            "options",
-            "stream_options",
-        }
-        merged_params = {
-            key: value for key, value in body.items() if key not in known_body_keys
-        }
-        log.debug("Model page parameters extracted from body:", payload=merged_params)
-
-        if __metadata__.get("task"):
-            log.debug(
-                f"Task model detected (task: {__metadata__.get('task')}). Ignoring chat control parameters."
-            )
-            return merged_params
-
-        chat_control_params = __metadata__.get("chat_control_params", {})
-        if chat_control_params:
-            log.debug(
-                "Chat control parameters extracted from metadata:",
-                payload=chat_control_params,
-            )
-            merged_params.update(chat_control_params)
-
-        return merged_params
 
     @staticmethod
     async def _get_toggleable_feature_status(
@@ -4246,78 +4179,6 @@ class Pipe:
 
         return (True, is_toggled_on)
 
-    @staticmethod
-    def _get_merged_valves(
-        default_valves: "Pipe.Valves",
-        user_valves: _SharedValves | None,
-        user_email: str,
-    ) -> "Pipe.Valves":
-        """
-        Merges UserValves into a base Valves configuration.
-
-        The general rule is that if a field in UserValves is not None or an empty
-        string, it overrides the corresponding field in the default_valves.
-        Otherwise, the default_valves field value is used.
-
-        Exceptions:
-        - If default_valves.USER_MUST_PROVIDE_AUTH_CONFIG is True and the user is
-          not on the AUTH_WHITELIST, then GEMINI_FREE_API_KEY and
-          GEMINI_PAID_API_KEY in the merged result will be taken directly from
-          user_valves (even if they are None), and Vertex AI usage is disabled.
-
-        Args:
-            default_valves: The base Valves object with default configurations.
-            user_valves: An optional UserValves object with user-specific overrides.
-                         If None, a copy of default_valves is returned.
-
-        Returns:
-            A new Valves object representing the merged configuration.
-        """
-        if user_valves is None:
-            # If no user-specific valves are provided, return a copy of the default valves.
-            return default_valves.model_copy(deep=True)
-
-        # Start with the values from the base `Valves`
-        merged_data = default_valves.model_dump()
-
-        # Override with non-None values from `UserValves`
-        # Iterate over fields defined in the UserValves model
-        for field_name in Pipe.UserValves.model_fields:
-            # getattr is safe as field_name comes from model_fields of user_valves' type
-            user_value = getattr(user_valves, field_name)
-            if user_value is not None and user_value != "":
-                # Only update if the field is also part of the main Valves model
-                # (keys of merged_data are fields of default_valves)
-                if field_name in merged_data:
-                    merged_data[field_name] = user_value
-
-        user_whitelist = (
-            default_valves.AUTH_WHITELIST.split(",")
-            if default_valves.AUTH_WHITELIST
-            else []
-        )
-
-        # Apply special logic based on default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
-        if (
-            default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
-            and user_email not in user_whitelist
-        ):
-            log.info(
-                f"User '{user_email}' is required to provide their own authentication credentials due to USER_MUST_PROVIDE_AUTH_CONFIG=True."
-                " Admin-provided API keys and Vertex AI settings will not be used."
-            )
-            # If USER_MUST_PROVIDE_AUTH_CONFIG is True and user is not in the whitelist,
-            # they must provide their own API keys.
-            # They are also disallowed from using the admin's Vertex AI configuration.
-            merged_data["GEMINI_FREE_API_KEY"] = user_valves.GEMINI_FREE_API_KEY
-            merged_data["GEMINI_PAID_API_KEY"] = user_valves.GEMINI_PAID_API_KEY
-            merged_data["VERTEX_PROJECT"] = None
-            merged_data["USE_VERTEX_AI"] = False
-
-        # Create a new Valves instance with the merged data.
-        # Pydantic will validate the data against the Valves model definition during instantiation.
-        return Pipe.Valves(**merged_data)
-
     def _get_first_candidate(
         self, candidates: list[types.Candidate] | None
     ) -> types.Candidate | None:
@@ -4370,3 +4231,169 @@ class Pipe:
     # endregion 1.7 Utility helpers
 
     # endregion 1. Helper methods inside the Pipe class
+
+# region Option resolution
+
+OPTION_SYNONYMS: Final[dict[str, str]] = {
+    "reasoning_effort": "THINKING_CONFIG_RULES",
+    "thinking_budget": "THINKING_CONFIG_RULES",
+    "thinking_level": "THINKING_CONFIG_RULES",
+}
+
+# Dynamic sets distinguishing overridable vs admin-only valve options
+USER_OVERRIDABLE_VALVE_FIELDS: Final[set[str]] = set(_SharedValves.model_fields.keys())
+ADMIN_ONLY_VALVE_FIELDS: Final[set[str]] = (
+    set(Pipe.Valves.model_fields.keys()) - USER_OVERRIDABLE_VALVE_FIELDS
+)
+
+# Pre-computed case-insensitive lookup dictionaries
+_VALVE_FIELD_LOOKUP: Final[dict[str, str]] = {
+    field_name.lower(): field_name
+    for field_name in Pipe.Valves.model_fields.keys()
+}
+
+_SYNONYM_LOOKUP: Final[dict[str, str]] = {
+    synonym.lower(): canonical_target
+    for synonym, canonical_target in OPTION_SYNONYMS.items()
+}
+
+
+def canonicalize_option_key(key: str) -> str:
+    """
+    Normalizes an option key using case-insensitive lookup against synonyms
+    and known valve fields. Returns the canonical key name or the stripped key if custom.
+    """
+    key_clean = key.strip()
+    key_lower = key_clean.lower()
+
+    if canonical := _SYNONYM_LOOKUP.get(key_lower):
+        return canonical
+
+    if canonical := _VALVE_FIELD_LOOKUP.get(key_lower):
+        return canonical
+
+    return key_clean
+
+
+class ResolvedOptions(Pipe.Valves):
+    """
+    Consolidated configuration combining Admin Valves, User Valves,
+    Model Advanced Params, and Chat Advanced Params according to priority.
+
+    Allows extra dynamic options defined at model or chat levels.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    def get_custom_params(self) -> dict[str, Any]:
+        """Returns extra parameters not defined in Pipe.Valves."""
+        valve_fields = set(Pipe.Valves.model_fields.keys())
+        return {
+            k: v for k, v in self.model_dump().items() if k not in valve_fields
+        }
+
+
+def _resolve_options(
+    admin_valves: Pipe.Valves,
+    user_valves: _SharedValves | None,
+    user_email: str,
+    body: "Body",
+    metadata: "Metadata",
+) -> ResolvedOptions:
+    """
+    Hierarchically resolves configuration options from 4 priority sources:
+    1. Admin Valves (Lowest priority)
+    2. User Valves
+    3. Model Page Advanced Params
+    4. Chat Side-Panel Advanced Params (Highest priority)
+
+    Admin-only options cannot be overridden by user-level sources.
+    Option keys and synonyms are normalized case-insensitively.
+    """
+    # Priority 1: Base options from Admin Valves
+    merged_data = admin_valves.model_dump()
+
+    # Priority 2: User Valves (user-overridable fields only)
+    if user_valves is not None:
+        for field_name in USER_OVERRIDABLE_VALVE_FIELDS:
+            user_val = getattr(user_valves, field_name, None)
+            if user_val is not None and user_val != "":
+                merged_data[field_name] = user_val
+
+    # Enforce admin authentication security rules
+    user_whitelist = (
+        admin_valves.AUTH_WHITELIST.split(",")
+        if admin_valves.AUTH_WHITELIST
+        else []
+    )
+    if (
+        admin_valves.USER_MUST_PROVIDE_AUTH_CONFIG
+        and user_email not in user_whitelist
+    ):
+        log.info(
+            f"User '{user_email}' is required to provide their own authentication credentials due to USER_MUST_PROVIDE_AUTH_CONFIG=True."
+        )
+        merged_data["GEMINI_FREE_API_KEY"] = (
+            getattr(user_valves, "GEMINI_FREE_API_KEY", None)
+            if user_valves
+            else None
+        )
+        merged_data["GEMINI_PAID_API_KEY"] = (
+            getattr(user_valves, "GEMINI_PAID_API_KEY", None)
+            if user_valves
+            else None
+        )
+        merged_data["VERTEX_PROJECT"] = None
+        merged_data["USE_VERTEX_AI"] = False
+
+    # TODO: does it make more sense for uservalves to overwrite model params?
+    # Priority 3: Model Page Advanced Params
+    known_body_keys = {
+        "stream",
+        "model",
+        "messages",
+        "files",
+        "options",
+        "stream_options",
+    }
+    model_params = {
+        k: v for k, v in body.items() if k not in known_body_keys
+    }
+    if isinstance(body.get("options"), dict):
+        for opt_k, opt_v in body["options"].items(): # type: ignore[reportTypedDictNotRequiredAccess]
+            if opt_k not in model_params:
+                model_params[opt_k] = opt_v
+
+    for raw_key, val in model_params.items():
+        if val is None or val == "":
+            continue
+        canonical_key = canonicalize_option_key(raw_key)
+        if canonical_key in ADMIN_ONLY_VALVE_FIELDS:
+            log.warning(
+                f"Model parameter '{raw_key}' attempts to override admin-only valve '{canonical_key}'. Ignoring override."
+            )
+            continue
+        merged_data[canonical_key] = val
+
+    # Priority 4: Chat Side-Panel Advanced Params (Skipped for task models)
+    if not metadata.get("task"):
+        chat_params = metadata.get("chat_control_params", {})
+        if isinstance(chat_params, dict):
+            for raw_key, val in chat_params.items():
+                if val is None or val == "":
+                    continue
+                canonical_key = canonicalize_option_key(raw_key)
+                if canonical_key in ADMIN_ONLY_VALVE_FIELDS:
+                    log.warning(
+                        f"Chat parameter '{raw_key}' attempts to override admin-only valve '{canonical_key}'. Ignoring override."
+                    )
+                    continue
+                merged_data[canonical_key] = val
+    else:
+        log.debug(
+            f"Task model detected ('{metadata.get('task')}'). Chat side-panel parameters ignored."
+        )
+
+    return ResolvedOptions(**merged_data)
+
+# endregion Option resolution
