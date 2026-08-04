@@ -101,7 +101,7 @@ from loguru import logger
 from fastapi import Request, FastAPI
 import pydantic_core
 from collections.abc import AsyncIterator
-from pydantic import BaseModel, Field, create_model, field_validator
+from pydantic import BaseModel, Field, StrictInt, StrictStr, create_model, field_validator
 from typing import (
     Any,
     Final,
@@ -1665,8 +1665,8 @@ _VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
     "CACHE_MODELS": "Whether to cache available models on startup and refresh only when whitelist or blacklist rules change.",
     # Features & Execution Parameters
     "THINKING_CONFIG_RULES": (
-        "JSON string mapping model name regex patterns to default thinking budget (int) or thinking level (str: `MINIMAL`, `LOW`, `MEDIUM`, `HIGH`).\n\n"
-        "Determines thinking parameters per model. **Note that key order matters:** the first matching regex pattern is used, so place more specific patterns before broader catch-all patterns.\n\n"
+        "Thinking parameter configuration. Can be an `int` (budget), a level `str` (`MINIMAL`, `LOW`, `MEDIUM`, `HIGH`), `None`, or a JSON string mapping model name regex patterns to budget (`int`) or level (`str`).\n\n"
+        "When using a JSON string mapping, **key order matters:** the first matching regex pattern is used, so place more specific patterns before broader catch-all patterns.\n\n"
         "For details on backend defaults and model support, see [Google Cloud Thinking Docs](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/thinking#budget)."
     ),
     "SHOW_THINKING_SUMMARY": "Whether to display the thinking process summary in responses (Gemini 2.5 and 3 models).",
@@ -1729,7 +1729,9 @@ class _SharedValves(BaseModel):
         "only_paid",
         "match_main",
     ] = _admin_field("TASK_MODEL_ROUTING", "match_main")
-    THINKING_CONFIG_RULES: str = _admin_field("THINKING_CONFIG_RULES", '{"$a": 0}')
+    THINKING_CONFIG_RULES: StrictInt | StrictStr | None = _admin_field(
+        "THINKING_CONFIG_RULES", '{"$a": 0}'
+    )
     SHOW_THINKING_SUMMARY: bool = _admin_field("SHOW_THINKING_SUMMARY", True)
     USE_FILES_API: bool = _admin_field("USE_FILES_API", True)
     PARSE_YOUTUBE_URLS: bool = _admin_field("PARSE_YOUTUBE_URLS", True)
@@ -1759,24 +1761,88 @@ class _SharedValves(BaseModel):
 
     @field_validator("THINKING_CONFIG_RULES", mode="after")
     @classmethod
-    def validate_thinking_config_rules(cls, v: str | None):
-        """Validates that THINKING_CONFIG_RULES is a valid JSON string mapping regex patterns to int or str."""
-        if v is not None and v.strip() != "":
+    def validate_thinking_config_rules(
+        cls, v: StrictInt | StrictStr | None
+    ) -> StrictInt | StrictStr | None:
+        """Validates THINKING_CONFIG_RULES as an int (>= -1), level str, JSON str dict, or None."""
+        if v is None:
+            return v
+
+        if isinstance(v, bool):
+            raise ValueError("Thinking budget must be an integer, not a boolean.")
+
+        if isinstance(v, int):
+            if v < -1:
+                raise ValueError("Thinking budget integer must be -1 or greater.")
+            return v
+
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return v
+
+            if s.upper() in {"MINIMAL", "LOW", "MEDIUM", "HIGH"}:
+                return v
+
             try:
-                data = json.loads(v)
-                if not isinstance(data, dict):
-                    raise ValueError("Must be a JSON object (dict).")
-                for key, val in data.items():
-                    re.compile(key)
-                    if not isinstance(val, (int, str)):
-                        raise ValueError(
-                            f"Value for pattern '{key}' must be an int or str, got {type(val).__name__}."
-                        )
-            except Exception as e:
+                data = json.loads(s)
+            except json.JSONDecodeError:
+                data = None
+
+            if isinstance(data, dict):
+                try:
+                    for key, val in data.items():
+                        re.compile(key)
+                        if isinstance(val, bool):
+                            raise ValueError(
+                                f"Value for pattern '{key}' must be an int or str, got bool."
+                            )
+                        if isinstance(val, int):
+                            if val < -1:
+                                raise ValueError(
+                                    f"Budget for pattern '{key}' must be -1 or greater."
+                                )
+                        elif isinstance(val, str):
+                            val_str = val.strip()
+                            if val_str.upper() not in {"MINIMAL", "LOW", "MEDIUM", "HIGH"}:
+                                try:
+                                    num = int(val_str)
+                                except ValueError:
+                                    raise ValueError(
+                                        f"Value for pattern '{key}' must be an int (>= -1), "
+                                        f"numeric string (>= -1), or level string "
+                                        f"(MINIMAL/LOW/MEDIUM/HIGH). Got: {val!r}"
+                                    ) from None
+                                if num < -1:
+                                    raise ValueError(
+                                        f"Budget for pattern '{key}' must be -1 or greater."
+                                    )
+                        else:
+                            raise ValueError(
+                                f"Value for pattern '{key}' must be an int or str, got {type(val).__name__}."
+                            )
+                except re.error as e:
+                    raise ValueError(
+                        f"Invalid regex pattern in THINKING_CONFIG_RULES JSON dict: {e}"
+                    ) from e
+                return v
+
+            # If JSON parsing produced a non-dict or failed, treat as a numeric string.
+            try:
+                val_int = int(s)
+            except ValueError:
                 raise ValueError(
-                    f"Invalid JSON format or structure for THINKING_CONFIG_RULES: {e}"
-                )
-        return v
+                    f"THINKING_CONFIG_RULES must be an int (>= -1), level str (MINIMAL, LOW, MEDIUM, HIGH), "
+                    f"a valid JSON object mapping regex patterns to int/str, or None. Got: {v!r}"
+                ) from None
+            if val_int < -1:
+                raise ValueError("Thinking budget integer must be -1 or greater.")
+            return v
+
+        raise ValueError(
+            f"Invalid type for THINKING_CONFIG_RULES: {type(v).__name__}. "
+            "Expected int (>= -1), str, or None."
+        )
 
     @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
     @classmethod
@@ -2489,53 +2555,91 @@ class Pipe:
 
     @classmethod
     def _resolve_valve_thinking_config(
-        cls, rules_json: str, model_id: str
+        cls, rules_val: int | str | None, model_id: str
     ) -> tuple[int | None, str | None]:
-        """Evaluates THINKING_CONFIG_RULES regex patterns against model_id to determine default budget/level."""
-        if not rules_json or not rules_json.strip():
+        """Evaluates THINKING_CONFIG_RULES (int, level str, or JSON regex dict) against model_id to determine default budget/level."""
+        if rules_val is None:
             return None, None
 
-        try:
-            rules = json.loads(rules_json)
-            if not isinstance(rules, dict):
+        if isinstance(rules_val, int):
+            return rules_val, None
+
+        if isinstance(rules_val, str):
+            s = rules_val.strip()
+            if not s:
                 return None, None
-        except Exception as e:
-            log.warning(f"Failed to parse THINKING_CONFIG_RULES JSON: {e}")
-            return None, None
 
-        matching_hits: list[tuple[str, int | str]] = []
-        for pattern, val in rules.items():
+            if s.upper() in {"MINIMAL", "LOW", "MEDIUM", "HIGH"}:
+                level = s.upper()
+                model_version = cls._parse_gemini_version(model_id)
+                if model_version < 3.0:
+                    log.warning(
+                        f"Model '{model_id}' (version {model_version}) is older than Gemini 3 and does not support thinking_level. "
+                        f"Specified level '{level}'. Falling back to API default."
+                    )
+                    return None, None
+                return None, level
+
             try:
-                if re.search(pattern, model_id):
-                    matching_hits.append((pattern, val))
-            except re.error as e:
-                log.warning(
-                    f"Invalid regex pattern '{pattern}' in THINKING_CONFIG_RULES: {e}"
-                )
+                budget = int(s)
+                return budget, None
+            except ValueError:
+                pass
 
-        if not matching_hits:
-            return None, None
-
-        model_version = cls._parse_gemini_version(model_id)
-        is_under_v3 = model_version < 3.0
-
-        level_hits = [val for _, val in matching_hits if isinstance(val, str)]
-        budget_hits = [val for _, val in matching_hits if isinstance(val, int)]
-
-        if is_under_v3:
-            if budget_hits:
-                return budget_hits[0], None
-            elif level_hits:
-                log.warning(
-                    f"Model '{model_id}' (version {model_version}) is older than Gemini 3 and does not support thinking_level. "
-                    f"Regex hit specified level '{level_hits[0]}', but no budget rule hit. Falling back to API default."
-                )
+            try:
+                rules = json.loads(s)
+                if not isinstance(rules, dict):
+                    return None, None
+            except Exception as e:
+                log.warning(f"Failed to parse THINKING_CONFIG_RULES JSON: {e}")
                 return None, None
-        else:
-            if level_hits:
-                return None, level_hits[0]
-            elif budget_hits:
-                return budget_hits[0], None
+
+            matching_hits: list[tuple[str, int | str]] = []
+            for pattern, val in rules.items():
+                try:
+                    if re.search(pattern, model_id):
+                        matching_hits.append((pattern, val))
+                except re.error as e:
+                    log.warning(
+                        f"Invalid regex pattern '{pattern}' in THINKING_CONFIG_RULES: {e}"
+                    )
+
+            if not matching_hits:
+                return None, None
+
+            model_version = cls._parse_gemini_version(model_id)
+            is_under_v3 = model_version < 3.0
+
+            level_hits: list[str] = []
+            budget_hits: list[int] = []
+
+            for _, val in matching_hits:
+                if isinstance(val, int):
+                    budget_hits.append(val)
+                elif isinstance(val, str):
+                    v_str = val.strip()
+                    if v_str.upper() in {"MINIMAL", "LOW", "MEDIUM", "HIGH"}:
+                        level_hits.append(v_str.upper())
+                    else:
+                        try:
+                            budget_hits.append(int(v_str))
+                        except ValueError:
+                            pass
+
+            if is_under_v3:
+                if budget_hits:
+                    return budget_hits[0], None
+                elif level_hits:
+                    log.warning(
+                        f"Model '{model_id}' (version {model_version}) is older than Gemini 3 and does not support thinking_level. "
+                        f"Regex hit specified level '{level_hits[0]}', but no budget rule hit. Falling back to API default."
+                    )
+                    return None, None
+            else:
+                if level_hits:
+                    return None, level_hits[0]
+                elif budget_hits:
+                    return budget_hits[0], None
 
         return None, None
 
