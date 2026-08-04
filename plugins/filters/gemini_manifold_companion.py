@@ -15,12 +15,7 @@ VERSION = "2.1.0"
 # set the feature back to False so Open WebUI does not run it's own logic and then
 # pass custom values to "Gemini Manifold google_genai" that signal which feature was enabled and intercepted.
 
-import copy
 import functools
-import json
-from google.genai import types
-
-import sys
 import time
 import asyncio
 import urllib.request
@@ -29,26 +24,16 @@ from fastapi import Request
 from fastapi.datastructures import State
 from loguru import logger
 from pydantic import BaseModel, Field
-import pydantic_core
 import yaml
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal, TYPE_CHECKING, cast
-
-from open_webui.models.functions import Functions
+from google.genai import types
 
 if TYPE_CHECKING:
-    from loguru import Record
-    from loguru._handler import Handler  # type: ignore
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
-
-DEFAULT_MODEL_CONFIG_PATH = "https://raw.githubusercontent.com/suurt8ll/open_webui_functions/master/plugins/pipes/gemini_models.yaml"
-
-# Default timeout for URL resolution
-# TODO: Move to Pipe.Valves.
-DEFAULT_URL_TIMEOUT = aiohttp.ClientTimeout(total=10)  # 10 seconds total timeout
 
 
 class EventEmitter:
@@ -235,36 +220,88 @@ class EventEmitter:
         self._enqueue(event)
 
 
+_SHARED_VALVE_DESCS = {
+    "USE_PERMISSIVE_SAFETY": (
+        "Whether to request relaxed safety filtering for Gemini models."
+    ),
+    "BYPASS_BACKEND_RAG": (
+        "Bypass Open WebUI's built-in RAG processing and pass documents directly to the Gemini API.\n\n"
+        "*Note: Temporary chats (`local`) cannot bypass RAG and will fallback to default RAG.*"
+    ),
+    "MODEL_CONFIG_PATH": (
+        "Publicly accessible URL (`http://` or `https://`) to the YAML file containing model definitions and capabilities."
+    ),
+    "URL_RESOLVE_TIMEOUT": (
+        "Timeout in seconds for resolving grounding source web URLs."
+    ),
+    "URL_RESOLVE_MAX_RETRIES": (
+        "Maximum number of retry attempts to resolve grounding URLs before giving up."
+    ),
+    "URL_RESOLVE_BASE_DELAY": (
+        "Initial delay in seconds between retries when resolving grounding URLs (uses exponential backoff)."
+    ),
+    "STATUS_EMISSION_BEHAVIOR": (
+        "Controls status message visibility and detail level in the chat interface:\n"
+        "- `disable`: Suppress all status messages.\n"
+        "- `hidden_compact`: Hide final completion status; hide thinking details.\n"
+        "- `hidden_detailed`: Hide final completion status; include detailed thinking steps.\n"
+        "- `visible`: Show all status messages.\n"
+        "- `visible_timed`: Show all status messages with execution timestamps."
+    ),
+}
+
+_ADMIN_VALVE_DESCS = {}
+
+
+def _format_valve_desc(text: str, default: Any = None, is_user: bool = False) -> str:
+    """Formats Markdown descriptions for Valves and UserValves fields."""
+    text = text.strip()
+    sep = "\n\n---\n\n"
+    if is_user:
+        return f"{text}\n\n*If not set, the admin's setting is used.*{sep}"
+    formatted_default = f"`{default}`" if default is not None else "`None`"
+    return f"{text}\n\n**Default:** {formatted_default}{sep}"
+
+
 class Filter:
 
     class Valves(BaseModel):
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=False,
-            description="""Whether to request relaxed safety filtering.
-            Default value is False.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["USE_PERMISSIVE_SAFETY"], default=False
+            ),
         )
         BYPASS_BACKEND_RAG: bool = Field(
             default=True,
-            description="""Decide if you want ot bypass Open WebUI's RAG and send your documents directly to Google API.
-            Default value is True.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["BYPASS_BACKEND_RAG"], default=True
+            ),
         )
         MODEL_CONFIG_PATH: str = Field(
-            default=DEFAULT_MODEL_CONFIG_PATH,
-            description=f"""URL to the YAML file containing model definitions.
-            Must be a publicly accessible URL (http:// or https://).
-            Default value is '{DEFAULT_MODEL_CONFIG_PATH}'.""",
+            default="https://raw.githubusercontent.com/suurt8ll/open_webui_functions/master/plugins/pipes/gemini_models.yaml",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["MODEL_CONFIG_PATH"],
+                default="https://raw.githubusercontent.com/suurt8ll/open_webui_functions/master/plugins/pipes/gemini_models.yaml",
+            ),
         )
         URL_RESOLVE_TIMEOUT: int = Field(
             default=10,
-            description="Timeout in seconds for resolving a single source URL. Default is 10.",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["URL_RESOLVE_TIMEOUT"], default=10
+            ),
         )
         URL_RESOLVE_MAX_RETRIES: int = Field(
             default=3,
-            description="Maximum number of attempts to resolve a URL before giving up. Default is 3.",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["URL_RESOLVE_MAX_RETRIES"], default=3
+            ),
         )
         URL_RESOLVE_BASE_DELAY: float = Field(
             default=0.5,
-            description="Initial delay in seconds between retries, using exponential backoff. Default is 0.5.",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["URL_RESOLVE_BASE_DELAY"], default=0.5
+            ),
         )
         STATUS_EMISSION_BEHAVIOR: Literal[
             "disable",
@@ -274,26 +311,69 @@ class Filter:
             "visible_timed",
         ] = Field(
             default="hidden_detailed",
-            description="""Control status display. (Default: hidden_detailed) • Options • disable: No status.
-            • hidden_compact: Final success hidden, no thoughts. • hidden_detailed: Final success hidden, with thoughts.
-            • visible: All status visible. • visible_timed: Visible with timestamps.""",
-        )
-        LOG_LEVEL: Literal[
-            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
-        ] = Field(
-            default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["STATUS_EMISSION_BEHAVIOR"],
+                default="hidden_detailed",
+            ),
         )
 
-    # TODO: Support user settting through UserValves.
+    class UserValves(BaseModel):
+        USE_PERMISSIVE_SAFETY: bool | None = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["USE_PERMISSIVE_SAFETY"], is_user=True
+            ),
+        )
+        BYPASS_BACKEND_RAG: bool | None = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["BYPASS_BACKEND_RAG"], is_user=True
+            ),
+        )
+        MODEL_CONFIG_PATH: str | None = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["MODEL_CONFIG_PATH"], is_user=True
+            ),
+        )
+        URL_RESOLVE_TIMEOUT: int | None = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["URL_RESOLVE_TIMEOUT"], is_user=True
+            ),
+        )
+        URL_RESOLVE_MAX_RETRIES: int | None = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["URL_RESOLVE_MAX_RETRIES"], is_user=True
+            ),
+        )
+        URL_RESOLVE_BASE_DELAY: float | None = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["URL_RESOLVE_BASE_DELAY"], is_user=True
+            ),
+        )
+        STATUS_EMISSION_BEHAVIOR: (
+            Literal[
+                "disable",
+                "hidden_compact",
+                "hidden_detailed",
+                "visible",
+                "visible_timed",
+                "",
+            ]
+            | None
+        ) = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["STATUS_EMISSION_BEHAVIOR"], is_user=True
+            ),
+        )
 
     def __init__(self):
-        # Initialize valves with defaults; the framework injects DB values before each request.
         self.valves = self.Valves()
-        self.log_level = self.valves.LOG_LEVEL
-        self._add_log_handler()
         log.success("Function has been initialized.")
-        log.trace("Full self object:", payload=self.__dict__)
 
     def inlet(
         self,
@@ -301,8 +381,15 @@ class Filter:
         __request__: Request,
         __metadata__: "Metadata",
         __event_emitter__: Callable[["Event"], Awaitable[None]],
+        __user__: "UserData",
     ) -> "Body":
         """Modifies the incoming request payload before it's sent to the LLM. Operates on the `form_data` dictionary."""
+        log.debug(
+            f"inlet method has been called. Gemini Manifold Companion version is {VERSION}"
+        )
+
+        user_valves = __user__.get("valves") if isinstance(__user__, dict) else None
+        valves = self._get_merged_valves(self.valves, user_valves)
 
         app_state: State = __request__.app.state
 
@@ -312,7 +399,7 @@ class Filter:
         self._cleanup_event_emitters(app_state)
 
         emitter = EventEmitter(
-            __event_emitter__, status_mode=self.valves.STATUS_EMISSION_BEHAVIOR
+            __event_emitter__, status_mode=valves.STATUS_EMISSION_BEHAVIOR
         )
         self._store_data_in_state(
             app_state,
@@ -323,22 +410,10 @@ class Filter:
 
         # Load and store model configuration in app state
         log.debug("Loading model configuration...")
-        model_config = self._load_model_config(self.valves.MODEL_CONFIG_PATH)
+        model_config = self._load_model_config(valves.MODEL_CONFIG_PATH)
         app_state._state["gemini_model_config"] = model_config
         log.debug(
             f"Stored model config in app state with {len(model_config)} model(s)."
-        )
-
-        # Detect log level change inside self.valves
-        if self.log_level != self.valves.LOG_LEVEL:
-            log.info(
-                f"Detected log level change: {self.log_level=} and {self.valves.LOG_LEVEL=}. "
-                "Running the logging setup again."
-            )
-            self._add_log_handler()
-
-        log.debug(
-            f"inlet method has been called. Gemini Manifold Companion version is {VERSION}"
         )
 
         canonical_model_name, is_manifold = self._get_model_name(body)
@@ -363,7 +438,7 @@ class Filter:
         log.debug(f"body.features:", payload=features)
 
         # Ensure features field exists
-        metadata = body.get("metadata")
+        metadata = body.setdefault("metadata", cast("Metadata", {}))
         metadata_features = metadata.get("features")
         if metadata_features is None:
             metadata_features = cast("Features", {})
@@ -400,13 +475,18 @@ class Filter:
                 # Disable code_interpreter
                 features["code_interpreter"] = False
                 metadata_features["google_code_execution"] = True
-        if self.valves.USE_PERMISSIVE_SAFETY:
+        if valves.USE_PERMISSIVE_SAFETY:
             log.info("Adding permissive safety settings to body.metadata")
             metadata["safety_settings"] = self._get_permissive_safety_settings(
                 canonical_model_name
             )
-        if self.valves.BYPASS_BACKEND_RAG:
-            if __metadata__["chat_id"] == "local":
+        if valves.BYPASS_BACKEND_RAG:
+            chat_id = __metadata__.get("chat_id")
+            chat_id_str = chat_id if isinstance(chat_id, str) else ""
+            is_temp_chat = (
+                not chat_id_str or "temporary" in chat_id_str or "local" in chat_id_str
+            )
+            if is_temp_chat:
                 # TODO toast notification
                 log.warning(
                     "Bypassing Open WebUI's RAG is not possible for temporary chats. "
@@ -443,28 +523,51 @@ class Filter:
         self,
         body: "Body",
         __request__: Request,
-        __metadata__: dict[str, Any],
+        __metadata__: "Metadata",
         __event_emitter__: Callable[["Event"], Awaitable[None]],
+        __user__: "UserData",
     ) -> "Body":
         """Modifies the complete response payload after it's received from the LLM. Operates on the final `body` dictionary."""
 
         log.debug("outlet method has been called.")
 
-        chat_id: str = __metadata__.get("chat_id", "")
-        message_id: str = __metadata__.get("message_id", "")
+        user_valves = __user__.get("valves") if isinstance(__user__, dict) else None
+        valves = self._get_merged_valves(self.valves, user_valves)
+
+        chat_id = __metadata__.get("chat_id", "")
+        message_id = __metadata__.get("message_id", "")
         app_state: State = __request__.app.state
 
         log.debug(f"Checking for attributes for message {message_id} in request state.")
-
         stored_metadata: types.GroundingMetadata | None = (
             self._get_and_clear_data_from_state(
                 app_state, chat_id, message_id, "grounding", True
             )
+            if chat_id and message_id
+            else None
         )
-        # FIXME: can this be None?
-        emitter: EventEmitter = self._get_and_clear_data_from_state(
-            app_state, chat_id, message_id, "gemini_event_emitter", True
+
+        event_emitter: "EventEmitter | None" = (
+            self._get_and_clear_data_from_state(
+                app_state,
+                chat_id,
+                message_id,
+                key_suffix="gemini_event_emitter",
+                clear_after_read=True,
+            )
+            if chat_id and message_id
+            else None
         )
+        if not event_emitter:
+            log.debug(
+                "No event emitter found in state for this request. Companion filter's inlet did not run? Event emissions will be disabled for this request."
+            )
+            # TODO: any better way how to do this that does not require a dummy empty emitter?
+            event_emitter = app_state._state.get("gemini_dummy_event_emitter")
+        if not event_emitter:
+            raise ValueError(
+                "No event emitter available. This is unexpected as the dummy event emitter should always be present."
+            )
 
         if stored_metadata:
             log.info("Found grounding metadata, processing citations.")
@@ -488,7 +591,10 @@ class Filter:
             )
 
             if cited_text:
-                content = body["messages"][-1]["content"]
+                target_msg = body["messages"][-1]
+                content = target_msg.get("content")
+
+                # 1. Update message content
                 if isinstance(content, list):
                     for item in content:
                         if item.get("type") == "text":
@@ -496,11 +602,26 @@ class Filter:
                             item["text"] = cited_text
                             break
                 else:
-                    body["messages"][-1]["content"] = cited_text
+                    target_msg["content"] = cited_text
+
+                # 2. Update message output array if present (used by UI for reasoning/structured models)
+                if "output" in target_msg and isinstance(target_msg["output"], list):
+                    for out_item in target_msg["output"]:
+                        if (
+                            isinstance(out_item, dict)
+                            and out_item.get("type") == "message"
+                        ):
+                            out_content = out_item.get("content")
+                            if isinstance(out_content, list):
+                                for sub_item in out_content:
+                                    if isinstance(sub_item, dict) and sub_item.get(
+                                        "type"
+                                    ) in ("output_text", "text"):
+                                        sub_item["text"] = cited_text
 
             # Emit status event with search queries before resolving URLs
             if stored_metadata.web_search_queries:
-                emitter.emit_grounding_queries(stored_metadata.web_search_queries)
+                event_emitter.emit_grounding_queries(stored_metadata.web_search_queries)
             else:
                 log.debug("Grounding metadata does not contain any search queries.")
 
@@ -511,15 +632,16 @@ class Filter:
                 await self._resolve_and_emit_sources(
                     grounding_chunks=gs_chunks,
                     supports=gs_supports,
-                    emitter=emitter,
+                    emitter=event_emitter,
+                    valves=valves,
                 )
-                emitter.emit_status(
+                event_emitter.emit_status(
                     "This response was grounded with a Google tool", done=True
                 )
             else:
                 msg = "Grounding metadata was found but it's missing grounding supports or chunks. The response is likely not grounded."
                 log.info(msg)
-                emitter.emit_status(msg, done=True)
+                event_emitter.emit_status(msg, done=True)
         else:
             log.info("No grounding metadata found in request state.")
 
@@ -628,12 +750,13 @@ class Filter:
                 log.warning("Raw string is empty, cannot inject citation markers.")
 
         final_result_str = thought_prefix + processed_content_part_with_markers
+        log.trace(
+            "final_result_str:", payload=final_result_str, _log_truncation_enabled=False
+        )
         return final_result_str
 
     async def _resolve_url(
-        self,
-        session: aiohttp.ClientSession,
-        url: str,
+        self, session: aiohttp.ClientSession, url: str, valves: "Filter.Valves"
     ) -> tuple[str, bool]:
         """
         Resolves a given URL using values from Valves.
@@ -642,9 +765,9 @@ class Filter:
         if not url:
             return "", False
 
-        timeout = aiohttp.ClientTimeout(total=self.valves.URL_RESOLVE_TIMEOUT)
-        max_retries = self.valves.URL_RESOLVE_MAX_RETRIES
-        base_delay = self.valves.URL_RESOLVE_BASE_DELAY
+        timeout = aiohttp.ClientTimeout(total=valves.URL_RESOLVE_TIMEOUT)
+        max_retries = valves.URL_RESOLVE_MAX_RETRIES
+        base_delay = valves.URL_RESOLVE_BASE_DELAY
 
         for attempt in range(max_retries + 1):
             try:
@@ -680,6 +803,7 @@ class Filter:
         grounding_chunks: list[types.GroundingChunk],
         supports: list[types.GroundingSupport],
         emitter: EventEmitter,
+        valves: "Filter.Valves",
     ):
         """
         Resolves URLs in the background and emits a chat completion event
@@ -716,7 +840,10 @@ class Filter:
             try:
                 log.info(f"Resolving {num_urls} source URLs...")
                 async with aiohttp.ClientSession() as session:
-                    tasks = [self._resolve_url(session, url) for url in urls_to_resolve]
+                    tasks = [
+                        self._resolve_url(session, url, valves)
+                        for url in urls_to_resolve
+                    ]
                     results = await asyncio.gather(*tasks)
                 log.info("URL resolution completed.")
 
@@ -882,7 +1009,7 @@ class Filter:
     @functools.lru_cache(maxsize=1)
     def _load_model_config(config_path: str) -> dict:
         """Loads the model configuration from a URL.
-        
+
         Uses LRU cache to avoid reloading the same configuration repeatedly.
         Cache is tied to the config_path argument.
         """
@@ -891,14 +1018,20 @@ class Filter:
             return {}
 
         try:
-            if not (config_path.startswith("http://") or config_path.startswith("https://")):
-                log.error(f"MODEL_CONFIG_PATH must be a URL (http:// or https://), got: {config_path}")
+            if not (
+                config_path.startswith("http://") or config_path.startswith("https://")
+            ):
+                log.error(
+                    f"MODEL_CONFIG_PATH must be a URL (http:// or https://), got: {config_path}"
+                )
                 return {}
 
             log.debug(f"Loading model configuration from: {config_path}")
             with urllib.request.urlopen(config_path) as response:
                 config = yaml.safe_load(response.read())
-                log.success(f"Successfully loaded model configuration with {len(config)} model(s).")
+                log.success(
+                    f"Successfully loaded model configuration with {len(config)} model(s)."
+                )
                 return config
         except Exception as e:
             log.error(f"Failed to load model config from {config_path}: {e}")
@@ -911,17 +1044,19 @@ class Filter:
     @staticmethod
     def _check_model_capability(model_id: str, config: dict, capability: str) -> bool:
         """Check if a model supports a specific capability based on YAML config.
-        
+
         Args:
             model_id: The canonical model id (without prefixes)
             config: The loaded YAML configuration dict
             capability: The capability to check (e.g., "search_grounding", "code_execution")
-            
+
         Returns:
             True if the model supports the capability, False otherwise
         """
         if model_id not in config:
-            log.debug(f"Model '{model_id}' not found in config, capability '{capability}' check returns False.")
+            log.debug(
+                f"Model '{model_id}' not found in config, capability '{capability}' check returns False."
+            )
             return False
 
         model_config = config[model_id]
@@ -934,6 +1069,35 @@ class Filter:
     # endregion 1.5 Model capability checks
 
     # region 1.6 Utility helpers
+
+    @staticmethod
+    def _get_merged_valves(
+        default_valves: "Filter.Valves",
+        user_valves: "Filter.UserValves | dict[str, Any] | None",
+    ) -> "Filter.Valves":
+        """Merges UserValves into a base Valves configuration.
+
+        If a field in UserValves is not None or an empty string, it overrides
+        the corresponding field in default_valves.
+        """
+        if user_valves is None:
+            return default_valves.model_copy(deep=True)
+
+        merged_data = default_valves.model_dump()
+
+        if isinstance(user_valves, dict):
+            for field_name, user_value in user_valves.items():
+                if user_value is not None and user_value != "":
+                    if field_name in merged_data:
+                        merged_data[field_name] = user_value
+        else:
+            for field_name in Filter.UserValves.model_fields:
+                user_value = getattr(user_valves, field_name)
+                if user_value is not None and user_value != "":
+                    if field_name in merged_data:
+                        merged_data[field_name] = user_value
+
+        return Filter.Valves(**merged_data)
 
     def _extract_chat_control_params(self, body: "Body") -> dict[str, Any]:
         """
@@ -1116,231 +1280,6 @@ class Filter:
 
         # 6. Return the canonical name and the manifold flag
         return canonical_model_name, is_manifold_model
-
-    def _is_flat_dict(self, data: Any) -> bool:
-        """
-        Checks if a dictionary contains only non-dict/non-list values (is one level deep).
-        """
-        if not isinstance(data, dict):
-            return False
-        return not any(isinstance(value, (dict, list)) for value in data.values())
-
-    def _truncate_long_strings(
-        self, data: Any, max_len: int, truncation_marker: str, truncation_enabled: bool
-    ) -> Any:
-        """
-        Recursively traverses a data structure (dicts, lists) and truncates
-        long string values. Creates copies to avoid modifying original data.
-
-        Args:
-            data: The data structure (dict, list, str, int, float, bool, None) to process.
-            max_len: The maximum allowed length for string values.
-            truncation_marker: The string to append to truncated values.
-            truncation_enabled: Whether truncation is enabled.
-
-        Returns:
-            A potentially new data structure with long strings truncated.
-        """
-        if not truncation_enabled or max_len <= len(truncation_marker):
-            # If truncation is disabled or max_len is too small, return original
-            # Make a copy only if it's a mutable type we might otherwise modify
-            if isinstance(data, (dict, list)):
-                return copy.deepcopy(data)  # Ensure deep copy for nested structures
-            return data  # Primitives are immutable
-
-        if isinstance(data, str):
-            if len(data) > max_len:
-                return data[: max_len - len(truncation_marker)] + truncation_marker
-            return data  # Return original string if not truncated
-        elif isinstance(data, dict):
-            # Process dictionary items, creating a new dict
-            return {
-                k: self._truncate_long_strings(
-                    v, max_len, truncation_marker, truncation_enabled
-                )
-                for k, v in data.items()
-            }
-        elif isinstance(data, list):
-            # Process list items, creating a new list
-            return [
-                self._truncate_long_strings(
-                    item, max_len, truncation_marker, truncation_enabled
-                )
-                for item in data
-            ]
-        else:
-            # Return non-string, non-container types as is (they are immutable)
-            return data
-
-    def plugin_stdout_format(self, record: "Record") -> str:
-        """
-        Custom format function for the plugin's logs.
-        Serializes and truncates data passed under the 'payload' key in extra.
-        """
-
-        # Configuration Keys
-        LOG_OPTIONS_PREFIX = "_log_"
-        TRUNCATION_ENABLED_KEY = f"{LOG_OPTIONS_PREFIX}truncation_enabled"
-        MAX_LENGTH_KEY = f"{LOG_OPTIONS_PREFIX}max_length"
-        TRUNCATION_MARKER_KEY = f"{LOG_OPTIONS_PREFIX}truncation_marker"
-        DATA_KEY = "payload"
-
-        original_extra = record["extra"]
-        # Extract the data intended for serialization using the chosen key
-        data_to_process = original_extra.get(DATA_KEY)
-
-        serialized_data_json = ""
-        if data_to_process is not None:
-            try:
-                serializable_data = pydantic_core.to_jsonable_python(
-                    data_to_process, serialize_unknown=True
-                )
-
-                # Determine truncation settings
-                truncation_enabled = original_extra.get(TRUNCATION_ENABLED_KEY, True)
-                max_length = original_extra.get(MAX_LENGTH_KEY, 256)
-                truncation_marker = original_extra.get(TRUNCATION_MARKER_KEY, "[...]")
-
-                # If max_length was explicitly provided, force truncation enabled
-                if MAX_LENGTH_KEY in original_extra:
-                    truncation_enabled = True
-
-                # Truncate long strings
-                truncated_data = self._truncate_long_strings(
-                    serializable_data,
-                    max_length,
-                    truncation_marker,
-                    truncation_enabled,
-                )
-
-                # Serialize the (potentially truncated) data
-                if self._is_flat_dict(truncated_data) and not isinstance(
-                    truncated_data, list
-                ):
-                    json_string = json.dumps(
-                        truncated_data, separators=(",", ":"), default=str
-                    )
-                    # Add a simple prefix if it's compact
-                    serialized_data_json = " - " + json_string
-                else:
-                    json_string = json.dumps(truncated_data, indent=2, default=str)
-                    # Prepend with newline for readability
-                    serialized_data_json = "\n" + json_string
-
-            except (TypeError, ValueError) as e:  # Catch specific serialization errors
-                serialized_data_json = f" - {{Serialization Error: {e}}}"
-            except (
-                Exception
-            ) as e:  # Catch any other unexpected errors during processing
-                serialized_data_json = f" - {{Processing Error: {e}}}"
-
-        # Add the final JSON string (or error message) back into the record
-        record["extra"]["_plugin_serialized_data"] = serialized_data_json
-
-        # Base template
-        base_template = (
-            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-            "<level>{level: <8}</level> | "
-            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-            "<level>{message}</level>"
-        )
-
-        # Append the serialized data
-        base_template += "{extra[_plugin_serialized_data]}"
-        # Append the exception part
-        base_template += "\n{exception}"
-        # Return the format string template
-        return base_template.rstrip()
-
-    def _add_log_handler(self):
-        """
-        Adds or updates the loguru handler specifically for this plugin.
-        Includes logic for serializing and truncating extra data.
-        """
-
-        def plugin_filter(record: "Record"):
-            """Filter function to only allow logs from this plugin (based on module name)."""
-            return record["name"] == __name__
-
-        # Get the desired level name and number
-        desired_level_name = self.valves.LOG_LEVEL
-        try:
-            # Use the public API to get level details
-            desired_level_info = log.level(desired_level_name)
-            desired_level_no = desired_level_info.no
-        except ValueError:
-            log.error(
-                f"Invalid LOG_LEVEL '{desired_level_name}' configured for plugin {__name__}. Cannot add/update handler."
-            )
-            return  # Stop processing if the level is invalid
-
-        # Access the internal state of the log
-        handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
-        handler_id_to_remove = None
-        found_correct_handler = False
-
-        for handler_id, handler in handlers.items():
-            existing_filter = handler._filter  # Access internal attribute
-
-            # Check if the filter matches our plugin_filter
-            # Comparing function objects directly can be fragile if they are recreated.
-            # Comparing by name and module is more robust for functions defined at module level.
-            is_our_filter = (
-                existing_filter is not None  # Make sure a filter is set
-                and hasattr(existing_filter, "__name__")
-                and existing_filter.__name__ == plugin_filter.__name__
-                and hasattr(existing_filter, "__module__")
-                and existing_filter.__module__ == plugin_filter.__module__
-            )
-
-            if is_our_filter:
-                existing_level_no = handler.levelno
-                log.trace(
-                    f"Found existing handler {handler_id} for {__name__} with level number {existing_level_no}."
-                )
-
-                # Check if the level matches the desired level
-                if existing_level_no == desired_level_no:
-                    log.debug(
-                        f"Handler {handler_id} for {__name__} already exists with the correct level '{desired_level_name}'."
-                    )
-                    found_correct_handler = True
-                    break  # Found the correct handler, no action needed
-                else:
-                    # Found our handler, but the level is wrong. Mark for removal.
-                    log.info(
-                        f"Handler {handler_id} for {__name__} found, but log level differs "
-                        f"(existing: {existing_level_no}, desired: {desired_level_no}). "
-                        f"Removing it to update."
-                    )
-                    handler_id_to_remove = handler_id
-                    break  # Found the handler to replace, stop searching
-
-        # Remove the old handler if marked for removal
-        if handler_id_to_remove is not None:
-            try:
-                log.remove(handler_id_to_remove)
-                log.debug(f"Removed handler {handler_id_to_remove} for {__name__}.")
-            except ValueError:
-                # This might happen if the handler was somehow removed between the check and now
-                log.warning(
-                    f"Could not remove handler {handler_id_to_remove} for {__name__}. It might have already been removed."
-                )
-                # If removal failed but we intended to remove, we should still proceed to add
-                # unless found_correct_handler is somehow True (which it shouldn't be if handler_id_to_remove was set).
-
-        # Add a new handler if no correct one was found OR if we just removed an incorrect one
-        if not found_correct_handler:
-            self.log_level = desired_level_name
-            log.add(
-                sys.stdout,
-                level=desired_level_name,
-                format=self.plugin_stdout_format,
-                filter=plugin_filter,
-            )
-            log.debug(
-                f"Added new handler to loguru for {__name__} with level {desired_level_name}."
-            )
 
     # endregion 1.4 Utility helpers
 

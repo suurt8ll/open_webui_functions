@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 2.1.0
-requirements: google-genai==2.8.0
+requirements: google-genai==2.14.0
 """
 
 # I change these only when I make a release to avoid PR merge conflicts.
@@ -32,9 +32,9 @@ from google.genai import errors as genai_errors
 from google.cloud import storage
 from google.api_core import exceptions
 
+import json
 import time
 import copy
-import json
 from urllib.parse import urlparse, parse_qs
 import xxhash
 import asyncio
@@ -52,7 +52,6 @@ import uuid
 import base64
 import re
 import fnmatch
-import sys
 import difflib
 from loguru import logger
 from fastapi import Request, FastAPI
@@ -76,8 +75,6 @@ from open_webui.utils.misc import pop_system_message
 
 # This block is skipped at runtime.
 if TYPE_CHECKING:
-    from loguru import Record
-    from loguru._handler import Handler  # type: ignore
     from plugins.filters.gemini_manifold_companion import EventEmitter
     # Imports custom type definitions (TypedDicts) for static analysis purposes (mypy/pylance).
     from utils.manifold_types import *
@@ -85,6 +82,14 @@ if TYPE_CHECKING:
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
 
+def _log_and_toast(
+    event_emitter: "EventEmitter",
+    msg: str,
+    level: Literal["info", "warning", "error"] = "warning",
+) -> None:
+    """Logs `msg` at the caller's stack location and mirrors it to the front-end as a toast."""
+    log.opt(depth=1).log(level.upper(), msg)
+    event_emitter.emit_toast(msg, level)
 
 # A mapping of finish reason names (str) to human-readable descriptions.
 # This allows handling of reasons that may not be defined in the current SDK version.
@@ -592,8 +597,12 @@ class GeminiContentBuilder:
         self.event_emitter = event_emitter
         self.valves = valves
         self.files_api_manager = files_api_manager
-        # FIXME: chat id could be `None`, leading to an iteration error.
-        self.is_temp_chat = "local" in metadata_body.get("chat_id", "")
+
+        chat_id = metadata_body.get("chat_id")
+        chat_id_str = chat_id if isinstance(chat_id, str) else ""
+        self.is_temp_chat = (
+            not chat_id_str or "local" in chat_id_str or "temporary" in chat_id_str
+        )
         self.vertexai = self.files_api_manager.client.vertexai
 
         self.system_prompt, self.messages_body = self._extract_system_prompt(
@@ -618,14 +627,6 @@ class GeminiContentBuilder:
         c_tokens, c_cost = self._retrieve_previous_usage_data()
         self.metadata_body["cumulative_tokens"] = c_tokens
         self.metadata_body["cumulative_cost"] = c_cost
-
-        if not self.messages_db:
-            warn_msg = (
-                "Database history not ready or lengths mismatched. "
-                "Falling back to active memory payload."
-            )
-            log.warning(warn_msg)
-            self.event_emitter.emit_toast(warn_msg, "warning")
 
         # 1. Set up and launch the status manager. It will activate itself if needed.
         status_manager = UploadStatusManager(self.event_emitter)
@@ -700,18 +701,39 @@ class GeminiContentBuilder:
         self, metadata_body: "Metadata", user_data: "UserData"
     ) -> list["ChatMessageTD"] | None:
         """
-        Reconstructs the active chat branch from history. Removes the trailing 
-        assistant placeholder and strictly validates that the DB history length 
+        Reconstructs the active chat branch from history. Removes the trailing
+        assistant placeholder and strictly validates that the DB history length
         matches the request body.
+
+        Every fallback to the active memory payload is logged and surfaced to the
+        user via a toast with a reason-specific message.
         """
-        chat_id = metadata_body.get("chat_id", "")
-        if not chat_id or "local" in chat_id:
+        if self.is_temp_chat:
+            # Expected path, not a failure: temp chats have no DB history by design.
+            _log_and_toast(
+                self.event_emitter,
+                "Temporary chat detected; skipping database history fetch and using the active memory payload.",
+                "info",
+            )
+            return None
+
+        chat_id = metadata_body.get("chat_id")
+        if not chat_id:
+            _log_and_toast(
+                self.event_emitter,
+                "No chat_id in metadata; cannot fetch database history. Using the active memory payload.",
+                "warning",
+            )
             return None
 
         chat = await Chats.get_chat_by_id_and_user_id(
             id=chat_id, user_id=user_data["id"]
         )
         if not chat:
+            _log_and_toast(
+                self.event_emitter,
+                f"Chat {chat_id} was not found in the database; using the active memory payload.",
+            )
             return None
 
         chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
@@ -720,31 +742,39 @@ class GeminiContentBuilder:
         current_id = history_data.get("currentId")
 
         if not messages_dict or not current_id:
+            _log_and_toast(
+                self.event_emitter,
+                "Chat history is empty or lacks a currentId; using the active memory payload.",
+                "warning",
+            )
             return None
 
         # 1. Walk up the parentId chain to reconstruct the linear conversation branch.
         messages_db: list["ChatMessageTD"] = []
         curr_id = current_id
-        
+
         while curr_id and curr_id in messages_dict:
             msg = messages_dict[curr_id]
             messages_db.insert(0, msg)
             curr_id = msg.get("parentId")
 
         # 2. Handle the trailing assistant placeholder.
-        # OWUI often inserts an empty assistant message entry for the turn currently 
-        # being processed. We remove it to align with the 'messages_body' which 
+        # OWUI often inserts an empty assistant message entry for the turn currently
+        # being processed. We remove it to align with the 'messages_body' which
         # only contains previous turns plus the current user message.
         if messages_db and messages_db[-1].get("role") == "assistant":
             messages_db.pop()
 
         # 3. Strict validation.
-        # If the reconstructed history (minus placeholder) doesn't exactly match the 
-        # length of the request body (minus system prompt), we bail out. 
+        # If the reconstructed history (minus placeholder) doesn't exactly match the
+        # length of the request body (minus system prompt), we bail out.
         # This prevents misaligned metadata mapping.
         if len(messages_db) != len(self.messages_body):
-            log.debug(
-                f"Strict length mismatch: DB={len(messages_db)}, Body={len(self.messages_body)}. Validation failed."
+            _log_and_toast(
+                self.event_emitter,
+                f"Strict length mismatch: DB={len(messages_db)}, Body={len(self.messages_body)}. "
+                "Using the active memory payload.",
+                "warning",
             )
             return None
 
@@ -767,14 +797,11 @@ class GeminiContentBuilder:
             parts = await self._process_user_message(i, message, status_queue)
             # Case 1: User content is completely empty (no text, no files).
             if not parts:
-                log.info(
-                    f"User message at index {i} is completely empty. "
-                    "Injecting a prompt to ask for clarification."
+                _log_and_toast(
+                    self.event_emitter,
+                    f"Your message #{i + 1} was completely empty. The assistant will ask for clarification.",
+                    "warning",
                 )
-                # Inform the user via a toast notification.
-                toast_msg = f"Your message #{i + 1} was empty. The assistant will ask for clarification."
-                self.event_emitter.emit_toast(toast_msg, "info")
-
                 clarification_prompt = (
                     "The user sent an empty message. Please ask the user for "
                     "clarification on what they would like to ask or discuss."
@@ -790,17 +817,12 @@ class GeminiContentBuilder:
                     # The user sent content (e.g., files) but no accompanying text.
                     if self.vertexai:
                         # Vertex AI requires a text part in multi-modal messages.
-                        log.info(
-                            f"User message at index {i} lacks a text component for Vertex AI. "
-                            "Adding default text prompt."
-                        )
-                        # Inform the user via a toast notification.
-                        toast_msg = (
+                        _log_and_toast(
+                            self.event_emitter,
                             f"For your message #{i + 1}, a default prompt was added as text is required "
-                            "for requests with attachments when using Vertex AI."
+                            "for requests with attachments when using Vertex AI.",
+                            "warning",
                         )
-                        self.event_emitter.emit_toast(toast_msg, "info")
-
                         default_prompt_text = (
                             "The user did not send any text message with the additional context. "
                             "Answer by summarizing the newly added context."
@@ -811,7 +833,7 @@ class GeminiContentBuilder:
                         parts.extend(default_text_parts)
                     else:
                         # Google Developer API allows no-text user content.
-                        log.info(
+                        log.debug(
                             f"User message at index {i} lacks a text component for Google Developer API. "
                             "Proceeding with non-text parts only."
                         )
@@ -825,9 +847,11 @@ class GeminiContentBuilder:
                 i, message, message_db, sources, status_queue
             )
         else:
-            warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
-            log.warning(warn_msg)
-            self.event_emitter.emit_toast(warn_msg, "warning")
+            _log_and_toast(
+                self.event_emitter,
+                f"Message {i} has an invalid role: {role}. Skipping to the next message.",
+                "warning",
+            )
             return None
 
         # Only create a Content object if there are parts to include.
@@ -860,7 +884,9 @@ class GeminiContentBuilder:
 
                     # Optimization: Task models (titles, tags, etc.) skip heavy documents
                     # but keep images as they provide high context value for low token cost.
-                    should_include = is_image or (self.upload_documents and not self.is_task)
+                    should_include = is_image or (
+                        self.upload_documents and not self.is_task
+                    )
 
                     if not should_include:
                         log.debug(
@@ -874,9 +900,16 @@ class GeminiContentBuilder:
                     # just the UUID, which isn't fetchable on its own.
                     if file_id := file.get("id"):
                         uri = f"/api/v1/files/{file_id}/content"
-                        upload_tasks.append(self._genai_part_from_uri(uri, status_queue))
+                        upload_tasks.append(
+                            self._genai_part_from_uri(uri, status_queue)
+                        )
                     else:
-                        log.warning("Could not determine ID for file in DB.", payload=file)
+                        _log_and_toast(
+                            self.event_emitter,
+                            f"Encountered a malformed file object in message #{i + 1} "
+                            "without an ID; it will not be injected into the model's context.",
+                            "warning",
+                        )
 
                 if upload_tasks:
                     log.info(f"Processing {len(upload_tasks)} file(s) from database.")
@@ -892,9 +925,12 @@ class GeminiContentBuilder:
         elif isinstance(user_content, list):
             user_content_list = user_content
         else:
-            warn_msg = "User message content is not a string or list, skipping."
-            log.warning(warn_msg)
-            self.event_emitter.emit_toast(warn_msg, "warning")
+            _log_and_toast(
+                self.event_emitter,
+                f"Message #{i + 1} has invalid content (not a string or list); "
+                "skipping the malformed content.",
+                "warning",
+            )
             return user_parts
 
         for c in user_content_list:
@@ -961,11 +997,11 @@ class GeminiContentBuilder:
     def _pop_thoughts(self, content: str) -> tuple[str, list[str]]:
         """
         Identifies and removes thought blocks from the content.
-        
+
         A thought is defined as text between <think> and </think>\n.
-        This method handles multiple thought blocks if they are peppered 
+        This method handles multiple thought blocks if they are peppered
         throughout the message.
-        
+
         :param content: The raw message content from the assistant.
         :return: A tuple containing (cleaned_content, list_of_extracted_thoughts).
         """
@@ -1017,13 +1053,22 @@ class GeminiContentBuilder:
                     return await self._rehydrate_assistant_parts(
                         gemini_parts, status_queue
                     )
-                except (pydantic_core.ValidationError, TypeError, ValueError):
-                    log.exception(
-                        f"Failed to reconstruct types.Part for message {i} from stored gemini_parts. "
-                        "Falling back to text processing."
+                except (pydantic_core.ValidationError, TypeError, ValueError) as exc:
+                    _log_and_toast(
+                        self.event_emitter,
+                        f"Failed to reconstruct assistant message #{i + 1} from stored data: {exc}. "
+                        "Falling back to plain text processing.",
+                        "warning",
                     )
             else:
                 # A meaningful edit was detected after accounting for whitespace.
+                _log_and_toast(
+                    self.event_emitter,
+                    f"An edit was detected in assistant message #{i + 1}. "
+                    "Using the edited text, which may affect model context for this turn.",
+                    "warning",
+                )
+
                 diff = difflib.unified_diff(
                     original_content.strip().splitlines(keepends=True),
                     current_content.strip().splitlines(keepends=True),
@@ -1031,24 +1076,15 @@ class GeminiContentBuilder:
                     tofile="current_content_stripped",
                 )
                 diff_str = "".join(diff)
-
                 log.warning(
-                    f"An edit was detected in assistant message at index {i}. The message will be "
-                    "reconstructed from the current edited text, and the original high-fidelity data "
-                    "from the database will be ignored for this turn.\n"
-                    f"--- Diff (on stripped content) ---\n{diff_str}"
-                )
-                self.event_emitter.emit_toast(
-                    f"An edit was detected in assistant message #{i + 1}. "
-                    "Using the edited text, which may affect model context for this turn.",
-                    "warning",
+                    f"Edited content diff for assistant message {i}:\n{diff_str}"
                 )
         elif message_db:
-            # Warn if the message was likely from another model (no-toast).
-            log.warning(
-                f"Assistant message at index {i} lacks 'gemini_parts' or 'original_content'. "
-                "This message was likely not generated by this plugin. "
-                "Falling back to processing its plain text content."
+            _log_and_toast(
+                self.event_emitter,
+                f"Assistant message #{i + 1} is missing stored high-fidelity data from the database. "
+                "Falling back to plain text reconstruction, which may affect model context for this turn.",
+                "warning",
             )
 
         # --- PATH 2: Fallback to processing text content ---
@@ -1093,8 +1129,10 @@ class GeminiContentBuilder:
                 uri = match.group(1)
 
             if not uri:
-                log.warning(
-                    f"Found unsupported URI format in text: {match.group(0)}. Skipping."
+                _log_and_toast(
+                    self.event_emitter,
+                    f"Failed to extract URI from match: {match.group(0)}. Skipping.",
+                    "warning",
                 )
                 continue
 
@@ -1149,9 +1187,11 @@ class GeminiContentBuilder:
             # TODO: Google Cloud Storage bucket support.
             # elif uri.startswith("gs://"): ...
             else:
-                warn_msg = f"Unsupported URI: '{uri[:64]}...' Links must be to YouTube or a supported file type."
-                log.warning(warn_msg)
-                self.event_emitter.emit_toast(warn_msg, "warning")
+                _log_and_toast(
+                    self.event_emitter,
+                    f"Unsupported URI: '{uri[:64]}...' Links must be to YouTube or a supported file type.",
+                    "warning",
+                )
                 return None
 
             # Step 2: If we have bytes, create the Part using the modularized helper
@@ -1166,12 +1206,18 @@ class GeminiContentBuilder:
             return None  # Return None if bytes/mime_type could not be determined
 
         except FilesAPIError as e:
-            error_msg = f"Files API failed for URI '{uri[:64]}...': {e}"
-            log.error(error_msg)
-            self.event_emitter.emit_toast(error_msg, "error")
+            _log_and_toast(
+                self.event_emitter,
+                f"Files API failed for URI '{uri[:64]}[...]': {e}",
+                "error",
+            )
             return None
-        except Exception:
-            log.exception(f"Error processing URI: {uri[:64]}[...]")
+        except Exception as e:
+            _log_and_toast(
+                self.event_emitter,
+                f"Error processing URI: {uri[:64]}[...]: {e}",
+                "error",
+            )
             return None
 
     async def _create_genai_part_from_file_data(
@@ -1525,6 +1571,86 @@ class GeminiContentBuilder:
         return text
 
 
+_SHARED_VALVE_DESCS = {
+    "GEMINI_FREE_API_KEY": "Free Gemini Developer API key.",
+    "GEMINI_PAID_API_KEY": "Paid Gemini Developer API key.",
+    "GEMINI_API_BASE_URL": "Custom base URL for calling the Gemini API.",
+    "USE_VERTEX_AI": (
+        "Whether to use Google Cloud Vertex AI instead of the standard Gemini API.\n\n"
+        "*Requires `VERTEX_PROJECT` to be set.*"
+    ),
+    "VERTEX_PROJECT": "Google Cloud project ID to use with Vertex AI.",
+    "VERTEX_LOCATION": "Google Cloud region/location for Vertex AI (e.g., `global`, `us-central1`).",
+    "ENABLE_FREE_TIER_FALLBACK": (
+        "Automatically switch to the Paid API if a Free API request fails due to quota limits (`429`) or model overload (`503`).\n\n"
+        "*Requires both Free and Paid API keys to be configured.*"
+    ),
+    "TASK_MODEL_ROUTING": (
+        "Determines API routing strategy for task models (e.g. title generation):\n"
+        "- `only_free`: Use only the Free API.\n"
+        "- `free_fallback`: Try Free API first, fallback to Paid on failure.\n"
+        "- `only_paid`: Bypass Free API and use Paid API directly (or Vertex AI if enabled).\n"
+        "- `match_main`: Follow the same routing logic as the main chat generation."
+    ),
+    "THINKING_CONFIG_RULES": (
+        "JSON string mapping model name regex patterns to default thinking budget (int) or thinking level (str: `MINIMAL`, `LOW`, `MEDIUM`, `HIGH`).\n\n"
+        "Determines thinking parameters per model. **Note that key order matters:** the first matching regex pattern is used, so place more specific patterns before broader catch-all patterns.\n\n"
+        "For details on backend defaults and model support, see [Google Cloud Thinking Docs](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/thinking#budget)."
+    ),
+    "SHOW_THINKING_SUMMARY": "Whether to display the thinking process summary in responses (Gemini 2.5 and 3 models).",
+    "USE_FILES_API": (
+        "Whether to use the Google Files API for uploading files (enables caching and performance benefits).\n\n"
+        "If disabled, raw file bytes are sent directly in request payloads."
+    ),
+    "PARSE_YOUTUBE_URLS": (
+        "Whether to parse YouTube video URLs from user messages and provide content as context.\n\n"
+        "If disabled, YouTube links are treated as plain text."
+    ),
+    "MAPS_GROUNDING_COORDINATES": (
+        "Latitude and longitude coordinates for location-aware Google Maps grounding.\n\n"
+        "Expected format: `latitude,longitude` (e.g., `40.7128,-74.0060`)."
+    ),
+    "IMAGE_RESOLUTION": (
+        "Output resolution for generated images.\n\n"
+        "If set to `None`, Google's backend uses its default value (typically `1K`)."
+    ),
+    "IMAGE_ASPECT_RATIO": (
+        "Aspect ratio for image generation.\n\n"
+        "If set to `None`, Google's backend uses its default value (matching aspect ratio for image editing, or `1:1` otherwise)."
+    ),
+}
+
+_ADMIN_VALVE_DESCS = {
+    "USER_MUST_PROVIDE_AUTH_CONFIG": (
+        "Require all users (including admins) to provide their own authentication credentials via `UserValves`.\n\n"
+        "Setting this to `True` prevents non-whitelisted users from using Vertex AI."
+    ),
+    "AUTH_WHITELIST": (
+        "Comma-separated list of user email addresses allowed to bypass `USER_MUST_PROVIDE_AUTH_CONFIG` and use default system credentials."
+    ),
+    "MODEL_WHITELIST": (
+        "Comma-separated list of allowed model names.\n\n"
+        "Supports `fnmatch` wildcard patterns: `*`, `?`, `[seq]`, `[!seq]`."
+    ),
+    "MODEL_BLACKLIST": (
+        "Comma-separated list of blacklisted model names.\n\n"
+        "Supports `fnmatch` wildcard patterns: `*`, `?`, `[seq]`, `[!seq]`."
+    ),
+    "CACHE_MODELS": "Whether to cache available models on startup and refresh only when whitelist or blacklist rules change.",
+    "USE_ENTERPRISE_SEARCH": "Enable Enterprise Search tool allowing models to fetch and ground content from specified web URLs.",
+}
+
+
+def _format_valve_desc(text: str, default: Any = None, is_user: bool = False) -> str:
+    """Formats Markdown descriptions for Valves and UserValves fields."""
+    text = text.strip()
+    sep = "\n\n---\n\n"
+    if is_user:
+        return f"{text}\n\n*If not set, the admin's setting is used.*{sep}"
+    formatted_default = f"`{default}`" if default is not None else "`None`"
+    return f"{text}\n\n**Default:** {formatted_default}{sep}"
+
+
 class Pipe:
 
     @staticmethod
@@ -1553,53 +1679,80 @@ class Pipe:
                 )
         return v
 
+    @staticmethod
+    def _validate_thinking_config_rules(v: str | None) -> str | None:
+        """Validates that THINKING_CONFIG_RULES is a valid JSON string mapping regex patterns to int or str."""
+        if v is not None and v.strip() != "":
+            try:
+                data = json.loads(v)
+                if not isinstance(data, dict):
+                    raise ValueError("Must be a JSON object (dict).")
+                for key, val in data.items():
+                    re.compile(key)
+                    if not isinstance(val, (int, str)):
+                        raise ValueError(
+                            f"Value for pattern '{key}' must be an int or str, got {type(val).__name__}."
+                        )
+            except Exception as e:
+                raise ValueError(
+                    f"Invalid JSON format or structure for THINKING_CONFIG_RULES: {e}"
+                )
+        return v
+
     class Valves(BaseModel):
-        # FIXME: docstrings don't get markdown rendered in the admin UI currently. rewrite docstrings accordingly.
         GEMINI_FREE_API_KEY: str | None = Field(
-            default=None, description="Free Gemini Developer API key."
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["GEMINI_FREE_API_KEY"], default=None
+            ),
         )
         GEMINI_PAID_API_KEY: str | None = Field(
-            default=None, description="Paid Gemini Developer API key."
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["GEMINI_PAID_API_KEY"], default=None
+            ),
         )
         USER_MUST_PROVIDE_AUTH_CONFIG: bool = Field(
             default=False,
-            description="""Whether to require users (including admins) to provide their own authentication configuration.
-            User can provide these through UserValves. Setting this to True will disallow users from using Vertex AI.
-            Default value is False.""",
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["USER_MUST_PROVIDE_AUTH_CONFIG"], default=False
+            ),
         )
         AUTH_WHITELIST: str | None = Field(
             default=None,
-            description="""Comma separated list of user emails that are allowed to bypass USER_MUST_PROVIDE_AUTH_CONFIG and use the default authentication configuration.
-            Default value is None (no users are whitelisted).""",
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["AUTH_WHITELIST"], default=None
+            ),
         )
         GEMINI_API_BASE_URL: str | None = Field(
             default=None,
-            description="""The base URL for calling the Gemini API.
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["GEMINI_API_BASE_URL"], default=None
+            ),
         )
-        # FIXME: assume the user wants Vertex if they set VERTEX_PROJECT, removing the need for this valve.
         USE_VERTEX_AI: bool = Field(
             default=False,
-            description="""Whether to use Google Cloud Vertex AI instead of the standard Gemini API.
-            If VERTEX_PROJECT is not set then the plugin will use the Gemini Developer API.
-            Default value is False.
-            Users can opt out of this by setting USE_VERTEX_AI to False in their UserValves.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["USE_VERTEX_AI"], default=False
+            ),
         )
         VERTEX_PROJECT: str | None = Field(
             default=None,
-            description="""The Google Cloud project ID to use with Vertex AI.
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["VERTEX_PROJECT"], default=None
+            ),
         )
         VERTEX_LOCATION: str = Field(
             default="global",
-            description="""The Google Cloud region to use with Vertex AI.
-            Default value is 'global'.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["VERTEX_LOCATION"], default="global"
+            ),
         )
         ENABLE_FREE_TIER_FALLBACK: bool = Field(
             default=False,
-            description="""Automatically switch to the Paid API if a Free API request fails due to quota limits (429) or model overload (503).
-            Requires both Free and Paid API keys to be configured. 
-            Default value is False.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["ENABLE_FREE_TIER_FALLBACK"], default=False
+            ),
         )
         TASK_MODEL_ROUTING: Literal[
             "only_free",
@@ -1608,112 +1761,99 @@ class Pipe:
             "match_main",
         ] = Field(
             default="match_main",
-            description="""Determines how task models (like title generation) are routed between Free and Paid APIs.
-            • only_free: Use only the Free API.
-            • free_fallback: Use Free API first, fallback to Paid on failure.
-            • only_paid: Bypass Free API and use Paid API directly (or Vertex if enabled).
-            • match_main: Follow the same logic as the main chat generation.
-            Default is match_main.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["TASK_MODEL_ROUTING"], default="match_main"
+            ),
         )
         MODEL_WHITELIST: str = Field(
             default="*",
-            description="""Comma-separated list of allowed model names.
-            Supports `fnmatch` patterns: *, ?, [seq], [!seq].
-            Default value is * (all models allowed).""",
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["MODEL_WHITELIST"], default="*"
+            ),
         )
         MODEL_BLACKLIST: str | None = Field(
             default=None,
-            description="""Comma-separated list of blacklisted model names.
-            Supports `fnmatch` patterns: *, ?, [seq], [!seq].
-            Default value is None (no blacklist).""",
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["MODEL_BLACKLIST"], default=None
+            ),
         )
         CACHE_MODELS: bool = Field(
             default=True,
-            description="""Whether to request models only on first load and when white- or blacklist changes.
-            Default value is True.""",
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["CACHE_MODELS"], default=True
+            ),
         )
-        THINKING_BUDGET: int = Field(
-            default=8192,
-            ge=-1,
-            # The widest possible range is 0 (for Lite/Flash) to 32768 (for Pro).
-            # -1 is used for dynamic thinking budget.
-            # Model-specific constraints are detailed in the description.
-            le=32768,
-            description="""Specifies the token budget for the model's internal thinking process,
-            used for complex tasks like tool use. Applicable to Gemini 2.5 models.
-            Default value is 8192. If you want the model to control the thinking budget when using the API, set the thinking budget to -1.
-
-            The valid token range depends on the specific model tier:
-            - **Pro models**: Must be a value between 128 and 32,768.
-            - **Flash and Lite models**: A value between 0 and 24,576. For these
-              models, a value of 0 disables the thinking feature.
-
-            See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more details.""",
+        THINKING_CONFIG_RULES: str = Field(
+            default='{"$a": 0}',
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["THINKING_CONFIG_RULES"], default='{"$a": 0}'
+            ),
         )
         SHOW_THINKING_SUMMARY: bool = Field(
             default=True,
-            description="""Whether to show the thinking summary in the response.
-            This is only applicable for Gemini 2.5 models.
-            Default value is True.""",
-        )
-        # FIXME: remove, toggle filter handles this now
-        ENABLE_URL_CONTEXT_TOOL: bool = Field(
-            default=False,
-            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
-            This tool is only compatible with specific models. Default value is False.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["SHOW_THINKING_SUMMARY"], default=True
+            ),
         )
         USE_FILES_API: bool = Field(
             default=True,
-            description="""Whether to use the Google Files API for uploading files.
-            This provides caching and performance benefits, but can be disabled for privacy, cost, or compatibility reasons.
-            If disabled, files are sent as raw bytes in the request.
-            Default value is True.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["USE_FILES_API"], default=True
+            ),
         )
         PARSE_YOUTUBE_URLS: bool = Field(
             default=True,
-            description="""Whether to parse YouTube URLs from user messages and provide them as context to the model.
-            If disabled, YouTube links are treated as plain text.
-            This is only applicable for models that support video.
-            Default value is True.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["PARSE_YOUTUBE_URLS"], default=True
+            ),
         )
         USE_ENTERPRISE_SEARCH: bool = Field(
             default=False,
-            description="""Enable the Enterprise Search tool to allow the model to fetch and use content from provided URLs. """,
+            description=_format_valve_desc(
+                _ADMIN_VALVE_DESCS["USE_ENTERPRISE_SEARCH"], default=False
+            ),
         )
         MAPS_GROUNDING_COORDINATES: str | None = Field(
             default=None,
-            description="""Optional latitude and longitude coordinates for location-aware results with Google Maps grounding.
-            Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["MAPS_GROUNDING_COORDINATES"], default=None
+            ),
         )
-        LOG_LEVEL: Literal[
-            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
-        ] = Field(
-            default="INFO",
-            description="""Select logging level. Use `docker logs -f open-webui` to view logs.
-            Default value is INFO.""",
+        IMAGE_RESOLUTION: Literal["512PX", "1K", "2K", "4K"] | None = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["IMAGE_RESOLUTION"], default=None
+            ),
         )
-        IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] = Field(
-            default="1K",
-            description="""Resolution for image generation (Gemini 3 Pro Image only).
-            Default value is 1K.""",
+        IMAGE_ASPECT_RATIO: (
+            Literal[
+                "1:1",
+                "1:4",
+                "1:8",
+                "2:3",
+                "3:2",
+                "3:4",
+                "4:1",
+                "4:3",
+                "4:5",
+                "5:4",
+                "8:1",
+                "9:16",
+                "16:9",
+                "21:9",
+            ]
+            | None
+        ) = Field(
+            default=None,
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["IMAGE_ASPECT_RATIO"], default=None
+            ),
         )
-        IMAGE_ASPECT_RATIO: Literal[
-            "1:1",
-            "2:3",
-            "3:2",
-            "3:4",
-            "4:3",
-            "4:5",
-            "5:4",
-            "9:16",
-            "16:9",
-            "21:9",
-        ] = Field(
-            default="16:9",
-            description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
-            Default value is 16:9.""",
-        )
+
+        @field_validator("THINKING_CONFIG_RULES", mode="after")
+        @classmethod
+        def validate_thinking_config_rules(cls, v: str | None):
+            return Pipe._validate_thinking_config_rules(v)
 
         @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
         @classmethod
@@ -1721,158 +1861,121 @@ class Pipe:
             return Pipe._validate_coordinates_format(v)
 
     class UserValves(BaseModel):
-        """Defines user-specific settings that can override the default `Valves`.
-
-        The `UserValves` class provides a mechanism for individual users to customize
-        their Gemini API settings for each request. This system is designed as a
-        practical workaround for backend/frontend limitations, enabling per-user
-        configurations.
-
-        Think of the main `Valves` as the global, admin-configured template for the
-        plugin. `UserValves` acts as a user-provided "overlay" or "patch" that
-        is applied on top of that template at runtime.
-
-        How it works:
-        1.  **Default Behavior:** At the start of a request, the system merges the
-            user's `UserValves` with the admin's `Valves`. If a field in
-            `UserValves` has a value (i.e., is not `None` or an empty string `""`),
-            it overrides the corresponding value from the main `Valves`. If a
-            field is `None` or `""`, the admin's default is used.
-
-        2.  **Special Authentication Logic:** A critical exception exists to enforce
-            security and usage policies. If the admin sets `USER_MUST_PROVIDE_AUTH_CONFIG`
-            to `True` in the main `Valves`, the merging logic changes for any user
-            not on the `AUTH_WHITELIST`:
-            - The user's `GEMINI_API_KEY` is taken directly from their `UserValves`,
-              bypassing the admin's key entirely.
-            - The ability to use the admin-configured Vertex AI is disabled
-              (`USE_VERTEX_AI` is forced to `False`).
-            This ensures that when required, users must use their own credentials
-            and cannot fall back on the shared, system-level authentication.
-
-        This two-tiered configuration allows administrators to set sensible defaults
-        and enforce policies, while still giving users the flexibility to tailor
-        certain parameters, like their API key or model settings, for their own use.
-        """
-        # FIXME: `Literal[""]` might not be necessary anymore
         GEMINI_FREE_API_KEY: str | None = Field(
             default=None,
-            description="""Free Gemini Developer API key. If not provided, the admin's key may be used if permitted.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["GEMINI_FREE_API_KEY"], is_user=True
+            ),
         )
         GEMINI_PAID_API_KEY: str | None = Field(
             default=None,
-            description="""Paid Gemini Developer API key. If not provided, the admin's key may be used if permitted.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["GEMINI_PAID_API_KEY"], is_user=True
+            ),
         )
         GEMINI_API_BASE_URL: str | None = Field(
             default=None,
-            description="""The base URL for calling the Gemini API
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["GEMINI_API_BASE_URL"], is_user=True
+            ),
         )
-        USE_VERTEX_AI: bool | None | Literal[""] = Field(
+        USE_VERTEX_AI: bool | None = Field(
             default=None,
-            description="""Whether to use Google Cloud Vertex AI instead of the standard Gemini API.
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["USE_VERTEX_AI"], is_user=True
+            ),
         )
         VERTEX_PROJECT: str | None = Field(
             default=None,
-            description="""The Google Cloud project ID to use with Vertex AI.
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["VERTEX_PROJECT"], is_user=True
+            ),
         )
         VERTEX_LOCATION: str | None = Field(
             default=None,
-            description="""The Google Cloud region to use with Vertex AI.
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["VERTEX_LOCATION"], is_user=True
+            ),
         )
-        ENABLE_FREE_TIER_FALLBACK: bool | None | Literal[""] = Field(
+        ENABLE_FREE_TIER_FALLBACK: bool | None = Field(
             default=None,
-            description="""Override the default setting for Free API fallback.
-            Set to True to enable automatic fallback to the Paid API, False to disable.
-            Default is None (use the admin's setting).""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["ENABLE_FREE_TIER_FALLBACK"], is_user=True
+            ),
         )
         TASK_MODEL_ROUTING: (
             Literal["only_free", "free_fallback", "only_paid", "match_main", ""] | None
         ) = Field(
             default=None,
-            description="""Override the default routing strategy for task models. 
-            Possible values: only_free | free_fallback | only_paid | match_main.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["TASK_MODEL_ROUTING"], is_user=True
+            ),
         )
-        THINKING_BUDGET: int | None | Literal[""] = Field(
+        THINKING_CONFIG_RULES: str | None = Field(
             default=None,
-            description="""Specifies the token budget for the model's internal thinking process,
-            used for complex tasks like tool use. Applicable to Gemini 2.5 models.
-            Default value is None. If you want the model to control the thinking budget when using the API, set the thinking budget to -1.
-
-            The valid token range depends on the specific model tier:
-            - **Pro models**: Must be a value between 128 and 32,768.
-            - **Flash and Lite models**: A value between 0 and 24,576. For these
-              models, a value of 0 disables the thinking feature.
-
-            See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more details.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["THINKING_CONFIG_RULES"], is_user=True
+            ),
         )
-        SHOW_THINKING_SUMMARY: bool | None | Literal[""] = Field(
+        SHOW_THINKING_SUMMARY: bool | None = Field(
             default=None,
-            description="""Whether to show the thinking summary in the response.
-            This is only applicable for Gemini 2.5 models.
-            Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["SHOW_THINKING_SUMMARY"], is_user=True
+            ),
         )
-        ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
+        USE_FILES_API: bool | None = Field(
             default=None,
-            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
-            This tool is only compatible with specific models. Default value is None.""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["USE_FILES_API"], is_user=True
+            ),
         )
-        USE_FILES_API: bool | None | Literal[""] = Field(
+        PARSE_YOUTUBE_URLS: bool | None = Field(
             default=None,
-            description="""Override the default setting for using the Google Files API.
-            Set to True to force use, False to disable.
-            Default is None (use the admin's setting).""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["PARSE_YOUTUBE_URLS"], is_user=True
+            ),
         )
-        PARSE_YOUTUBE_URLS: bool | None | Literal[""] = Field(
+        MAPS_GROUNDING_COORDINATES: str | None = Field(
             default=None,
-            description="""Override the default setting for parsing YouTube URLs.
-            Set to True to enable, False to disable.
-            Default is None (use the admin's setting).""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["MAPS_GROUNDING_COORDINATES"], is_user=True
+            ),
         )
-        MAPS_GROUNDING_COORDINATES: str | None | Literal[""] = Field(
+        IMAGE_RESOLUTION: Literal["512PX", "1K", "2K", "4K"] | None = Field(
             default=None,
-            description="""Optional latitude and longitude coordinates for location-aware results with Google Maps grounding.
-            Overrides the admin setting. Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
-            Default value is None.""",
-        )
-        IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] | None | Literal[""] = Field(
-            default=None,
-            description="""Resolution for image generation (Gemini 3 Pro Image only).
-            Default value is None (use the admin's setting). Possible values: 1K, 2K, 4K""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["IMAGE_RESOLUTION"], is_user=True
+            ),
         )
         IMAGE_ASPECT_RATIO: (
             Literal[
                 "1:1",
+                "1:4",
+                "1:8",
                 "2:3",
                 "3:2",
                 "3:4",
+                "4:1",
                 "4:3",
                 "4:5",
                 "5:4",
+                "8:1",
                 "9:16",
                 "16:9",
                 "21:9",
             ]
             | None
-            | Literal[""]
         ) = Field(
             default=None,
-            description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
-            Default value is None (use the admin's setting). Possible values: 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9""",
+            description=_format_valve_desc(
+                _SHARED_VALVE_DESCS["IMAGE_ASPECT_RATIO"], default=None, is_user=True
+            ),
         )
 
-        @field_validator("THINKING_BUDGET", mode="after")
+        @field_validator("THINKING_CONFIG_RULES", mode="after")
         @classmethod
-        def validate_thinking_budget_range(cls, v):
-            if v is not None and v != "":
-                if not (-1 <= v <= 32768):
-                    raise ValueError(
-                        "THINKING_BUDGET must be between -1 and 32768, inclusive."
-                    )
-            return v
+        def validate_thinking_config_rules(cls, v: str | None):
+            return Pipe._validate_thinking_config_rules(v)
 
         @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
         @classmethod
@@ -1887,7 +1990,6 @@ class Pipe:
 
     async def pipes(self) -> list["ModelData"]:
         """Register all available Google models."""
-        self._add_log_handler(self.valves.LOG_LEVEL)
         log.debug("pipes method has been called.")
 
         # Clear cache if caching is disabled
@@ -1907,7 +2009,8 @@ class Pipe:
             return [self._return_error_model(error_msg, exception=True)]
 
         log.info(f"Returning {len(filtered_models)} models to Open WebUI.")
-        log.debug("Model list:", payload=filtered_models, _log_truncation_enabled=False)
+        log.debug(f"Model list:", payload=[model["id"] for model in filtered_models])
+        log.trace("List of dicts that Pipe.pipes() will return:", payload=filtered_models, _log_truncation_enabled=False)
         log.debug("pipes method has finished.")
 
         return filtered_models
@@ -1917,11 +2020,8 @@ class Pipe:
         body: "Body",
         __user__: "UserData",
         __request__: Request,
-        __event_emitter__: Callable[["Event"], Awaitable[None]] | None,
         __metadata__: "Metadata",
     ) -> AsyncGenerator[dict | str, None] | dict:
-
-        self._add_log_handler(self.valves.LOG_LEVEL)
 
         log.debug(
             f"pipe method has been called. Gemini Manifold google_genai version is {VERSION}"
@@ -1934,14 +2034,11 @@ class Pipe:
 
         # Retrieve model configuration from app state
         app_state: State = __request__.app.state
-        model_config: dict[str, Any] = app_state._state.get("gemini_model_config")
-        # FIXME: be even more strict by requring the model id to be present in the config to proceed?
-        if model_config is None:
-            error_msg = (
-                "FATAL: Gemini model configuration not found in app state. "
-                "Please ensure the Gemini Manifold Companion filter is installed and enabled."
-            )
-            raise ValueError(error_msg)
+        model_config: dict[str, Any] = await self._wait_for_state_value(
+            app_state,
+            key="gemini_model_config",
+            description="Gemini model configuration",
+        )
 
         merged_custom_params = self._resolve_custom_params(body, __metadata__)
         __metadata__["merged_custom_params"] = merged_custom_params
@@ -1956,7 +2053,6 @@ class Pipe:
 
         if task_type := __metadata__.get("task"):
             log.info(f"{task_type=}, disabling event emissions, YouTube URL parsing and document processing.")
-            __event_emitter__ = None
             # We disable YouTube parsing for task models to minimize latency and token costs,
             # as simple tasks like title or tag generation do not require video context.
             valves.PARSE_YOUTUBE_URLS = False
@@ -1971,21 +2067,16 @@ class Pipe:
             features=features,
         )
 
-        log.debug(f"Chat ID: {__metadata__.get('chat_id')}, Message ID: {__metadata__.get('message_id')}")
+        chat_id = __metadata__.get("chat_id")
+        message_id = __metadata__.get("message_id")
+        log.debug(f"Chat ID: {chat_id}, Message ID: {message_id}")
 
-        # FIXME: might be None in some cases, needs handling
-        event_emitter: "EventEmitter" = self._get_and_clear_data_from_state(
+        event_emitter = await self._get_event_emitter(
             app_state=app_state,
-            chat_id=__metadata__.get("chat_id"),
-            message_id=__metadata__.get("message_id"),
-            key_suffix="gemini_event_emitter",
-            clear_after_read=False
+            chat_id=chat_id,
+            message_id=message_id,
+            is_task=bool(__metadata__.get("task")),
         )
-        if not event_emitter:
-            log.debug("No event emitter found in state for this request. Companion filter's inlet did not run? Event emissions will be disabled for this request.")
-            event_emitter = app_state._state.get("gemini_dummy_event_emitter")
-        if not event_emitter:
-            log.error("No event emitter available. This is unexpected as the dummy event emitter should always be present. Request will likely error out.")
 
         # --- Execution Loop ---
         for attempt_idx, tier in enumerate(execution_order):
@@ -2054,9 +2145,9 @@ class Pipe:
 
         raise ValueError("Exhausted execution options without result.")
 
-    # region 2. Helper methods inside the Pipe class
+    # region 1. Helper methods inside the Pipe class
 
-    # region 2.1 Client initialization
+    # region 1.1 Client initialization
     @staticmethod
     @cache
     def _get_or_create_genai_client(
@@ -2147,9 +2238,10 @@ class Pipe:
         ]
         return [getattr(source_valves, attr, None) for attr in ATTRS]
 
-    # endregion 2.1 Client initialization
+    # endregion 1.1 Client initialization
 
-    # region 2.2 Model retrival from Google API
+    # region 1.2 Model retrival from Google API
+
     @cached()  # aiocache.cached for async method
     async def _get_genai_models(
         self,
@@ -2491,9 +2583,82 @@ class Pipe:
 
         return False
 
-    # endregion 2.2 Model retrival from Google API
+    @staticmethod
+    def _parse_gemini_version(model_id: str) -> float:
+        """Extracts the Gemini model version number from model ID.
 
-    # region 2.3 GenerateContentConfig assembly
+        If not a Gemini model or version is missing, logs a warning and returns 3.0.
+        """
+        model_id_lower = model_id.lower()
+        if "gemini" in model_id_lower:
+            match = re.search(r"gemini-(\d+(?:\.\d+)?)", model_id_lower)
+            if match:
+                try:
+                    return float(match.group(1))
+                except ValueError:
+                    pass
+
+        log.warning(
+            f"Model '{model_id}' is either not a Gemini model or missing a standard version number. "
+            "Treating as Gemini 3+ model."
+        )
+        return 3.0
+
+    # endregion 1.2 Model retrival from Google API
+
+    # region 1.3 GenerateContentConfig assembly
+
+    @classmethod
+    def _resolve_valve_thinking_config(
+        cls, rules_json: str, model_id: str
+    ) -> tuple[int | None, str | None]:
+        """Evaluates THINKING_CONFIG_RULES regex patterns against model_id to determine default budget/level."""
+        if not rules_json or not rules_json.strip():
+            return None, None
+
+        try:
+            rules = json.loads(rules_json)
+            if not isinstance(rules, dict):
+                return None, None
+        except Exception as e:
+            log.warning(f"Failed to parse THINKING_CONFIG_RULES JSON: {e}")
+            return None, None
+
+        matching_hits: list[tuple[str, int | str]] = []
+        for pattern, val in rules.items():
+            try:
+                if re.search(pattern, model_id):
+                    matching_hits.append((pattern, val))
+            except re.error as e:
+                log.warning(
+                    f"Invalid regex pattern '{pattern}' in THINKING_CONFIG_RULES: {e}"
+                )
+
+        if not matching_hits:
+            return None, None
+
+        model_version = cls._parse_gemini_version(model_id)
+        is_under_v3 = model_version < 3.0
+
+        level_hits = [val for _, val in matching_hits if isinstance(val, str)]
+        budget_hits = [val for _, val in matching_hits if isinstance(val, int)]
+
+        if is_under_v3:
+            if budget_hits:
+                return budget_hits[0], None
+            elif level_hits:
+                log.warning(
+                    f"Model '{model_id}' (version {model_version}) is older than Gemini 3 and does not support thinking_level. "
+                    f"Regex hit specified level '{level_hits[0]}', but no budget rule hit. Falling back to API default."
+                )
+                return None, None
+        else:
+            if level_hits:
+                return None, level_hits[0]
+            elif budget_hits:
+                return budget_hits[0], None
+
+        return None, None
 
     async def _build_gen_content_config(
         self,
@@ -2501,6 +2666,7 @@ class Pipe:
         __metadata__: "Metadata",
         valves: "Valves",
         config: dict,
+        event_emitter: "EventEmitter",
     ) -> types.GenerateContentConfig:
         """Assembles the GenerateContentConfig for a Gemini API request."""
         features = __metadata__.get("features", {}) or {}
@@ -2508,7 +2674,7 @@ class Pipe:
 
         log.debug(
             "Features extracted from metadata (UI toggles and config):",
-            payload=features
+            payload=features,
         )
 
         safety_settings: list[types.SafetySetting] | None = __metadata__.get(
@@ -2520,24 +2686,25 @@ class Pipe:
         model_id: str = __metadata__.get("canonical_model_id", "")
         is_thinking_model = False
         if model_id in config:
-            is_thinking_model = config[model_id].get("capabilities", {}).get("thinking", False)
+            is_thinking_model = (
+                config[model_id].get("capabilities", {}).get("thinking", False)
+            )
 
         log.debug(
             f"Model '{model_id}' is classified as a reasoning model: {bool(is_thinking_model)}. "
         )
 
         if is_thinking_model:
-            # Start with the default thinking configuration from valves.
-            log.info(
-                f"Setting thinking config defaults: budget={valves.THINKING_BUDGET}, "
-                f"include_thoughts={valves.SHOW_THINKING_SUMMARY}."
+            # Precedence level 1 (lowest): Valves option
+            chosen_budget, chosen_level = self._resolve_valve_thinking_config(
+                valves.THINKING_CONFIG_RULES, model_id
             )
-            thinking_conf = types.ThinkingConfig(
-                thinking_budget=valves.THINKING_BUDGET,
-                include_thoughts=valves.SHOW_THINKING_SUMMARY,
+            log.info(
+                f"Resolved valve thinking config for model '{model_id}': "
+                f"budget={chosen_budget}, level={chosen_level}"
             )
 
-            # Override defaults with custom 'reasoning_effort' parameter if present.
+            # Precedence level 2 (medium): Merged params override
             merged_params = __metadata__.get("merged_custom_params", {})
             if reasoning_effort := merged_params.get("reasoning_effort"):
                 log.info(
@@ -2545,57 +2712,83 @@ class Pipe:
                 )
 
                 try:
-                    # Attempt to parse as a number (for thinking_budget).
                     budget = round(float(reasoning_effort))
                     log.info(
                         f"Interpreting `reasoning_effort` as a thinking budget: {budget}"
                     )
-                    thinking_conf.thinking_budget = budget
-                    thinking_conf.thinking_level = (
-                        None  # Budget and level are mutually exclusive.
-                    )
+                    chosen_budget = budget
+                    chosen_level = None
                 except (ValueError, TypeError):
-                    # If it's not a number, treat it as a thinking_level string.
                     if isinstance(reasoning_effort, str):
                         effort_level_str = reasoning_effort.upper()
-                        if effort_level_str in types.ThinkingLevel.__members__:
+                        valid_levels = {"MINIMAL", "LOW", "MEDIUM", "HIGH"}
+                        if effort_level_str in valid_levels:
                             log.info(
                                 f"Interpreting `reasoning_effort` as a thinking level: {effort_level_str}"
                             )
-                            thinking_conf.thinking_level = types.ThinkingLevel[
-                                effort_level_str
-                            ]
-                            thinking_conf.thinking_budget = (
-                                None  # Budget and level are mutually exclusive.
-                            )
+                            chosen_level = effort_level_str
+                            chosen_budget = None
                         else:
                             log.warning(
                                 f"Invalid `reasoning_effort` string value: '{reasoning_effort}'. "
-                                f"Valid values are {list(types.ThinkingLevel.__members__.keys())}. "
-                                "Falling back to valve defaults."
+                                f"Valid values are {sorted(valid_levels)}. "
+                                "Falling back to valve settings."
                             )
                     else:
                         log.warning(
                             f"Unsupported type for `reasoning_effort`: {type(reasoning_effort)}. "
-                            "Expected a number or string. Falling back to valve defaults."
+                            "Expected a number or string. Falling back to valve settings."
                         )
 
-            # Check if reasoning can be disabled via toggle, which overrides other settings.
+            # Precedence level 3 (highest): Toggle filter override
             is_avail, is_on = await self._get_toggleable_feature_status(
                 "gemini_reasoning_toggle", __metadata__
             )
             if is_avail and not is_on:
-                # This toggle is only applicable to flash/lite models, which support a budget of 0.
-                is_reasoning_toggleable = "flash" in model_id or "lite" in model_id
-                if is_reasoning_toggleable:
+                is_25_flash_or_lite = bool(
+                    re.search(
+                        r"gemini-2\.5-(?:flash|flash-lite)", model_id, re.IGNORECASE
+                    )
+                )
+                if is_25_flash_or_lite:
                     log.info(
-                        f"Model '{model_id}' supports disabling reasoning, and it is toggled OFF in the UI. "
+                        f"Model '{model_id}' is Gemini 2.5 Flash/Flash-Lite and reasoning toggle is OFF in UI. "
                         "Overwriting `thinking_budget` to 0 to disable reasoning."
                     )
-                    thinking_conf.thinking_budget = 0
-                    thinking_conf.thinking_level = (
-                        None  # Ensure level is cleared when budget is forced to 0.
+                    chosen_budget = 0
+                    chosen_level = None
+                else:
+                    log.info(
+                        f"Reasoning toggle is OFF in UI, but model '{model_id}' does not support disabling thinking. "
+                        "Ignoring toggle setting."
                     )
+
+            model_version = self._parse_gemini_version(model_id)
+            if model_version < 3.0 and chosen_level is not None:
+                log.warning(
+                    f"Model '{model_id}' (version {model_version}) does not support `thinking_level`. "
+                    f"Clearing requested thinking level '{chosen_level}'."
+                )
+                chosen_level = None
+
+            thinking_kwargs: dict[str, Any] = {
+                "include_thoughts": valves.SHOW_THINKING_SUMMARY
+            }
+
+            if chosen_level is not None:
+                if hasattr(types, "ThinkingLevel") and hasattr(
+                    types.ThinkingLevel, chosen_level
+                ):
+                    thinking_kwargs["thinking_level"] = types.ThinkingLevel[
+                        chosen_level
+                    ]
+                else:
+                    thinking_kwargs["thinking_level"] = chosen_level
+            elif chosen_budget is not None:
+                thinking_kwargs["thinking_budget"] = chosen_budget
+
+            thinking_conf = types.ThinkingConfig(**thinking_kwargs)
+            log.info("Final thinking config payload:", payload=thinking_conf)
 
         # TODO: Take defaults from the general front-end config.
         # system_instruction is intentionally left unset here. It will be set by the caller.
@@ -2618,19 +2811,62 @@ class Pipe:
 
         if self._is_image_model(model_id, config):
             gen_content_conf.response_modalities.append("IMAGE")
-            if "gemini-3-pro-image" in model_id and valves.IMAGE_RESOLUTION:
-                log.debug(f"Setting image resolution to {valves.IMAGE_RESOLUTION}")
-                if not gen_content_conf.image_config:
-                    gen_content_conf.image_config = types.ImageConfig()
-                gen_content_conf.image_config.image_size = valves.IMAGE_RESOLUTION
 
-            if (
-                "gemini-3-pro-image" in model_id or "gemini-2.5-flash-image" in model_id
-            ) and valves.IMAGE_ASPECT_RATIO:
+            image_cfg = config.get(model_id, {}).get("image_generation", {}) or {}
+            if not isinstance(image_cfg, dict):
+                image_cfg = {}
+
+            supported_resolutions = image_cfg.get("resolutions", []) or []
+            supported_aspect_ratios = image_cfg.get("aspect_ratios", []) or []
+
+            if not isinstance(supported_resolutions, list):
+                supported_resolutions = []
+            if not isinstance(supported_aspect_ratios, list):
+                supported_aspect_ratios = []
+
+            image_config_kwargs: dict[str, Any] = {}
+
+            # Missing/empty resolutions means the model doesn't support `image_size`.
+            if supported_resolutions and valves.IMAGE_RESOLUTION:
+                if valves.IMAGE_RESOLUTION not in supported_resolutions:
+                    warn_msg = (
+                        f"Valve IMAGE_RESOLUTION '{valves.IMAGE_RESOLUTION}' is not listed in "
+                        f"supported resolutions for '{model_id}': {supported_resolutions}. "
+                        "Using it anyway; the API will likely reject it."
+                    )
+                    _log_and_toast(event_emitter, warn_msg, level="warning")
+                else:
+                    log.debug(f"Setting image resolution to {valves.IMAGE_RESOLUTION}")
+
+                image_config_kwargs["image_size"] = valves.IMAGE_RESOLUTION
+            else:
+                log.debug(
+                    f"Model '{model_id}' does not declare supported image resolutions; "
+                    "skipping ImageConfig.image_size."
+                )
+
+            if not supported_aspect_ratios:
+                warn_msg = (
+                    f"Model '{model_id}' is an image model but "
+                    "`image_generation.aspect_ratios` is missing or empty. "
+                    "This config entry looks malformed; using the valve value anyway."
+                )
+                _log_and_toast(event_emitter, warn_msg, level="warning")
+            elif valves.IMAGE_ASPECT_RATIO not in supported_aspect_ratios:
+                warn_msg = (
+                    f"Valve IMAGE_ASPECT_RATIO '{valves.IMAGE_ASPECT_RATIO}' is not listed in "
+                    f"supported aspect ratios for '{model_id}': {supported_aspect_ratios}. "
+                    "Using it anyway; the API will likely reject it."
+                )
+                _log_and_toast(event_emitter, warn_msg, level="warning")
+            else:
                 log.debug(f"Setting image aspect ratio to {valves.IMAGE_ASPECT_RATIO}")
-                if not gen_content_conf.image_config:
-                    gen_content_conf.image_config = types.ImageConfig()
-                gen_content_conf.image_config.aspect_ratio = valves.IMAGE_ASPECT_RATIO
+
+            if valves.IMAGE_ASPECT_RATIO:
+                image_config_kwargs["aspect_ratio"] = valves.IMAGE_ASPECT_RATIO
+
+            if image_config_kwargs:
+                gen_content_conf.image_config = types.ImageConfig(**image_config_kwargs)
 
         gen_content_conf.tools = []
 
@@ -2658,7 +2894,7 @@ class Pipe:
         is_avail, is_on = await self._get_toggleable_feature_status(
             "gemini_url_context_toggle", __metadata__
         )
-        enable_url_context = valves.ENABLE_URL_CONTEXT_TOOL  # Start with valve default.
+        enable_url_context = False
         if is_avail:
             # If the toggle filter is configured, it overrides the valve setting.
             enable_url_context = is_on
@@ -2728,9 +2964,9 @@ class Pipe:
 
         return gen_content_conf
 
-    # endregion 2.3 GenerateContentConfig assembly
+    # endregion 1.3 GenerateContentConfig assembly
 
-    # region 2.4 Model response processing
+    # region 1.4 Model response processing
 
     async def _aggregate_to_dict(
         self,
@@ -2822,7 +3058,7 @@ class Pipe:
 
         # 4. Configuration Building
         gen_content_conf = await self._build_gen_content_config(
-            body, __metadata__, valves, model_config
+            body, __metadata__, valves, model_config, event_emitter
         )
         gen_content_conf.system_instruction = builder.system_prompt
 
@@ -2853,15 +3089,12 @@ class Pipe:
         is_streaming_request = body.get("stream", True)
         use_streaming_api = is_streaming_request
 
-        # If a high-resolution image is requested with the gemini-3-pro-image model,
         # the Google GenAI SDK's streaming method often raises a "chunk too big" error
-        # during the transfer of the generated image bytes. We avoid this by forcing
+        # if a high-resolution image is requested. We avoid this by forcing
         # a non-streaming SDK call, while still yielding the result as a stream to OWUI.
         if (
             use_streaming_api
             and valves.IMAGE_RESOLUTION in ["2K", "4K"]
-            # FIXME: Nano Banana 2 supports resolutions too now.
-            and "gemini-3-pro-image" in model_id
         ):
             log.info(
                 f"Forcing non-streaming SDK call due to {valves.IMAGE_RESOLUTION} resolution "
@@ -2875,6 +3108,7 @@ class Pipe:
         event_emitter.emit_status(request_type_msg)
 
         # 6. Execution & Peek Logic
+        api_request_start_time = time.monotonic()
         if use_streaming_api:
             stream = await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
         else:
@@ -2891,6 +3125,7 @@ class Pipe:
 
         try:
             first_chunk = await iterator.__anext__()
+            first_token_time = time.monotonic()
         except StopAsyncIteration:
             raise ValueError("API returned an empty response stream.")
 
@@ -2907,6 +3142,8 @@ class Pipe:
             __request__.app,
             event_emitter,
             __metadata__,
+            api_request_start_time=api_request_start_time,
+            first_token_time=first_token_time,
         )
 
         # If OWUI requested a stream, we return the AsyncGenerator.
@@ -2964,6 +3201,8 @@ class Pipe:
         app: FastAPI,
         event_emitter: "EventEmitter",
         __metadata__: "Metadata",
+        api_request_start_time: float | None = None,
+        first_token_time: float | None = None,
     ) -> AsyncGenerator[dict | str, None]:
         """
         Processes an async iterator of GenerateContentResponse objects, yielding
@@ -3107,6 +3346,8 @@ class Pipe:
                     app.state,
                     __metadata__,
                     event_emitter.start_time,
+                    api_request_start_time,
+                    first_token_time,
                 )
             ):
                 # Yielding this dictionary allows the OWUI proxy to catch and save usage.
@@ -3375,9 +3616,9 @@ class Pipe:
         else:
             return None
 
-    # endregion 2.4 Model response processing
+    # endregion 1.4 Model response processing
 
-    # region 2.5 Post-processing
+    # region 1.5 Post-processing
     async def _do_post_processing(
         self,
         model_response: types.GenerateContentResponse | None,
@@ -3452,67 +3693,6 @@ class Pipe:
         self._store_data_in_state(app_state, __metadata__, storage_payload)
 
     @staticmethod
-    def _store_data_in_state(
-        app_state: State,
-        __metadata__: "Metadata",
-        data: dict[str, Any],
-    ):
-        """
-        Stores multiple values in the app state, namespaced by chat and message ID.
-        Exits early if this is a task model (e.g. title generation) to prevent 
-        state bloat and interference with the main chat's filter logic.
-        """
-        # TODO: code a separate dataclass that handles all stuff that I need to store in app state
-        if __metadata__.get("task"):
-            return
-
-        chat_id = __metadata__.get("chat_id")
-        message_id = __metadata__.get("message_id")
-
-        if not chat_id or not message_id:
-            log.warning("Skipping state storage: chat_id or message_id missing from metadata.")
-            return
-
-        for key_suffix, value in data.items():
-            key = f"{key_suffix}_{chat_id}_{message_id}"
-            log.debug(f"Storing data in app state with key '{key}'.")
-            # Using shared `request.app.state` to pass data to Filter.outlet.
-            # This is necessary because Pipe.pipe and Filter.outlet operate on different requests.
-            app_state._state[key] = value
-
-    @staticmethod
-    def _get_and_clear_data_from_state(
-        app_state: State,
-        chat_id: str,
-        message_id: str,
-        key_suffix: str,
-        clear_after_read: bool,
-    ) -> Any | None:
-        """Retrieves data from the app state using a namespaced key.
-
-        Deletes the value only when clear_after_read is True.
-        """
-        key = f"{key_suffix}_{chat_id}_{message_id}"
-        value = getattr(app_state, key, None)
-        if value is None:
-            return None
-
-        if clear_after_read:
-            log.debug(f"Retrieved and cleared data from app state for key '{key}'.")
-            try:
-                delattr(app_state, key)
-            except AttributeError:
-                # This case is unlikely but handles a race condition where the attribute might already be gone.
-                log.warning(
-                    f"State key '{key}' was already gone before deletion attempt."
-                )
-        else:
-            log.debug(
-                f"Retrieved data from app state for key '{key}' without clearing it."
-            )
-        return value
-
-    @staticmethod
     def _calculate_cost(token_count: int, pricing_tiers: list[dict]) -> float:
         """
         Calculates cost based on tiered pricing structure (in USD)
@@ -3549,6 +3729,8 @@ class Pipe:
         app_state: State,
         metadata: "Metadata",
         start_time: float,
+        api_request_start_time: float | None = None,
+        first_token_time: float | None = None,
     ) -> dict[str, Any] | None:
         """
         Extracts usage data from a GenerateContentResponse object.
@@ -3669,22 +3851,14 @@ class Pipe:
                     f"Failed to calculate cost: {e}. Cost details will be empty."
                 )
 
-        # OWUI expects 'input_tokens' and 'output_tokens' at the top level of the usage dict
-        # to populate the admin dashboard.
-        # We aggregate Gemini's specific counts into these two categories.
-        input_tokens = (
-            token_details.get("prompt_token_count", 0) + 
-            token_details.get("tool_use_prompt_token_count", 0)
+        input_tokens = token_details.get("prompt_token_count", 0) + token_details.get(
+            "tool_use_prompt_token_count", 0
         )
-        output_tokens = (
-            token_details.get("candidates_token_count", 0) + 
-            token_details.get("thoughts_token_count", 0)
-        )
+        output_tokens = token_details.get(
+            "candidates_token_count", 0
+        ) + token_details.get("thoughts_token_count", 0)
 
         usage_payload = {
-            # FIXME: put these to the end of the payload
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
             "token_details": token_details,
             "cost_details": cost_details,
         }
@@ -3701,246 +3875,163 @@ class Pipe:
             usage_payload["cumulative_token_count"] = prev_tokens + current_tokens
             usage_payload["cumulative_total_cost"] = round(prev_cost + current_cost, 6)
 
-        # Include completion time
-        elapsed_time = time.monotonic() - start_time
-        usage_payload["completion_time"] = round(elapsed_time, 2)
+        now = time.monotonic()
+        if api_request_start_time is not None and first_token_time is not None:
+            usage_payload["time_to_first_token"] = round(
+                first_token_time - api_request_start_time, 2
+            )
+
+        if api_request_start_time is not None:
+            usage_payload["generation_time"] = round(now - api_request_start_time, 2)
+
+        usage_payload["completion_time"] = round(now - start_time, 2)
+
+        # Top-level token counts required by Open WebUI's admin dashboard
+        usage_payload["input_tokens"] = input_tokens
+        usage_payload["output_tokens"] = output_tokens
 
         return usage_payload
 
-    # endregion 2.5 Post-processing
+    # endregion 1.5 Post-processing
 
-    # region 2.6 Logging
-    # TODO: Move to a separate plugin that does not have any Open WebUI funcitonlity and is only imported by this plugin.
+    # region 1.6 __request__.app.state
 
-    def _is_flat_dict(self, data: Any) -> bool:
+    @staticmethod
+    def _store_data_in_state(
+        app_state: State,
+        __metadata__: "Metadata",
+        data: dict[str, Any],
+    ):
         """
-        Checks if a dictionary contains only non-dict/non-list values (is one level deep).
+        Stores multiple values in the app state, namespaced by chat and message ID.
+        Exits early if this is a task model (e.g. title generation) to prevent
+        state bloat and interference with the main chat's filter logic.
         """
-        if not isinstance(data, dict):
-            return False
-        return not any(isinstance(value, (dict, list)) for value in data.values())
+        # TODO: code a separate dataclass that handles all stuff that I need to store in app state
+        if __metadata__.get("task"):
+            return
 
-    def _truncate_long_strings(
-        self, data: Any, max_len: int, truncation_marker: str, truncation_enabled: bool
-    ) -> Any:
+        chat_id = __metadata__.get("chat_id")
+        message_id = __metadata__.get("message_id")
+
+        if not chat_id or not message_id:
+            log.warning(
+                "Skipping state storage: chat_id or message_id missing from metadata."
+            )
+            return
+
+        for key_suffix, value in data.items():
+            key = f"{key_suffix}_{chat_id}_{message_id}"
+            log.debug(f"Storing data in app state with key '{key}'.")
+            # Using shared `request.app.state` to pass data to Filter.outlet.
+            # This is necessary because Pipe.pipe and Filter.outlet operate on different requests.
+            app_state._state[key] = value
+
+    @staticmethod
+    def _get_and_clear_data_from_state(
+        app_state: State,
+        chat_id: str,
+        message_id: str,
+        key_suffix: str,
+        clear_after_read: bool,
+    ) -> Any | None:
+        """Retrieves data from the app state using a namespaced key.
+
+        Deletes the value only when clear_after_read is True.
         """
-        Recursively traverses a data structure (dicts, lists) and truncates
-        long string values. Creates copies to avoid modifying original data.
+        key = f"{key_suffix}_{chat_id}_{message_id}"
+        value = getattr(app_state, key, None)
+        if value is None:
+            return None
 
-        Args:
-            data: The data structure (dict, list, str, int, float, bool, None) to process.
-            max_len: The maximum allowed length for string values.
-            truncation_marker: The string to append to truncated values.
-            truncation_enabled: Whether truncation is enabled.
-
-        Returns:
-            A potentially new data structure with long strings truncated.
-        """
-        if not truncation_enabled or max_len <= len(truncation_marker):
-            # If truncation is disabled or max_len is too small, return original
-            # Make a copy only if it's a mutable type we might otherwise modify
-            if isinstance(data, (dict, list)):
-                return copy.deepcopy(data)  # Ensure deep copy for nested structures
-            return data  # Primitives are immutable
-
-        if isinstance(data, str):
-            if len(data) > max_len:
-                return data[: max_len - len(truncation_marker)] + truncation_marker
-            return data  # Return original string if not truncated
-        elif isinstance(data, dict):
-            # Process dictionary items, creating a new dict
-            return {
-                k: self._truncate_long_strings(
-                    v, max_len, truncation_marker, truncation_enabled
-                )
-                for k, v in data.items()
-            }
-        elif isinstance(data, list):
-            # Process list items, creating a new list
-            return [
-                self._truncate_long_strings(
-                    item, max_len, truncation_marker, truncation_enabled
-                )
-                for item in data
-            ]
-        else:
-            # Return non-string, non-container types as is (they are immutable)
-            return data
-
-    def plugin_stdout_format(self, record: "Record") -> str:
-        """
-        Custom format function for the plugin's logs.
-        Serializes and truncates data passed under the 'payload' key in extra.
-        """
-
-        # Configuration Keys
-        LOG_OPTIONS_PREFIX = "_log_"
-        TRUNCATION_ENABLED_KEY = f"{LOG_OPTIONS_PREFIX}truncation_enabled"
-        MAX_LENGTH_KEY = f"{LOG_OPTIONS_PREFIX}max_length"
-        TRUNCATION_MARKER_KEY = f"{LOG_OPTIONS_PREFIX}truncation_marker"
-        DATA_KEY = "payload"
-
-        original_extra = record["extra"]
-        # Extract the data intended for serialization using the chosen key
-        data_to_process = original_extra.get(DATA_KEY)
-
-        serialized_data_json = ""
-        if data_to_process is not None:
+        if clear_after_read:
+            log.debug(f"Retrieved and cleared data from app state for key '{key}'.")
             try:
-                serializable_data = pydantic_core.to_jsonable_python(
-                    data_to_process, serialize_unknown=True, exclude_none=True
+                delattr(app_state, key)
+            except AttributeError:
+                # This case is unlikely but handles a race condition where the attribute might already be gone.
+                log.warning(
+                    f"State key '{key}' was already gone before deletion attempt."
                 )
+        else:
+            log.debug(
+                f"Retrieved data from app state for key '{key}' without clearing it."
+            )
+        return value
 
-                # Determine truncation settings
-                truncation_enabled = original_extra.get(TRUNCATION_ENABLED_KEY, True)
-                max_length = original_extra.get(MAX_LENGTH_KEY, 256)
-                truncation_marker = original_extra.get(TRUNCATION_MARKER_KEY, "[...]")
+    async def _wait_for_state_value(
+        self,
+        app_state: State,
+        key: str,
+        timeout: float = 10.0,
+        poll_interval: float = 0.1,
+        description: str = "state value",
+    ) -> Any:
+        """Polls app state until the requested key is populated or timeout expires."""
+        if value := app_state._state.get(key):
+            return value
 
-                # If max_length was explicitly provided, force truncation enabled
-                if MAX_LENGTH_KEY in original_extra:
-                    truncation_enabled = True
+        log.warning(
+            f"'{key}' not found in state ({description}). Waiting up to {timeout}s for companion filter inlet..."
+        )
+        start_time = time.monotonic()
 
-                # Truncate long strings
-                truncated_data = self._truncate_long_strings(
-                    serializable_data,
-                    max_length,
-                    truncation_marker,
-                    truncation_enabled,
+        while time.monotonic() - start_time < timeout:
+            await asyncio.sleep(poll_interval)
+            if value := app_state._state.get(key):
+                log.debug(
+                    f"'{key}' became available after {time.monotonic() - start_time:.2f}s."
                 )
+                return value
 
-                # Serialize the (potentially truncated) data
-                if self._is_flat_dict(truncated_data) and not isinstance(
-                    truncated_data, list
-                ):
-                    json_string = json.dumps(
-                        truncated_data, separators=(",", ":"), default=str
-                    )
-                    # Add a simple prefix if it's compact
-                    serialized_data_json = " - " + json_string
-                else:
-                    json_string = json.dumps(truncated_data, indent=2, default=str)
-                    # Prepend with newline for readability
-                    serialized_data_json = "\n" + json_string
-
-            except (TypeError, ValueError) as e:  # Catch specific serialization errors
-                serialized_data_json = f" - {{Serialization Error: {e}}}"
-            except (
-                Exception
-            ) as e:  # Catch any other unexpected errors during processing
-                serialized_data_json = f" - {{Processing Error: {e}}}"
-
-        # Add the final JSON string (or error message) back into the record
-        record["extra"]["_plugin_serialized_data"] = serialized_data_json
-
-        # Base template
-        base_template = (
-            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-            "<level>{level: <8}</level> | "
-            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-            "<level>{message}</level>"
+        raise ValueError(
+            f"FATAL: '{key}' ({description}) not found in app state after {timeout}s timeout. "
+            "Please ensure the Gemini Manifold Companion filter is installed and enabled."
         )
 
-        # Append the serialized data
-        base_template += "{extra[_plugin_serialized_data]}"
-        # Append the exception part
-        base_template += "\n{exception}"
-        # Return the format string template
-        return base_template.rstrip()
-
-    @cache
-    def _add_log_handler(self, log_level: str):
-        """
-        Adds or updates the loguru handler specifically for this plugin.
-        Includes logic for serializing and truncating extra data.
-        The handler is added only if the log_level has changed since the last call.
-        """
-
-        def plugin_filter(record: "Record"):
-            """Filter function to only allow logs from this plugin (based on module name)."""
-            return record["name"] == __name__
-
-        # Get the desired level name and number
-        desired_level_name = log_level
-        try:
-            # Use the public API to get level details
-            desired_level_info = log.level(desired_level_name)
-            desired_level_no = desired_level_info.no
-        except ValueError:
-            log.error(
-                f"Invalid LOG_LEVEL '{desired_level_name}' configured for plugin {__name__}. Cannot add/update handler."
-            )
-            return  # Stop processing if the level is invalid
-
-        # Access the internal state of the log
-        handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
-        handler_id_to_remove = None
-        found_correct_handler = False
-
-        for handler_id, handler in handlers.items():
-            existing_filter = handler._filter  # Access internal attribute
-
-            # Check if the filter matches our plugin_filter
-            # Comparing function objects directly can be fragile if they are recreated.
-            # Comparing by name and module is more robust for functions defined at module level.
-            is_our_filter = (
-                existing_filter is not None  # Make sure a filter is set
-                and hasattr(existing_filter, "__name__")
-                and existing_filter.__name__ == plugin_filter.__name__
-                and hasattr(existing_filter, "__module__")
-                and existing_filter.__module__ == plugin_filter.__module__
+    async def _get_event_emitter(
+        self,
+        app_state: State,
+        chat_id: str | None,
+        message_id: str | None,
+        is_task: bool,
+    ) -> "EventEmitter":
+        """Resolves the appropriate event emitter from app state for tasks or regular generation."""
+        if is_task:
+            return await self._wait_for_state_value(
+                app_state,
+                key="gemini_dummy_event_emitter",
+                description="dummy event emitter for task model",
             )
 
-            if is_our_filter:
-                existing_level_no = handler.levelno
-                log.trace(
-                    f"Found existing handler {handler_id} for {__name__} with level number {existing_level_no}."
-                )
-
-                # Check if the level matches the desired level
-                if existing_level_no == desired_level_no:
-                    log.debug(
-                        f"Handler {handler_id} for {__name__} already exists with the correct level '{desired_level_name}'."
-                    )
-                    found_correct_handler = True
-                    break  # Found the correct handler, no action needed
-                else:
-                    # Found our handler, but the level is wrong. Mark for removal.
-                    log.info(
-                        f"Handler {handler_id} for {__name__} found, but log level differs "
-                        f"(existing: {existing_level_no}, desired: {desired_level_no}). "
-                        f"Removing it to update."
-                    )
-                    handler_id_to_remove = handler_id
-                    break  # Found the handler to replace, stop searching
-
-        # Remove the old handler if marked for removal
-        if handler_id_to_remove is not None:
-            try:
-                log.remove(handler_id_to_remove)
-                log.debug(f"Removed handler {handler_id_to_remove} for {__name__}.")
-            except ValueError:
-                # This might happen if the handler was somehow removed between the check and now
-                log.warning(
-                    f"Could not remove handler {handler_id_to_remove} for {__name__}. It might have already been removed."
-                )
-                # If removal failed but we intended to remove, we should still proceed to add
-                # unless found_correct_handler is somehow True (which it shouldn't be if handler_id_to_remove was set).
-
-        # Add a new handler if no correct one was found OR if we just removed an incorrect one
-        if not found_correct_handler:
-            log.add(
-                sys.stdout,
-                level=desired_level_name,
-                format=self.plugin_stdout_format,
-                filter=plugin_filter,
+        event_emitter = (
+            self._get_and_clear_data_from_state(
+                app_state,
+                chat_id,
+                message_id,
+                key_suffix="gemini_event_emitter",
+                clear_after_read=False,
             )
-            log.debug(
-                f"Added new handler to loguru for {__name__} with level {desired_level_name}."
-            )
+            if chat_id and message_id
+            else None
+        )
+        if event_emitter is not None:
+            return event_emitter
 
-    # endregion 2.6 Logging
+        log.warning(
+            "No event emitter found in state for this request. Companion filter's inlet did not run? "
+            "Falling back to dummy event emitter."
+        )
+        if dummy_emitter := app_state._state.get("gemini_dummy_event_emitter"):
+            return dummy_emitter
 
-    # region 2.7 Utility helpers
+        raise ValueError(
+            "Neither request event emitter nor dummy event emitter is available in app state."
+        )
+
+    # endregion 1.6 __request__.app.state
+
+    # region 1.7 Utility helpers
 
     async def _determine_execution_order(
         self,
@@ -4044,6 +4135,7 @@ class Pipe:
                                 elif has_paid_key:
                                     execution_order.append("paid")
                         else:
+                            # FIXME: Does it make sense if paid tier fallback is explicitly blocked?
                             # If model isn't free-eligible, jump straight to paid tiers.
                             # If no paid tier exists, we try free anyway to let the API return the specific error.
                             if can_use_vertex:
@@ -4296,6 +4388,6 @@ class Pipe:
                     f"Could not parse companion version string: '{companion_version}'. Version check skipped."
                 )
 
-    # endregion 2.7 Utility helpers
+    # endregion 1.7 Utility helpers
 
-    # endregion 2. Helper methods inside the Pipe class
+    # endregion 1. Helper methods inside the Pipe class
