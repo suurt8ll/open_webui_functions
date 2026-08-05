@@ -155,6 +155,7 @@ class VeniceParams(BaseModel):
     scale: float | None = None
     replication: float | None = None
     negative_prompt: str | None = None
+    variants: int | None = None
 
 
 # endregion Pydantic Models
@@ -242,8 +243,8 @@ class VeniceAPIClient:
         model_spec: VeniceImageModel,
         prompt: str,
         params: VeniceParams,
-    ) -> bytes:
-        """Processes text-to-image queries and returns the raw output file byte stream."""
+    ) -> list[bytes]:
+        """Processes text-to-image queries and returns a list of raw output image byte streams."""
         payload = self._prepare_generation_payload(model_spec, prompt, params)
         return await self._request_image("/image/generate", payload)
 
@@ -253,8 +254,8 @@ class VeniceAPIClient:
         prompt: str,
         image_url: str,
         params: VeniceParams,
-    ) -> bytes:
-        """Processes editing/inpainting queries and returns the raw output file byte stream."""
+    ) -> list[bytes]:
+        """Processes editing/inpainting queries and returns a list of raw output image byte streams."""
         payload = self._prepare_edit_payload(model_spec, prompt, image_url, params)
         return await self._request_image("/image/edit", payload)
 
@@ -262,7 +263,7 @@ class VeniceAPIClient:
         self,
         image_url: str,
         params: VeniceParams,
-    ) -> bytes:
+    ) -> list[bytes]:
         """
         Upscales or enhances an image based on the supplied parameters.
         Enforces strict validation bounding checks to protect against payload rejections.
@@ -284,32 +285,32 @@ class VeniceAPIClient:
         return await self._request_image("/image/upscale", payload)
 
     def _derive_dimensions_from_aspect_ratio(self, aspect_ratio: str) -> tuple[int, int]:
-            """
+        """
             Converts an aspect ratio string (e.g. '16:9') into pixel dimensions
             with the longer side fixed at 1280. Used for models that only accept
             raw width/height but the user configured an aspect ratio.
             """
-            try:
-                w_str, h_str = aspect_ratio.split(":")
-                ratio_w, ratio_h = int(w_str), int(h_str)
-                if ratio_w <= 0 or ratio_h <= 0:
-                    raise ValueError
-            except (ValueError, AttributeError):
-                log.warning(
+        try:
+            w_str, h_str = aspect_ratio.split(":")
+            ratio_w, ratio_h = int(w_str), int(h_str)
+            if ratio_w <= 0 or ratio_h <= 0:
+                raise ValueError
+        except (ValueError, AttributeError):
+            log.warning(
                     f"Could not parse aspect ratio '{aspect_ratio}' for dimension derivation. "
                     f"Falling back to 1:1 (1280x1280)."
                 )
-                return 1280, 1280
+            return 1280, 1280
 
-            base = 1280
-            if ratio_w >= ratio_h:
-                width = base
-                height = round(base * ratio_h / ratio_w)
-            else:
-                height = base
-                width = round(base * ratio_w / ratio_h)
+        base = 1280
+        if ratio_w >= ratio_h:
+            width = base
+            height = round(base * ratio_h / ratio_w)
+        else:
+            height = base
+            width = round(base * ratio_w / ratio_h)
 
-            return width, height
+        return width, height
 
     def _prepare_generation_payload(
         self, model_spec: VeniceImageModel, prompt: str, params: VeniceParams
@@ -330,6 +331,7 @@ class VeniceAPIClient:
             "hide_watermark": True,
             "return_binary": False,
             "format": "png",
+            "mbed_exif_metadata": True,
         }
 
         if params.negative_prompt is not None:
@@ -354,6 +356,14 @@ class VeniceAPIClient:
                 payload["steps"] = params.steps
         else:
             payload["steps"] = constraints.steps.default
+
+        if params.variants is not None:
+            variants = max(1, min(4, params.variants))
+            if variants != params.variants:
+                log.warning(
+                    f"Variants setting ({params.variants}) clamped to {variants}. Must be between 1 and 4."
+                )
+            payload["variants"] = variants
 
         if constraints.aspectRatios:
             log.debug(
@@ -522,10 +532,11 @@ class VeniceAPIClient:
         )
         return payload
 
-    async def _request_image(self, endpoint: str, payload: dict[str, Any]) -> bytes:
+    async def _request_image(self, endpoint: str, payload: dict[str, Any]) -> list[bytes]:
         """
         Executes raw POST requests and simplifies data streams. Unifies both API JSON outputs
         (extracting base64 image strings) and direct image binary streams into clean raw bytes.
+        Returns a list of decoded images; binary responses yield a single-element list.
         """
         try:
             async with aiohttp.ClientSession() as session:
@@ -558,7 +569,7 @@ class VeniceAPIClient:
                     content_type = response.headers.get("Content-Type", "")
 
                     if content_type.startswith("image/"):
-                        return await response.read()
+                        return [await response.read()]
 
                     # Venice default fallback parsing
                     json_data = await response.json()
@@ -569,7 +580,7 @@ class VeniceAPIClient:
                             "Venice API response did not contain any images."
                         )
 
-                    return base64.b64decode(images[0])
+                    return [base64.b64decode(img) for img in images]
 
         except aiohttp.ClientResponseError as e:
             raise VeniceAPIError(f"API request failed: {str(e)}") from e
@@ -692,6 +703,7 @@ _VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
     "ASPECT_RATIO": "Optional aspect ratio configuration for supported models (e.g. '1:1', '16:9').",
     "RESOLUTION": "Optional resolution tier for supported models (e.g. '1K', '2K').",
     "NEGATIVE PROMPT": "Optional negative prompt to steer the generation away from undesired features.",
+    "VARIANTS": "Number of image variants to generate per request (1-4). Only supported by text-to-image models, not inpaint or upscale.",
     "SAFE_MODE": "Enables content blurring for adult material generated by models.",
     "UPSCALER_SCALE": "The upscaling size multiplier. Real range values are strictly restricted between 1.0 and 4.0.",
     "UPSCALER_REPLICATION": "Controls how closely lines and patterns from the source are preserved (0.0 to 1.0).",
@@ -731,6 +743,7 @@ class _SharedValves(BaseModel):
     RESOLUTION: str | None = _admin_field("RESOLUTION")
     SAFE_MODE: bool | None = _admin_field("SAFE_MODE")
     NEGATIVE_PROMPT: str | None = _admin_field("NEGATIVE_PROMPT")
+    VARIANTS: int = _admin_field("VARIANTS", 1)
     UPSCALER_SCALE: float | None = _admin_field("UPSCALER_SCALE")
     UPSCALER_REPLICATION: float | None = _admin_field("UPSCALER_REPLICATION")
     EMISSION_VERBOSITY: Literal["disabled", "visible", "visible_timed"] = _admin_field(
@@ -910,6 +923,7 @@ class Pipe:
                 f"Target generation model parsed: {model_spec.id if model_spec else ''}, Prompt: {prompt}"
             )
 
+        emitter.emit_status("Preparing image parameters...", done=False)
         # Construct configuration overrides
         params = VeniceParams(
             cfg_scale=options.CFG_SCALE,
@@ -922,41 +936,46 @@ class Pipe:
             scale=options.UPSCALER_SCALE,
             replication=options.UPSCALER_REPLICATION,
             negative_prompt=options.NEGATIVE_PROMPT,
+            variants=options.VARIANTS,
         )
 
         client = VeniceAPIClient(options.VENICE_API_TOKEN)
 
-        emitter.emit_status("Preparing image parameters...", done=False)
-
         if is_upscale_task:
             emitter.emit_status("Processing upscale...", done=False)
+        elif is_edit_model:
+            emitter.emit_status("Processing edit...", done=False)
         else:
-            emitter.emit_status(
-                f"Processing {'edit' if is_edit_model else 'image'}...", done=False
-            )
+            num_variants = params.variants or 1
+            if num_variants > 1:
+                emitter.emit_status(f"Generating {num_variants} images...", done=False)
+            else:
+                emitter.emit_status("Generating image...", done=False)
 
-        image_bytes = None
+        image_bytes_list: list[bytes] = []
         try:
             if is_upscale_task:
                 assert image_url
-                image_bytes = await client.upscale_image(image_url, params)
+                image_bytes_list = await client.upscale_image(image_url, params)
             elif is_edit_model:
                 assert image_url and isinstance(model_spec, VeniceInpaintModel)
-                image_bytes = await client.edit_image(
+                image_bytes_list = await client.edit_image(
                     model_spec, prompt, image_url, params
                 )
             else:
                 assert isinstance(model_spec, VeniceImageModel)
-                image_bytes = await client.generate_image(model_spec, prompt, params)
+                image_bytes_list = await client.generate_image(model_spec, prompt, params)
         except VeniceAPIError as e:
-            status_text = f"Image generation failed"
-            emitter.emit_status(status_text, done=True)
+            emitter.emit_status("Image generation failed", done=True)
             await emitter.shutdown()
             raise e
 
-        log.info("Image request completed successfully!")
-        status_text = f"Image generation successful"
-        emitter.emit_status(status_text, done=True)
+        num_images = len(image_bytes_list)
+        log.info(f"Image request completed successfully! ({num_images} image(s) generated)")
+        if num_images > 1:
+            emitter.emit_status(f"Image generation successful ({num_images} images)", done=True)
+        else:
+            emitter.emit_status("Image generation successful", done=True)
 
         output_model_id = (
             "upscaler"
@@ -965,19 +984,25 @@ class Pipe:
         )
 
         if options.USE_FILES_API:
-            # TODO: catch errors and fall back to raw base64 if upload fails?
-            uploaded_url = await self._upload_image(
-                image_bytes,
-                "image/png",
-                output_model_id,
-                prompt,
-                __user__["id"],
-                __request__,
-            )
-            response = f"![Generated Image]({uploaded_url})"
+            uploaded_urls = []
+            for img_bytes in image_bytes_list:
+                # TODO: catch errors and fall-back to bytes?
+                url = await self._upload_image(
+                    img_bytes,
+                    "image/png",
+                    output_model_id,
+                    prompt,
+                    __user__["id"],
+                    __request__,
+                )
+                uploaded_urls.append(url)
+            response = "\n\n".join(f"![Generated Image]({url})" for url in uploaded_urls)
         else:
-            base64_image = base64.b64encode(image_bytes).decode("utf-8")
-            response = f"![Generated Image](data:image/png;base64,{base64_image})"
+            parts = []
+            for img_bytes in image_bytes_list:
+                base64_image = base64.b64encode(img_bytes).decode("utf-8")
+                parts.append(f"![Generated Image](data:image/png;base64,{base64_image})")
+            response = "\n\n".join(parts)
         await emitter.shutdown()
         return response
 
