@@ -15,7 +15,6 @@ version: 0.11.0
 
 # TODO: Negative prompts
 
-import inspect
 import io
 import mimetypes
 import os
@@ -49,6 +48,7 @@ log = logger.bind(auditable=False)
 
 
 # region Pydantic Models
+
 
 class VeniceStepsConstraint(BaseModel):
     """Represents min/max iteration bounds for image generation."""
@@ -157,7 +157,9 @@ class VeniceParams(BaseModel):
     scale: float | None = None
     replication: float | None = None
 
+
 # endregion Pydantic Models
+
 
 class VeniceAPIClient:
     """
@@ -326,9 +328,7 @@ class VeniceAPIClient:
         else:
             payload["steps"] = constraints.steps.default
 
-        supports_aspect_ratio = bool(constraints.aspectRatios)
-
-        if supports_aspect_ratio:
+        if constraints.aspectRatios:
             log.debug(
                 f"Model '{model_spec.id}' processes aspect ratios. Ignoring static width/height parameters."
             )
@@ -681,7 +681,7 @@ class _SharedValves(BaseModel):
     HEIGHT: int | None = _admin_field("HEIGHT")
     WIDTH: int | None = _admin_field("WIDTH")
     STEPS: int | None = _admin_field("STEPS")
-    CFG_SCALE: float | None = _admin_field("CFG_SCALE")
+    CFG_SCALE: int | None = _admin_field("CFG_SCALE")
     ASPECT_RATIO: str | None = _admin_field("ASPECT_RATIO")
     RESOLUTION: str | None = _admin_field("RESOLUTION")
     SAFE_MODE: bool | None = _admin_field("SAFE_MODE")
@@ -728,7 +728,7 @@ class Pipe:
         self.models: list[VeniceModel] = []
         log.success("Function has been initialized.")
 
-    async def pipes(self) -> list["ModelData"]:
+    async def pipes(self) -> list[dict[str, str]]:
         if self.models and self.valves.CACHE_MODELS:
             log.info("Models are already initialized. Returning mapped list.")
             mapped = [{"id": m.id, "name": m.model_spec.name} for m in self.models]
@@ -906,28 +906,27 @@ class Pipe:
                 f"Processing {'edit' if is_edit_model else 'image'}...", done=False
             )
 
+        image_bytes = None
         try:
             if is_upscale_task:
+                assert image_url
                 image_bytes = await client.upscale_image(image_url, params)
             elif is_edit_model:
+                assert image_url and isinstance(model_spec, VeniceInpaintModel)
                 image_bytes = await client.edit_image(
                     model_spec, prompt, image_url, params
                 )
             else:
+                assert isinstance(model_spec, VeniceImageModel)
                 image_bytes = await client.generate_image(model_spec, prompt, params)
-            success = True
         except VeniceAPIError as e:
-            log.error(str(e))
-            emitter.emit_completion_error(str(e))
-            success = False
-
-        status_text = f"Image {'processed' if success else 'failed'}"
-        emitter.emit_status(status_text, done=True)
-
-        if not success:
-            return None
+            status_text = f"Image generation failed"
+            emitter.emit_status(status_text, done=True)
+            raise e
 
         log.info("Image request completed successfully!")
+        status_text = f"Image generation successful"
+        emitter.emit_status(status_text, done=True)
 
         output_model_id = (
             "upscaler"
@@ -953,7 +952,7 @@ class Pipe:
 
     def _return_error_model(
         self, error_msg: str, warning: bool = False, exception: bool = True
-    ) -> "ModelData":
+    ) -> dict[str, str]:
         if warning:
             log.opt(depth=1, exception=False).warning(error_msg)
         else:
@@ -1028,21 +1027,9 @@ class Pipe:
         log.info("Uploading the model generated image to Open WebUI backend.")
         log.debug("Uploading to the configured storage provider.")
         try:
-            sig = inspect.signature(Storage.upload_file)
-            has_tags = "tags" in sig.parameters
-        except Exception as e:
-            log.error(f"Error checking Storage.upload_file signature: {e}")
-            has_tags = False
-
-        try:
-            if has_tags:
-                contents, image_path = await asyncio.to_thread(
-                    Storage.upload_file, image, imagename, tags={}
-                )
-            else:
-                contents, image_path = await asyncio.to_thread(
-                    Storage.upload_file, image, imagename
-                )
+            contents, image_path = await asyncio.to_thread(
+                Storage.upload_file, image, imagename, tags={}
+            )
         except Exception:
             error_msg = "Error occurred during upload to the storage provider."
             log.exception(error_msg)
@@ -1075,6 +1062,7 @@ class Pipe:
     # endregion 1.2 Image generation
 
     # endregion 1. Helper methods inside the Pipe class
+
 
 # region Option resolution
 
