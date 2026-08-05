@@ -13,9 +13,7 @@ version: 0.11.0
 # Feel free to contribute to the development of this function in my GitHub repository!
 # Currently it takes the last user message as prompt and generates an image using the selected model and returns it as a markdown image.
 
-# TODO: Use another LLM model to generate the image prompt?
 # TODO: Negative prompts
-# TODO: Upscaling
 
 import inspect
 import io
@@ -26,17 +24,21 @@ import asyncio
 import uuid
 import aiohttp
 import base64
+from loguru import logger
+from fastapi import Request
 from collections.abc import Awaitable, Callable
+from pydantic import BaseModel, Field, ValidationError, ConfigDict, create_model
 from typing import (
     Literal,
     Any,
+    Final,
     TYPE_CHECKING,
+    get_args,
+    get_origin,
 )
-from pydantic import BaseModel, Field, ValidationError
-from fastapi import Request
+
 from open_webui.models.files import Files, FileForm
 from open_webui.storage.provider import Storage
-from loguru import logger
 
 if TYPE_CHECKING:
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
@@ -45,6 +47,8 @@ if TYPE_CHECKING:
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.
 log = logger.bind(auditable=False)
 
+
+# region Pydantic Models
 
 class VeniceStepsConstraint(BaseModel):
     """Represents min/max iteration bounds for image generation."""
@@ -153,6 +157,7 @@ class VeniceParams(BaseModel):
     scale: float | None = None
     replication: float | None = None
 
+# endregion Pydantic Models
 
 class VeniceAPIClient:
     """
@@ -630,7 +635,12 @@ class EventEmitter:
         self._enqueue(event)
 
 
-_SHARED_VALVE_DESCS = {
+_VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
+    # Admin-Only
+    "VENICE_API_TOKEN": "Venice.ai API Token.",
+    "CACHE_MODELS": "Whether to request and cache available models only on initial load.",
+    "USE_FILES_API": "Save generated image files using Open WebUI's file storage API.",
+    # User-Configurable
     "HEIGHT": "Height of generated images in pixels.",
     "WIDTH": "Width of generated images in pixels.",
     "STEPS": "Number of inference and generation steps.",
@@ -641,12 +651,6 @@ _SHARED_VALVE_DESCS = {
     "UPSCALER_SCALE": "The upscaling size multiplier. Real range values are strictly restricted between 1.0 and 4.0.",
     "UPSCALER_REPLICATION": "Controls how closely lines and patterns from the source are preserved (0.0 to 1.0).",
     "EMISSION_VERBOSITY": "Control websocket emission verbosity.",
-}
-
-_ADMIN_VALVE_DESCS = {
-    "VENICE_API_TOKEN": "Venice.ai API Token.",
-    "CACHE_MODELS": "Whether to request and cache available models only on initial load.",
-    "USE_FILES_API": "Save generated image files using Open WebUI's file storage API.",
 }
 
 
@@ -660,167 +664,64 @@ def _format_valve_desc(text: str, default: Any = None, is_user: bool = False) ->
     return f"{text}\n\n**Default:** {formatted_default}{sep}"
 
 
-class Pipe:
-    class Valves(BaseModel):
-        VENICE_API_TOKEN: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _ADMIN_VALVE_DESCS["VENICE_API_TOKEN"], default=None
-            ),
-        )
-        HEIGHT: int = Field(
-            default=1024,
-            description=_format_valve_desc(_SHARED_VALVE_DESCS["HEIGHT"], default=1024),
-        )
-        WIDTH: int = Field(
-            default=1024,
-            description=_format_valve_desc(_SHARED_VALVE_DESCS["WIDTH"], default=1024),
-        )
-        STEPS: int = Field(
-            default=16,
-            description=_format_valve_desc(_SHARED_VALVE_DESCS["STEPS"], default=16),
-        )
-        CFG_SCALE: float = Field(
-            default=4.0,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["CFG_SCALE"], default=4.0
-            ),
-        )
-        ASPECT_RATIO: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["ASPECT_RATIO"], default=None
-            ),
-        )
-        RESOLUTION: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["RESOLUTION"], default=None
-            ),
-        )
-        SAFE_MODE: bool | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["SAFE_MODE"], default=None
-            ),
-        )
-        UPSCALER_SCALE: float = Field(
-            default=2.0,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["UPSCALER_SCALE"], default=2.0
-            ),
-        )
-        UPSCALER_REPLICATION: float = Field(
-            default=0.35,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["UPSCALER_REPLICATION"], default=0.35
-            ),
-        )
-        CACHE_MODELS: bool = Field(
-            default=True,
-            description=_format_valve_desc(
-                _ADMIN_VALVE_DESCS["CACHE_MODELS"], default=True
-            ),
-        )
-        EMISSION_VERBOSITY: Literal["disabled", "visible", "visible_timed"] = Field(
-            default="visible_timed",
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["EMISSION_VERBOSITY"], default="visible_timed"
-            ),
-        )
-        USE_FILES_API: bool = Field(
-            default=True,
-            description=_format_valve_desc(
-                _ADMIN_VALVE_DESCS["USE_FILES_API"], default=True
-            ),
-        )
+def _admin_field(
+    name: str, default: Any = None, admin_section_start: bool = False
+) -> Any:
+    """Helper to construct a Pydantic Field with default value and formatted admin description."""
+    raw_desc = _VALVE_DESCRIPTIONS.get(name, "")
+    desc = _format_valve_desc(raw_desc, default=default)
+    if admin_section_start:
+        desc = f"{desc}### Admin-Only Options"
+    return Field(default=default, description=desc)
 
-    class UserValves(BaseModel):
-        HEIGHT: int | None = Field(
-            default=None,
-            description=_format_valve_desc(_SHARED_VALVE_DESCS["HEIGHT"], is_user=True),
-        )
-        WIDTH: int | None = Field(
-            default=None,
-            description=_format_valve_desc(_SHARED_VALVE_DESCS["WIDTH"], is_user=True),
-        )
-        STEPS: int | None = Field(
-            default=None,
-            description=_format_valve_desc(_SHARED_VALVE_DESCS["STEPS"], is_user=True),
-        )
-        CFG_SCALE: float | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["CFG_SCALE"], is_user=True
-            ),
-        )
-        ASPECT_RATIO: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["ASPECT_RATIO"], is_user=True
-            ),
-        )
-        RESOLUTION: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["RESOLUTION"], is_user=True
-            ),
-        )
-        SAFE_MODE: bool | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["SAFE_MODE"], is_user=True
-            ),
-        )
-        UPSCALER_SCALE: float | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["UPSCALER_SCALE"], is_user=True
-            ),
-        )
-        UPSCALER_REPLICATION: float | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["UPSCALER_REPLICATION"], is_user=True
-            ),
-        )
-        EMISSION_VERBOSITY: Literal["disabled", "visible", "visible_timed"] | None = (
-            Field(
-                default=None,
-                description=_format_valve_desc(
-                    _SHARED_VALVE_DESCS["EMISSION_VERBOSITY"], is_user=True
-                ),
+
+class _SharedValves(BaseModel):
+    """Base model holding user-configurable options and shared field validators."""
+
+    HEIGHT: int | None = _admin_field("HEIGHT")
+    WIDTH: int | None = _admin_field("WIDTH")
+    STEPS: int | None = _admin_field("STEPS")
+    CFG_SCALE: float | None = _admin_field("CFG_SCALE")
+    ASPECT_RATIO: str | None = _admin_field("ASPECT_RATIO")
+    RESOLUTION: str | None = _admin_field("RESOLUTION")
+    SAFE_MODE: bool | None = _admin_field("SAFE_MODE")
+    UPSCALER_SCALE: float | None = _admin_field("UPSCALER_SCALE")
+    UPSCALER_REPLICATION: float | None = _admin_field("UPSCALER_REPLICATION")
+    EMISSION_VERBOSITY: Literal["disabled", "visible", "visible_timed"] = _admin_field(
+        "EMISSION_VERBOSITY", "visible_timed", admin_section_start=True
+    )
+
+
+def _generate_user_valves(shared_cls: type[BaseModel]) -> type[BaseModel]:
+    """Generates Pipe.UserValves model from _SharedValves with Optional fields and user descriptions."""
+    fields: dict[str, Any] = {}
+    for name, field_info in shared_cls.model_fields.items():
+        raw_desc = _VALVE_DESCRIPTIONS.get(name, "")
+        user_desc = _format_valve_desc(raw_desc, is_user=True)
+
+        ann = field_info.annotation
+        if get_origin(ann) is Literal:
+            args = get_args(ann)
+            user_ann = (
+                Literal[(*args, "")] | None if "" not in args else ann | None  # type: ignore[operator]
             )
-        )
-
-    @staticmethod
-    def _get_merged_valves(
-        default_valves: "Pipe.Valves",
-        user_valves: "Pipe.UserValves | dict[str, Any] | None",
-    ) -> "Pipe.Valves":
-        """Merges UserValves into a base Valves configuration.
-
-        If a field in UserValves is not None or an empty string, it overrides
-        the corresponding field in default_valves.
-        """
-        if user_valves is None:
-            return default_valves.model_copy(deep=True)
-
-        merged_data = default_valves.model_dump()
-
-        if isinstance(user_valves, dict):
-            for field_name, user_value in user_valves.items():
-                if user_value is not None and user_value != "":
-                    if field_name in merged_data:
-                        merged_data[field_name] = user_value
+        elif ann is not None:
+            user_ann = ann | None
         else:
-            for field_name in Pipe.UserValves.model_fields:
-                user_value = getattr(user_valves, field_name)
-                if user_value is not None and user_value != "":
-                    if field_name in merged_data:
-                        merged_data[field_name] = user_value
+            user_ann = Any
 
-        return Pipe.Valves(**merged_data)
+        fields[name] = (user_ann, Field(default=None, description=user_desc))
+
+    return create_model("UserValves", __base__=shared_cls, **fields)  # type: ignore[call-overload]
+
+
+class Pipe:
+    class Valves(_SharedValves):
+        VENICE_API_TOKEN: str | None = _admin_field("VENICE_API_TOKEN")
+        CACHE_MODELS: bool = _admin_field("CACHE_MODELS", True)
+        USE_FILES_API: bool = _admin_field("USE_FILES_API", True)
+
+    UserValves = _generate_user_valves(_SharedValves)
 
     def __init__(self):
         self.valves = self.Valves()
@@ -858,18 +759,22 @@ class Pipe:
 
     async def pipe(
         self,
-        body: dict,
+        body: "Body",
         __user__: "UserData",
         __request__: Request,
+        __metadata__: "Metadata",
         __event_emitter__: Callable[["Event"], Awaitable[None]],
-        __task__: str,
-        __metadata__: dict[str, Any],
     ) -> str | None:
 
-        user_valves = __user__.get("valves") if isinstance(__user__, dict) else None
-        valves = self._get_merged_valves(self.valves, user_valves)
+        options = _resolve_options(
+            self.valves,
+            __user__.get("valves") if isinstance(__user__, dict) else None,
+            __user__.get("email", "") if isinstance(__user__, dict) else "",
+            body,
+            __metadata__,
+        )
 
-        emitter = EventEmitter(__event_emitter__, verbosity=valves.EMISSION_VERBOSITY)
+        emitter = EventEmitter(__event_emitter__, verbosity=options.EMISSION_VERBOSITY)
 
         if "error" in __metadata__["model"]["id"]:
             error_msg = f'There has been an error during model retrieval phase: {str(__metadata__["model"])}'
@@ -877,7 +782,7 @@ class Pipe:
             emitter.emit_completion_error(error_msg)
             return
 
-        if not valves.VENICE_API_TOKEN:
+        if not options.VENICE_API_TOKEN:
             error_msg = "Missing VENICE_API_TOKEN in valves configuration."
             log.error(error_msg)
             emitter.emit_completion_error(error_msg)
@@ -907,12 +812,13 @@ class Pipe:
                 emitter.emit_completion_error(error_msg)
                 return
 
-        if __task__ == "title_generation":
+        task = __metadata__.get("task")
+        if task == "title_generation":
             log.warning(
                 "Detected title generation task! I do not know how to handle this so I'm returning something generic."
             )
             return '{"title": "🖼️ Image Generation"}'
-        if __task__ == "tags_generation":
+        if task == "tags_generation":
             log.warning(
                 "Detected tag generation task! I do not know how to handle this so I'm returning an empty list."
             )
@@ -978,18 +884,18 @@ class Pipe:
 
         # Construct configuration overrides
         params = VeniceParams(
-            cfg_scale=valves.CFG_SCALE,
-            safe_mode=valves.SAFE_MODE,
-            steps=valves.STEPS,
-            aspect_ratio=valves.ASPECT_RATIO,
-            resolution=valves.RESOLUTION,
-            width=valves.WIDTH,
-            height=valves.HEIGHT,
-            scale=valves.UPSCALER_SCALE,
-            replication=valves.UPSCALER_REPLICATION,
+            cfg_scale=options.CFG_SCALE,
+            safe_mode=options.SAFE_MODE,
+            steps=options.STEPS,
+            aspect_ratio=options.ASPECT_RATIO,
+            resolution=options.RESOLUTION,
+            width=options.WIDTH,
+            height=options.HEIGHT,
+            scale=options.UPSCALER_SCALE,
+            replication=options.UPSCALER_REPLICATION,
         )
 
-        client = VeniceAPIClient(valves.VENICE_API_TOKEN)
+        client = VeniceAPIClient(options.VENICE_API_TOKEN)
 
         emitter.emit_status("Preparing image parameters...", done=False)
 
@@ -1029,7 +935,7 @@ class Pipe:
             else (model_spec.id if model_spec else "unknown")
         )
 
-        if valves.USE_FILES_API:
+        if options.USE_FILES_API:
             uploaded_url = await self._upload_image(
                 image_bytes,
                 "image/png",
@@ -1169,3 +1075,135 @@ class Pipe:
     # endregion 1.2 Image generation
 
     # endregion 1. Helper methods inside the Pipe class
+
+# region Option resolution
+
+OPTION_SYNONYMS: Final[dict[str, str]] = {
+    "scale": "UPSCALER_SCALE",
+    "replication": "UPSCALER_REPLICATION",
+}
+
+USER_OVERRIDABLE_VALVE_FIELDS: Final[set[str]] = set(_SharedValves.model_fields.keys())
+ADMIN_ONLY_VALVE_FIELDS: Final[set[str]] = (
+    set(Pipe.Valves.model_fields.keys()) - USER_OVERRIDABLE_VALVE_FIELDS
+)
+
+_VALVE_FIELD_LOOKUP: Final[dict[str, str]] = {
+    field_name.lower(): field_name for field_name in Pipe.Valves.model_fields.keys()
+}
+
+_SYNONYM_LOOKUP: Final[dict[str, str]] = {
+    synonym.lower(): canonical_target
+    for synonym, canonical_target in OPTION_SYNONYMS.items()
+}
+
+
+def canonicalize_option_key(key: str) -> str:
+    """
+    Normalizes an option key using case-insensitive lookup against synonyms
+    and known valve fields. Returns the canonical key name or the stripped key if custom.
+    """
+    key_clean = key.strip()
+    key_lower = key_clean.lower()
+
+    if canonical := _SYNONYM_LOOKUP.get(key_lower):
+        return canonical
+
+    if canonical := _VALVE_FIELD_LOOKUP.get(key_lower):
+        return canonical
+
+    return key_clean
+
+
+class ResolvedOptions(Pipe.Valves):
+    """
+    Consolidated configuration combining Admin Valves, User Valves,
+    Model Advanced Params, and Chat Advanced Params according to priority.
+
+    Allows extra dynamic options defined at model or chat levels.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    def get_custom_params(self) -> dict[str, Any]:
+        """Returns extra parameters not defined in Pipe.Valves."""
+        valve_fields = set(Pipe.Valves.model_fields.keys())
+        return {k: v for k, v in self.model_dump().items() if k not in valve_fields}
+
+
+def _resolve_options(
+    admin_valves: Pipe.Valves,
+    user_valves: _SharedValves | None,
+    user_email: str,
+    body: "Body",
+    metadata: "Metadata",
+) -> ResolvedOptions:
+    """
+    Hierarchically resolves configuration options from 4 priority sources:
+    1. Admin Valves (Lowest priority)
+    2. User Valves
+    3. Model Page Advanced Params
+    4. Chat Side-Panel Advanced Params (Highest priority)
+
+    Admin-only options cannot be overridden by user-level sources.
+    Option keys and synonyms are normalized case-insensitively.
+    """
+    # Priority 1: Base options from Admin Valves
+    merged_data = admin_valves.model_dump()
+
+    # Priority 2: User Valves (user-overridable fields only)
+    if user_valves is not None:
+        for field_name in USER_OVERRIDABLE_VALVE_FIELDS:
+            user_val = getattr(user_valves, field_name, None)
+            if user_val is not None and user_val != "":
+                merged_data[field_name] = user_val
+
+    # Priority 3: Model Page Advanced Params
+    known_body_keys = {
+        "stream",
+        "model",
+        "messages",
+        "files",
+        "options",
+        "stream_options",
+    }
+    model_params = {k: v for k, v in body.items() if k not in known_body_keys}
+    if isinstance(body.get("options"), dict):
+        for opt_k, opt_v in body["options"].items():  # type: ignore[reportTypedDictNotRequiredAccess]
+            if opt_k not in model_params:
+                model_params[opt_k] = opt_v
+
+    for raw_key, val in model_params.items():
+        if val is None or val == "":
+            continue
+        canonical_key = canonicalize_option_key(raw_key)
+        if canonical_key in ADMIN_ONLY_VALVE_FIELDS:
+            log.warning(
+                f"Model parameter '{raw_key}' attempts to override admin-only valve '{canonical_key}'. Ignoring override."
+            )
+            continue
+        merged_data[canonical_key] = val
+
+    # Priority 4: Chat Side-Panel Advanced Params (Skipped for task models)
+    if not metadata.get("task"):
+        chat_params = metadata.get("chat_control_params", {})
+        if isinstance(chat_params, dict):
+            for raw_key, val in chat_params.items():
+                if val is None or val == "":
+                    continue
+                canonical_key = canonicalize_option_key(raw_key)
+                if canonical_key in ADMIN_ONLY_VALVE_FIELDS:
+                    log.warning(
+                        f"Chat parameter '{raw_key}' attempts to override admin-only valve '{canonical_key}'. Ignoring override."
+                    )
+                    continue
+                merged_data[canonical_key] = val
+    else:
+        log.debug(
+            f"Task model detected ('{metadata.get('task')}'). Chat side-panel parameters ignored."
+        )
+
+    return ResolvedOptions(**merged_data)
+
+
+# endregion Option resolution
