@@ -283,6 +283,34 @@ class VeniceAPIClient:
 
         return await self._request_image("/image/upscale", payload)
 
+    def _derive_dimensions_from_aspect_ratio(self, aspect_ratio: str) -> tuple[int, int]:
+            """
+            Converts an aspect ratio string (e.g. '16:9') into pixel dimensions
+            with the longer side fixed at 1280. Used for models that only accept
+            raw width/height but the user configured an aspect ratio.
+            """
+            try:
+                w_str, h_str = aspect_ratio.split(":")
+                ratio_w, ratio_h = int(w_str), int(h_str)
+                if ratio_w <= 0 or ratio_h <= 0:
+                    raise ValueError
+            except (ValueError, AttributeError):
+                log.warning(
+                    f"Could not parse aspect ratio '{aspect_ratio}' for dimension derivation. "
+                    f"Falling back to 1:1 (1280x1280)."
+                )
+                return 1280, 1280
+
+            base = 1280
+            if ratio_w >= ratio_h:
+                width = base
+                height = round(base * ratio_h / ratio_w)
+            else:
+                height = base
+                width = round(base * ratio_w / ratio_h)
+
+            return width, height
+
     def _prepare_generation_payload(
         self, model_spec: VeniceImageModel, prompt: str, params: VeniceParams
     ) -> dict[str, Any]:
@@ -368,8 +396,20 @@ class VeniceAPIClient:
         else:
             log.debug(f"Model '{model_spec.id}' utilizes raw dimensions.")
 
-            user_width = params.width if params.width is not None else 1024
-            user_height = params.height if params.height is not None else 1024
+            if params.width is not None or params.height is not None:
+                user_width = params.width if params.width is not None else 1024
+                user_height = params.height if params.height is not None else 1024
+            elif params.aspect_ratio is not None:
+                user_width, user_height = self._derive_dimensions_from_aspect_ratio(
+                    params.aspect_ratio
+                )
+                log.info(
+                    f"Model '{model_spec.id}' does not support aspect ratios natively. "
+                    f"Derived dimensions {user_width}x{user_height} from aspect ratio '{params.aspect_ratio}'."
+                )
+            else:
+                user_width, user_height = 1024, 1024
+
             max_limit = 1280
 
             if user_width > max_limit or user_height > max_limit:
