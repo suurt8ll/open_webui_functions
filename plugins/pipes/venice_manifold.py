@@ -632,11 +632,13 @@ class EventEmitter:
     async def shutdown(self) -> None:
         """Gracefully halts the worker and waits for remaining events to drain."""
         if self._worker_task and not self._worker_task.done():
+            log.debug("Shutting down EventEmitter worker task.")
             self._queue.put_nowait(None)
             try:
                 await self._worker_task
+                log.debug("EventEmitter worker task has been shut down successfully.")
             except asyncio.CancelledError:
-                pass
+                log.debug("EventEmitter worker task was cancelled during shutdown.")
 
     def emit_status(
         self, description: str, done: bool = False, hidden: bool = False
@@ -808,7 +810,7 @@ class Pipe:
         __request__: Request,
         __metadata__: "Metadata",
         __event_emitter__: Callable[["Event"], Awaitable[None]],
-    ) -> str | None:
+    ) -> str:
 
         options = _resolve_options(
             self.valves,
@@ -822,15 +824,11 @@ class Pipe:
 
         if "error" in __metadata__["model"]["id"]:
             error_msg = f'There has been an error during model retrieval phase: {str(__metadata__["model"])}'
-            log.error(error_msg)
-            emitter.emit_completion_error(error_msg)
-            return
+            raise RuntimeError(error_msg)
 
         if not options.VENICE_API_TOKEN:
             error_msg = "Missing VENICE_API_TOKEN in valves configuration."
-            log.error(error_msg)
-            emitter.emit_completion_error(error_msg)
-            return
+            raise RuntimeError(error_msg)
 
         selected_model_id = body.get("model", "").split(".", 1)[-1]
 
@@ -841,9 +839,7 @@ class Pipe:
             error_msg = (
                 "Image generation blocked: Venice models cache has not been populated."
             )
-            log.error(error_msg)
-            emitter.emit_completion_error(error_msg)
-            return
+            raise RuntimeError(error_msg)
 
         model_spec = None
         if not is_upscale_task:
@@ -852,9 +848,7 @@ class Pipe:
             )
             if not model_spec:
                 error_msg = f"Requested model '{selected_model_id}' was not found in the initialized Venice models list."
-                log.error(error_msg)
-                emitter.emit_completion_error(error_msg)
-                return
+                raise RuntimeError(error_msg)
 
         task = __metadata__.get("task")
         if task == "title_generation":
@@ -879,16 +873,12 @@ class Pipe:
 
         if not last_user_message:
             error_msg = "No user message found to process."
-            log.error(error_msg)
-            emitter.emit_completion_error(error_msg)
-            return
+            raise ValueError(error_msg)
 
         content = last_user_message.get("content")
         if not content:
             error_msg = "User message has empty or missing content."
-            log.error(error_msg)
-            emitter.emit_completion_error(error_msg)
-            return
+            raise ValueError(error_msg)
 
         prompt, image_url = self._extract_media_from_message(content)
 
@@ -896,17 +886,13 @@ class Pipe:
         if is_upscale_task:
             if not image_url:
                 error_msg = "Requested upscaling requires an attached image, but none was provided."
-                log.error(error_msg)
-                emitter.emit_completion_error(error_msg)
-                return
+                raise ValueError(error_msg)
             # Provide a generic visual target prompt to prevent blank parameters down the line
             prompt = prompt or "Upscaled Image"
         else:
             if not prompt:
                 error_msg = "No valid text prompt found in the user's message."
-                log.error(error_msg)
-                emitter.emit_completion_error(error_msg)
-                return
+                raise ValueError(error_msg)
 
         is_edit_model = model_spec.type == "inpaint" if model_spec else False
 
@@ -915,9 +901,7 @@ class Pipe:
         elif is_edit_model:
             if not image_url:
                 error_msg = f"Requested editing model '{selected_model_id}' requires an attached image, but none was provided."
-                log.error(error_msg)
-                emitter.emit_completion_error(error_msg)
-                return
+                raise ValueError(error_msg)
             log.debug(
                 f"Target edit model parsed: {model_spec.id if model_spec else ''}, Prompt: {prompt}, Image: [Present]"
             )
@@ -967,6 +951,7 @@ class Pipe:
         except VeniceAPIError as e:
             status_text = f"Image generation failed"
             emitter.emit_status(status_text, done=True)
+            await emitter.shutdown()
             raise e
 
         log.info("Image request completed successfully!")
@@ -980,6 +965,7 @@ class Pipe:
         )
 
         if options.USE_FILES_API:
+            # TODO: catch errors and fall back to raw base64 if upload fails?
             uploaded_url = await self._upload_image(
                 image_bytes,
                 "image/png",
@@ -988,10 +974,12 @@ class Pipe:
                 __user__["id"],
                 __request__,
             )
-            return f"![Generated Image]({uploaded_url})" if uploaded_url else None
+            response = f"![Generated Image]({uploaded_url})"
         else:
             base64_image = base64.b64encode(image_bytes).decode("utf-8")
-            return f"![Generated Image](data:image/png;base64,{base64_image})"
+            response = f"![Generated Image](data:image/png;base64,{base64_image})"
+        await emitter.shutdown()
+        return response
 
     # region 1. Helper methods inside the Pipe class
 
@@ -1058,7 +1046,7 @@ class Pipe:
         prompt: str,
         user_id: str,
         __request__: Request,
-    ) -> str | None:
+    ) -> str:
         image_format = mimetypes.guess_extension(mime_type)
         id = str(uuid.uuid4())
         name = os.path.basename(f"generated-image{image_format}")
@@ -1071,14 +1059,13 @@ class Pipe:
 
         log.info("Uploading the model generated image to Open WebUI backend.")
         log.debug("Uploading to the configured storage provider.")
+
         try:
             contents, image_path = await asyncio.to_thread(
                 Storage.upload_file, image, imagename, tags={}
             )
-        except Exception:
-            error_msg = "Error occurred during upload to the storage provider."
-            log.exception(error_msg)
-            return None
+        except Exception as e:
+            raise Exception(f"Failed to upload the image to storage: {str(e)}") from e
 
         log.info("Adding the image file to Open WebUI files database.")
         file_item = await Files.insert_new_file(
@@ -1096,8 +1083,9 @@ class Pipe:
             ),
         )
         if not file_item:
-            log.warning("Files.insert_new_file did not return anything.")
-            return None
+            raise ValueError(
+                "Failed to insert new file. Files.insert_new_file did not return anything."
+            )
 
         image_url: str = __request__.app.url_path_for(
             "get_file_content_by_id", id=file_item.id
