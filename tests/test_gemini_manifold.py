@@ -36,9 +36,12 @@ sys.modules["open_webui.utils.misc"] = mock_misc_module
 from plugins.pipes.gemini_manifold import (
     Pipe,
     GeminiContentBuilder,
+    _resolve_options,
     types as gemini_types,
 )  # gemini_types is google.genai.types
 from plugins.filters.gemini_manifold_companion import EventEmitter
+
+# FIXME: resolve Pylance complaints
 
 # region Test Constants
 # General Users
@@ -270,8 +273,8 @@ def test_user_must_auth_no_user_key_provided_errors(pipe_instance_fixture):
     user_valves_instance = Pipe.UserValves(
         GEMINI_FREE_API_KEY=None, GEMINI_PAID_API_KEY=None
     )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED, body={}, metadata={}
     )
 
     with pytest.raises(
@@ -301,8 +304,8 @@ def test_user_must_auth_user_provides_gemini_key_uses_user_creds(pipe_instance_f
         GEMINI_PAID_API_KEY=None,
         GEMINI_API_BASE_URL=USER_GEMINI_BASE_URL,
     )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED, body={}, metadata={}
     )
 
     pipe._get_user_client(merged_valves, USER_EMAIL_UNPRIVILEGED)
@@ -333,8 +336,8 @@ def test_user_must_auth_user_tries_vertex_no_user_gemini_key_errors(
         GEMINI_FREE_API_KEY=None,
         GEMINI_PAID_API_KEY=None,
     )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED, body={}, metadata={}
     )
 
     assert merged_valves.USE_VERTEX_AI is False
@@ -369,8 +372,8 @@ def test_user_must_auth_user_tries_vertex_with_user_gemini_key_falls_back(
         GEMINI_PAID_API_KEY=USER_PAID_KEY,
         GEMINI_API_BASE_URL=USER_GEMINI_BASE_URL,
     )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED, body={}, metadata={}
     )
 
     assert merged_valves.USE_VERTEX_AI is False
@@ -403,8 +406,8 @@ def test_whitelist_user_no_uservalves_uses_admin_gemini_config(pipe_instance_fix
     pipe.valves.USE_VERTEX_AI = False
 
     user_valves_instance = Pipe.UserValves()
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED, body={}, metadata={}
     )
 
     pipe._get_user_client(merged_valves, USER_EMAIL_WHITELISTED)
@@ -429,8 +432,8 @@ def test_whitelist_user_no_uservalves_uses_admin_vertex_config(pipe_instance_fix
     pipe.valves.VERTEX_PROJECT = ADMIN_VERTEX_PROJECT
 
     user_valves_instance = Pipe.UserValves()
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED, body={}, metadata={}
     )
 
     pipe._get_user_client(merged_valves, USER_EMAIL_WHITELISTED)
@@ -459,8 +462,8 @@ def test_whitelist_user_provides_own_gemini_key_overrides_admin(pipe_instance_fi
     pipe.valves.GEMINI_PAID_API_KEY = "admin_paid_key_to_be_overridden"
 
     user_valves_instance = Pipe.UserValves(GEMINI_PAID_API_KEY=USER_PAID_KEY)
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED, body={}, metadata={}
     )
 
     pipe._get_user_client(merged_valves, USER_EMAIL_WHITELISTED)
@@ -492,8 +495,8 @@ def test_user_opts_out_of_admin_vertex_to_user_gemini(pipe_instance_fixture):
         GEMINI_FREE_API_KEY=USER_FREE_KEY,
         GEMINI_API_BASE_URL=USER_GEMINI_BASE_URL,
     )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_REGULAR
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_REGULAR, body={}, metadata={}
     )
 
     pipe._get_user_client(merged_valves, USER_EMAIL_REGULAR)
@@ -520,8 +523,8 @@ def test_user_opts_in_to_vertex_from_admin_gemini(pipe_instance_fixture):
         VERTEX_PROJECT=USER_VERTEX_PROJECT,
         VERTEX_LOCATION=USER_VERTEX_LOCATION,
     )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_REGULAR
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_REGULAR, body={}, metadata={}
     )
 
     pipe._get_user_client(merged_valves, USER_EMAIL_REGULAR)
@@ -595,8 +598,8 @@ async def test_paid_api_toggle_selects_correct_key(
         pipe, "_get_user_client", wraps=pipe._get_user_client
     ), patch.object(
         pipe, "_check_companion_filter_version"
-    ), patch.object(
-        pipe, "_get_merged_valves", return_value=pipe.valves
+    ), patch(
+        "plugins.pipes.gemini_manifold._resolve_options", return_value=pipe.valves
     ):
         try:
             # We expect this to get quite far now with the fixed metadata
@@ -610,8 +613,6 @@ async def test_paid_api_toggle_selects_correct_key(
             # Still catching exceptions as we aren't mocking the full builder/network stack
             pass
 
-        # Update: Pipe now adds 'merged_custom_params' to metadata before checking toggles.
-        # We check that the toggle was called with the model ID present.
         assert mock_toggle_status.called
         args, _ = mock_toggle_status.call_args
         assert args[0] == "gemini_paid_api"
@@ -669,7 +670,7 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
         metadata_body={"chat_id": "test_chat_id"},  # type: ignore
         user_data=mock_user_data,  # type: ignore
         event_emitter=mock_event_emitter,
-        valves=pipe_instance.valves,
+        options=pipe_instance.valves,
         files_api_manager=mock_files_api_manager,  # Pass the new mock
     )
 
@@ -740,7 +741,7 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
         metadata_body={"chat_id": "test_chat_id"},  # type: ignore
         user_data=mock_user_data,  # type: ignore
         event_emitter=mock_event_emitter,
-        valves=pipe_instance.valves,
+        options=pipe_instance.valves,
         files_api_manager=mock_files_api_manager,  # Pass the new mock
     )
 
@@ -868,7 +869,7 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
         },
         user_data=mock_user_data,  # type: ignore
         event_emitter=mock_event_emitter,
-        valves=pipe_instance.valves,
+        options=pipe_instance.valves,
         files_api_manager=mock_files_api_manager,
     )
 
