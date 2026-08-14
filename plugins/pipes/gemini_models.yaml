@@ -44,6 +44,44 @@ gemini-3.1-flash-lite-image:
       - up_to_tokens: null
         price_per_million: 30.00
 
+gemini-3.7-flash:
+  description: "Our most intelligent workhorse Flash model, refining Gemini 3.6 Flash with algorithmic improvements to its reasoning foundation for stronger software engineering, document-heavy knowledge work, and web development, with customizable thinking to balance quality, cost, and latency."
+  knowledge_cutoff: "2026-03"
+  latest_update: "2026-08"
+  supported_data_types:
+    inputs: [Text, Image, Video, Audio, PDF]
+    outputs: [Text]
+  tokens:
+    input: 1048576
+    output: 65536
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: true
+    code_execution: true
+    file_search: true
+    function_calling: true
+    grounding_google_maps: true
+    image_generation: false
+    live_api: false
+    search_grounding: true
+    structured_outputs: true
+    thinking: true
+    url_context: true
+  pricing:
+    free_tier: true
+    excluded_features: [search_grounding, grounding_google_maps]
+    # Introductory pricing through 2026-12-31; standard pricing from 2027-01-01 is input 1.50, output 7.50, caching 0.15.
+    input:
+      - up_to_tokens: null
+        price_per_million: 0.75
+    output:
+      - up_to_tokens: null
+        price_per_million: 3.75
+    caching:
+      - up_to_tokens: null
+        price_per_million: 0.075
+
 gemini-3.6-flash:
   description: "Our most token-efficient Flash model, combining frontier intelligence with strong agentic, coding, and search performance while using significantly fewer output tokens than Gemini 3.5 Flash, at a lower price."
   knowledge_cutoff: "2026-03"
