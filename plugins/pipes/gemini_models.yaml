@@ -6,6 +6,44 @@
 
 
 
+gemini-3.8-flash:
+  description: "Gemini 3.8 Flash is our most intelligent Flash model, engineered for long-horizon software engineering, autonomous agents, and complex enterprise workflows—all with the speed and cost efficiency of Flash."
+  knowledge_cutoff: "2026-03"
+  latest_update: "2026-09"
+  supported_data_types:
+    inputs: [Text, Image, Video, Audio, PDF]
+    outputs: [Text]
+  tokens:
+    input: 1048576
+    output: 65536
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: true
+    code_execution: true
+    file_search: true
+    function_calling: true
+    grounding_google_maps: true
+    image_generation: false
+    live_api: false
+    search_grounding: true
+    structured_outputs: true
+    thinking: true
+    url_context: true
+  pricing:
+    free_tier: true
+    excluded_features: [search_grounding, grounding_google_maps]
+    # Introductory pricing through 2026-12-31; standard pricing from 2027-01-01 is input 1.50, output 7.50, caching 0.15.
+    input:
+      - up_to_tokens: null
+        price_per_million: 0.75
+    output:
+      - up_to_tokens: null
+        price_per_million: 3.75
+    caching:
+      - up_to_tokens: null
+        price_per_million: 0.075
+
 gemini-3.1-flash-lite-image:
   description: "Our smallest and most cost effective image generation and editing model, built for at scale usage."
   knowledge_cutoff: "2025-01"
@@ -45,7 +83,7 @@ gemini-3.1-flash-lite-image:
         price_per_million: 30.00
 
 gemini-3.7-flash:
-  description: "Our most intelligent workhorse Flash model, refining Gemini 3.6 Flash with algorithmic improvements to its reasoning foundation for stronger software engineering, document-heavy knowledge work, and web development, with customizable thinking to balance quality, cost, and latency."
+  description: "Gemini 3.7 Flash is the next iteration in the Gemini 3 series of highly-capable, natively multimodal, reasoning models."
   knowledge_cutoff: "2026-03"
   latest_update: "2026-08"
   supported_data_types:
