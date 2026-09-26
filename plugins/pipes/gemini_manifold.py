@@ -26,6 +26,50 @@ RECOMMENDED_COMPANION_VERSION = "2.1.0"
 # This is a helper function that provides a manifold for Google's Gemini Studio API and Vertex AI.
 # Be sure to check out my GitHub repository for more information! Contributions, questions and suggestions are very welcome.
 
+import importlib.metadata
+import sys
+
+
+def _unload_stale_modules() -> None:
+    """
+    Open WebUI pip installs frontmatter `requirements` into the already running server, which can replace
+    packages on disk while their old versions are still in `sys.modules`. Importing `google.genai` would then
+    mix modules from both versions and fail, e.g. with `cannot import name 'OP_BINARY' from 'websockets.frames'`
+    (`google-genai` requires `websockets<17`, so pip downgrades it) or with
+    `module 'google.genai.types' has no attribute ...` (`google-genai` itself got upgraded).
+    Dropping the stale modules makes the import load a consistent set of modules from disk.
+    Code that already imported the old modules (e.g. uvicorn) keeps its own references to them.
+    """
+    unloaded = False
+    # Distribution name, package name and the module whose `__version__` tells which version is loaded.
+    for distribution, package, version_module in (
+        ("websockets", "websockets", "websockets"),
+        ("google-genai", "google.genai", "google.genai.version"),
+    ):
+        loaded = sys.modules.get(version_module)
+        if loaded is None:
+            continue
+        try:
+            installed_version = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        if getattr(loaded, "__version__", None) == installed_version:
+            continue
+        for name in [n for n in sys.modules if n == package or n.startswith(f"{package}.")]:
+            del sys.modules[name]
+        # `from google import genai` would otherwise still return the old module set on the parent package.
+        parent_name, _, child = package.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None and hasattr(parent, child):
+            delattr(parent, child)
+        unloaded = True
+    if unloaded:
+        importlib.invalidate_caches()
+
+
+# Must run before `google.genai` is imported.
+_unload_stale_modules()
+
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
