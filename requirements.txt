@@ -1,7 +1,6 @@
-google-genai==1.65.0
-fastapi==0.118.0
-loguru==0.7.3
-
+google-genai==2.14.0
+fastapi
+loguru
 pytest
 pytest-asyncio
 pydantic
@@ -13,3 +12,4 @@ xxhash
 google-cloud-storage
 google-api-core
 pyyaml
+watchfiles

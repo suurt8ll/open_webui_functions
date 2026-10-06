@@ -6,46 +6,38 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 0.10.1
+version: 0.11.0
 """
 
 # NB! This is work in progress and not yet fully featured.
 # Feel free to contribute to the development of this function in my GitHub repository!
 # Currently it takes the last user message as prompt and generates an image using the selected model and returns it as a markdown image.
 
-# TODO: Use another LLM model to generate the image prompt?
-# TODO: Negative prompts
-# TODO: Upscaling
-
-import copy
-import inspect
 import io
-import json
 import mimetypes
 import os
-import sys
 import time
 import asyncio
 import uuid
 import aiohttp
 import base64
-from collections.abc import Awaitable, Callable
-from typing import (
-    Any,
-    Literal,
-    TYPE_CHECKING,
-)
-from pydantic import BaseModel, Field
-from fastapi import Request
-import pydantic_core
-from open_webui.models.files import Files, FileForm
-from open_webui.models.functions import Functions
-from open_webui.storage.provider import Storage
 from loguru import logger
+from fastapi import Request
+from collections.abc import Awaitable, Callable
+from pydantic import BaseModel, Field, ValidationError, ConfigDict, create_model
+from typing import (
+    Literal,
+    Any,
+    Final,
+    TYPE_CHECKING,
+    get_args,
+    get_origin,
+)
+
+from open_webui.models.files import Files, FileForm
+from open_webui.storage.provider import Storage
 
 if TYPE_CHECKING:
-    from loguru import Record
-    from loguru._handler import Handler  # type: ignore
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 
@@ -53,212 +45,972 @@ if TYPE_CHECKING:
 log = logger.bind(auditable=False)
 
 
+# region Pydantic Models
+
+
+class VeniceStepsConstraint(BaseModel):
+    """Represents min/max iteration bounds for image generation."""
+
+    default: int
+    max: int
+
+
+class VeniceImageConstraints(BaseModel):
+    """
+    Validation schema mapping standard text-to-image constraints.
+    Some models omit resolutions or aspect ratios; these are mapped to optional fields.
+    """
+
+    promptCharacterLimit: int
+    steps: VeniceStepsConstraint
+    widthHeightDivisor: int
+    aspectRatios: list[str] | None = None
+    defaultAspectRatio: str | None = None
+    resolutions: list[str] | None = None
+    defaultResolution: str | None = None
+
+
+class VeniceImageModelSpec(BaseModel):
+    """Houses human-readable metadata and operational bounds for text-to-image models."""
+
+    name: str
+    constraints: VeniceImageConstraints
+
+
+class VeniceImageModel(BaseModel):
+    """
+    Root validator matching Venice's standard text-to-image metadata schema.
+    We strictly assert the type criteria to enforce standard pipeline routing.
+    """
+
+    id: str
+    object: Literal["model"]
+    type: Literal["image"]
+    model_spec: VeniceImageModelSpec
+
+
+class VeniceInpaintConstraints(BaseModel):
+    """
+    Validation schema mapping image editing/inpainting constraints.
+    Edit models process tasks differently and require aspect ratio support without raw step limits.
+    """
+
+    promptCharacterLimit: int
+    aspectRatios: list[str]  # Enforced as mandatory for inpaint models
+    defaultAspectRatio: str | None = None
+    resolutions: list[str] | None = None
+    defaultResolution: str | None = None
+    combineImages: bool | None = None
+    singleImageAspectRatio: bool | None = None
+
+
+class VeniceInpaintModelSpec(BaseModel):
+    """Houses human-readable metadata and operational bounds for image editing/inpainting models."""
+
+    name: str
+    constraints: VeniceInpaintConstraints
+
+
+class VeniceInpaintModel(BaseModel):
+    """
+    Root validator matching Venice's image editing metadata schema.
+    Asserts the type criteria to enforce editing pipeline routing.
+    """
+
+    id: str
+    object: Literal["model"]
+    type: Literal["inpaint"]
+    model_spec: VeniceInpaintModelSpec
+
+
+# A Type Alias representing either a standard or edit model.
+# Enables clean union handling across validation and payload steps.
+VeniceModel = VeniceImageModel | VeniceInpaintModel
+
+
+class VeniceAPIError(Exception):
+    """
+    Custom exception representing transport or operational failures when communicating
+    with the Venice.ai API. Decouples client exceptions from Open WebUI websocket handlers.
+    """
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class VeniceParams(BaseModel):
+    """
+    Unified transfer schema containing generation and rendering configurations.
+    Protects the API client from direct dependencies on Open WebUI Valve variables.
+    """
+
+    cfg_scale: int | None = None
+    safe_mode: bool | None = None
+    steps: int | None = None
+    aspect_ratio: str | None = None
+    resolution: str | None = None
+    width: int | None = None
+    height: int | None = None
+    scale: float | None = None
+    replication: float | None = None
+    negative_prompt: str | None = None
+    variants: int | None = None
+
+
+# endregion Pydantic Models
+
+
+class VeniceAPIClient:
+    """
+    Dedicated client managing transport payloads, validation checks, endpoints,
+    and model mapping tasks directly targeting the Venice.ai REST endpoints.
+    """
+
+    def __init__(self, api_token: str):
+        self.api_token = api_token
+        self.base_url = "https://api.venice.ai/api/v1"
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_token}"}
+
+    async def get_models(self) -> list[VeniceModel]:
+        """
+        Retrieves and parses image and inpaint models strictly utilizing Pydantic.
+        Invalid schemas are skipped and reported to prevent runtime errors in subsequent steps.
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{self.base_url}/models?type=all",
+                    headers=self._headers(),
+                ) as response:
+                    if response.status != 200:
+                        raise VeniceAPIError(
+                            f"Failed to fetch models: HTTP {response.status}"
+                        )
+
+                    raw_models_data = await response.json()
+                    raw_models = raw_models_data.get("data", [])
+
+                    if not raw_models:
+                        log.warning("Venice API returned no models.")
+                        return []
+
+                    valid_models: list[VeniceModel] = []
+                    for model_dict in raw_models:
+                        m_type = model_dict.get("type")
+                        if m_type == "image":
+                            try:
+                                validated = VeniceImageModel.model_validate(model_dict)
+                                valid_models.append(validated)
+                            except ValidationError as e:
+                                log.warning(
+                                    f"Skipping malformed image model '{model_dict.get('id', 'UNKNOWN')}'. "
+                                    f"Validation failed: {e.errors()}"
+                                )
+                        elif m_type == "inpaint":
+                            try:
+                                constraints = model_dict.get("model_spec", {}).get(
+                                    "constraints", {}
+                                )
+                                if (
+                                    "aspectRatios" not in constraints
+                                    or not constraints["aspectRatios"]
+                                ):
+                                    log.warning(
+                                        f"Skipping inpaint model '{model_dict.get('id')}': Missing or empty aspectRatios constraint."
+                                    )
+                                    continue
+
+                                validated = VeniceInpaintModel.model_validate(
+                                    model_dict
+                                )
+                                valid_models.append(validated)
+                            except ValidationError as e:
+                                log.warning(
+                                    f"Skipping malformed inpaint model '{model_dict.get('id', 'UNKNOWN')}'. "
+                                    f"Validation failed: {e.errors()}"
+                                )
+                    return valid_models
+        except Exception as e:
+            if not isinstance(e, VeniceAPIError):
+                raise VeniceAPIError(f"Failed to retrieve models: {str(e)}") from e
+            raise
+
+    async def generate_image(
+        self,
+        model_spec: VeniceImageModel,
+        prompt: str,
+        params: VeniceParams,
+    ) -> list[bytes]:
+        """Processes text-to-image queries and returns a list of raw output image byte streams."""
+        payload = self._prepare_generation_payload(model_spec, prompt, params)
+        return await self._request_image("/image/generate", payload)
+
+    async def edit_image(
+        self,
+        model_spec: VeniceInpaintModel,
+        prompt: str,
+        image_url: str,
+        params: VeniceParams,
+    ) -> list[bytes]:
+        """Processes editing/inpainting queries and returns a list of raw output image byte streams."""
+        payload = self._prepare_edit_payload(model_spec, prompt, image_url, params)
+        return await self._request_image("/image/edit", payload)
+
+    async def upscale_image(
+        self,
+        image_url: str,
+        params: VeniceParams,
+    ) -> list[bytes]:
+        """
+        Upscales or enhances an image based on the supplied parameters.
+        Enforces strict validation bounding checks to protect against payload rejections.
+        """
+        # Range validations conforming directly with Venice's specification
+        scale = params.scale if params.scale is not None else 2.0
+        scale = max(1.0, min(4.0, scale))
+
+        replication = params.replication if params.replication is not None else 0.35
+        replication = max(0.0, min(1.0, replication))
+
+        payload: dict[str, Any] = {
+            "image": self._clean_image_payload(image_url),
+            "enhance": False,  # Enhancer disabled statically as requested
+            "scale": scale,
+            "replication": replication,
+        }
+
+        return await self._request_image("/image/upscale", payload)
+
+    def _derive_dimensions_from_aspect_ratio(self, aspect_ratio: str) -> tuple[int, int]:
+        """
+            Converts an aspect ratio string (e.g. '16:9') into pixel dimensions
+            with the longer side fixed at 1280. Used for models that only accept
+            raw width/height but the user configured an aspect ratio.
+            """
+        try:
+            w_str, h_str = aspect_ratio.split(":")
+            ratio_w, ratio_h = int(w_str), int(h_str)
+            if ratio_w <= 0 or ratio_h <= 0:
+                raise ValueError
+        except (ValueError, AttributeError):
+            log.warning(
+                    f"Could not parse aspect ratio '{aspect_ratio}' for dimension derivation. "
+                    f"Falling back to 1:1 (1280x1280)."
+                )
+            return 1280, 1280
+
+        base = 1280
+        if ratio_w >= ratio_h:
+            width = base
+            height = round(base * ratio_h / ratio_w)
+        else:
+            height = base
+            width = round(base * ratio_w / ratio_h)
+
+        return width, height
+
+    def _prepare_generation_payload(
+        self, model_spec: VeniceImageModel, prompt: str, params: VeniceParams
+    ) -> dict[str, Any]:
+        """
+        Builds and validates the JSON payload for Venice.ai's image generation API.
+        Separates deterministic transformation and clamping logic from network operations.
+
+        Guarantees dimensions never exceed 1280x1280 by performing aspect-ratio preserving
+        downscaling first, and then performing divisor alignments that safely round downwards
+        if adjustments threaten to breach the 1280 ceiling.
+        """
+        constraints = model_spec.model_spec.constraints
+
+        payload: dict[str, Any] = {
+            "model": model_spec.id,
+            "prompt": prompt,
+            "hide_watermark": True,
+            "return_binary": False,
+            "format": "png",
+            "mbed_exif_metadata": True,
+        }
+
+        if params.negative_prompt is not None:
+            payload["negative_prompt"] = params.negative_prompt
+        if params.cfg_scale is not None:
+            payload["cfg_scale"] = params.cfg_scale
+        if params.safe_mode is not None:
+            payload["safe_mode"] = params.safe_mode
+        if params.steps is not None:
+            max_steps = constraints.steps.max
+            if params.steps > max_steps:
+                log.warning(
+                    f"Steps setting ({params.steps}) exceeds maximum for model ({max_steps}). Clamping."
+                )
+                payload["steps"] = max_steps
+            elif params.steps < 1:
+                log.warning(
+                    f"Steps setting ({params.steps}) must be 1 or higher. Clamping."
+                )
+                payload["steps"] = 1
+            else:
+                payload["steps"] = params.steps
+        else:
+            payload["steps"] = constraints.steps.default
+
+        if params.variants is not None:
+            variants = max(1, min(4, params.variants))
+            if variants != params.variants:
+                log.warning(
+                    f"Variants setting ({params.variants}) clamped to {variants}. Must be between 1 and 4."
+                )
+            payload["variants"] = variants
+
+        if constraints.aspectRatios:
+            log.debug(
+                f"Model '{model_spec.id}' processes aspect ratios. Ignoring static width/height parameters."
+            )
+
+            selected_ar = params.aspect_ratio
+            if selected_ar:
+                if selected_ar in constraints.aspectRatios:
+                    payload["aspect_ratio"] = selected_ar
+                else:
+                    fallback_ar = constraints.defaultAspectRatio or "1:1"
+                    log.warning(
+                        f"Requested aspect ratio '{selected_ar}' is unsupported by '{model_spec.id}'. "
+                        f"Reverting to default: '{fallback_ar}'."
+                    )
+                    payload["aspect_ratio"] = fallback_ar
+            else:
+                if constraints.defaultAspectRatio:
+                    payload["aspect_ratio"] = constraints.defaultAspectRatio
+
+            if constraints.resolutions:
+                selected_res = params.resolution
+                if selected_res:
+                    if selected_res in constraints.resolutions:
+                        payload["resolution"] = selected_res
+                    else:
+                        fallback_res = (
+                            constraints.defaultResolution or constraints.resolutions[0]
+                        )
+                        log.warning(
+                            f"Requested resolution tier '{selected_res}' is unsupported. "
+                            f"Reverting to default: '{fallback_res}'."
+                        )
+                        payload["resolution"] = fallback_res
+                else:
+                    if constraints.defaultResolution:
+                        payload["resolution"] = constraints.defaultResolution
+
+        else:
+            log.debug(f"Model '{model_spec.id}' utilizes raw dimensions.")
+
+            if params.width is not None or params.height is not None:
+                user_width = params.width if params.width is not None else 1024
+                user_height = params.height if params.height is not None else 1024
+            elif params.aspect_ratio is not None:
+                user_width, user_height = self._derive_dimensions_from_aspect_ratio(
+                    params.aspect_ratio
+                )
+                log.info(
+                    f"Model '{model_spec.id}' does not support aspect ratios natively. "
+                    f"Derived dimensions {user_width}x{user_height} from aspect ratio '{params.aspect_ratio}'."
+                )
+            else:
+                user_width, user_height = 1024, 1024
+
+            max_limit = 1280
+
+            if user_width > max_limit or user_height > max_limit:
+                scale = min(max_limit / user_width, max_limit / user_height)
+                original_width, original_height = user_width, user_height
+                user_width = max(1, int(user_width * scale))
+                user_height = max(1, int(user_height * scale))
+                log.warning(
+                    f"Requested dimensions {original_width}x{original_height} exceed limit of {max_limit}. "
+                    f"Preserved aspect ratio and downscaled parameters to {user_width}x{user_height}."
+                )
+
+            divisor = constraints.widthHeightDivisor
+            if divisor > 1:
+                adjusted_width = int(round(user_width / divisor) * divisor)
+                adjusted_height = int(round(user_height / divisor) * divisor)
+
+                if adjusted_width > max_limit:
+                    adjusted_width = int((user_width // divisor) * divisor)
+                if adjusted_height > max_limit:
+                    adjusted_height = int((user_height // divisor) * divisor)
+
+                adjusted_width = max(divisor, adjusted_width)
+                adjusted_height = max(divisor, adjusted_height)
+
+                if adjusted_width != user_width or adjusted_height != user_height:
+                    log.warning(
+                        f"Adjusted dimensions to conform with divisor {divisor}: "
+                        f"{user_width}x{user_height} -> {adjusted_width}x{adjusted_height}."
+                    )
+                payload["width"] = adjusted_width
+                payload["height"] = adjusted_height
+            else:
+                payload["width"] = user_width
+                payload["height"] = user_height
+
+        log.debug("Deterministic Venice payload built successfully:", payload=payload)
+        return payload
+
+    def _clean_image_payload(self, image_url: str) -> str:
+        """
+        Strips the data URI scheme prefix (e.g., 'data:image/png;base64,') from the input URL,
+        leaving only the raw base64 data. Decoupled helper ready for conditional invocation.
+        """
+        if image_url.startswith("data:"):
+            if "," in image_url:
+                return image_url.split(",", 1)[1]
+        return image_url
+
+    def _prepare_edit_payload(
+        self,
+        model_spec: VeniceInpaintModel,
+        prompt: str,
+        image_url: str,
+        params: VeniceParams,
+    ) -> dict[str, Any]:
+        """
+        Builds and validates the JSON payload for Venice.ai's image editing API (/image/edit).
+        Ensures proper aspect ratio mapping and model specific configuration bounds.
+        """
+        constraints = model_spec.model_spec.constraints
+
+        payload: dict[str, Any] = {
+            "model": model_spec.id,
+            "prompt": prompt,
+            "image": self._clean_image_payload(image_url),
+            "output_format": "png",
+        }
+
+        if params.safe_mode is not None:
+            payload["safe_mode"] = params.safe_mode
+
+        selected_ar = params.aspect_ratio
+        if selected_ar:
+            if selected_ar in constraints.aspectRatios:
+                payload["aspect_ratio"] = selected_ar
+            else:
+                fallback_ar = constraints.defaultAspectRatio or "auto"
+                log.warning(
+                    f"Requested aspect ratio '{selected_ar}' is unsupported by '{model_spec.id}'. "
+                    f"Reverting to default/fallback: '{fallback_ar}'."
+                )
+                payload["aspect_ratio"] = fallback_ar
+        else:
+            if constraints.defaultAspectRatio:
+                payload["aspect_ratio"] = constraints.defaultAspectRatio
+            else:
+                payload["aspect_ratio"] = "auto"
+
+        if constraints.resolutions:
+            selected_res = params.resolution
+            if selected_res:
+                if selected_res in constraints.resolutions:
+                    payload["resolution"] = selected_res
+                else:
+                    fallback_res = (
+                        constraints.defaultResolution or constraints.resolutions[0]
+                    )
+                    log.warning(
+                        f"Requested resolution tier '{selected_res}' is unsupported. "
+                        f"Reverting to default: '{fallback_res}'."
+                    )
+                    payload["resolution"] = fallback_res
+            else:
+                if constraints.defaultResolution:
+                    payload["resolution"] = constraints.defaultResolution
+
+        log.debug(
+            "Deterministic Venice edit payload built successfully:", payload=payload
+        )
+        return payload
+
+    async def _request_image(self, endpoint: str, payload: dict[str, Any]) -> list[bytes]:
+        """
+        Executes raw POST requests and simplifies data streams. Unifies both API JSON outputs
+        (extracting base64 image strings) and direct image binary streams into clean raw bytes.
+        Returns a list of decoded images; binary responses yield a single-element list.
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                log.info(
+                    f"Sending request to Venice.ai {endpoint} for model: {payload.get('model')}"
+                )
+                log.debug("Request payload:", payload=payload)
+                async with session.post(
+                    f"{self.base_url}{endpoint}",
+                    headers=self._headers(),
+                    json=payload,
+                ) as response:
+                    log.info(
+                        f"Received response from Venice.ai with status: {response.status}"
+                    )
+                    log.debug("Response object:", payload=response)
+                    if response.status != 200:
+                        try:
+                            err_body = await response.json()
+                            error_detail = err_body.get("error", {}).get(
+                                "message", "Unknown Venice API error."
+                            )
+                        except Exception:
+                            error_detail = await response.text()
+                        raise VeniceAPIError(
+                            f"Venice API Error ({response.status}): {error_detail}",
+                            status_code=response.status,
+                        )
+
+                    content_type = response.headers.get("Content-Type", "")
+
+                    if content_type.startswith("image/"):
+                        return [await response.read()]
+
+                    # Venice default fallback parsing
+                    json_data = await response.json()
+                    log.debug("Response json:", payload=json_data)
+                    images = json_data.get("images")
+                    if not images:
+                        raise VeniceAPIError(
+                            "Venice API response did not contain any images."
+                        )
+
+                    return [base64.b64decode(img) for img in images]
+
+        except aiohttp.ClientResponseError as e:
+            raise VeniceAPIError(f"API request failed: {str(e)}") from e
+        except Exception as e:
+            if not isinstance(e, VeniceAPIError):
+                raise VeniceAPIError(f"Network or execution error: {str(e)}") from e
+            raise
+
+
+class EventEmitter:
+    """
+    An asynchronous queue-based event emitter tailored for image generation models.
+    Guarantees in-order, non-blocking delivery of websocket status events to the Open WebUI frontend,
+    allowing tasks to dispatch events instantly without yielding or halting network cycles.
+    """
+
+    def __init__(
+        self,
+        event_emitter: Callable[["Event"], Awaitable[None]] | None,
+        verbosity: Literal["disabled", "visible", "visible_timed"] = "visible_timed",
+    ):
+        self._emitter = event_emitter
+        self.verbosity = verbosity
+        self.start_time = time.monotonic()
+
+        self._queue: asyncio.Queue["Event | None"] = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+
+        if self._emitter is not None:
+            self._worker_task = asyncio.create_task(self._process_queue())
+
+    async def _process_queue(self) -> None:
+        """
+        Sequentially consumes and processes events until a None poison pill is encountered.
+        This design guarantees that status updates and error details are delivered chronologically.
+        """
+        while True:
+            try:
+                event = await self._queue.get()
+            except asyncio.CancelledError:
+                break
+
+            if event is None:
+                self._queue.task_done()
+                break
+
+            if self._emitter:
+                try:
+                    await self._emitter(event)
+                except Exception:
+                    log.exception("Error processing event in emitter background worker")
+
+            self._queue.task_done()
+
+    def _enqueue(self, event: "Event") -> None:
+        if self._emitter is None:
+            return
+        self._queue.put_nowait(event)
+
+    async def shutdown(self) -> None:
+        """Gracefully halts the worker and waits for remaining events to drain."""
+        if self._worker_task and not self._worker_task.done():
+            log.debug("Shutting down EventEmitter worker task.")
+            self._queue.put_nowait(None)
+            try:
+                await self._worker_task
+                log.debug("EventEmitter worker task has been shut down successfully.")
+            except asyncio.CancelledError:
+                log.debug("EventEmitter worker task was cancelled during shutdown.")
+
+    def emit_status(
+        self, description: str, done: bool = False, hidden: bool = False
+    ) -> None:
+        """
+        Sends status notifications to the frontend UI.
+        Supports disabled output, raw messages, and timed increments showing total execution length.
+        """
+        if self.verbosity == "disabled":
+            return
+
+        if self.verbosity == "visible_timed":
+            elapsed = time.monotonic() - self.start_time
+            description = f"{description} (+{elapsed:.2f}s)"
+
+        event: "StatusEvent" = {
+            "type": "status",
+            "data": {
+                "description": description,
+                "done": done,
+                "hidden": hidden,
+            },
+        }
+        self._enqueue(event)
+
+    def emit_completion_error(self, error_msg: str) -> None:
+        """
+        Directly delivers raw error messages into chat interface outputs to ensure
+        frontend rendering remains responsive and correctly terminates processing state.
+        """
+        event: "ChatCompletionEvent" = {
+            "type": "chat:completion",
+            "data": {
+                "done": True,
+                "error": {"detail": f"\n{error_msg}"},
+            },
+        }
+        self._enqueue(event)
+
+
+_VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
+    # Admin-Only
+    "VENICE_API_TOKEN": "Venice.ai API Token.",
+    "CACHE_MODELS": "Whether to request and cache available models only on initial load.",
+    "USE_FILES_API": "Save generated image files using Open WebUI's file storage API.",
+    # User-Configurable
+    "HEIGHT": "Height of generated images in pixels.",
+    "WIDTH": "Width of generated images in pixels.",
+    "STEPS": "Number of inference and generation steps.",
+    "CFG_SCALE": "Classifier-Free Guidance (CFG) scale determining how closely the generation follows the prompt.",
+    "ASPECT_RATIO": "Optional aspect ratio configuration for supported models (e.g. '1:1', '16:9').",
+    "RESOLUTION": "Optional resolution tier for supported models (e.g. '1K', '2K').",
+    "NEGATIVE PROMPT": "Optional negative prompt to steer the generation away from undesired features.",
+    "VARIANTS": "Number of image variants to generate per request (1-4). Only supported by text-to-image models, not inpaint or upscale.",
+    "SAFE_MODE": "Enables content blurring for adult material generated by models.",
+    "UPSCALER_SCALE": "The upscaling size multiplier. Real range values are strictly restricted between 1.0 and 4.0.",
+    "UPSCALER_REPLICATION": "Controls how closely lines and patterns from the source are preserved (0.0 to 1.0).",
+    "EMISSION_VERBOSITY": "Control websocket emission verbosity.",
+}
+
+
+def _format_valve_desc(text: str, default: Any = None, is_user: bool = False) -> str:
+    """Formats Markdown descriptions for Valves and UserValves fields."""
+    text = text.strip()
+    sep = "\n\n---\n\n"
+    if is_user:
+        return f"{text}\n\n*If not set, the admin's setting is used.*{sep}"
+    formatted_default = f"`{default}`" if default is not None else "`None`"
+    return f"{text}\n\n**Default:** {formatted_default}{sep}"
+
+
+def _admin_field(
+    name: str, default: Any = None, admin_section_start: bool = False
+) -> Any:
+    """Helper to construct a Pydantic Field with default value and formatted admin description."""
+    raw_desc = _VALVE_DESCRIPTIONS.get(name, "")
+    desc = _format_valve_desc(raw_desc, default=default)
+    if admin_section_start:
+        desc = f"{desc}### Admin-Only Options"
+    return Field(default=default, description=desc)
+
+
+class _SharedValves(BaseModel):
+    """Base model holding user-configurable options and shared field validators."""
+
+    HEIGHT: int | None = _admin_field("HEIGHT")
+    WIDTH: int | None = _admin_field("WIDTH")
+    STEPS: int | None = _admin_field("STEPS")
+    CFG_SCALE: int | None = _admin_field("CFG_SCALE")
+    ASPECT_RATIO: str | None = _admin_field("ASPECT_RATIO")
+    RESOLUTION: str | None = _admin_field("RESOLUTION")
+    SAFE_MODE: bool | None = _admin_field("SAFE_MODE")
+    NEGATIVE_PROMPT: str | None = _admin_field("NEGATIVE_PROMPT")
+    VARIANTS: int = _admin_field("VARIANTS", 1)
+    UPSCALER_SCALE: float | None = _admin_field("UPSCALER_SCALE")
+    UPSCALER_REPLICATION: float | None = _admin_field("UPSCALER_REPLICATION")
+    EMISSION_VERBOSITY: Literal["disabled", "visible", "visible_timed"] = _admin_field(
+        "EMISSION_VERBOSITY", "visible_timed", admin_section_start=True
+    )
+
+
+def _generate_user_valves(shared_cls: type[BaseModel]) -> type[BaseModel]:
+    """Generates Pipe.UserValves model from _SharedValves with Optional fields and user descriptions."""
+    fields: dict[str, Any] = {}
+    for name, field_info in shared_cls.model_fields.items():
+        raw_desc = _VALVE_DESCRIPTIONS.get(name, "")
+        user_desc = _format_valve_desc(raw_desc, is_user=True)
+
+        ann = field_info.annotation
+        if get_origin(ann) is Literal:
+            args = get_args(ann)
+            user_ann = (
+                Literal[(*args, "")] | None if "" not in args else ann | None  # type: ignore[operator]
+            )
+        elif ann is not None:
+            user_ann = ann | None
+        else:
+            user_ann = Any
+
+        fields[name] = (user_ann, Field(default=None, description=user_desc))
+
+    return create_model("UserValves", __base__=shared_cls, **fields)  # type: ignore[call-overload]
+
+
 class Pipe:
-    class Valves(BaseModel):
-        VENICE_API_TOKEN: str | None = Field(
-            default=None, description="Venice.ai API Token"
-        )
-        HEIGHT: int = Field(default=1024, description="Image height")
-        WIDTH: int = Field(default=1024, description="Image width")
-        STEPS: int = Field(default=16, description="Image generation steps")
-        CFG_SCALE: int = Field(default=4, description="Image generation scale")
-        CACHE_MODELS: bool = Field(
-            default=True,
-            description="Whether to request models only on first load.",
-        )
-        LOG_LEVEL: Literal[
-            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
-        ] = Field(
-            default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
-        )
-        USE_FILES_API: bool = Field(
-            title="Use Files API",
-            default=True,
-            description="Save the image files using Open WebUI's API for files.",
-        )
+    class Valves(_SharedValves):
+        VENICE_API_TOKEN: str | None = _admin_field("VENICE_API_TOKEN")
+        CACHE_MODELS: bool = _admin_field("CACHE_MODELS", True)
+        USE_FILES_API: bool = _admin_field("USE_FILES_API", True)
+
+    UserValves = _generate_user_valves(_SharedValves)
 
     def __init__(self):
-
-        # This hack makes the valves values available to the `__init__` method.
-        # TODO: Get the id from the frontmatter instead of hardcoding it.
-        valves = Functions.get_function_valves_by_id("venice_image_generation")
-        self.valves = self.Valves(**(valves if valves else {}))
-        self.log_level = self.valves.LOG_LEVEL
-        self._add_log_handler()
-
-        self.models: list["ModelData"] = []
-
+        self.valves = self.Valves()
+        self.models: list[VeniceModel] = []
         log.success("Function has been initialized.")
-        log.trace("Full self object:", payload=self.__dict__)
 
-    async def pipes(self) -> list["ModelData"]:
-
-        # Detect log level change inside self.valves
-        if self.log_level != self.valves.LOG_LEVEL:
-            log.info(
-                f"Detected log level change: {self.log_level=} and {self.valves.LOG_LEVEL=}. "
-                "Running the logging setup again."
+    async def pipes(self) -> list[dict[str, str]]:
+        if self.models and self.valves.CACHE_MODELS:
+            log.info("Models are already initialized. Returning mapped list.")
+            mapped = [{"id": m.id, "name": m.model_spec.name} for m in self.models]
+            # Manual append for the virtual upscaling utility
+            mapped.append(
+                {"id": "upscaler", "name": "Venice Image Upscaler & Enhancer"}
             )
-            self._add_log_handler()
+            return mapped
 
-        # Return existing models if all conditions are met and no error models are present
-        if (
-            self.models
-            and self.valves.CACHE_MODELS
-            and not any(model["id"] == "error" for model in self.models)
-        ):
-            log.info("Models are already initialized. Returning the cached list.")
-            return self.models
+        if not self.valves.VENICE_API_TOKEN:
+            return [
+                self._return_error_model(
+                    "Missing VENICE_API_TOKEN in valves configuration."
+                )
+            ]
 
-        self.models = await self._get_models()
-        return self.models
+        try:
+            client = VeniceAPIClient(self.valves.VENICE_API_TOKEN)
+            self.models = await client.get_models()
+            mapped = [{"id": m.id, "name": m.model_spec.name} for m in self.models]
+            mapped.append(
+                {"id": "upscaler", "name": "Venice Image Upscaler & Enhancer"}
+            )
+            return mapped
+        except Exception as e:
+            log.exception("Retrieval of Venice image/inpaint models failed.")
+            return [self._return_error_model(str(e))]
 
     async def pipe(
         self,
-        body: dict,
+        body: "Body",
         __user__: "UserData",
         __request__: Request,
+        __metadata__: "Metadata",
         __event_emitter__: Callable[["Event"], Awaitable[None]],
-        __task__: str,
-        __metadata__: dict[str, Any],
-    ) -> str | None:
+    ) -> str:
 
-        # TODO: [refac] Move __user__ to self like that also.
-        self.__event_emitter__ = __event_emitter__
-
-        if "error" in __metadata__["model"]["id"]:
-            error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
-            await self._emit_error(error_msg, exception=False)
-            return
-
-        if not self.valves.VENICE_API_TOKEN:
-            error_msg = "Missing VENICE_API_TOKEN in valves configuration."
-            await self._emit_error(error_msg, exception=False)
-            return
-
-        model = body.get("model", "").split(".", 1)[-1]
-        prompt = next(
-            (
-                msg["content"]
-                for msg in reversed(body["messages"])
-                if msg["role"] == "user"
-            ),
-            "",
+        options = _resolve_options(
+            self.valves,
+            __user__.get("valves") if isinstance(__user__, dict) else None,
+            __user__.get("email", "") if isinstance(__user__, dict) else "",
+            body,
+            __metadata__,
         )
 
-        if not prompt:
-            error_msg = "No prompt found in user message."
-            await self._emit_error(error_msg, exception=False)
-            return
+        emitter = EventEmitter(__event_emitter__, verbosity=options.EMISSION_VERBOSITY)
 
-        # FIXME move these to the beginning.
-        if __task__ == "title_generation":
+        if "error" in __metadata__["model"]["id"]:
+            error_msg = f'There has been an error during model retrieval phase: {str(__metadata__["model"])}'
+            raise RuntimeError(error_msg)
+
+        if not options.VENICE_API_TOKEN:
+            error_msg = "Missing VENICE_API_TOKEN in valves configuration."
+            raise RuntimeError(error_msg)
+
+        selected_model_id = body.get("model", "").split(".", 1)[-1]
+
+        # Upscaler behaves as a virtual model and can skip model catalog cache checks
+        is_upscale_task = selected_model_id == "upscaler"
+
+        if not is_upscale_task and not self.models:
+            error_msg = (
+                "Image generation blocked: Venice models cache has not been populated."
+            )
+            raise RuntimeError(error_msg)
+
+        model_spec = None
+        if not is_upscale_task:
+            model_spec = next(
+                (m for m in self.models if m.id == selected_model_id), None
+            )
+            if not model_spec:
+                error_msg = f"Requested model '{selected_model_id}' was not found in the initialized Venice models list."
+                raise RuntimeError(error_msg)
+
+        task = __metadata__.get("task")
+        if task == "title_generation":
             log.warning(
                 "Detected title generation task! I do not know how to handle this so I'm returning something generic."
             )
             return '{"title": "🖼️ Image Generation"}'
-        if __task__ == "tags_generation":
+        if task == "tags_generation":
             log.warning(
                 "Detected tag generation task! I do not know how to handle this so I'm returning an empty list."
             )
             return '{"tags": []}'
 
-        log.debug(f"Model: {model}, Prompt: {prompt}")
-
-        # FIXME [refac] Move it out of pipe for cleaner code?
-        async def timer_task(start_time: float):
-            """Counts up and emits status updates."""
-            try:
-                while True:
-                    elapsed_time = time.time() - start_time
-                    await __event_emitter__(
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": f"Generating image... Time elapsed: {elapsed_time:.2f}s",
-                                "done": False,
-                                "hidden": False,
-                            },
-                        }
-                    )
-                    await asyncio.sleep(1)  # Update every second
-            except asyncio.CancelledError:
-                log.debug("Timer task cancelled.")
-
-        start_time = time.time()
-        timer = asyncio.create_task(timer_task(start_time))
-
-        image_data = await self._generate_image(model, prompt)
-
-        timer.cancel()
-        try:
-            await timer  # Ensure timer is fully cleaned up
-        except asyncio.CancelledError:
-            pass  # Expected, already handled
-
-        total_time = time.time() - start_time
-        success = image_data and image_data.get("images")
-        status_text = f"Image {'generated' if success else 'generation failed'} after {total_time:.2f}s"
-
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "description": status_text,
-                    "done": True,
-                    "hidden": False,
-                },
-            }
+        last_user_message = next(
+            (
+                msg
+                for msg in reversed(body.get("messages", []))
+                if msg.get("role") == "user"
+            ),
+            None,
         )
-        if not success:
-            return None
 
-        log.info("Image generated successfully!")
-        base64_image = image_data["images"][0]  # type: ignore
+        if not last_user_message:
+            error_msg = "No user message found to process."
+            raise ValueError(error_msg)
 
-        if self.valves.USE_FILES_API:
-            # Decode the base64 image data
-            image_data = base64.b64decode(base64_image)
-            # FIXME make mime type dynamic
-            image_url = self._upload_image(
-                image_data, "image/png", model, prompt, __user__["id"], __request__
-            )
-            return f"![Generated Image]({image_url})" if image_url else None
+        content = last_user_message.get("content")
+        if not content:
+            error_msg = "User message has empty or missing content."
+            raise ValueError(error_msg)
+
+        prompt, image_url = self._extract_media_from_message(content)
+
+        # Verify prompt or assign placeholder values if processing pure upscaling tasks
+        if is_upscale_task:
+            if not image_url:
+                error_msg = "Requested upscaling requires an attached image, but none was provided."
+                raise ValueError(error_msg)
+            # Provide a generic visual target prompt to prevent blank parameters down the line
+            prompt = prompt or "Upscaled Image"
         else:
-            return f"![Generated Image](data:image/png;base64,{base64_image})"
+            if not prompt:
+                error_msg = "No valid text prompt found in the user's message."
+                raise ValueError(error_msg)
+
+        is_edit_model = model_spec.type == "inpaint" if model_spec else False
+
+        if is_upscale_task:
+            log.debug("Target pipeline isolated: Image Upscale")
+        elif is_edit_model:
+            if not image_url:
+                error_msg = f"Requested editing model '{selected_model_id}' requires an attached image, but none was provided."
+                raise ValueError(error_msg)
+            log.debug(
+                f"Target edit model parsed: {model_spec.id if model_spec else ''}, Prompt: {prompt}, Image: [Present]"
+            )
+        else:
+            log.debug(
+                f"Target generation model parsed: {model_spec.id if model_spec else ''}, Prompt: {prompt}"
+            )
+
+        emitter.emit_status("Preparing image parameters...", done=False)
+        # Construct configuration overrides
+        params = VeniceParams(
+            cfg_scale=options.CFG_SCALE,
+            safe_mode=options.SAFE_MODE,
+            steps=options.STEPS,
+            aspect_ratio=options.ASPECT_RATIO,
+            resolution=options.RESOLUTION,
+            width=options.WIDTH,
+            height=options.HEIGHT,
+            scale=options.UPSCALER_SCALE,
+            replication=options.UPSCALER_REPLICATION,
+            negative_prompt=options.NEGATIVE_PROMPT,
+            variants=options.VARIANTS,
+        )
+
+        client = VeniceAPIClient(options.VENICE_API_TOKEN)
+
+        if is_upscale_task:
+            emitter.emit_status("Processing upscale...", done=False)
+        elif is_edit_model:
+            emitter.emit_status("Processing edit...", done=False)
+        else:
+            num_variants = params.variants or 1
+            if num_variants > 1:
+                emitter.emit_status(f"Generating {num_variants} images...", done=False)
+            else:
+                emitter.emit_status("Generating image...", done=False)
+
+        image_bytes_list: list[bytes] = []
+        try:
+            if is_upscale_task:
+                assert image_url
+                image_bytes_list = await client.upscale_image(image_url, params)
+            elif is_edit_model:
+                assert image_url and isinstance(model_spec, VeniceInpaintModel)
+                image_bytes_list = await client.edit_image(
+                    model_spec, prompt, image_url, params
+                )
+            else:
+                assert isinstance(model_spec, VeniceImageModel)
+                image_bytes_list = await client.generate_image(model_spec, prompt, params)
+        except VeniceAPIError as e:
+            emitter.emit_status("Image generation failed", done=True)
+            await emitter.shutdown()
+            raise e
+
+        num_images = len(image_bytes_list)
+        log.info(f"Image request completed successfully! ({num_images} image(s) generated)")
+        if num_images > 1:
+            emitter.emit_status(f"Image generation successful ({num_images} images)", done=True)
+        else:
+            emitter.emit_status("Image generation successful", done=True)
+
+        output_model_id = (
+            "upscaler"
+            if is_upscale_task
+            else (model_spec.id if model_spec else "unknown")
+        )
+
+        if options.USE_FILES_API:
+            uploaded_urls = []
+            for img_bytes in image_bytes_list:
+                # TODO: catch errors and fall-back to bytes?
+                url = await self._upload_image(
+                    img_bytes,
+                    "image/png",
+                    output_model_id,
+                    prompt,
+                    __user__["id"],
+                    __request__,
+                )
+                uploaded_urls.append(url)
+            response = "\n\n".join(f"![Generated Image]({url})" for url in uploaded_urls)
+        else:
+            parts = []
+            for img_bytes in image_bytes_list:
+                base64_image = base64.b64encode(img_bytes).decode("utf-8")
+                parts.append(f"![Generated Image](data:image/png;base64,{base64_image})")
+            response = "\n\n".join(parts)
+        await emitter.shutdown()
+        return response
 
     # region 1. Helper methods inside the Pipe class
 
-    # region 1.1 Model retrieval
-
-    async def _get_models(self) -> list["ModelData"]:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    "https://api.venice.ai/api/v1/models?type=image",
-                    headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},
-                ) as response:
-                    response.raise_for_status()
-                    raw_models = await response.json()
-                    raw_models = raw_models.get("data", [])
-                    if not raw_models:
-                        log.warning("Venice API returned no models.")
-                    return [
-                        {"id": model["id"], "name": model["id"], "description": None}
-                        for model in raw_models
-                    ]
-        except aiohttp.ClientResponseError as e:
-            error_msg = f"Error getting models: {str(e)}"
-            return [self._return_error_model(error_msg)]
-        except Exception as e:
-            error_msg = f"An unexpected error occurred: {str(e)}"
-            return [self._return_error_model(error_msg)]
-
     def _return_error_model(
         self, error_msg: str, warning: bool = False, exception: bool = True
-    ) -> "ModelData":
-        """Returns a placeholder model for communicating error inside the pipes method to the front-end."""
+    ) -> dict[str, str]:
         if warning:
             log.opt(depth=1, exception=False).warning(error_msg)
         else:
@@ -269,47 +1021,49 @@ class Pipe:
             "description": error_msg,
         }
 
-    # endregion 1.1 Model retrieval
+    def _extract_media_from_message(
+        self, content: Any
+    ) -> tuple[str | None, str | None]:
+        """
+        Parses text prompts and base64-encoded image components from user messages.
+        Supports standard raw string payloads and complex multimedia structure arrays.
+        """
+        if isinstance(content, str):
+            return content.strip() or None, None
 
-    # region 1.2 Image generation
+        if not isinstance(content, list):
+            return None, None
 
-    async def _generate_image(self, model: str, prompt: str) -> dict | None:
-        try:
-            async with aiohttp.ClientSession() as session:
-                log.info(
-                    f"Sending image generation request to Venice.ai for model: {model}"
-                )
-                async with session.post(
-                    "https://api.venice.ai/api/v1/image/generate",
-                    headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},
-                    json={
-                        "model": model,
-                        "prompt": prompt,
-                        "width": self.valves.WIDTH,
-                        "height": self.valves.HEIGHT,
-                        "steps": self.valves.STEPS,
-                        "hide_watermark": True,
-                        "return_binary": False,
-                        "cfg_scale": self.valves.CFG_SCALE,
-                        "safe_mode": False,
-                    },
-                ) as response:
-                    log.info(
-                        f"Received response from Venice.ai with status: {response.status}"
-                    )
-                    response.raise_for_status()
-                    return await response.json()
+        texts: list[str] = []
+        images: list[str] = []
 
-        except aiohttp.ClientResponseError as e:
-            error_msg = f"Image generation failed: {str(e)}"
-            await self._emit_error(error_msg)
-            return
-        except Exception as e:
-            error_msg = f"Generation error: {str(e)}"
-            await self._emit_error(error_msg)
-            return
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text":
+                text_val = block.get("text", "")
+                if isinstance(text_val, str) and text_val.strip():
+                    texts.append(text_val.strip())
+            elif block_type == "image_url":
+                img_url_obj = block.get("image_url")
+                if isinstance(img_url_obj, dict):
+                    img_url = img_url_obj.get("url")
+                    if isinstance(img_url, str) and img_url.strip():
+                        images.append(img_url.strip())
 
-    def _upload_image(
+        primary_text = texts[-1] if texts else None
+        primary_image = images[-1] if images else None
+
+        if len(texts) > 1 or len(images) > 1:
+            log.warning(
+                f"Detected multiple text/image objects in the last user message. "
+                f"Using the last available blocks (Texts: {len(texts)}, Images: {len(images)})."
+            )
+
+        return primary_text, primary_image
+
+    async def _upload_image(
         self,
         image_data: bytes,
         mime_type: str,
@@ -317,14 +1071,9 @@ class Pipe:
         prompt: str,
         user_id: str,
         __request__: Request,
-    ) -> str | None:
-        """
-        Helper method that uploads the generated image to a storage provider configured inside Open WebUI settings.
-        Returns the url to uploaded image.
-        """
+    ) -> str:
         image_format = mimetypes.guess_extension(mime_type)
         id = str(uuid.uuid4())
-        # TODO: Better filename? Prompt as the filename?
         name = os.path.basename(f"generated-image{image_format}")
         imagename = f"{id}_{name}"
         image = io.BytesIO(image_data)
@@ -333,32 +1082,18 @@ class Pipe:
             "prompt": prompt,
         }
 
-        # Upload the image to user configured storage provider.
         log.info("Uploading the model generated image to Open WebUI backend.")
         log.debug("Uploading to the configured storage provider.")
-        try:
-            # Dynamically check if 'tags' parameter exists
-            sig = inspect.signature(Storage.upload_file)
-            has_tags = "tags" in sig.parameters
-        except Exception as e:
-            log.error(f"Error checking Storage.upload_file signature: {e}")
-            has_tags = False  # Default to old behavior
 
         try:
-            # TODO: Remove this in the future.
-            if has_tags:
-                # New version with tags support >=v0.6.6
-                contents, image_path = Storage.upload_file(image, imagename, tags={})
-            else:
-                # Old version without tags <v0.6.5
-                contents, image_path = Storage.upload_file(image, imagename)  # type: ignore
-        except Exception:
-            error_msg = "Error occurred during upload to the storage provider."
-            log.exception(error_msg)
-            return None
-        # Add the image file to files database.
+            contents, image_path = await asyncio.to_thread(
+                Storage.upload_file, image, imagename, tags={}
+            )
+        except Exception as e:
+            raise Exception(f"Failed to upload the image to storage: {str(e)}") from e
+
         log.info("Adding the image file to Open WebUI files database.")
-        file_item = Files.insert_new_file(
+        file_item = await Files.insert_new_file(
             user_id,
             FileForm(
                 id=id,
@@ -373,9 +1108,10 @@ class Pipe:
             ),
         )
         if not file_item:
-            log.warning("Files.insert_new_file did not return anything.")
-            return None
-        # Get the image url.
+            raise ValueError(
+                "Failed to insert new file. Files.insert_new_file did not return anything."
+            )
+
         image_url: str = __request__.app.url_path_for(
             "get_file_content_by_id", id=file_item.id
         )
@@ -383,253 +1119,137 @@ class Pipe:
 
     # endregion 1.2 Image generation
 
-    # region 1.3 Event emissions
+    # endregion 1. Helper methods inside the Pipe class
 
-    async def _emit_error(
-        self, error_msg: str, warning: bool = False, exception: bool = True
-    ) -> None:
-        """Emits an event to the front-end that causes it to display a nice red error message."""
-        error: "ChatCompletionEvent" = {
-            "type": "chat:completion",
-            "data": {
-                "done": True,
-                "error": {"detail": "\n" + error_msg},
-            },
-        }
-        if warning:
-            log.opt(depth=1, exception=False).warning(error_msg)
-        else:
-            log.opt(depth=1, exception=exception).error(error_msg)
-        await self.__event_emitter__(error)
 
-    # endregion 1.3 Event emissions
+# region Option resolution
 
-    # region 1.4 Logging
-    def _is_flat_dict(self, data: Any) -> bool:
-        """
-        Checks if a dictionary contains only non-dict/non-list values (is one level deep).
-        """
-        if not isinstance(data, dict):
-            return False
-        return not any(isinstance(value, (dict, list)) for value in data.values())
+OPTION_SYNONYMS: Final[dict[str, str]] = {
+    "scale": "UPSCALER_SCALE",
+    "replication": "UPSCALER_REPLICATION",
+}
 
-    def _truncate_long_strings(
-        self, data: Any, max_len: int, truncation_marker: str, truncation_enabled: bool
-    ) -> Any:
-        """
-        Recursively traverses a data structure (dicts, lists) and truncates
-        long string values. Creates copies to avoid modifying original data.
+USER_OVERRIDABLE_VALVE_FIELDS: Final[set[str]] = set(_SharedValves.model_fields.keys())
+ADMIN_ONLY_VALVE_FIELDS: Final[set[str]] = (
+    set(Pipe.Valves.model_fields.keys()) - USER_OVERRIDABLE_VALVE_FIELDS
+)
 
-        Args:
-            data: The data structure (dict, list, str, int, float, bool, None) to process.
-            max_len: The maximum allowed length for string values.
-            truncation_marker: The string to append to truncated values.
-            truncation_enabled: Whether truncation is enabled.
+_VALVE_FIELD_LOOKUP: Final[dict[str, str]] = {
+    field_name.lower(): field_name for field_name in Pipe.Valves.model_fields.keys()
+}
 
-        Returns:
-            A potentially new data structure with long strings truncated.
-        """
-        if not truncation_enabled or max_len <= len(truncation_marker):
-            # If truncation is disabled or max_len is too small, return original
-            # Make a copy only if it's a mutable type we might otherwise modify
-            if isinstance(data, (dict, list)):
-                return copy.deepcopy(data)  # Ensure deep copy for nested structures
-            return data  # Primitives are immutable
+_SYNONYM_LOOKUP: Final[dict[str, str]] = {
+    synonym.lower(): canonical_target
+    for synonym, canonical_target in OPTION_SYNONYMS.items()
+}
 
-        if isinstance(data, str):
-            if len(data) > max_len:
-                return data[: max_len - len(truncation_marker)] + truncation_marker
-            return data  # Return original string if not truncated
-        elif isinstance(data, dict):
-            # Process dictionary items, creating a new dict
-            return {
-                k: self._truncate_long_strings(
-                    v, max_len, truncation_marker, truncation_enabled
-                )
-                for k, v in data.items()
-            }
-        elif isinstance(data, list):
-            # Process list items, creating a new list
-            return [
-                self._truncate_long_strings(
-                    item, max_len, truncation_marker, truncation_enabled
-                )
-                for item in data
-            ]
-        else:
-            # Return non-string, non-container types as is (they are immutable)
-            return data
 
-    def plugin_stdout_format(self, record: "Record") -> str:
-        """
-        Custom format function for the plugin's logs.
-        Serializes and truncates data passed under the 'payload' key in extra.
-        """
+def canonicalize_option_key(key: str) -> str:
+    """
+    Normalizes an option key using case-insensitive lookup against synonyms
+    and known valve fields. Returns the canonical key name or the stripped key if custom.
+    """
+    key_clean = key.strip()
+    key_lower = key_clean.lower()
 
-        # Configuration Keys
-        LOG_OPTIONS_PREFIX = "_log_"
-        TRUNCATION_ENABLED_KEY = f"{LOG_OPTIONS_PREFIX}truncation_enabled"
-        MAX_LENGTH_KEY = f"{LOG_OPTIONS_PREFIX}max_length"
-        TRUNCATION_MARKER_KEY = f"{LOG_OPTIONS_PREFIX}truncation_marker"
-        DATA_KEY = "payload"
+    if canonical := _SYNONYM_LOOKUP.get(key_lower):
+        return canonical
 
-        original_extra = record["extra"]
-        # Extract the data intended for serialization using the chosen key
-        data_to_process = original_extra.get(DATA_KEY)
+    if canonical := _VALVE_FIELD_LOOKUP.get(key_lower):
+        return canonical
 
-        serialized_data_json = ""
-        if data_to_process is not None:
-            try:
-                serializable_data = pydantic_core.to_jsonable_python(
-                    data_to_process, serialize_unknown=True
-                )
+    return key_clean
 
-                # Determine truncation settings
-                truncation_enabled = original_extra.get(TRUNCATION_ENABLED_KEY, True)
-                max_length = original_extra.get(MAX_LENGTH_KEY, 256)
-                truncation_marker = original_extra.get(TRUNCATION_MARKER_KEY, "[...]")
 
-                # If max_length was explicitly provided, force truncation enabled
-                if MAX_LENGTH_KEY in original_extra:
-                    truncation_enabled = True
+class ResolvedOptions(Pipe.Valves):
+    """
+    Consolidated configuration combining Admin Valves, User Valves,
+    Model Advanced Params, and Chat Advanced Params according to priority.
 
-                # Truncate long strings
-                truncated_data = self._truncate_long_strings(
-                    serializable_data,
-                    max_length,
-                    truncation_marker,
-                    truncation_enabled,
-                )
+    Allows extra dynamic options defined at model or chat levels.
+    """
 
-                # Serialize the (potentially truncated) data
-                if self._is_flat_dict(truncated_data) and not isinstance(
-                    truncated_data, list
-                ):
-                    json_string = json.dumps(
-                        truncated_data, separators=(",", ":"), default=str
+    model_config = ConfigDict(extra="allow")
+
+    def get_custom_params(self) -> dict[str, Any]:
+        """Returns extra parameters not defined in Pipe.Valves."""
+        valve_fields = set(Pipe.Valves.model_fields.keys())
+        return {k: v for k, v in self.model_dump().items() if k not in valve_fields}
+
+
+def _resolve_options(
+    admin_valves: Pipe.Valves,
+    user_valves: _SharedValves | None,
+    user_email: str,
+    body: "Body",
+    metadata: "Metadata",
+) -> ResolvedOptions:
+    """
+    Hierarchically resolves configuration options from 4 priority sources:
+    1. Admin Valves (Lowest priority)
+    2. User Valves
+    3. Model Page Advanced Params
+    4. Chat Side-Panel Advanced Params (Highest priority)
+
+    Admin-only options cannot be overridden by user-level sources.
+    Option keys and synonyms are normalized case-insensitively.
+    """
+    # Priority 1: Base options from Admin Valves
+    merged_data = admin_valves.model_dump()
+
+    # Priority 2: User Valves (user-overridable fields only)
+    if user_valves is not None:
+        for field_name in USER_OVERRIDABLE_VALVE_FIELDS:
+            user_val = getattr(user_valves, field_name, None)
+            if user_val is not None and user_val != "":
+                merged_data[field_name] = user_val
+
+    # Priority 3: Model Page Advanced Params
+    known_body_keys = {
+        "stream",
+        "model",
+        "messages",
+        "files",
+        "options",
+        "stream_options",
+    }
+    model_params = {k: v for k, v in body.items() if k not in known_body_keys}
+    if isinstance(body.get("options"), dict):
+        for opt_k, opt_v in body["options"].items():  # type: ignore[reportTypedDictNotRequiredAccess]
+            if opt_k not in model_params:
+                model_params[opt_k] = opt_v
+
+    for raw_key, val in model_params.items():
+        if val is None or val == "":
+            continue
+        canonical_key = canonicalize_option_key(raw_key)
+        if canonical_key in ADMIN_ONLY_VALVE_FIELDS:
+            log.warning(
+                f"Model parameter '{raw_key}' attempts to override admin-only valve '{canonical_key}'. Ignoring override."
+            )
+            continue
+        merged_data[canonical_key] = val
+
+    # Priority 4: Chat Side-Panel Advanced Params (Skipped for task models)
+    if not metadata.get("task"):
+        chat_params = metadata.get("chat_control_params", {})
+        if isinstance(chat_params, dict):
+            for raw_key, val in chat_params.items():
+                if val is None or val == "":
+                    continue
+                canonical_key = canonicalize_option_key(raw_key)
+                if canonical_key in ADMIN_ONLY_VALVE_FIELDS:
+                    log.warning(
+                        f"Chat parameter '{raw_key}' attempts to override admin-only valve '{canonical_key}'. Ignoring override."
                     )
-                    # Add a simple prefix if it's compact
-                    serialized_data_json = " - " + json_string
-                else:
-                    json_string = json.dumps(truncated_data, indent=2, default=str)
-                    # Prepend with newline for readability
-                    serialized_data_json = "\n" + json_string
-
-            except (TypeError, ValueError) as e:  # Catch specific serialization errors
-                serialized_data_json = f" - {{Serialization Error: {e}}}"
-            except (
-                Exception
-            ) as e:  # Catch any other unexpected errors during processing
-                serialized_data_json = f" - {{Processing Error: {e}}}"
-
-        # Add the final JSON string (or error message) back into the record
-        record["extra"]["_plugin_serialized_data"] = serialized_data_json
-
-        # Base template
-        base_template = (
-            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-            "<level>{level: <8}</level> | "
-            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-            "<level>{message}</level>"
+                    continue
+                merged_data[canonical_key] = val
+    else:
+        log.debug(
+            f"Task model detected ('{metadata.get('task')}'). Chat side-panel parameters ignored."
         )
 
-        # Append the serialized data
-        base_template += "{extra[_plugin_serialized_data]}"
-        # Append the exception part
-        base_template += "\n{exception}"
-        # Return the format string template
-        return base_template.rstrip()
+    return ResolvedOptions(**merged_data)
 
-    def _add_log_handler(self):
-        """
-        Adds or updates the loguru handler specifically for this plugin.
-        Includes logic for serializing and truncating extra data.
-        """
 
-        def plugin_filter(record: "Record"):
-            """Filter function to only allow logs from this plugin (based on module name)."""
-            return record["name"] == __name__
-
-        # Get the desired level name and number
-        desired_level_name = self.valves.LOG_LEVEL
-        try:
-            # Use the public API to get level details
-            desired_level_info = log.level(desired_level_name)
-            desired_level_no = desired_level_info.no
-        except ValueError:
-            log.error(
-                f"Invalid LOG_LEVEL '{desired_level_name}' configured for plugin {__name__}. Cannot add/update handler."
-            )
-            return  # Stop processing if the level is invalid
-
-        # Access the internal state of the log
-        handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
-        handler_id_to_remove = None
-        found_correct_handler = False
-
-        for handler_id, handler in handlers.items():
-            existing_filter = handler._filter  # Access internal attribute
-
-            # Check if the filter matches our plugin_filter
-            # Comparing function objects directly can be fragile if they are recreated.
-            # Comparing by name and module is more robust for functions defined at module level.
-            is_our_filter = (
-                existing_filter is not None  # Make sure a filter is set
-                and hasattr(existing_filter, "__name__")
-                and existing_filter.__name__ == plugin_filter.__name__
-                and hasattr(existing_filter, "__module__")
-                and existing_filter.__module__ == plugin_filter.__module__
-            )
-
-            if is_our_filter:
-                existing_level_no = handler.levelno
-                log.trace(
-                    f"Found existing handler {handler_id} for {__name__} with level number {existing_level_no}."
-                )
-
-                # Check if the level matches the desired level
-                if existing_level_no == desired_level_no:
-                    log.debug(
-                        f"Handler {handler_id} for {__name__} already exists with the correct level '{desired_level_name}'."
-                    )
-                    found_correct_handler = True
-                    break  # Found the correct handler, no action needed
-                else:
-                    # Found our handler, but the level is wrong. Mark for removal.
-                    log.info(
-                        f"Handler {handler_id} for {__name__} found, but log level differs "
-                        f"(existing: {existing_level_no}, desired: {desired_level_no}). "
-                        f"Removing it to update."
-                    )
-                    handler_id_to_remove = handler_id
-                    break  # Found the handler to replace, stop searching
-
-        # Remove the old handler if marked for removal
-        if handler_id_to_remove is not None:
-            try:
-                log.remove(handler_id_to_remove)
-                log.debug(f"Removed handler {handler_id_to_remove} for {__name__}.")
-            except ValueError:
-                # This might happen if the handler was somehow removed between the check and now
-                log.warning(
-                    f"Could not remove handler {handler_id_to_remove} for {__name__}. It might have already been removed."
-                )
-                # If removal failed but we intended to remove, we should still proceed to add
-                # unless found_correct_handler is somehow True (which it shouldn't be if handler_id_to_remove was set).
-
-        # Add a new handler if no correct one was found OR if we just removed an incorrect one
-        if not found_correct_handler:
-            self.log_level = desired_level_name
-            log.add(
-                sys.stdout,
-                level=desired_level_name,
-                format=self.plugin_stdout_format,
-                filter=plugin_filter,
-            )
-            log.debug(
-                f"Added new handler to loguru for {__name__} with level {desired_level_name}."
-            )
-
-    # endregion 1.4 Logging
-
-    # endregion 1. Helper methods inside the Pipe class
+# endregion Option resolution
