@@ -1807,7 +1807,7 @@ class Pipe:
         )
         IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] = Field(
             default="1K",
-            description="""Resolution for image generation (Gemini 3 Pro Image only).
+            description="""Resolution for image generation (Gemini 3 Pro Image and Nano Banana 2.1).
             Default value is 1K.""",
         )
         IMAGE_ASPECT_RATIO: Literal[
@@ -1821,9 +1821,13 @@ class Pipe:
             "9:16",
             "16:9",
             "21:9",
+            "1:4",
+            "4:1",
+            "1:8",
+            "8:1",
         ] = Field(
             default="16:9",
-            description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
+            description="""Aspect ratio for image generation (Gemini 3 Pro Image, 2.5 Flash Image and Nano Banana 2.1).
             Default value is 16:9.""",
         )
 
@@ -1960,7 +1964,7 @@ class Pipe:
         )
         IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] | None | Literal[""] = Field(
             default=None,
-            description="""Resolution for image generation (Gemini 3 Pro Image only).
+            description="""Resolution for image generation (Gemini 3 Pro Image and Nano Banana 2.1).
             Default value is None (use the admin's setting). Possible values: 1K, 2K, 4K""",
         )
         IMAGE_ASPECT_RATIO: (
@@ -1975,13 +1979,17 @@ class Pipe:
                 "9:16",
                 "16:9",
                 "21:9",
+                "1:4",
+                "4:1",
+                "1:8",
+                "8:1",
             ]
             | None
             | Literal[""]
         ) = Field(
             default=None,
-            description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
-            Default value is None (use the admin's setting). Possible values: 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9""",
+            description="""Aspect ratio for image generation (Gemini 3 Pro Image, 2.5 Flash Image and Nano Banana 2.1).
+            Default value is None (use the admin's setting). Possible values: 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9, 1:4, 4:1, 1:8, 8:1""",
         )
 
         @field_validator("THINKING_BUDGET", mode="after")
@@ -2733,14 +2741,18 @@ class Pipe:
         gen_content_conf.response_modalities = ["TEXT"]
         if self._is_image_model(model_id, config):
             gen_content_conf.response_modalities.append("IMAGE")
-            if "gemini-3-pro-image" in model_id and valves.IMAGE_RESOLUTION:
+            if (
+                "gemini-3-pro-image" in model_id or "gemini-nano-banana-2.1" in model_id
+            ) and valves.IMAGE_RESOLUTION:
                 log.debug(f"Setting image resolution to {valves.IMAGE_RESOLUTION}")
                 if not gen_content_conf.image_config:
                     gen_content_conf.image_config = types.ImageConfig()
                 gen_content_conf.image_config.image_size = valves.IMAGE_RESOLUTION
 
             if (
-                "gemini-3-pro-image" in model_id or "gemini-2.5-flash-image" in model_id
+                "gemini-3-pro-image" in model_id
+                or "gemini-2.5-flash-image" in model_id
+                or "gemini-nano-banana-2.1" in model_id
             ) and valves.IMAGE_ASPECT_RATIO:
                 log.debug(f"Setting image aspect ratio to {valves.IMAGE_ASPECT_RATIO}")
                 if not gen_content_conf.image_config:
