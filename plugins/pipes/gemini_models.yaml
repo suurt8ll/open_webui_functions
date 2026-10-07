@@ -6,6 +6,44 @@
 
 
 
+gemini-nano-banana-2.1:
+  description: "Latest high-efficiency image generation and conversational editing model (Nano Banana 2.1). Flash-level speed and cost with improved visual quality, prompt adherence, multi-turn character consistency and text rendering. Supports Google Search grounding and 1K/2K/4K output."
+  knowledge_cutoff: "2025-01"
+  latest_update: "2026-10"
+  supported_data_types:
+    inputs: [Text, Image, Video, PDF]
+    outputs: [Text, Image]
+  tokens:
+    input: 131072
+    output: 32768
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: false
+    code_execution: false
+    file_search: false
+    function_calling: false
+    grounding_google_maps: false
+    image_generation: true
+    live_api: false
+    search_grounding: true
+    structured_outputs: false
+    thinking: true
+    url_context: false
+  image_generation:
+    resolutions: ["1K", "2K", "4K"]
+    aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
+  pricing:
+    input:
+      - up_to_tokens: null
+        price_per_million: 0.25
+    output:
+      - up_to_tokens: null
+        price_per_million: 1.50
+    image_output:
+      - up_to_tokens: null
+        price_per_million: 30.00
+
 gemini-3.8-flash:
   description: "Gemini 3.8 Flash is our most intelligent Flash model, engineered for long-horizon software engineering, autonomous agents, and complex enterprise workflows—all with the speed and cost efficiency of Flash."
   knowledge_cutoff: "2026-03"
