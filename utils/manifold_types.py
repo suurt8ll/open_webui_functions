@@ -4,22 +4,25 @@ from google.genai import types
 
 # region `__files__` and `__metadata__.files`
 class FileContentDataTD(TypedDict):
-    content: str
+    # This can be 'completed' or a dictionary containing the content string
+    status: NotRequired[str]
+    content: NotRequired[str]
 
 
 class FileMetadataTD(TypedDict):
     name: str
     content_type: str
     size: int
-    data: dict[str, Any]  # Assuming this is always a dict, even if empty
-    collection_name: str
+    data: dict[str, Any]
+    collection_name: NotRequired[str]  # Only present for documents/RAG files
 
 
 class InnerFileDetailTD(TypedDict):
     id: str
     user_id: str
-    hash: str
+    hash: str | None  # Can be null for images
     filename: str
+    path: NotRequired[str]  # Only present for local filesystem files
     data: FileContentDataTD
     meta: FileMetadataTD
     created_at: int
@@ -27,16 +30,16 @@ class InnerFileDetailTD(TypedDict):
 
 
 class FileAttachmentTD(TypedDict):
-    type: str
+    type: str  # Usually "file"
     file: InnerFileDetailTD
     id: str
     url: str
     name: str
-    collection_name: str
     status: str
     size: int
     error: str
     itemId: str
+    content_type: str
 
 
 # endregion `__files__` and `__metadata__.files`
@@ -100,13 +103,38 @@ class ChatCompletionEvent(TypedDict):
     data: ChatCompletionEventData
 
 
+class WebSearchItem(TypedDict):
+    link: str
+    title: NotRequired[str]
+
+
 class StatusEventData(TypedDict):
-    action: NotRequired[Literal["web_search", "knowledge_search"]]
-    description: str
+    # Specific actions found in StatusItem.svelte
+    action: NotRequired[
+        Literal[
+            "web_search",
+            "knowledge_search",
+            "queries_generated",
+            "web_search_queries_generated",
+            "sources_retrieved",
+        ]
+    ]
+    description: NotRequired[str]
     done: NotRequired[bool]
-    query: NotRequired[str]  # knowledge_search
-    urls: NotRequired[list[str]]  # web_search
     hidden: NotRequired[bool]
+
+    # Used by "knowledge_search" and "web_search" (for the top link)
+    query: NotRequired[str]
+
+    # Used by "queries_generated" and "web_search_queries_generated" (the gray chips)
+    queries: NotRequired[list[str]]
+
+    # Used by "web_search"
+    urls: NotRequired[list[str]]  # Basic mode
+    items: NotRequired[list[WebSearchItem]]  # Rich mode (Title + Favicon)
+
+    # Used by "sources_retrieved" and injected into description via {{count}}
+    count: NotRequired[int]
 
 
 class StatusEvent(TypedDict):
@@ -114,11 +142,25 @@ class StatusEvent(TypedDict):
     data: StatusEventData
 
 
-Event = ChatCompletionEvent | StatusEvent | NotificationEvent
+class SourceData(TypedDict):
+    source: SourceSource  # The file or url object
+    document: list[str]  # The chunks of text
+    metadata: NotRequired[list[SourceMetadata]]
+
+
+class CitationEvent(TypedDict):
+    # Backend get_event_emitter handles both "source" and "citation" types
+    type: Literal["source", "citation"]
+    data: SourceData
+
+
+# Refined Event Union
+Event = ChatCompletionEvent | StatusEvent | NotificationEvent | CitationEvent
 # endregion __event_emitter__
 
 
 # region `__metadata__`
+
 
 # Ollama-specific model details. Not present for pipe models.
 class ModelDetails(TypedDict):
@@ -156,16 +198,21 @@ class ModelInfoMetaCapabilities(TypedDict):
     citations: bool
     status_updates: bool
     usage: bool
+    file_context: NotRequired[bool]
+    terminal: NotRequired[bool]
+    builtin_tools: NotRequired[bool]
+    memory: NotRequired[bool]
 
 
 class ModelInfoMeta(TypedDict):
-    profile_image_url: str
+    profile_image_url: NotRequired[str]
     description: str | None
     capabilities: ModelInfoMetaCapabilities
+    knowledge: NotRequired[Any | None]
     suggestion_prompts: Any | None
     tags: list[str]
     filterIds: list[str]
-    defaultFilterIds: list[str]
+    defaultFilterIds: NotRequired[list[str]]
 
 
 class AccessControlPermissions(TypedDict):
@@ -178,14 +225,25 @@ class ModelInfoAccessControl(TypedDict):
     write: AccessControlPermissions
 
 
+class ModelInfoAccessGrant(TypedDict):
+    id: str
+    resource_type: str
+    resource_id: str
+    principal_type: str
+    principal_id: str
+    permission: str
+    created_at: int
+
+
 class ModelInfo(TypedDict):
     id: str
     user_id: str
     base_model_id: str | None
     name: str
-    params: dict[str, Any]
+    params: NotRequired[dict[str, Any]]
     meta: ModelInfoMeta
-    access_control: ModelInfoAccessControl
+    access_control: NotRequired[ModelInfoAccessControl]
+    access_grants: NotRequired[list[ModelInfoAccessGrant]]
     is_active: bool
     updated_at: int
     created_at: int
@@ -228,30 +286,21 @@ class MetadataModel(TypedDict):
     ollama: NotRequired[OllamaDetails]
 
 
-class MetadataVariables(TypedDict):
-    """Represents variables used in the prompt/request."""
-
-    # Keys are variable names (e.g., "{{USER_NAME}}"), values are strings
-    __dict__: dict[str, str]
-
-
 class Features(TypedDict):
     """Represents the enabled/disabled features for the request."""
 
+    voice: NotRequired[bool]
     image_generation: bool
     code_interpreter: bool
     web_search: bool
 
     # These are my own custom fields, not used by Open WebUI.
-    google_search_retrieval: NotRequired[bool]
-    google_search_retrieval_threshold: NotRequired[float | None]
     google_search_tool: NotRequired[bool]
     google_code_execution: NotRequired[bool]
     upload_documents: NotRequired[bool]
     reason: NotRequired[bool]
     url_context: NotRequired[bool]
     google_maps_grounding: NotRequired[bool]
-    stream: NotRequired[bool]
     gemini_manifold_companion_version: NotRequired[str]
 
 
@@ -260,6 +309,7 @@ class MetadataParams(TypedDict):
 
     stream_delta_chunk_size: int | None
     reasoning_tags: Any | None
+    compact_token_threshold: NotRequired[int | None]
     function_calling: Literal["default", "native"]
 
 
@@ -267,30 +317,46 @@ class Metadata(TypedDict):
     """Represents the metadata object in the request body."""
 
     user_id: str  # UUID
-    chat_id: str  # UUID
-    message_id: str  # UUID
+    chat_id: str | None  # UUID, 'temporary:...', 'local:...', or None
     session_id: str
+    user_agent: NotRequired[str]
+    internal: NotRequired[bool]
     filter_ids: list[str]
     tool_ids: list[str] | None
     tool_servers: list[Any]
     files: list[FileAttachmentTD] | None
     features: Features | None
-    variables: MetadataVariables
+    variables: dict[
+        str, str
+    ]  # Keys are variable names (e.g., "{{USER_NAME}}"), values are strings
+    chat_variables: NotRequired[dict[str, Any]]
     model: MetadataModel
     direct: bool
     params: MetadataParams
 
-    # Optional/Context-dependent keys
+    # Task / context specific fields
     task: NotRequired[str | None]
     task_body: NotRequired[dict[str, Any] | None]
+    task_id: NotRequired[str | None]
+    message_id: NotRequired[str | None]
+    user_message_id: NotRequired[str | None]
+    assistant_message_id: NotRequired[str | None]
+    folder_id: NotRequired[str | None]
+    system_prompt: NotRequired[str | None]
+    user_prompt: NotRequired[str | None]
+    user_message: NotRequired[dict[str, Any] | None]
+    sources: NotRequired[list[Any]]
+    skill_ids: NotRequired[list[str]]
+    terminal_id: NotRequired[str | None]
+    model_id: NotRequired[str]
 
     # These are my own added custom keys, not used by Open WebUI.
-    safety_settings: list[types.SafetySetting]  # Added in `Filter.inlet`
-    chat_control_params: dict[str, Any]  # Added in `Filter.inlet`
+    safety_settings: NotRequired[list[types.SafetySetting]]  # Added in `Filter.inlet`
+    chat_control_params: NotRequired[dict[str, Any]]  # Added in `Filter.inlet`
     merged_custom_params: dict[str, Any]  # Added in `Pipe.pipe`
     is_paid_api: NotRequired[bool]  # Added in `Pipe.pipe`
     is_vertex_ai: NotRequired[bool]  # Added in `Pipe.pipe`
-    canonical_model_id: NotRequired[str] # Added in `Filter.inlet`
+    canonical_model_id: NotRequired[str]  # Added in `Pipe.pipe`
     cumulative_tokens: NotRequired[int | None]  # Added in `Pipe.pipe`
     cumulative_cost: NotRequired[float | None]  # Added in `Pipe.pipe`
 
@@ -324,20 +390,64 @@ class ImageContent(TypedDict):
 Content = TextContent | ImageContent  # Union of possible content types
 
 
+class OutputTextContent(TypedDict):
+    """Represents output text content blocks within model outputs."""
+
+    type: Literal["output_text", "text"]
+    text: str
+
+
+class ReasoningOutputItem(TypedDict):
+    """Represents reasoning / thinking output blocks."""
+
+    type: Literal["reasoning"]
+    id: NotRequired[str]
+    status: NotRequired[str]
+    start_tag: NotRequired[str]
+    end_tag: NotRequired[str]
+    attributes: NotRequired[dict[str, Any]]
+    content: list[OutputTextContent]
+    summary: NotRequired[str | None]
+    started_at: NotRequired[float]
+    ended_at: NotRequired[float]
+    duration: NotRequired[float]
+
+
+class MessageOutputItem(TypedDict):
+    """Represents message output blocks."""
+
+    type: Literal["message"]
+    id: NotRequired[str]
+    status: NotRequired[str]
+    role: NotRequired[Literal["assistant", "user", "system"]]
+    content: list[OutputTextContent]
+
+
+OutputItem = ReasoningOutputItem | MessageOutputItem
+
+
 class UserMessage(TypedDict):
     """Represents a message from the user."""
 
     role: Literal["user"]
-    content: (
-        str | list[Content]
-    )  # Content can be a simple string or a list of Content blocks
+    id: NotRequired[str]
+    content: str | list[Content]
+    timestamp: NotRequired[int]
+    info: NotRequired[dict[str, Any] | None]
 
 
 class AssistantMessage(TypedDict):
     """Represents a message from the assistant."""
 
     role: Literal["assistant"]
-    content: str  # Assistant messages typically have string content
+    id: NotRequired[str]
+    content: str  # I've never seen a non-string assistant message.
+    timestamp: NotRequired[int]
+    info: NotRequired[dict[str, Any] | None]
+    output: NotRequired[list[OutputItem]]
+    sources: NotRequired[list[Any]]
+    usage: NotRequired[dict[str, Any]]
+    originalContent: NotRequired[str]
     # This custom key is added by the Gemini Manifold companion filter to store the
     # raw structured response parts from the Gemini API for potential future use.
     # It is not part of the standard Open WebUI message format and will be ignored by the core system.
@@ -372,7 +482,7 @@ class Options(TypedDict):
 
 class Body(TypedDict):
     """
-    Represents the main request body structure. 
+    Represents the main request body structure.
     This differs between `Filter.inlet`, `Pipe.pipe`, and `Filter.outlet`.
     """
 
@@ -381,8 +491,10 @@ class Body(TypedDict):
     messages: list[Message]
     files: NotRequired[list[FileAttachmentTD]]
     features: NotRequired[Features]  # Only present in `Filter.inlet`
-    metadata: Metadata # Only present in `Filter.inlet`
+    metadata: Metadata  # Only present in `Filter.inlet`
     options: NotRequired[Options]
+
+
 # endregion `body` dict
 
 
@@ -411,7 +523,7 @@ class ChatMessageTD(TypedDict):
     sources: NotRequired[
         list[Source]
     ]  # Present in history.messages for assistant, not in top-level messages list
-    statusHistory: NotRequired[list[StatusEventData]] # assistant messages only
+    statusHistory: NotRequired[list[StatusEventData]]  # assistant messages only
     usage: NotRequired[dict[str, Any]]  # assistant messages only
 
     # Custom keys added by Gemini Manifold plugin
