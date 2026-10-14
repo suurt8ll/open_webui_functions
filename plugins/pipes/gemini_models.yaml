@@ -6,6 +6,46 @@
 
 
 
+gemini-4-argon:
+  description: "Our flagship reasoning model, built for complex software engineering, deep mathematical and scientific problem solving, autonomous multi-step agents, and long-decode generation up to 1M tokens."
+  # knowledge_cutoff: not published by Google.
+  latest_update: "2026-10"
+  supported_data_types:
+    inputs: [Text, Image, Video, Audio, PDF]
+    outputs: [Text]
+  tokens:
+    # Context window is a unified input + output limit.
+    input: 1048576
+    # Default synchronous limit. Up to 1048576 with long decode (not used by this pipe).
+    output: 65536
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    # Implicit caching only. Explicit caching (cachedContents) is not supported.
+    caching: true
+    code_execution: true
+    file_search: true
+    function_calling: true
+    grounding_google_maps: true
+    image_generation: false
+    live_api: false
+    search_grounding: true
+    structured_outputs: true
+    thinking: true
+    url_context: true
+  pricing:
+    # Not available on the Free tier.
+    # Introductory pricing through 2026-11-30; standard pricing from 2026-12-01 is input 4.00, output 20.00, caching 0.20.
+    input:
+      - up_to_tokens: null
+        price_per_million: 2.00
+    output:
+      - up_to_tokens: null
+        price_per_million: 10.00
+    caching:
+      - up_to_tokens: null
+        price_per_million: 0.10
+
 gemini-nano-banana-2.1:
   description: "Latest high-efficiency image generation and conversational editing model (Nano Banana 2.1). Flash-level speed and cost with improved visual quality, prompt adherence, multi-turn character consistency and text rendering. Supports Google Search grounding and 1K/2K/4K output."
   knowledge_cutoff: "2025-01"
