@@ -1,332 +1,483 @@
 #!/bin/bash
+#
+# dev.sh — headless dev-environment manager for Open WebUI plugin development.
+#
+# Sets up the environment (venvs, deps, optionally the frontend build) and runs
+# the OWUI backend + the function updater as detached background processes,
+# logging to files. Built for both humans and agents: everything is scriptable,
+# nothing requires a TTY or a terminal multiplexer.
+#
+# Usage:
+#   dev.sh [env-file] start      Set up (if needed) + launch backend & updater
+#   dev.sh [env-file] restart    stop, then start
+#   dev.sh stop                  Stop backend & updater
+#   dev.sh status                Show process/port state + updater sync state
+#   dev.sh logs [name] [-f]      Show logs (backend|updater|all), -f to follow
+#   dev.sh [env-file] setup      Environment setup only (--recreate to rebuild
+#                                venvs, --frontend to force an npm build)
+#   dev.sh help
+#
+# If the first argument is not a known command but an existing file, it is
+# treated as the env file for `start` (backwards compatible with the old
+# `dev.sh dev/.env.dev` invocation).
+#
+# Env file (defaults to dev/.env.dev when present) may set:
+#   PYTHON_VERSION, PROTOCOL, HOST, PORT, API_KEY, POLLING_INTERVAL,
+#   ONE_TIME_RUN, FILEPATHS, DATA_DIR, WEBUI_SECRET_KEY, ...
+# See .env.example for documentation. The explicit env file always wins over
+# ambient environment variables (it is sourced with allexport after parsing).
 
-# Exit immediately if a command exits with a non-zero status.
-# Treat unset variables as an error when substituting.
-# Prevent errors in a pipeline from being masked.
 set -euo pipefail
 
-# --- Configuration & Argument Parsing ---
+# --- Paths ---
 
-# Default values if not provided via env file or environment
-PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
-HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8080}"
-
-ENV_ARG=""
-ENV_FILE_PATH=""
-
-if [ $# -gt 0 ]; then
-    if [ -f "$1" ]; then
-        ENV_FILE_PATH=$(realpath "$1")
-        echo "Loading configuration from: $ENV_FILE_PATH"
-        
-        # 'set -a' (allexport) causes all variables defined or modified from 
-        # this point until 'set +a' to be automatically exported to the 
-        # environment. This is much cleaner than using xargs and properly 
-        # handles quoted values or special characters in your .env file.
-        set -a
-        source "$ENV_FILE_PATH"
-        set +a
-        
-        ENV_ARG="--env $ENV_FILE_PATH"
-    else
-        echo "ERROR: Configuration file '$1' not found." >&2
-        exit 1
-    fi
-fi
-
-# Re-evaluate variables in case they were loaded from the env file
-PYTHON_VERSION="${PYTHON_VERSION:-$PYTHON_VERSION}"
-HOST="${HOST:-$HOST}"
-PORT="${PORT:-$PORT}"
-
-# Project structure definition
-SCRIPT_DIR=$(dirname "$(realpath "$0")")
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
 FRONTEND_DIR="$PROJECT_ROOT/submodules/open-webui"
 BACKEND_DIR="$FRONTEND_DIR/backend"
-
-# Virtual environment paths
-BACKEND_VENV_DIR="$BACKEND_DIR/.venv"
-UPDATER_VENV_DIR="$PROJECT_ROOT/.venv"
-
-# Single State directory
+BACKEND_VENV="$BACKEND_DIR/.venv"
+UPDATER_VENV="$PROJECT_ROOT/.venv"
 STATE_DIR="$SCRIPT_DIR/.dev_state"
+LOG_DIR="$SCRIPT_DIR/logs"
+BACKEND_LOG="$LOG_DIR/backend.log"
+UPDATER_LOG="$LOG_DIR/updater.log"
+BACKEND_PID_FILE="$STATE_DIR/backend.pid"
+UPDATER_PID_FILE="$STATE_DIR/updater.pid"
+RUNTIME_STATE_FILE="$STATE_DIR/runtime.env"
 
-# --- Helper Functions ---
+# Pin uv's managed Python install + cache inside the repo so venvs created
+# here also work inside the pi-fluid dev container (and vice versa).
+# shellcheck source=uv-shared-env.sh
+source "$SCRIPT_DIR/uv-shared-env.sh"
 
-ensure_state_dir() {
-    local dir="$1"
-    mkdir -p "$dir"
-    echo "*" > "$dir/.gitignore"
-}
+# --- Pretty output ---
 
-check_openssl() {
-    if ! command -v openssl &> /dev/null; then
-        echo "ERROR: openssl is required for hashing but is not installed." >&2
-        exit 1
-    fi
-}
+log()  { printf '\033[1;34m[dev]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[dev]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[dev]\033[0m %s\n' "$*" >&2; exit 1; }
 
-check_uv() {
-    if ! command -v uv &> /dev/null; then
-        echo "ERROR: 'uv' is required for Python package management but is not installed." >&2
-        echo "Please install uv (e.g., curl -LsSf https://astral.sh/uv/install.sh | sh)." >&2
-        exit 1
-    fi
-}
-
-get_hash() {
-    check_openssl
-    local files_to_hash=()
-    for f in "$@"; do
-        if [[ -f "$f" ]]; then
-            files_to_hash+=("$f")
-        fi
-    done
-    if [[ ${#files_to_hash[@]} -eq 0 ]]; then
-        echo "d41d8cd98f00b204e9800998ecf8427e" # MD5 of empty string
-        return
-    fi
-    # shellcheck disable=SC2002
-    cat "${files_to_hash[@]}" | openssl md5 | awk '{print $2}'
-}
-
-read_state() {
-    local state_file="$1"
-    if [ -f "$state_file" ]; then
-        cat "$state_file"
-    else
-        echo "nostate"
-    fi
-}
-
-write_state() {
-    local state_file="$1"
-    local hash="$2"
-    echo "$hash" > "$state_file"
-}
-
-# --- Environment Setup Functions ---
-
-check_and_create_frontend_env() {
-    local frontend_dir="$1"
-    local env_file="$frontend_dir/.env"
-    local example_env_file="$frontend_dir/.env.example"
-
-    echo "Checking for frontend .env file..."
-    if [ ! -f "$env_file" ]; then
-        if [ -f "$example_env_file" ]; then
-            echo "Frontend .env file not found. Copying from .env.example."
-            cp "$example_env_file" "$env_file"
-        else
-            echo "Warning: $env_file and $example_env_file not found."
-        fi
-    fi
-}
-
-check_and_install_npm() {
-    local target_dir="$1"
-    local component_name="$2"
-    local state_file="$STATE_DIR/${component_name}_npm_deps.hash"
-    local needs_install=false
-
-    echo "Checking frontend dependencies in '$target_dir'..."
-    ensure_state_dir "$STATE_DIR"
-
-    (
-        cd "$target_dir" || exit 1
-
-        local lock_file="package-lock.json"
-        local pkg_file="package.json"
-        local dep_file_to_hash=""
-
-        if [ -f "$lock_file" ]; then
-            dep_file_to_hash="$lock_file"
-        elif [ -f "$pkg_file" ]; then
-            dep_file_to_hash="$pkg_file"
-        else
-            echo "Warning: Neither package.json nor package-lock.json found. Skipping npm install."
-            exit 0
-        fi
-
-        local current_hash
-        local stored_hash
-        current_hash=$(get_hash "$dep_file_to_hash")
-        stored_hash=$(read_state "$state_file")
-
-        if [ ! -d "node_modules" ] || [ "$current_hash" != "$stored_hash" ]; then
-            needs_install=true
-        fi
-
-        if $needs_install; then
-            echo "Installing frontend dependencies..."
-            if npm install; then
-                write_state "$state_file" "$current_hash"
-            else
-                echo "Warning: 'npm install' failed. Retrying with --force..."
-                if npm install --force; then
-                    write_state "$state_file" "$current_hash"
-                else
-                    echo "ERROR: npm install failed." >&2
-                    exit 1
-                fi
-            fi
-        else
-            echo "Frontend dependencies are up to date."
-        fi
-    )
-}
-
-build_frontend() {
-    local target_dir="$1"
-    local build_dir="$target_dir/build"
-    local state_file="$STATE_DIR/frontend_build.hash"
-    local needs_build=false
-
-    echo "Checking if frontend requires building..."
-    ensure_state_dir "$STATE_DIR"
-
-    (
-        cd "$target_dir" || exit 1
-        
-        # We hash package.json as a proxy to detect if the OWUI submodule was updated
-        local current_hash
-        local stored_hash
-        current_hash=$(get_hash "package.json")
-        stored_hash=$(read_state "$state_file")
-
-        if [ ! -d "$build_dir" ] || [ "$current_hash" != "$stored_hash" ]; then
-            needs_build=true
-        fi
-
-        if $needs_build; then
-            echo "Building frontend static assets (npm run build)..."
-            if npm run build; then
-                echo "Frontend built successfully."
-                write_state "$state_file" "$current_hash"
-            else
-                echo "ERROR: Frontend build failed." >&2
-                exit 1
-            fi
-        else
-            echo "Frontend build is up to date."
-        fi
-    )
-}
-
-setup_pip_venv() {
-    local target_desc="$1"
-    local component_name="$2"
-    local target_dir="$3"
-    local venv_dir="$4"
-    local requirements_file="$5"
-    local state_file="$STATE_DIR/${component_name}_pip_deps.hash"
-    local needs_install=false
-
-    echo "Checking $target_desc Python environment in '$target_dir'..."
-    ensure_state_dir "$STATE_DIR"
-
-    if [ ! -d "$venv_dir" ] || [ ! -f "$venv_dir/bin/activate" ]; then
-        echo "$target_desc virtual environment not found. Creating it with 'uv' (Python $PYTHON_VERSION)..."
-        # --seed ensures pip is available for OWUI's internal plugin installer
-        uv venv --python "$PYTHON_VERSION" --seed "$venv_dir"
-        needs_install=true
-    fi
-
-    if [ ! -f "$requirements_file" ]; then
-        echo "Warning: $requirements_file not found. Skipping dependency check."
-        rm -f "$state_file"
-        return
-    fi
-
-    local current_hash
-    local stored_hash
-    current_hash=$(get_hash "$requirements_file")
-    stored_hash=$(read_state "$state_file")
-
-    if [ "$current_hash" != "$stored_hash" ]; then
-        needs_install=true
-    fi
-
-    if $needs_install; then
-        echo "Installing/updating $target_desc dependencies using uv..."
-        if uv pip install --python "$venv_dir" -r "$requirements_file"; then
-            echo "$target_desc dependencies installed/updated successfully."
-            write_state "$state_file" "$current_hash"
-        else
-            echo "ERROR: uv pip install failed for $target_desc" >&2
-            exit 1
-        fi
-    else
-        echo "$target_desc dependencies are up to date."
-    fi
-}
-
-# --- Main Setup ---
-
-echo "Starting development environment setup..."
-
-check_uv
-
-# 1. Setup & Build Frontend
-check_and_create_frontend_env "$FRONTEND_DIR"
-check_and_install_npm "$FRONTEND_DIR" "open-webui"
-build_frontend "$FRONTEND_DIR"
-
-# 2. Setup Backend Environment
-setup_pip_venv "backend" "backend" "$BACKEND_DIR" "$BACKEND_VENV_DIR" "$BACKEND_DIR/requirements.txt"
-
-# 3. Setup Updater Environment
-setup_pip_venv "updater" "updater" "$PROJECT_ROOT" "$UPDATER_VENV_DIR" "$PROJECT_ROOT/requirements.txt"
-
-
-echo "Setup complete. Launching tmux session..."
-
-# --- tmux Launch ---
-
-if [ -n "${TMUX:-}" ]; then
-    echo "Already inside a tmux session. Skipping new session creation."
+usage() {
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
+}
+
+# --- Config loading ---
+
+ENV_FILE=""
+SETUP_RECREATE=false
+SETUP_FRONTEND=false
+
+# Extracts setup-related flags so they don't get mistaken for an env file
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --recreate) SETUP_RECREATE=true ;;
+        --frontend) SETUP_FRONTEND=true ;;
+        *) ARGS+=("$arg") ;;
+    esac
+done
+
+COMMAND="${ARGS[0]:-help}"
+if ! [[ "$COMMAND" =~ ^(start|stop|restart|status|logs|setup|help)$ ]]; then
+    if [ -f "$COMMAND" ]; then
+        # Backwards compatibility: first arg was the env file
+        ENV_FILE="$COMMAND"
+        COMMAND="${ARGS[1]:-start}"
+        [ "${#ARGS[@]}" -le 2 ] || die "Unexpected extra arguments: ${ARGS[*]:2}"
+    else
+        die "Unknown command '$COMMAND'. Run 'dev.sh help'."
+    fi
+elif [ "${#ARGS[@]}" -gt 1 ]; then
+    if [ "$COMMAND" = "logs" ]; then
+        # logs takes its own args, never an env file
+        LOGS_ARGS=("${ARGS[@]:1}")
+    elif [ -f "${ARGS[1]}" ]; then
+        ENV_FILE="${ARGS[1]}"
+        [ "${#ARGS[@]}" -le 2 ] || die "Unexpected extra arguments: ${ARGS[*]:2}"
+    else
+        die "'$ARGS[1]' is not a file."
+    fi
 fi
 
-SESSION_NAME="openwebui_dev"
+load_env() {
+    if [ -z "$ENV_FILE" ]; then
+        if [ -f "$SCRIPT_DIR/.env.dev" ]; then
+            ENV_FILE="$SCRIPT_DIR/.env.dev"
+        else
+            log "No env file given and no .env.dev found; using built-in defaults."
+            return
+        fi
+    fi
+    [ -f "$ENV_FILE" ] || die "Env file '$ENV_FILE' not found."
+    ENV_FILE=$(realpath "$ENV_FILE")
+    # 'set -a' exports everything the file defines; the file is the source of
+    # truth and intentionally wins over any pre-exported variables.
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+    log "Config: $ENV_FILE"
+}
 
-# --- Define Commands for Each tmux Window ---
+load_env
 
-# 1. Unified OWUI Server Command
-# We use the HOST and PORT determined by the env/defaults
-BACKEND_START_COMMAND="uvicorn open_webui.main:app --port $PORT --host $HOST"
-BACKEND_COMMAND="cd '$BACKEND_DIR' && \
-                   echo 'Activating backend venv...' && \
-                   . '$BACKEND_VENV_DIR/bin/activate' && \
-                   echo '--- Starting Open WebUI Server ($HOST:$PORT) ---' && \
-                   exec $BACKEND_START_COMMAND"
+PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
+PROTOCOL="${PROTOCOL:-http}"
+HOST="${HOST:-127.0.0.1}"
+PORT="${PORT:-8080}"
+API_URL="$PROTOCOL://$HOST:$PORT"
 
-# 2. Function Updater Command
-# We pass the absolute path to the env file if one was provided to dev.sh
-UPDATER_COMMAND="cd '$SCRIPT_DIR' && \
-                   echo 'Activating updater venv...' && \
-                   . '$UPDATER_VENV_DIR/bin/activate' && \
-                   echo '--- Starting Function Updater ---' && \
-                   exec python function_updater.py $ENV_ARG"
+# Optional DATA_DIR override (OWUI reads the same variable). When running from
+# source, OWUI never creates a custom DATA_DIR, and SQLite then fails to create
+# the database file in the missing directory ("unable to open database file"
+# during alembic migrations). We resolve it to an absolute path and create it
+# here, so pointing it at a fresh directory gives you a disposable instance
+# with a fresh database. Relative paths are resolved against the env file's
+# directory (same convention as FILEPATHS).
+if [ -n "${DATA_DIR:-}" ]; then
+    case "$DATA_DIR" in
+        /*) ;;                                   # already absolute
+        *)
+            base=$(dirname "$(realpath "${ENV_FILE:-$SCRIPT_DIR/.env.dev}")")
+            DATA_DIR="$base/$DATA_DIR"
+            ;;
+    esac
+    DATA_DIR=$(mkdir -p "$DATA_DIR" && cd "$DATA_DIR" && pwd)
+    export DATA_DIR
+    # Keep the normalized value under a dedicated name: the backend subshell
+    # re-sources the env file, which would otherwise clobber DATA_DIR with the
+    # raw (possibly relative) value from the file.
+    BACKEND_DATA_DIR="$DATA_DIR"
+fi
 
-# --- Create and Configure tmux Session ---
+# --- Small helpers ---
 
-# Create a new detached tmux session with two windows
-tmux new-session -d -s "$SESSION_NAME" -n "open-webui" "$BACKEND_COMMAND" \; \
-     new-window -n "function-updater" "$UPDATER_COMMAND"
+ensure_dir() {
+    mkdir -p "$1"
+    printf '*\n' > "$1/.gitignore"
+}
 
-# Select the first window to be active when attaching
-tmux select-window -t "$SESSION_NAME:open-webui"
+pid_alive() {
+    local pid="$1" state
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+    # kill -0 also succeeds for zombies; in containers without a reaping init,
+    # an orphaned process that exited can stay defunct indefinitely. Treat
+    # zombie state as dead so stop() doesn't needlessly escalate to SIGKILL.
+    state=$(awk '/^State:/{print $2}' "/proc/$pid/status" 2>/dev/null || true)
+    [ -z "$state" ] || [ "$state" != "Z" ]
+}
 
-# Enable mouse mode for convenience
-tmux set-option -g mouse on
+# A PID file may be stale and the PID recycled by an unrelated process; verify
+# the command line matches what we expect before trusting it.
+pid_matches() {
+    local pid="$1" needle="$2"
+    pid_alive "$pid" || return 1
+    if [ -r "/proc/$pid/cmdline" ]; then
+        tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q "$needle"
+    else
+        return 1
+    fi
+}
 
-# Attach to the created tmux session
-echo "Attaching to tmux session '$SESSION_NAME'..."
-echo "Windows created: [open-webui], [function-updater]"
-echo "Use 'Ctrl-b n' to cycle to the next window, 'Ctrl-b p' for the previous."
-tmux attach-session -t "$SESSION_NAME"
+read_pid() {
+    local file="$1" needle="$2"
+    [ -f "$file" ] || return 1
+    local pid
+    pid=$(cat "$file" 2>/dev/null) || return 1
+    if pid_matches "$pid" "$needle"; then
+        printf '%s' "$pid"
+        return 0
+    fi
+    rm -f "$file"   # stale or recycled PID
+    return 1
+}
 
-echo "Tmux session '$SESSION_NAME' ended."
+health_ok() {
+    curl -sf -o /dev/null --max-time 3 "$API_URL/health"
+}
+
+write_runtime_state() {
+    cat > "$RUNTIME_STATE_FILE" <<EOF
+ENV_FILE=$ENV_FILE
+PROTOCOL=$PROTOCOL
+HOST=$HOST
+PORT=$PORT
+DATA_DIR=${BACKEND_DATA_DIR:-}
+EOF
+}
+
+# --- Process management ---
+
+stop_pid_file() {
+    local file="$1" needle="$2" name="$3"
+    local pid
+    if ! pid=$(read_pid "$file" "$needle"); then
+        log "$name: not running"
+        return 0
+    fi
+    log "$name: stopping (pid $pid)..."
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 100); do
+        pid_alive "$pid" || break
+        sleep 0.1
+    done
+    if pid_alive "$pid"; then
+        warn "$name: did not exit after SIGTERM, sending SIGKILL"
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$file"
+    log "$name: stopped"
+}
+
+do_stop() {
+    stop_pid_file "$UPDATER_PID_FILE" "function_updater" "updater"
+    stop_pid_file "$BACKEND_PID_FILE" "uvicorn" "backend"
+    rm -f "$RUNTIME_STATE_FILE"
+}
+
+wait_for_health() {
+    local timeout="${1:-90}"
+    log "Waiting up to ${timeout}s for backend at $API_URL ..."
+    local waited=0 pid
+    while ! health_ok; do
+        # read_pid only succeeds while the recorded PID is alive and still is
+        # the uvicorn process (avoids the kill -0 0 process-group pitfall)
+        if ! pid=$(read_pid "$BACKEND_PID_FILE" "uvicorn"); then
+            warn "Backend process died during startup. Last log lines:"
+            tail -n 30 "$BACKEND_LOG" >&2 || true
+            die "Backend failed to start. Full log: $BACKEND_LOG"
+        fi
+        if [ "$waited" -ge "$timeout" ]; then
+            warn "Backend not healthy after ${timeout}s. Last log lines:"
+            tail -n 30 "$BACKEND_LOG" >&2 || true
+            die "Backend health check timed out. Full log: $BACKEND_LOG"
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+rotate_log() {
+    local file="$1"
+    [ -f "$file" ] && mv "$file" "$file.1"
+    : > "$file"
+}
+
+# --- Environment setup ---
+
+check_uv() {
+    command -v uv &> /dev/null || die "'uv' is required but not installed (https://docs.astral.sh/uv/)."
+}
+
+# Hash of the requirements files that drive a dependency install
+deps_hash() {
+    local files=()
+    local f
+    for f in "$@"; do
+        [ -f "$f" ] && files+=("$f")
+    done
+    [ ${#files[@]} -eq 0 ] && { echo none; return; }
+    cat "${files[@]}" | md5sum | awk '{print $1}'
+}
+
+# A hash alone can't tell a healthy venv from one whose interpreter vanished
+# (e.g. after a container/base-image change). Actually run the interpreter and
+# import a sentinel package before trusting the venv.
+venv_healthy() {
+    local venv="$1" sentinel="$2"
+    [ -x "$venv/bin/python" ] || return 1
+    "$venv/bin/python" -c "import $sentinel" &> /dev/null
+}
+
+setup_venv() {
+    local name="$1" venv="$2" requirements="$3" sentinel="$4"
+    local hash_file="$STATE_DIR/${name}_pip_deps.hash"
+
+    if $SETUP_RECREATE; then
+        log "$name: --recreate given, wiping venv..."
+        rm -rf "$venv"
+        rm -f "$hash_file"
+    fi
+
+    if ! venv_healthy "$venv" "$sentinel"; then
+        if [ -d "$venv" ]; then
+            warn "$name: venv exists but is unhealthy (broken interpreter or missing core deps). Recreating..."
+            rm -rf "$venv"
+            rm -f "$hash_file"
+        fi
+        log "$name: creating venv (Python $PYTHON_VERSION)..."
+        uv venv --python "$PYTHON_VERSION" --seed "$venv"
+        rm -f "$hash_file"   # fresh venv, force install below
+    fi
+
+    if [ ! -f "$requirements" ]; then
+        warn "$name: requirements file '$requirements' not found, skipping deps."
+        return 0
+    fi
+
+    local current stored
+    current=$(deps_hash "$requirements")
+    stored=$(cat "$hash_file" 2>/dev/null || echo nostate)
+
+    if [ "$current" != "$stored" ] || ! venv_healthy "$venv" "$sentinel"; then
+        log "$name: installing dependencies..."
+        uv pip install --python "$venv/bin/python" -r "$requirements" \
+            || die "$name: dependency install failed."
+    else
+        log "$name: dependencies up to date."
+    fi
+
+    venv_healthy "$venv" "$sentinel" || die "$name: venv still unhealthy after install. $venv"
+    echo "$current" > "$hash_file"
+}
+
+setup_frontend() {
+    local build_dir="$FRONTEND_DIR/build"
+    local npm_hash_file="$STATE_DIR/open-webui_npm_deps.hash"
+    local build_hash_file="$STATE_DIR/frontend_build.hash"
+
+    if ! $SETUP_FRONTEND && [ -d "$build_dir" ] && [ -n "$(ls -A "$build_dir" 2>/dev/null)" ]; then
+        log "Frontend: prebuilt assets found (pass --frontend to force a rebuild)."
+        return 0
+    fi
+
+    command -v npm &> /dev/null || die "npm is required for the frontend build but not installed."
+    log "Frontend: installing npm dependencies..."
+    ( cd "$FRONTEND_DIR" && npm install ) || die "npm install failed."
+    echo "$(deps_hash "$FRONTEND_DIR/package-lock.json")" > "$npm_hash_file"
+
+    log "Frontend: building static assets (this can take several minutes)..."
+    ( cd "$FRONTEND_DIR" && npm run build ) || die "frontend build failed."
+    echo "$(deps_hash "$FRONTEND_DIR/package.json")" > "$build_hash_file"
+}
+
+do_setup() {
+    check_uv
+    ensure_dir "$STATE_DIR"
+    ensure_dir "$LOG_DIR"
+
+    setup_frontend
+    setup_venv "backend" "$BACKEND_VENV" "$BACKEND_DIR/requirements.txt" "uvicorn, fastapi"
+    setup_venv "updater" "$UPDATER_VENV" "$PROJECT_ROOT/requirements.txt" "aiohttp, watchfiles, dotenv, loguru"
+    log "Setup complete."
+}
+
+# --- Commands ---
+
+do_start() {
+    do_stop   # clean slate: also clears stale pid files
+    do_setup
+
+    log "Launching backend ($API_URL)..."
+    if [ -n "${DATA_DIR:-}" ]; then
+        log "  DATA_DIR: $DATA_DIR"
+    fi
+    rotate_log "$BACKEND_LOG"
+    (
+        set -a
+        # shellcheck disable=SC1090
+        [ -n "$ENV_FILE" ] && . "$ENV_FILE"
+        set +a
+        # Re-apply the normalized DATA_DIR: the env file may hold a relative
+        # path, which would otherwise resolve against $BACKEND_DIR below.
+        [ -n "${BACKEND_DATA_DIR:-}" ] && export DATA_DIR="$BACKEND_DATA_DIR"
+        cd "$BACKEND_DIR"
+        exec "$BACKEND_VENV/bin/uvicorn" open_webui.main:app \
+            --host "$HOST" --port "$PORT"
+    ) < /dev/null >> "$BACKEND_LOG" 2>&1 &
+    echo $! > "$BACKEND_PID_FILE"
+
+    log "Launching function updater..."
+    rotate_log "$UPDATER_LOG"
+    (
+        cd "$SCRIPT_DIR"
+        env_arg=""
+        [ -n "$ENV_FILE" ] && env_arg="--env $ENV_FILE"
+        exec "$UPDATER_VENV/bin/python" function_updater.py $env_arg
+    ) < /dev/null >> "$UPDATER_LOG" 2>&1 &
+    echo $! > "$UPDATER_PID_FILE"
+
+    write_runtime_state
+
+    # catch instant-death failures (bad args, missing interpreter, port taken)
+    sleep 2
+    pid_matches "$(cat "$BACKEND_PID_FILE")" "uvicorn" || { tail -n 20 "$BACKEND_LOG" >&2; die "Backend exited immediately. See $BACKEND_LOG"; }
+    pid_matches "$(cat "$UPDATER_PID_FILE")" "function_updater" || { tail -n 20 "$UPDATER_LOG" >&2; die "Updater exited immediately. See $UPDATER_LOG"; }
+
+    wait_for_health "${BACKEND_TIMEOUT:-120}"
+
+    log "Running:"
+    log "  backend : pid $(cat "$BACKEND_PID_FILE")  $API_URL  (log: $BACKEND_LOG)"
+    log "  updater : pid $(cat "$UPDATER_PID_FILE")  (log: $UPDATER_LOG)"
+    log "Stop with 'dev.sh stop'. Watch with 'dev.sh logs -f'. Status with 'dev.sh status'."
+}
+
+do_status() {
+    local backend_pid updater_pid
+    if backend_pid=$(read_pid "$BACKEND_PID_FILE" "uvicorn" 2>/dev/null); then
+        if health_ok; then
+            log "backend : RUNNING (pid $backend_pid), healthy at $API_URL"
+        else
+            warn "backend : RUNNING (pid $backend_pid) but NOT healthy at $API_URL/health"
+        fi
+    else
+        log "backend : stopped"
+    fi
+
+    if updater_pid=$(read_pid "$UPDATER_PID_FILE" "function_updater" 2>/dev/null); then
+        log "updater : RUNNING (pid $updater_pid)"
+    else
+        log "updater : stopped"
+    fi
+
+    # Updater sync state: delegate to the updater's --status mode when possible
+    if [ -x "$UPDATER_VENV/bin/python" ]; then
+        local env_arg=""
+        [ -n "$ENV_FILE" ] && env_arg="--env $ENV_FILE"
+        # shellcheck disable=SC2086
+        "$UPDATER_VENV/bin/python" "$SCRIPT_DIR/function_updater.py" --status $env_arg \
+            2>/dev/null || warn "updater: could not determine sync state (see warning above)"
+    fi
+}
+
+do_logs() {
+    local name="all" follow=false
+    for arg in ${LOGS_ARGS[@]+"${LOGS_ARGS[@]}"}; do
+        case "$arg" in
+            -f|--follow) follow=true ;;
+            backend|updater|all) name="$arg" ;;
+            *) die "logs: unknown argument '$arg' (use backend|updater|all, -f)" ;;
+        esac
+    done
+
+    show_one() {
+        local file="$1" label="$2"
+        [ -f "$file" ] || { warn "$label: no log file yet ($file)"; return 0; }
+        echo "==> $label ($file) <=="
+        if $follow; then
+            tail -F "$file"
+        else
+            tail -n 50 "$file"
+        fi
+        echo
+    }
+
+    case "$name" in
+        backend) show_one "$BACKEND_LOG" "backend" ;;
+        updater) show_one "$UPDATER_LOG" "updater" ;;
+        all)
+            show_one "$BACKEND_LOG" "backend"
+            show_one "$UPDATER_LOG" "updater"
+            ;;
+    esac
+}
+
+case "$COMMAND" in
+    start)   do_start ;;
+    restart) do_stop; do_start ;;
+    stop)    do_stop ;;
+    status)  do_status ;;
+    logs)    do_logs ;;
+    setup)   do_setup ;;
+    help|*)  usage ;;
+esac

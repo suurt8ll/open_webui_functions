@@ -64,7 +64,7 @@ Use the included utility script to automatically create/update multiple function
 
 - **`utils/`**: Contains shared code like `manifold_types.py` used by multiple plugins.
 - **`examples/`**: Test scripts and example plugins demonstrating specific capabilities.
-- **`dev/`**: Tools for active development, including `function_updater.py` for monitoring file changes and `dev.sh` for environment setup.
+- **`dev/`**: Tools for active development — `dev.sh` (headless environment setup + backend/updater process manager) and `function_updater.py` for monitoring file changes. See `dev/README.md`.
 
 ## Archived Functions
 
