@@ -62,6 +62,21 @@ bash dev/dev.sh logs backend|updater      # one log instead of both
    python dev/function_updater.py --status --env dev/.env.dev
    ```
 
+### Disposable / second instance
+
+To run a throwaway instance (fresh database, different port) alongside or
+instead of the main dev instance, copy `.env.example` somewhere (e.g.
+`/tmp/.env.owui-test`), give it its own `PORT`, `API_KEY` and a fresh
+`DATA_DIR`, then:
+
+```bash
+bash dev/dev.sh /tmp/.env.owui-test start
+```
+
+`DATA_DIR` is created if it does not exist, so the fresh boot "just works".
+Keep in mind the pid files in `dev/.dev_state/` track only the most recent
+`start`, so `dev.sh stop` stops the last instance you launched.
+
 ## Notes for agents (and headless humans)
 
 - **Never attach to a terminal.** There is nothing to attach to. Read
@@ -77,10 +92,13 @@ bash dev/dev.sh logs backend|updater      # one log instead of both
   `.env.dev` is for the local instance only; never commit real keys.
 - **Fresh-instance caveat:** `start` uses whatever database the backend is
   configured with (default `submodules/open-webui/backend/data/webui.db`).
-  Booting a *second, empty* instance in this sandbox has previously failed in
-  alembic migrations (`sqlite3.OperationalError: unable to open database
-  file`); the pre-existing database works reliably, so treat it as the
-  fixture of record.
+  Booting a *second, empty* instance used to fail in alembic migrations
+  (`sqlite3.OperationalError: unable to open database file`): when run from
+  source, OWUI never creates a custom `DATA_DIR`, and SQLite cannot create the
+  database file inside a missing directory. `dev.sh` now supports a `DATA_DIR`
+  env-file variable (resolved and created automatically), so a disposable
+  instance with a fresh database is just a second env file away — see
+  [Disposable / second instance](#disposable--second-instance).
 
 ## Env file reference
 
@@ -94,4 +112,5 @@ See `.env.example`. Key variables:
 | `POLLING_INTERVAL` | `60` | Fallback poll period (s); file-watcher events are instant |
 | `ONE_TIME_RUN` | `false` | Sync all files once and exit (install mode) |
 | `FILEPATHS` | — | Comma-separated plugin paths; relative ones resolve against the env file's directory |
+| `DATA_DIR` | — | Override the backend's `DATA_DIR` (SQLite DB, uploads, vector store). Created automatically if missing; relative paths resolve against the env file's directory |
 | `WEBUI_SECRET_KEY` | — | Passed through to the OWUI backend |

@@ -23,7 +23,7 @@
 #
 # Env file (defaults to dev/.env.dev when present) may set:
 #   PYTHON_VERSION, PROTOCOL, HOST, PORT, API_KEY, POLLING_INTERVAL,
-#   ONE_TIME_RUN, FILEPATHS, WEBUI_SECRET_KEY, ...
+#   ONE_TIME_RUN, FILEPATHS, DATA_DIR, WEBUI_SECRET_KEY, ...
 # See .env.example for documentation. The explicit env file always wins over
 # ambient environment variables (it is sourced with allexport after parsing).
 
@@ -127,6 +127,29 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
 API_URL="$PROTOCOL://$HOST:$PORT"
 
+# Optional DATA_DIR override (OWUI reads the same variable). When running from
+# source, OWUI never creates a custom DATA_DIR, and SQLite then fails to create
+# the database file in the missing directory ("unable to open database file"
+# during alembic migrations). We resolve it to an absolute path and create it
+# here, so pointing it at a fresh directory gives you a disposable instance
+# with a fresh database. Relative paths are resolved against the env file's
+# directory (same convention as FILEPATHS).
+if [ -n "${DATA_DIR:-}" ]; then
+    case "$DATA_DIR" in
+        /*) ;;                                   # already absolute
+        *)
+            base=$(dirname "$(realpath "${ENV_FILE:-$SCRIPT_DIR/.env.dev}")")
+            DATA_DIR="$base/$DATA_DIR"
+            ;;
+    esac
+    DATA_DIR=$(mkdir -p "$DATA_DIR" && cd "$DATA_DIR" && pwd)
+    export DATA_DIR
+    # Keep the normalized value under a dedicated name: the backend subshell
+    # re-sources the env file, which would otherwise clobber DATA_DIR with the
+    # raw (possibly relative) value from the file.
+    BACKEND_DATA_DIR="$DATA_DIR"
+fi
+
 # --- Small helpers ---
 
 ensure_dir() {
@@ -179,6 +202,7 @@ ENV_FILE=$ENV_FILE
 PROTOCOL=$PROTOCOL
 HOST=$HOST
 PORT=$PORT
+DATA_DIR=${BACKEND_DATA_DIR:-}
 EOF
 }
 
@@ -345,12 +369,18 @@ do_start() {
     do_setup
 
     log "Launching backend ($API_URL)..."
+    if [ -n "${DATA_DIR:-}" ]; then
+        log "  DATA_DIR: $DATA_DIR"
+    fi
     rotate_log "$BACKEND_LOG"
     (
         set -a
         # shellcheck disable=SC1090
         [ -n "$ENV_FILE" ] && . "$ENV_FILE"
         set +a
+        # Re-apply the normalized DATA_DIR: the env file may hold a relative
+        # path, which would otherwise resolve against $BACKEND_DIR below.
+        [ -n "${BACKEND_DATA_DIR:-}" ] && export DATA_DIR="$BACKEND_DATA_DIR"
         cd "$BACKEND_DIR"
         exec "$BACKEND_VENV/bin/uvicorn" open_webui.main:app \
             --host "$HOST" --port "$PORT"
