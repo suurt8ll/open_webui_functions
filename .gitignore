@@ -17,3 +17,6 @@ docs/knowledge_for_llms/
 .pi-fluid/
 .uv-python/
 .uv-cache/
+
+# E2E script screenshots (scratch, see dev/E2E.md)
+e2e_shots/
