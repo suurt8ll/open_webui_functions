@@ -12,7 +12,7 @@ import aiofiles
 import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
-from watchfiles import awatch, Change
+from watchfiles import Change, awatch
 
 # --- Configuration & State Management ---
 
@@ -36,13 +36,31 @@ class Config:
     one_time_run: bool
 
 
+def instance_state_file(config: Config) -> str:
+    """Path of the sync-state file for a given config (endpoint+key scoped).
+
+    The suffix prevents false-positive sync states when switching between
+    different OWUI environments (e.g., local vs remote).
+    """
+    instance_id = hashlib.sha256(
+        f"{config.api_endpoint}{config.api_key}".encode()
+    ).hexdigest()[:8]
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    state_dir = os.path.join(current_dir, ".dev_state")
+    return os.path.join(state_dir, f"hashes_{instance_id}.json")
+
+
 def load_config(env_path: str | None = None) -> Config:
     """Loads and validates required environment variables into a Config object."""
     if env_path:
         abs_env_path = os.path.abspath(env_path)
         if not os.path.isfile(abs_env_path):
             raise ValueError(f"Custom .env file not found at: {abs_env_path}")
-        load_dotenv(dotenv_path=abs_env_path)
+        # An explicitly provided env file is the authoritative source: it wins
+        # over any variables already present in the environment. Without this,
+        # pre-exported vars would silently shadow the file and produce confusing
+        # behavior when switching between env files in one shell.
+        load_dotenv(dotenv_path=abs_env_path, override=True)
         base_dir = os.path.dirname(abs_env_path)
     else:
         load_dotenv()
@@ -156,7 +174,7 @@ class OwuiApiClient:
                 f"{self._root_url}/health", timeout=aiohttp.ClientTimeout(total=3)
             ) as response:
                 return response.status == 200
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except (TimeoutError, aiohttp.ClientError):
             return False
         except Exception as e:
             logger.exception(f"Unexpected error checking API: {e}")
@@ -171,7 +189,7 @@ class OwuiApiClient:
                 response.raise_for_status()
                 functions = await response.json()
                 return any(f["id"] == function_id for f in functions)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             logger.error(f"Error checking function existence: {e}")
             return False
         except Exception as e:
@@ -212,7 +230,7 @@ class OwuiApiClient:
         try:
             async with aiofiles.open(filepath, "r", encoding="utf-8") as file:
                 code_content = await file.read()
-        except (IOError, OSError) as e:
+        except OSError as e:
             logger.error(f"Failed to read file {filepath} before update: {e}")
             return False
 
@@ -243,15 +261,15 @@ class OwuiApiClient:
                         filepath, function_id, function_name, description, code_content
                     )
                     return True
-                except (aiohttp.ClientError, asyncio.TimeoutError) as create_err:
+                except (TimeoutError, aiohttp.ClientError) as create_err:
                     logger.error(f"Creation failed for {filepath}: {create_err}")
-                except Exception as create_exc:
+                except Exception:
                     logger.exception(
                         f"Unexpected error creating function {function_id}"
                     )
             else:
                 logger.error(f"Update failed for {filepath}: {e}")
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             logger.error(
                 f"Update failed for {filepath}: {type(e).__name__}: {e}. Check network/API status."
             )
@@ -274,18 +292,7 @@ class FunctionUpdater:
         self.missing_file_logged: set[str] = set()
         self._process_lock = asyncio.Lock()
 
-        # State persistence setup
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        self._state_dir = os.path.join(current_dir, ".dev_state")
-
-        # We generate a unique suffix based on the endpoint and key. This prevents
-        # hash collisions or "false-positive" sync states when switching between
-        # different OWUI environments (e.g., local vs remote).
-        instance_id = hashlib.sha256(
-            f"{config.api_endpoint}{config.api_key}".encode()
-        ).hexdigest()[:8]
-
-        self._state_file = os.path.join(self._state_dir, f"hashes_{instance_id}.json")
+        self._state_file = instance_state_file(config)
 
         self.file_hashes: dict[str, str | None] = self._load_state()
 
@@ -311,8 +318,7 @@ class FunctionUpdater:
     async def _save_state(self) -> None:
         """Saves the current file hashes to disk asynchronously."""
         try:
-            # Ensure the .dev_state directory exists
-            os.makedirs(self._state_dir, exist_ok=True)
+            os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
             async with aiofiles.open(self._state_file, "w", encoding="utf-8") as f:
                 await f.write(json.dumps(self.file_hashes, indent=2))
         except Exception as e:
@@ -383,7 +389,23 @@ class FunctionUpdater:
         if self.config.one_time_run:
             return
 
-        directories_to_watch = set(os.path.dirname(p) for p in self.config.filepaths)
+        # awatch crashes the whole TaskGroup (killing the poll loop too) if a
+        # watched directory doesn't exist. Skip missing dirs with a warning;
+        # the poll loop still picks up files there once they appear.
+        directories_to_watch: set[str] = set()
+        for path in self.config.filepaths:
+            directory = os.path.dirname(path) or "."
+            if os.path.isdir(directory):
+                directories_to_watch.add(directory)
+            else:
+                logger.warning(
+                    f"Watch directory does not exist, not watching it "
+                    f"(poll fallback still applies): {directory}"
+                )
+
+        if not directories_to_watch:
+            logger.warning("No watchable directories; relying on the poll loop only.")
+            return
 
         logger.info(f"👀 Started file watcher on {len(self.config.filepaths)} files...")
 
@@ -421,7 +443,7 @@ class FunctionUpdater:
                 await asyncio.wait_for(
                     self.shutdown_event.wait(), timeout=current_interval
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
             except asyncio.CancelledError:
                 break
@@ -442,10 +464,64 @@ class FunctionUpdater:
                     logger.exception(f"An error occurred during execution: {e}")
 
 
+# --- Status Mode ---
+
+
+async def print_sync_status(config: Config) -> int:
+    """Print per-file sync state (local file hash vs last-successfully-synced
+    hash) without touching the API or starting any watchers. Useful for agents
+    and humans to verify what is in sync at a glance."""
+    state_file = instance_state_file(config)
+    try:
+        async with aiofiles.open(state_file, "r", encoding="utf-8") as f:
+            stored_hashes: dict[str, str | None] = json.loads(await f.read())
+    except FileNotFoundError:
+        stored_hashes = {}
+        logger.warning(
+            f"No sync state file yet ({state_file}) — nothing has been synced for this endpoint."
+        )
+    except Exception as e:
+        logger.warning(f"Could not read sync state ({e}); treating as empty.")
+        stored_hashes = {}
+
+    rows: list[tuple[str, str, str]] = []
+    for path in config.filepaths:
+        display = os.path.relpath(path)
+        if not os.path.isfile(path):
+            rows.append((display, "-", "MISSING"))
+            continue
+        metadata = await extract_metadata_from_file(path)
+        function_id = metadata.get("id") or "?"
+        current_hash = await file_hash(path)
+        if current_hash is None:
+            status = "MISSING"
+        elif path not in stored_hashes:
+            status = "NEVER SYNCED"
+        elif stored_hashes[path] == current_hash:
+            status = "IN SYNC"
+        else:
+            status = "MODIFIED (sync pending)"
+        rows.append((display, function_id, status))
+
+    width_path = max(len(r[0]) for r in rows) if rows else 0
+    width_id = max(len(r[1]) for r in rows) if rows else 0
+    print(f"Target: {config.api_endpoint}")
+    print(f"{'FILE'.ljust(width_path)}  {'FUNCTION ID'.ljust(width_id)}  STATUS")
+    for display, function_id, status in rows:
+        print(f"{display.ljust(width_path)}  {function_id.ljust(width_id)}  {status}")
+    return 0
+
+
 async def main_wrapper() -> None:
     """Sets up signal handling and runs the main application."""
     parser = argparse.ArgumentParser(description="OWUI Function Updater Utility")
     parser.add_argument("--env", type=str, help="Path to a custom .env file (optional)")
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Print the per-file sync state for the given endpoint and exit "
+        "(no watching, no API writes).",
+    )
     args = parser.parse_args()
 
     shutdown_event = asyncio.Event()
@@ -461,6 +537,13 @@ async def main_wrapper() -> None:
     try:
         # Pass the parsed env path to the config loader
         config = load_config(args.env)
+        logger.info(
+            f"🎯 Target: {config.api_endpoint} | {len(config.filepaths)} file(s) | "
+            f"config source: {os.path.abspath(args.env) if args.env else 'ambient environment'}"
+        )
+        if args.status:
+            await print_sync_status(config)
+            return
         updater = FunctionUpdater(config, shutdown_event)
         await updater.run()
     except ValueError as e:
