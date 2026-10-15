@@ -15,3 +15,5 @@ docs/knowledge_for_llms/
 # Pi Agent harness / sandbox stuff
 .pi/
 .pi-fluid/
+.uv-python/
+.uv-cache/

@@ -45,6 +45,11 @@ BACKEND_PID_FILE="$STATE_DIR/backend.pid"
 UPDATER_PID_FILE="$STATE_DIR/updater.pid"
 RUNTIME_STATE_FILE="$STATE_DIR/runtime.env"
 
+# Pin uv's managed Python install + cache inside the repo so venvs created
+# here also work inside the pi-fluid dev container (and vice versa).
+# shellcheck source=uv-shared-env.sh
+source "$SCRIPT_DIR/uv-shared-env.sh"
+
 # --- Pretty output ---
 
 log()  { printf '\033[1;34m[dev]\033[0m %s\n' "$*"; }
