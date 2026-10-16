@@ -15,6 +15,9 @@ VERSION = "2.1.0"
 # set the feature back to False so Open WebUI does not run it's own logic and then
 # pass custom values to "Gemini Manifold google_genai" that signal which feature was enabled and intercepted.
 
+# FIXME: Add `from __future__ import annotations` at the top of this file (repo
+# convention, see AGENTS.md). Until then the file relies on string annotations.
+
 import functools
 import importlib.metadata
 import sys
@@ -25,10 +28,10 @@ import aiohttp
 from fastapi import Request
 from fastapi.datastructures import State
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, create_model
 import yaml
 from collections.abc import Awaitable, Callable
-from typing import Any, Literal, TYPE_CHECKING, cast
+from typing import Any, Final, Literal, TYPE_CHECKING, cast, get_args, get_origin
 
 
 def _unload_stale_modules() -> None:
@@ -56,7 +59,9 @@ def _unload_stale_modules() -> None:
             continue
         if getattr(loaded, "__version__", None) == installed_version:
             continue
-        for name in [n for n in sys.modules if n == package or n.startswith(f"{package}.")]:
+        for name in [
+            n for n in sys.modules if n == package or n.startswith(f"{package}.")
+        ]:
             del sys.modules[name]
         # `from google import genai` would otherwise still return the old module set on the parent package.
         parent_name, _, child = package.rpartition(".")
@@ -264,7 +269,7 @@ class EventEmitter:
         self._enqueue(event)
 
 
-_SHARED_VALVE_DESCS = {
+_VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
     "USE_PERMISSIVE_SAFETY": (
         "Whether to request relaxed safety filtering for Gemini models."
     ),
@@ -294,8 +299,6 @@ _SHARED_VALVE_DESCS = {
     ),
 }
 
-_ADMIN_VALVE_DESCS = {}
-
 
 def _format_valve_desc(text: str, default: Any = None, is_user: bool = False) -> str:
     """Formats Markdown descriptions for Valves and UserValves fields."""
@@ -307,113 +310,72 @@ def _format_valve_desc(text: str, default: Any = None, is_user: bool = False) ->
     return f"{text}\n\n**Default:** {formatted_default}{sep}"
 
 
+def _admin_field(
+    name: str, default: Any = None, admin_section_start: bool = False
+) -> Any:
+    """Helper to construct a Pydantic Field with default value and formatted admin description."""
+    raw_desc = _VALVE_DESCRIPTIONS.get(name, "")
+    desc = _format_valve_desc(raw_desc, default=default)
+    if admin_section_start:
+        desc = f"{desc}### Admin-Only Options"
+    return Field(default=default, description=desc)
+
+
+class _SharedValves(BaseModel):
+    """Base model holding user-configurable options shared between Valves and UserValves."""
+
+    USE_PERMISSIVE_SAFETY: bool = _admin_field("USE_PERMISSIVE_SAFETY", False)
+    BYPASS_BACKEND_RAG: bool = _admin_field("BYPASS_BACKEND_RAG", True)
+    MODEL_CONFIG_PATH: str = _admin_field(
+        "MODEL_CONFIG_PATH",
+        "https://raw.githubusercontent.com/suurt8ll/open_webui_functions/master/plugins/pipes/gemini_models.yaml",
+    )
+    URL_RESOLVE_TIMEOUT: int = _admin_field("URL_RESOLVE_TIMEOUT", 10)
+    URL_RESOLVE_MAX_RETRIES: int = _admin_field("URL_RESOLVE_MAX_RETRIES", 3)
+    URL_RESOLVE_BASE_DELAY: float = _admin_field("URL_RESOLVE_BASE_DELAY", 0.5)
+    STATUS_EMISSION_BEHAVIOR: Literal[
+        "disable",
+        "hidden_compact",
+        "hidden_detailed",
+        "visible",
+        "visible_timed",
+    ] = _admin_field("STATUS_EMISSION_BEHAVIOR", "hidden_detailed")
+
+
+def _generate_user_valves(shared_cls: type[BaseModel]) -> type[BaseModel]:
+    """Generates Filter.UserValves model from _SharedValves with Optional fields and user descriptions."""
+    fields: dict[str, Any] = {}
+    for name, field_info in shared_cls.model_fields.items():
+        raw_desc = _VALVE_DESCRIPTIONS.get(name, "")
+        user_desc = _format_valve_desc(raw_desc, is_user=True)
+
+        ann = field_info.annotation
+        if get_origin(ann) is Literal:
+            args = get_args(ann)
+            user_ann = (
+                Literal[(*args, "")] | None if "" not in args else ann | None  # type: ignore[operator]
+            )
+        elif ann is not None:
+            user_ann = ann | None
+        else:
+            user_ann = Any
+
+        fields[name] = (user_ann, Field(default=None, description=user_desc))
+
+    return create_model("UserValves", __base__=shared_cls, **fields)  # type: ignore[call-overload]
+
+
 class Filter:
+    class Valves(_SharedValves):
+        """Admin-level configuration for the filter.
 
-    class Valves(BaseModel):
-        USE_PERMISSIVE_SAFETY: bool = Field(
-            default=False,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["USE_PERMISSIVE_SAFETY"], default=False
-            ),
-        )
-        BYPASS_BACKEND_RAG: bool = Field(
-            default=True,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["BYPASS_BACKEND_RAG"], default=True
-            ),
-        )
-        MODEL_CONFIG_PATH: str = Field(
-            default="https://raw.githubusercontent.com/suurt8ll/open_webui_functions/master/plugins/pipes/gemini_models.yaml",
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["MODEL_CONFIG_PATH"],
-                default="https://raw.githubusercontent.com/suurt8ll/open_webui_functions/master/plugins/pipes/gemini_models.yaml",
-            ),
-        )
-        URL_RESOLVE_TIMEOUT: int = Field(
-            default=10,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["URL_RESOLVE_TIMEOUT"], default=10
-            ),
-        )
-        URL_RESOLVE_MAX_RETRIES: int = Field(
-            default=3,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["URL_RESOLVE_MAX_RETRIES"], default=3
-            ),
-        )
-        URL_RESOLVE_BASE_DELAY: float = Field(
-            default=0.5,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["URL_RESOLVE_BASE_DELAY"], default=0.5
-            ),
-        )
-        STATUS_EMISSION_BEHAVIOR: Literal[
-            "disable",
-            "hidden_compact",
-            "hidden_detailed",
-            "visible",
-            "visible_timed",
-        ] = Field(
-            default="hidden_detailed",
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["STATUS_EMISSION_BEHAVIOR"],
-                default="hidden_detailed",
-            ),
-        )
+        Currently adds no extra fields, it only inherits the shared options from
+        `_SharedValves`. The subclass exists so that admin-only options (which
+        user valves and request parameters cannot override) can be added later
+        without reshaping the class hierarchy.
+        """
 
-    class UserValves(BaseModel):
-        USE_PERMISSIVE_SAFETY: bool | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["USE_PERMISSIVE_SAFETY"], is_user=True
-            ),
-        )
-        BYPASS_BACKEND_RAG: bool | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["BYPASS_BACKEND_RAG"], is_user=True
-            ),
-        )
-        MODEL_CONFIG_PATH: str | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["MODEL_CONFIG_PATH"], is_user=True
-            ),
-        )
-        URL_RESOLVE_TIMEOUT: int | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["URL_RESOLVE_TIMEOUT"], is_user=True
-            ),
-        )
-        URL_RESOLVE_MAX_RETRIES: int | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["URL_RESOLVE_MAX_RETRIES"], is_user=True
-            ),
-        )
-        URL_RESOLVE_BASE_DELAY: float | None = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["URL_RESOLVE_BASE_DELAY"], is_user=True
-            ),
-        )
-        STATUS_EMISSION_BEHAVIOR: (
-            Literal[
-                "disable",
-                "hidden_compact",
-                "hidden_detailed",
-                "visible",
-                "visible_timed",
-                "",
-            ]
-            | None
-        ) = Field(
-            default=None,
-            description=_format_valve_desc(
-                _SHARED_VALVE_DESCS["STATUS_EMISSION_BEHAVIOR"], is_user=True
-            ),
-        )
+    UserValves = _generate_user_valves(_SharedValves)
 
     def __init__(self):
         self.valves = self.Valves()
@@ -432,8 +394,19 @@ class Filter:
             f"inlet method has been called. Gemini Manifold Companion version is {VERSION}"
         )
 
+        canonical_model_name, is_manifold = self._get_model_name(body)
+
+        # Exit early if this is not a model that the companion is intended to be tied to.
+        if not is_manifold:
+            log.debug(
+                "Returning the original body object because the request is not for a Gemini Manifold pipe model."
+            )
+            return body
+
+        # Resolve the final option values from admin valves, user valves and any
+        # parameters that Open WebUI has already merged into the request body.
         user_valves = __user__.get("valves") if isinstance(__user__, dict) else None
-        valves = self._get_merged_valves(self.valves, user_valves)
+        valves = _resolve_options(self.valves, user_valves, body)
 
         app_state: State = __request__.app.state
 
@@ -445,10 +418,16 @@ class Filter:
         emitter = EventEmitter(
             __event_emitter__, status_mode=valves.STATUS_EMISSION_BEHAVIOR
         )
+        # The outlet receives a body that OWUI has rebuilt from scratch, without any
+        # request parameters. Ferry the inlet-resolved options (which already include
+        # model page/chat parameter overrides) through the shared app state instead.
         self._store_data_in_state(
             app_state,
             __metadata__,
-            {"gemini_event_emitter": emitter},
+            {
+                "gemini_event_emitter": emitter,
+                "gemini_resolved_valves": valves,
+            },
         )
         app_state._state["gemini_dummy_event_emitter"] = EventEmitter(None)
 
@@ -459,15 +438,6 @@ class Filter:
         log.debug(
             f"Stored model config in app state with {len(model_config)} model(s)."
         )
-
-        canonical_model_name, is_manifold = self._get_model_name(body)
-
-        # Exit early if we are filtering an unsupported model.
-        if not is_manifold:
-            log.debug(
-                "Returning the original body object because conditions for proceeding are not fulfilled."
-            )
-            return body
 
         # Check if the model supports grounding or code execution using YAML config
         is_grounding_model = self._check_model_capability(
@@ -487,8 +457,6 @@ class Filter:
         if metadata_features is None:
             metadata_features = cast("Features", {})
             metadata["features"] = metadata_features
-
-        metadata["chat_control_params"] = self._extract_chat_control_params(body)
 
         # Add the companion version to the payload for the pipe to consume.
         metadata_features["gemini_manifold_companion_version"] = VERSION
@@ -575,12 +543,33 @@ class Filter:
 
         log.debug("outlet method has been called.")
 
-        user_valves = __user__.get("valves") if isinstance(__user__, dict) else None
-        valves = self._get_merged_valves(self.valves, user_valves)
-
         chat_id = __metadata__.get("chat_id", "")
         message_id = __metadata__.get("message_id", "")
         app_state: State = __request__.app.state
+
+        # Prefer the inlet-resolved options (which already include model page/chat
+        # parameter overrides) ferried through the app state. Falls back to resolving
+        # admin + user valves only for requests where the inlet did not store state
+        # (task models, missing ids, stale state).
+        stored_valves = (
+            self._get_and_clear_data_from_state(
+                app_state,
+                chat_id,
+                message_id,
+                key_suffix="gemini_resolved_valves",
+                clear_after_read=False,
+            )
+            if chat_id and message_id
+            else None
+        )
+        if isinstance(stored_valves, ResolvedOptions):
+            valves: Filter.Valves = stored_valves
+        else:
+            log.debug(
+                "No resolved valves found in state for this request. Resolving from admin and user valves only."
+            )
+            user_valves = __user__.get("valves") if isinstance(__user__, dict) else None
+            valves = _resolve_options(self.valves, user_valves, None)
 
         log.debug(f"Checking for attributes for message {message_id} in request state.")
         stored_metadata: types.GroundingMetadata | None = (
@@ -1115,66 +1104,6 @@ class Filter:
     # region 1.6 Utility helpers
 
     @staticmethod
-    def _get_merged_valves(
-        default_valves: "Filter.Valves",
-        user_valves: "Filter.UserValves | dict[str, Any] | None",
-    ) -> "Filter.Valves":
-        """Merges UserValves into a base Valves configuration.
-
-        If a field in UserValves is not None or an empty string, it overrides
-        the corresponding field in default_valves.
-        """
-        if user_valves is None:
-            return default_valves.model_copy(deep=True)
-
-        merged_data = default_valves.model_dump()
-
-        if isinstance(user_valves, dict):
-            for field_name, user_value in user_valves.items():
-                if user_value is not None and user_value != "":
-                    if field_name in merged_data:
-                        merged_data[field_name] = user_value
-        else:
-            for field_name in Filter.UserValves.model_fields:
-                user_value = getattr(user_valves, field_name)
-                if user_value is not None and user_value != "":
-                    if field_name in merged_data:
-                        merged_data[field_name] = user_value
-
-        return Filter.Valves(**merged_data)
-
-    def _extract_chat_control_params(self, body: "Body") -> dict[str, Any]:
-        """
-        Extracts custom parameters set at the chat level.
-        By storing these in metadata, we protect them from being overwritten
-        by model-level defaults during OWUI's pre-pipe merge phase. The pipe
-        can then prioritize these chat-specific settings over model-wide defaults.
-        """
-        chat_control_params: dict[str, Any] = {}
-        # Standard OWUI body keys. Any others are treated as custom chat parameters.
-        known_body_keys = {
-            "stream",
-            "model",
-            "messages",
-            "files",
-            "features",
-            "metadata",
-            "options",
-            "stream_options",
-        }
-
-        custom_param_keys = [key for key in body.keys() if key not in known_body_keys]
-        for key in custom_param_keys:
-            chat_control_params[key] = body[key]
-
-        if custom_param_keys:
-            log.debug(
-                f"Found and preserved custom chat control parameters: {custom_param_keys}"
-            )
-
-        return chat_control_params
-
-    @staticmethod
     def _cleanup_event_emitters(app_state: State) -> None:
         """
         Scans the FastAPI app state for abandoned EventEmitter instances and removes them.
@@ -1328,3 +1257,147 @@ class Filter:
     # endregion 1.4 Utility helpers
 
     # endregion 1. Helper methods inside the Filter class
+
+
+# region 2. Option resolution
+
+# TODO: Share the logic with Gemini Manifold Pipe somehow?
+# (the single-file constraint of Open WebUI Functions makes literal code sharing impossible,
+# so this region mirrors the pipe's option resolution machinery.)
+
+# Synonyms map alternative (user-facing) spellings to canonical valve field names.
+OPTION_SYNONYMS: Final[dict[str, str]] = {}
+
+# Dynamic sets distinguishing overridable vs admin-only valve options
+USER_OVERRIDABLE_VALVE_FIELDS: Final[set[str]] = set(_SharedValves.model_fields.keys())
+ADMIN_ONLY_VALVE_FIELDS: Final[set[str]] = (
+    set(Filter.Valves.model_fields.keys()) - USER_OVERRIDABLE_VALVE_FIELDS
+)
+
+# Pre-computed case-insensitive lookup dictionaries
+_VALVE_FIELD_LOOKUP: Final[dict[str, str]] = {
+    field_name.lower(): field_name for field_name in Filter.Valves.model_fields.keys()
+}
+
+_SYNONYM_LOOKUP: Final[dict[str, str]] = {
+    synonym.lower(): canonical_target
+    for synonym, canonical_target in OPTION_SYNONYMS.items()
+}
+
+
+def canonicalize_option_key(key: str) -> str:
+    """
+    Normalizes an option key using case-insensitive lookup against synonyms
+    and known valve fields. Returns the canonical key name or the stripped key if custom.
+    """
+    key_clean = key.strip()
+    key_lower = key_clean.lower()
+
+    if canonical := _SYNONYM_LOOKUP.get(key_lower):
+        return canonical
+
+    if canonical := _VALVE_FIELD_LOOKUP.get(key_lower):
+        return canonical
+
+    return key_clean
+
+
+class ResolvedOptions(Filter.Valves):
+    """
+    Consolidated configuration combining Admin Valves, User Valves,
+    and request parameters according to priority.
+
+    Allows extra dynamic options defined at model or chat levels.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    def get_custom_params(self) -> dict[str, Any]:
+        """Returns extra parameters not defined in Filter.Valves."""
+        valve_fields = set(Filter.Valves.model_fields.keys())
+        return {k: v for k, v in self.model_dump().items() if k not in valve_fields}
+
+
+def _resolve_options(
+    admin_valves: "Filter.Valves",
+    user_valves: Filter.UserValves | None,
+    body: "Body | None",
+) -> ResolvedOptions:
+    """
+    Resolves the option hierarchy for the filter:
+
+    admin valves < user valves < model page params < chat params.
+
+    Since Open WebUI v0.12 the backend merges model page params and chat params
+    into the request body before filter inlets run (body-level keys winning over
+    model-side writes), so anything unknown in `body` is simply adopted as an
+    option override. `body=None` (the outlet fallback path) ignores the body
+    entirely and resolves from valves only.
+
+    Admin-only options cannot be overridden by user-level sources.
+    Option keys and synonyms are normalized case-insensitively.
+
+    TODO (security tradeoff): allowing model page/chat parameters to override any
+    user-overridable valve means a chat user can control options like
+    `MODEL_CONFIG_PATH` from the chat level. `MODEL_CONFIG_PATH` can point the
+    filter at an arbitrary YAML config, and the loaded config is cached in the
+    *shared* app state (`gemini_model_config`), so one user's override affects
+    every request until it is overwritten. This is not a new footgun (UserValves
+    could already do the same), but consider demoting `MODEL_CONFIG_PATH` (and
+    anything similarly sensitive) to an admin-only field before opening this up
+    to less trusted audiences.
+    """
+    # Priority 1: Base options from Admin Valves
+    merged_data = admin_valves.model_dump()
+
+    # Priority 2: User Valves (user-overridable fields only)
+    if user_valves is not None:
+        for field_name in USER_OVERRIDABLE_VALVE_FIELDS:
+            user_val = getattr(user_valves, field_name, None)
+            if user_val is not None and user_val != "":
+                merged_data[field_name] = user_val
+
+    # Priority 3: Anything that the backend merged into the body is treated as
+    # an option override. Since Open WebUI v0.12 the backend itself resolves
+    # the priority between admin defaults, model page params and chat params
+    # before the filters run, so no per-source distinction is needed here.
+    if body is not None:
+        known_body_keys = {
+            "stream",
+            "model",
+            "messages",
+            "files",
+            "options",
+            "stream_options",
+            "features",
+            "metadata",
+            "params",
+            "tool_ids",
+            "tools",
+            "tool_choice",
+            "variables",
+            "skill_ids",
+            "terminal_id",
+            "chat_id",
+        }
+        body_options = {k: v for k, v in body.items() if k not in known_body_keys}
+        if isinstance(body.get("options"), dict):
+            for opt_k, opt_v in body["options"].items():
+                if opt_k not in body_options:
+                    body_options[opt_k] = opt_v
+
+        for raw_key, val in body_options.items():
+            if val is None or val == "":
+                continue
+            canonical_key = canonicalize_option_key(raw_key)
+            if canonical_key in ADMIN_ONLY_VALVE_FIELDS:
+                log.warning(
+                    f"Body parameter '{raw_key}' attempts to override admin-only valve '{canonical_key}'. Ignoring override."
+                )
+                continue
+            merged_data[canonical_key] = val
+
+    return ResolvedOptions(**merged_data)
+
+
+# endregion Option resolution
