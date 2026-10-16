@@ -63,7 +63,7 @@ MANAGER_VERSION = "1.1.0"
 class Pipe:
     class Valves(BaseModel):
         FUNCTIONS_LOG_LEVELS: str = Field(
-            default='{}',
+            default="{}",
             description="JSON object mapping function IDs to Loguru log levels (e.g. TRACE, DEBUG, INFO, WARNING, ERROR).",
         )
 

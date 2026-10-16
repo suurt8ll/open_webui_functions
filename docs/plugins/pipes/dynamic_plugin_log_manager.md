@@ -48,9 +48,10 @@ Now use `log.info`, `log.debug`, etc. as usual.
 To attach serialisable data to a log line:
 
 ```python
-log.info("Request finished", payload={
-    "status": 200, "model": "gemini-2.0-flash", "tokens": 145
-})
+log.info(
+    "Request finished",
+    payload={"status": 200, "model": "gemini-2.0-flash", "tokens": 145},
+)
 ```
 
 The plugin's format function will:
@@ -72,8 +73,9 @@ Add these to `extra` on the log call (or bind them once on the logger):
 Example:
 
 ```python
-log.warning("Large response", payload=data,
-            _log_truncation_enabled=True, _log_max_length=512)
+log.warning(
+    "Large response", payload=data, _log_truncation_enabled=True, _log_max_length=512
+)
 ```
 
 ## Caveats / prerequisites

@@ -18,7 +18,6 @@ if TYPE_CHECKING:
 
 
 class Filter:
-
     class Valves(BaseModel):
         pass
 

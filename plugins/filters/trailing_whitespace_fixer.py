@@ -86,7 +86,7 @@ class Filter:
 
                     # If any part of the message was changed, update the message content.
                     if was_modified:
-                        message["content"] = content_parts # type: ignore
+                        message["content"] = content_parts  # type: ignore
                         modified_count += 1
 
         if user_message_count > 0:
