@@ -39,7 +39,13 @@ from plugins.pipes.gemini_manifold import (
     _resolve_options,
     types as gemini_types,
 )  # gemini_types is google.genai.types
-from plugins.filters.gemini_manifold_companion import EventEmitter
+from plugins.filters.gemini_manifold_companion import (
+    EventEmitter,
+    Filter,
+    ResolvedOptions,
+    _SharedValves,
+    _resolve_options as _companion_resolve_options,
+)
 
 # FIXME: resolve Pylance complaints
 
@@ -540,6 +546,7 @@ def test_user_opts_in_to_vertex_from_admin_gemini(pipe_instance_fixture):
 
 # region Test Toggleable Paid API Filter
 
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "toggle_status, expected_api_key",
@@ -569,10 +576,7 @@ async def test_paid_api_toggle_selects_correct_key(
 
     # Provide both the model ID and the canonical ID required by the new pipe logic
     model_id = "gemini-pro"
-    __metadata__ = {
-        "model": {"id": model_id},
-        "canonical_model_id": model_id 
-    }
+    __metadata__ = {"model": {"id": model_id}, "canonical_model_id": model_id}
 
     # Ensure both keys are present in the initial valves
     pipe.valves.GEMINI_FREE_API_KEY = ADMIN_FREE_KEY
@@ -592,14 +596,15 @@ async def test_paid_api_toggle_selects_correct_key(
             return toggle_status
         return (False, False)
 
-    with patch.object(
-        pipe, "_get_toggleable_feature_status", side_effect=mock_toggle_side_effect
-    ) as mock_toggle_status, patch.object(
-        pipe, "_get_user_client", wraps=pipe._get_user_client
-    ), patch.object(
-        pipe, "_check_companion_filter_version"
-    ), patch(
-        "plugins.pipes.gemini_manifold._resolve_options", return_value=pipe.valves
+    with (
+        patch.object(
+            pipe, "_get_toggleable_feature_status", side_effect=mock_toggle_side_effect
+        ) as mock_toggle_status,
+        patch.object(pipe, "_get_user_client", wraps=pipe._get_user_client),
+        patch.object(pipe, "_check_companion_filter_version"),
+        patch(
+            "plugins.pipes.gemini_manifold._resolve_options", return_value=pipe.valves
+        ),
     ):
         try:
             # We expect this to get quite far now with the fixed metadata
@@ -622,12 +627,13 @@ async def test_paid_api_toggle_selects_correct_key(
         MockedGenAIClientConstructor.assert_called()
         # Find the call that matches our expected key
         api_keys_used = [
-            call.kwargs.get("api_key") 
+            call.kwargs.get("api_key")
             for call in MockedGenAIClientConstructor.call_args_list
         ]
         assert expected_api_key in api_keys_used
 
     Pipe._get_or_create_genai_client.cache_clear()
+
 
 # endregion Test Toggleable Paid API Filter
 
@@ -924,6 +930,122 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
 
 
 # endregion Test GeminiContentBuilder
+
+
+# region Test companion filter `_resolve_options`
+@pytest.fixture
+def companion_filter_fixture():
+    """Instantiates the companion filter once for option-resolution tests."""
+    return Filter()
+
+
+def test_companion_resolve_admin_defaults_only(companion_filter_fixture):
+    """`body=None` and no user valves resolve to plain admin valve defaults."""
+    f = companion_filter_fixture
+    resolved = _companion_resolve_options(f.valves, None, None)
+
+    assert isinstance(resolved, ResolvedOptions)
+    assert resolved.model_dump() == f.valves.model_dump()
+    assert resolved.get_custom_params() == {}
+
+
+def test_companion_resolve_user_valves_override(companion_filter_fixture):
+    """User valves (pydantic instance) override admin defaults."""
+    f = companion_filter_fixture
+    user_valves = f.UserValves(URL_RESOLVE_TIMEOUT=99)
+    resolved = _companion_resolve_options(f.valves, user_valves, None)
+
+    assert resolved.URL_RESOLVE_TIMEOUT == 99
+    assert resolved.USE_PERMISSIVE_SAFETY == f.valves.USE_PERMISSIVE_SAFETY
+
+
+def test_companion_resolve_body_key_wins_over_valves(companion_filter_fixture):
+    """Body keys beat admin valves and user valves, case-insensitively."""
+    f = companion_filter_fixture
+    user_valves = f.UserValves(URL_RESOLVE_TIMEOUT=99)
+    resolved = _companion_resolve_options(
+        f.valves, user_valves, {"url_resolve_timeout": 123}
+    )
+
+    assert resolved.URL_RESOLVE_TIMEOUT == 123
+
+
+def test_companion_resolve_body_options_and_level_priority(companion_filter_fixture):
+    """`body['options']` entries merge in, but body-level keys win."""
+    f = companion_filter_fixture
+    resolved = _companion_resolve_options(
+        f.valves,
+        None,
+        {"URL_RESOLVE_TIMEOUT": 55, "options": {"URL_RESOLVE_TIMEOUT": 77}},
+    )
+
+    assert resolved.URL_RESOLVE_TIMEOUT == 55
+
+
+def test_companion_resolve_options_entry_used_without_body_key(
+    companion_filter_fixture,
+):
+    """`body['options']` entries apply when the body-level key is absent."""
+    f = companion_filter_fixture
+    resolved = _companion_resolve_options(
+        f.valves, None, {"options": {"URL_RESOLVE_TIMEOUT": 77}}
+    )
+
+    assert resolved.URL_RESOLVE_TIMEOUT == 77
+
+
+def test_companion_resolve_none_values_skipped(companion_filter_fixture):
+    """`None` values from user valves and body are ignored."""
+    f = companion_filter_fixture
+    user_valves = f.UserValves(URL_RESOLVE_TIMEOUT=None, MODEL_CONFIG_PATH=None)
+    resolved = _companion_resolve_options(
+        f.valves,
+        user_valves,
+        {"url_resolve_timeout": None, "model_config_path": None},
+    )
+
+    assert resolved.URL_RESOLVE_TIMEOUT == f.valves.URL_RESOLVE_TIMEOUT
+    assert resolved.MODEL_CONFIG_PATH == f.valves.MODEL_CONFIG_PATH
+
+
+def test_companion_resolve_empty_string_skipped(companion_filter_fixture):
+    """Empty-string values from user valves and body are ignored."""
+    f = companion_filter_fixture
+    user_valves = f.UserValves(MODEL_CONFIG_PATH="")
+    resolved = _companion_resolve_options(
+        f.valves, user_valves, {"model_config_path": ""}
+    )
+
+    assert resolved.MODEL_CONFIG_PATH == f.valves.MODEL_CONFIG_PATH
+
+
+def test_companion_resolve_unknown_key_becomes_custom_param(
+    companion_filter_fixture,
+):
+    """Unknown body keys are adopted as extras, valve fields stay excluded."""
+    f = companion_filter_fixture
+    resolved = _companion_resolve_options(
+        f.valves, None, {"MY_CUSTOM_THING": "hello", "use_permissive_safety": True}
+    )
+
+    assert resolved.USE_PERMISSIVE_SAFETY is True
+    assert resolved.get_custom_params() == {"MY_CUSTOM_THING": "hello"}
+
+
+def test_companion_resolve_body_none_ignores_body(companion_filter_fixture):
+    """`body=None` (outlet fallback) resolves from valves only."""
+    f = companion_filter_fixture
+    resolved = _companion_resolve_options(f.valves, None, None)
+
+    assert resolved.model_dump() == f.valves.model_dump()
+
+
+def test_companion_admin_only_fields_empty(companion_filter_fixture):
+    """No admin-only fields exist today; pins the expected default state."""
+    assert Filter.Valves.model_fields.keys() == _SharedValves.model_fields.keys()
+
+
+# endregion Test companion filter `_resolve_options`
 
 
 def teardown_module(module):
