@@ -352,7 +352,6 @@ class Metadata(TypedDict):
 
     # These are my own added custom keys, not used by Open WebUI.
     safety_settings: NotRequired[list[types.SafetySetting]]  # Added in `Filter.inlet`
-    chat_control_params: NotRequired[dict[str, Any]]  # Added in `Filter.inlet`
     merged_custom_params: dict[str, Any]  # Added in `Pipe.pipe`
     is_paid_api: NotRequired[bool]  # Added in `Pipe.pipe`
     is_vertex_ai: NotRequired[bool]  # Added in `Pipe.pipe`

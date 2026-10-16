@@ -448,48 +448,45 @@ class Filter:
         )
         log.debug(f"{is_grounding_model=}, {is_code_exec_model=}")
 
-        features = body.get("features", {})
-        log.debug(f"body.features:", payload=features)
-
-        # Ensure features field exists
-        metadata = body.setdefault("metadata", cast("Metadata", {}))
-        metadata_features = metadata.get("features")
-        if metadata_features is None:
-            metadata_features = cast("Features", {})
-            metadata["features"] = metadata_features
+        # Open WebUI snapshots `body['features']` into `metadata['features']` BEFORE
+        # filters run, so when the request has no `features` field the snapshot is a
+        # detached `{}` and anything written only to `metadata['features']` would be
+        # dropped when Open WebUI later updates `metadata` with `body['features']`.
+        # Assigning a single shared dict to both guarantees the flags below survive.
+        # The pipe reads `__metadata__['features']`, while Open WebUI itself pops
+        # `body['features']` after the filters to decide native web_search and
+        # code_interpreter handling.
+        features = body.get("features")
+        if not isinstance(features, dict):
+            features = cast("Features", {})
+            body["features"] = features
+        __metadata__["features"] = features
+        log.debug("body.features:", payload=features)
 
         # Add the companion version to the payload for the pipe to consume.
-        metadata_features["gemini_manifold_companion_version"] = VERSION
+        features["gemini_manifold_companion_version"] = VERSION
 
         if is_grounding_model:
-            web_search_enabled = (
-                features.get("web_search", False)
-                if isinstance(features, dict)
-                else False
-            )
+            web_search_enabled = features.get("web_search", False)
             if web_search_enabled:
                 log.info(
                     "Search feature is enabled, disabling it and adding custom feature called google_search_tool."
                 )
                 # Disable web_search
                 features["web_search"] = False
-                metadata_features["google_search_tool"] = True
+                features["google_search_tool"] = True
         if is_code_exec_model:
-            code_execution_enabled = (
-                features.get("code_interpreter", False)
-                if isinstance(features, dict)
-                else False
-            )
+            code_execution_enabled = features.get("code_interpreter", False)
             if code_execution_enabled:
                 log.info(
                     "Code interpreter feature is enabled, disabling it and adding custom feature called google_code_execution."
                 )
                 # Disable code_interpreter
                 features["code_interpreter"] = False
-                metadata_features["google_code_execution"] = True
+                features["google_code_execution"] = True
         if valves.USE_PERMISSIVE_SAFETY:
-            log.info("Adding permissive safety settings to body.metadata")
-            metadata["safety_settings"] = self._get_permissive_safety_settings(
+            log.info("Adding permissive safety settings to `__metadata__`.")
+            __metadata__["safety_settings"] = self._get_permissive_safety_settings(
                 canonical_model_name
             )
         if valves.BYPASS_BACKEND_RAG:
@@ -505,7 +502,7 @@ class Filter:
                     "The Manifold pipe requires a database entry to access uploaded files, "
                     "which temporary chats do not have. Falling back to Open WebUI's RAG."
                 )
-                metadata_features["upload_documents"] = False
+                features["upload_documents"] = False
             else:
                 log.info(
                     "BYPASS_BACKEND_RAG is enabled, bypassing Open WebUI RAG to let the Manifold pipe handle documents."
@@ -515,12 +512,12 @@ class Filter:
                         f"Removing {len(files)} files from the Open WebUI RAG pipeline."
                     )
                     body["files"] = []
-                metadata_features["upload_documents"] = True
+                features["upload_documents"] = True
         else:
             log.info(
                 "BYPASS_BACKEND_RAG is disabled. Open WebUI's RAG will be used if applicable."
             )
-            metadata_features["upload_documents"] = False
+            features["upload_documents"] = False
 
         # TODO: Filter out the citation markers here.
 
