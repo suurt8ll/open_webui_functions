@@ -9,7 +9,7 @@ A centralised Loguru handler injector for Open WebUI plugins. It eliminates the 
 2. **Reads a JSON config from Valves** — each key is a *function ID* (as set in the target plugin's `Valves` → `id`), each value is a `loguru` level (`TRACE`, `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`).
 
 3. **Injects / updates Loguru handlers** — for each configured function ID it creates a dedicated handler that:
-   - only captures logs from `function_<id>` (via filter on `record["name"]`)
+   - only captures logs from that function's module (via filter on `record["name"]`), matching both the plain `function_<id>` name used by OWUI <= 0.11 and the hash-suffixed `function_<id>_<hash>` name used by newer versions
    - uses the compact, truncating format shown below
    - respects `auditable=False` (the standard OWUI trick to avoid double-printing, see OWUI `start_logger`)
 

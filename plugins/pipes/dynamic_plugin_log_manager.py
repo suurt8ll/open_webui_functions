@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.0.0
+version: 1.1.0
 """
 
 import copy
@@ -23,10 +23,41 @@ if TYPE_CHECKING:
 
 def _create_plugin_filter(target_module: str):
     def filter_func(record: "Record") -> bool:
-        return record["name"] == target_module
+        return _module_matches(record["name"], target_module)
 
     filter_func.target_module = target_module  # type: ignore
+    filter_func.manager_version = MANAGER_VERSION  # type: ignore
     return filter_func
+
+
+def _module_matches(record_name: str | None, target_module: str) -> bool:
+    """Match a log record's module name against a target function module name.
+
+    OWUI <= 0.11 loads function modules as ``function_<id>`` while newer
+    versions append a random hash suffix (``function_<id>_<uuid4.hex>``)
+    to avoid stale module caching. Match both shapes by comparing the
+    candidate name against the target plus an optional ``_<hash>`` suffix.
+    """
+    if not record_name:
+        return False
+    if record_name == target_module:
+        return True
+    suffix = record_name[len(target_module) :]
+    # OWUI >= 0.12 suffix is `uuid4().hex`: exactly 32 lowercase hex chars.
+    if not suffix.startswith("_") or len(suffix) != 33:
+        return False
+    hash_part = suffix[1:]
+    try:
+        int(hash_part, 16)
+    except ValueError:
+        return False
+    return hash_part.islower() or hash_part.isdigit()
+
+
+# Bumped alongside the frontmatter `version`. Managed handlers carry a stamp of
+# this value so that updating the plugin recreates stale handlers instead of
+# silently reusing filters from the previous version.
+MANAGER_VERSION = "1.1.0"
 
 
 class Pipe:
@@ -181,6 +212,19 @@ class Pipe:
 
             if target_module is not None:
                 desired_level = target_levels.get(target_module)
+
+                # Recreate handlers injected by a different version of this
+                # plugin (e.g. filters that predate the module name fix).
+                if getattr(existing_filter, "manager_version", None) != MANAGER_VERSION:
+                    try:
+                        logger.remove(handler_id)
+                        logger.info(
+                            f"Removed outdated Loguru handler {handler_id} for module "
+                            f"'{target_module}' (manager version mismatch)."
+                        )
+                    except ValueError:
+                        pass
+                    continue
 
                 if desired_level is not None:
                     desired_level_no = logger.level(desired_level).no
