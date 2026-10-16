@@ -36,9 +36,18 @@ sys.modules["open_webui.utils.misc"] = mock_misc_module
 from plugins.pipes.gemini_manifold import (
     Pipe,
     GeminiContentBuilder,
+    _resolve_options,
     types as gemini_types,
 )  # gemini_types is google.genai.types
-from plugins.filters.gemini_manifold_companion import EventEmitter
+from plugins.filters.gemini_manifold_companion import (
+    EventEmitter,
+    Filter,
+    ResolvedOptions,
+    _SharedValves,
+    _resolve_options as _companion_resolve_options,
+)
+
+# FIXME: resolve Pylance complaints
 
 # region Test Constants
 # General Users
@@ -270,8 +279,8 @@ def test_user_must_auth_no_user_key_provided_errors(pipe_instance_fixture):
     user_valves_instance = Pipe.UserValves(
         GEMINI_FREE_API_KEY=None, GEMINI_PAID_API_KEY=None
     )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED, body={}, metadata={}
     )
 
     with pytest.raises(
@@ -301,8 +310,8 @@ def test_user_must_auth_user_provides_gemini_key_uses_user_creds(pipe_instance_f
         GEMINI_PAID_API_KEY=None,
         GEMINI_API_BASE_URL=USER_GEMINI_BASE_URL,
     )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED, body={}, metadata={}
     )
 
     pipe._get_user_client(merged_valves, USER_EMAIL_UNPRIVILEGED)
@@ -333,8 +342,8 @@ def test_user_must_auth_user_tries_vertex_no_user_gemini_key_errors(
         GEMINI_FREE_API_KEY=None,
         GEMINI_PAID_API_KEY=None,
     )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED, body={}, metadata={}
     )
 
     assert merged_valves.USE_VERTEX_AI is False
@@ -369,8 +378,8 @@ def test_user_must_auth_user_tries_vertex_with_user_gemini_key_falls_back(
         GEMINI_PAID_API_KEY=USER_PAID_KEY,
         GEMINI_API_BASE_URL=USER_GEMINI_BASE_URL,
     )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED, body={}, metadata={}
     )
 
     assert merged_valves.USE_VERTEX_AI is False
@@ -403,8 +412,8 @@ def test_whitelist_user_no_uservalves_uses_admin_gemini_config(pipe_instance_fix
     pipe.valves.USE_VERTEX_AI = False
 
     user_valves_instance = Pipe.UserValves()
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED, body={}, metadata={}
     )
 
     pipe._get_user_client(merged_valves, USER_EMAIL_WHITELISTED)
@@ -429,8 +438,8 @@ def test_whitelist_user_no_uservalves_uses_admin_vertex_config(pipe_instance_fix
     pipe.valves.VERTEX_PROJECT = ADMIN_VERTEX_PROJECT
 
     user_valves_instance = Pipe.UserValves()
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED, body={}, metadata={}
     )
 
     pipe._get_user_client(merged_valves, USER_EMAIL_WHITELISTED)
@@ -459,8 +468,8 @@ def test_whitelist_user_provides_own_gemini_key_overrides_admin(pipe_instance_fi
     pipe.valves.GEMINI_PAID_API_KEY = "admin_paid_key_to_be_overridden"
 
     user_valves_instance = Pipe.UserValves(GEMINI_PAID_API_KEY=USER_PAID_KEY)
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_WHITELISTED, body={}, metadata={}
     )
 
     pipe._get_user_client(merged_valves, USER_EMAIL_WHITELISTED)
@@ -492,8 +501,8 @@ def test_user_opts_out_of_admin_vertex_to_user_gemini(pipe_instance_fixture):
         GEMINI_FREE_API_KEY=USER_FREE_KEY,
         GEMINI_API_BASE_URL=USER_GEMINI_BASE_URL,
     )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_REGULAR
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_REGULAR, body={}, metadata={}
     )
 
     pipe._get_user_client(merged_valves, USER_EMAIL_REGULAR)
@@ -520,8 +529,8 @@ def test_user_opts_in_to_vertex_from_admin_gemini(pipe_instance_fixture):
         VERTEX_PROJECT=USER_VERTEX_PROJECT,
         VERTEX_LOCATION=USER_VERTEX_LOCATION,
     )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_REGULAR
+    merged_valves = _resolve_options(
+        pipe.valves, user_valves_instance, USER_EMAIL_REGULAR, body={}, metadata={}
     )
 
     pipe._get_user_client(merged_valves, USER_EMAIL_REGULAR)
@@ -536,6 +545,7 @@ def test_user_opts_in_to_vertex_from_admin_gemini(pipe_instance_fixture):
 
 
 # region Test Toggleable Paid API Filter
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -566,10 +576,7 @@ async def test_paid_api_toggle_selects_correct_key(
 
     # Provide both the model ID and the canonical ID required by the new pipe logic
     model_id = "gemini-pro"
-    __metadata__ = {
-        "model": {"id": model_id},
-        "canonical_model_id": model_id 
-    }
+    __metadata__ = {"model": {"id": model_id}, "canonical_model_id": model_id}
 
     # Ensure both keys are present in the initial valves
     pipe.valves.GEMINI_FREE_API_KEY = ADMIN_FREE_KEY
@@ -589,14 +596,15 @@ async def test_paid_api_toggle_selects_correct_key(
             return toggle_status
         return (False, False)
 
-    with patch.object(
-        pipe, "_get_toggleable_feature_status", side_effect=mock_toggle_side_effect
-    ) as mock_toggle_status, patch.object(
-        pipe, "_get_user_client", wraps=pipe._get_user_client
-    ), patch.object(
-        pipe, "_check_companion_filter_version"
-    ), patch.object(
-        pipe, "_get_merged_valves", return_value=pipe.valves
+    with (
+        patch.object(
+            pipe, "_get_toggleable_feature_status", side_effect=mock_toggle_side_effect
+        ) as mock_toggle_status,
+        patch.object(pipe, "_get_user_client", wraps=pipe._get_user_client),
+        patch.object(pipe, "_check_companion_filter_version"),
+        patch(
+            "plugins.pipes.gemini_manifold._resolve_options", return_value=pipe.valves
+        ),
     ):
         try:
             # We expect this to get quite far now with the fixed metadata
@@ -610,8 +618,6 @@ async def test_paid_api_toggle_selects_correct_key(
             # Still catching exceptions as we aren't mocking the full builder/network stack
             pass
 
-        # Update: Pipe now adds 'merged_custom_params' to metadata before checking toggles.
-        # We check that the toggle was called with the model ID present.
         assert mock_toggle_status.called
         args, _ = mock_toggle_status.call_args
         assert args[0] == "gemini_paid_api"
@@ -621,12 +627,13 @@ async def test_paid_api_toggle_selects_correct_key(
         MockedGenAIClientConstructor.assert_called()
         # Find the call that matches our expected key
         api_keys_used = [
-            call.kwargs.get("api_key") 
+            call.kwargs.get("api_key")
             for call in MockedGenAIClientConstructor.call_args_list
         ]
         assert expected_api_key in api_keys_used
 
     Pipe._get_or_create_genai_client.cache_clear()
+
 
 # endregion Test Toggleable Paid API Filter
 
@@ -669,7 +676,7 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
         metadata_body={"chat_id": "test_chat_id"},  # type: ignore
         user_data=mock_user_data,  # type: ignore
         event_emitter=mock_event_emitter,
-        valves=pipe_instance.valves,
+        options=pipe_instance.valves,
         files_api_manager=mock_files_api_manager,  # Pass the new mock
     )
 
@@ -740,7 +747,7 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
         metadata_body={"chat_id": "test_chat_id"},  # type: ignore
         user_data=mock_user_data,  # type: ignore
         event_emitter=mock_event_emitter,
-        valves=pipe_instance.valves,
+        options=pipe_instance.valves,
         files_api_manager=mock_files_api_manager,  # Pass the new mock
     )
 
@@ -868,7 +875,7 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
         },
         user_data=mock_user_data,  # type: ignore
         event_emitter=mock_event_emitter,
-        valves=pipe_instance.valves,
+        options=pipe_instance.valves,
         files_api_manager=mock_files_api_manager,
     )
 
@@ -923,6 +930,122 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
 
 
 # endregion Test GeminiContentBuilder
+
+
+# region Test companion filter `_resolve_options`
+@pytest.fixture
+def companion_filter_fixture():
+    """Instantiates the companion filter once for option-resolution tests."""
+    return Filter()
+
+
+def test_companion_resolve_admin_defaults_only(companion_filter_fixture):
+    """`body=None` and no user valves resolve to plain admin valve defaults."""
+    f = companion_filter_fixture
+    resolved = _companion_resolve_options(f.valves, None, None)
+
+    assert isinstance(resolved, ResolvedOptions)
+    assert resolved.model_dump() == f.valves.model_dump()
+    assert resolved.get_custom_params() == {}
+
+
+def test_companion_resolve_user_valves_override(companion_filter_fixture):
+    """User valves (pydantic instance) override admin defaults."""
+    f = companion_filter_fixture
+    user_valves = f.UserValves(URL_RESOLVE_TIMEOUT=99)
+    resolved = _companion_resolve_options(f.valves, user_valves, None)
+
+    assert resolved.URL_RESOLVE_TIMEOUT == 99
+    assert resolved.USE_PERMISSIVE_SAFETY == f.valves.USE_PERMISSIVE_SAFETY
+
+
+def test_companion_resolve_body_key_wins_over_valves(companion_filter_fixture):
+    """Body keys beat admin valves and user valves, case-insensitively."""
+    f = companion_filter_fixture
+    user_valves = f.UserValves(URL_RESOLVE_TIMEOUT=99)
+    resolved = _companion_resolve_options(
+        f.valves, user_valves, {"url_resolve_timeout": 123}
+    )
+
+    assert resolved.URL_RESOLVE_TIMEOUT == 123
+
+
+def test_companion_resolve_body_options_and_level_priority(companion_filter_fixture):
+    """`body['options']` entries merge in, but body-level keys win."""
+    f = companion_filter_fixture
+    resolved = _companion_resolve_options(
+        f.valves,
+        None,
+        {"URL_RESOLVE_TIMEOUT": 55, "options": {"URL_RESOLVE_TIMEOUT": 77}},
+    )
+
+    assert resolved.URL_RESOLVE_TIMEOUT == 55
+
+
+def test_companion_resolve_options_entry_used_without_body_key(
+    companion_filter_fixture,
+):
+    """`body['options']` entries apply when the body-level key is absent."""
+    f = companion_filter_fixture
+    resolved = _companion_resolve_options(
+        f.valves, None, {"options": {"URL_RESOLVE_TIMEOUT": 77}}
+    )
+
+    assert resolved.URL_RESOLVE_TIMEOUT == 77
+
+
+def test_companion_resolve_none_values_skipped(companion_filter_fixture):
+    """`None` values from user valves and body are ignored."""
+    f = companion_filter_fixture
+    user_valves = f.UserValves(URL_RESOLVE_TIMEOUT=None, MODEL_CONFIG_PATH=None)
+    resolved = _companion_resolve_options(
+        f.valves,
+        user_valves,
+        {"url_resolve_timeout": None, "model_config_path": None},
+    )
+
+    assert resolved.URL_RESOLVE_TIMEOUT == f.valves.URL_RESOLVE_TIMEOUT
+    assert resolved.MODEL_CONFIG_PATH == f.valves.MODEL_CONFIG_PATH
+
+
+def test_companion_resolve_empty_string_skipped(companion_filter_fixture):
+    """Empty-string values from user valves and body are ignored."""
+    f = companion_filter_fixture
+    user_valves = f.UserValves(MODEL_CONFIG_PATH="")
+    resolved = _companion_resolve_options(
+        f.valves, user_valves, {"model_config_path": ""}
+    )
+
+    assert resolved.MODEL_CONFIG_PATH == f.valves.MODEL_CONFIG_PATH
+
+
+def test_companion_resolve_unknown_key_becomes_custom_param(
+    companion_filter_fixture,
+):
+    """Unknown body keys are adopted as extras, valve fields stay excluded."""
+    f = companion_filter_fixture
+    resolved = _companion_resolve_options(
+        f.valves, None, {"MY_CUSTOM_THING": "hello", "use_permissive_safety": True}
+    )
+
+    assert resolved.USE_PERMISSIVE_SAFETY is True
+    assert resolved.get_custom_params() == {"MY_CUSTOM_THING": "hello"}
+
+
+def test_companion_resolve_body_none_ignores_body(companion_filter_fixture):
+    """`body=None` (outlet fallback) resolves from valves only."""
+    f = companion_filter_fixture
+    resolved = _companion_resolve_options(f.valves, None, None)
+
+    assert resolved.model_dump() == f.valves.model_dump()
+
+
+def test_companion_admin_only_fields_empty(companion_filter_fixture):
+    """No admin-only fields exist today; pins the expected default state."""
+    assert Filter.Valves.model_fields.keys() == _SharedValves.model_fields.keys()
+
+
+# endregion Test companion filter `_resolve_options`
 
 
 def teardown_module(module):

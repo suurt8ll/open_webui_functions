@@ -43,17 +43,28 @@ Once installed and configured, the filter automatically modifies requests for mo
 
 The filter checks for the `gemini_manifold_google_genai.` prefix in the model name (or its base model ID) to ensure it's interacting with a model managed by the `gemini_manifold.py` pipe.
 
+## Option resolution hierarchy
+
+Filter options are resolved with the following priority (later sources win):
+
+1.  **Admin valves** — the filter's own Valves configuration.
+2.  **User valves** — the per-user valve overrides (user-overridable fields only).
+3.  **Model page params** — parameters set on the model's admin page, which Open WebUI v0.12+ merges into the request body before filters run.
+4.  **Chat params** — parameters set in the chat's side panel, also merged into the request body (body-level keys win over model page writes).
+
+Any unknown key found in the request body is adopted as an option override, so the companion picks up model page and chat parameters without needing its own merge logic. Keys are normalized case-insensitively, and `None`/empty-string values are ignored.
+
 ## Data Pipeline
 
 The filter's operation can be summarized as follows:
 
 1.  **`inlet(body: dict, __metadata__: dict[str, Any]) -> dict`:** This function modifies the incoming request payload (`body`) *before* it's sent to the `gemini_manifold.py` pipe.
     *   It checks if the model is a supported Gemini model for grounding or code execution using the `gemini_manifold_google_genai.` prefix and internal model lists (`ALLOWED_GROUNDING_MODELS`, `ALLOWED_CODE_EXECUTION_MODELS`).
-    *   If **web search** is enabled in the request's `features` dictionary and the model supports grounding, it disables the default `web_search` feature. It then adds custom features (`google_search_retrieval` for 1.0/1.5 models, `google_search_tool` for >=2.0 models) to `body["metadata"]["features"]` to signal the pipe to use Google Search grounding. If the "Set Temp To Zero" valve is enabled, it overwrites the `temperature` value with `0`.
-    *   If **code interpreter** is enabled in the request's `features` dictionary and the model supports code execution, it disables the default `code_interpreter` feature. It then adds the custom feature `google_code_execution` to `body["metadata"]["features"]` to signal the pipe to use Google's code execution tool.
-    *   If the **`BYPASS_BACKEND_RAG`** valve is enabled and documents are present in `body["files"]` (and the chat is not temporary), it clears the `body["files"]` list to prevent Open WebUI's backend RAG from processing them. It then adds `upload_documents: true` to `body["metadata"]["features"]` to signal the pipe to handle the raw documents directly with the Gemini API. If the valve is disabled or it's a temporary chat, `upload_documents: false` is added.
-    *   If the **`USE_PERMISSIVE_SAFETY`** valve is enabled, it adds permissive safety settings to `body["metadata"]["safety_settings"]`.
-    *   It ensures the necessary `metadata` and `metadata.features` structures exist in the `body`.
+    *   If **web search** is enabled in the request's `features` dictionary and the model supports grounding, it disables the default `web_search` feature. It then adds custom features (`google_search_tool`) to the shared `features` dict (see below) to signal the pipe to use Google Search grounding. If the "Set Temp To Zero" valve is enabled, it overwrites the `temperature` value with `0`.
+    *   If **code interpreter** is enabled in the request's `features` dictionary and the model supports code execution, it disables the default `code_interpreter` feature. It then adds the custom feature `google_code_execution` to the shared `features` dict to signal the pipe to use Google's code execution tool.
+    *   If the **`BYPASS_BACKEND_RAG`** valve is enabled and documents are present in `body["files"]` (and the chat is not temporary), it clears the `body["files"]` list to prevent Open WebUI's backend RAG from processing them. It then adds `upload_documents: true` to the shared `features` dict to signal the pipe to handle the raw documents directly with the Gemini API. If the valve is disabled or it's a temporary chat, `upload_documents: false` is added.
+    *   If the **`USE_PERMISSIVE_SAFETY`** valve is enabled, it adds permissive safety settings to `__metadata__["safety_settings"]`, which is where the pipe reads them from.
+    *   It ensures a single shared `features` dict exists, assigned to both `body["features"]` and `__metadata__["features"]`. Open WebUI snapshots `body["features"]` into `metadata["features"]` *before* filters run, so without this sharing, flags written only to `metadata["features"]` would be dropped for featureless requests. Open WebUI pops `body["features"]` after the filters to decide native `web_search`/`code_interpreter` handling, while the pipe reads the flags from `__metadata__["features"]`.
 2.  **`stream(event: dict) -> dict`:** This function currently performs no modifications on the streaming response from the LLM. It's included for potential future use.
 3.  **`outlet(body: dict, __request__: Request, __metadata__: dict[str, Any], __event_emitter__: Callable[["Event"], Awaitable[None]], **kwargs) -> dict`:** This function processes the complete response payload *after* it's received from the `gemini_manifold.py` pipe.
     *   It checks for `GroundingMetadata` that the pipe may have stored in the request state (`__request__.app.state`).
