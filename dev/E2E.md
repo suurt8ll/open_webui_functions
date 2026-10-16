@@ -72,16 +72,22 @@ import asyncio, re, sys
 from playwright.async_api import async_playwright
 
 BASE = "http://127.0.0.1:8084"
-EMAIL, PASSWORD = "e2e@test.local", "..."   # test account
+EMAIL, PASSWORD = "e2e@test.local", "..."  # test account
 MODEL_LABEL = "gemini-3.5-flash-lite"
-PROMPT = "What are the top headlines on Hacker News right now? Cite the sources you used."
-SHOTS = "e2e_shots"   # keep screenshots next to the script so they persist
+PROMPT = (
+    "What are the top headlines on Hacker News right now? Cite the sources you used."
+)
+SHOTS = "e2e_shots"  # keep screenshots next to the script so they persist
+
 
 async def main() -> int:
     results = []
+
     def check(name, ok, detail=""):
         results.append(ok)
-        print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""))
+        print(
+            f"[{'PASS' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else "")
+        )
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -117,7 +123,10 @@ async def main() -> int:
 
         # 5. wait for streaming to finish (stop button disappears)
         for _ in range(120):
-            if await page.get_by_role("button", name=re.compile("stop", re.I)).count() == 0:
+            if (
+                await page.get_by_role("button", name=re.compile("stop", re.I)).count()
+                == 0
+            ):
                 break
             await page.wait_for_timeout(1000)
         await page.wait_for_timeout(3000)
@@ -126,8 +135,13 @@ async def main() -> int:
         # 6. assertions
         text = re.sub(r"\s+", " ", await page.locator("body").inner_text())
         check("response non-empty", len(text) > 200, f"len={len(text)}")
-        check("no error text", not any(
-            s in text.lower() for s in ("exhausted execution options", "error occurred")))
+        check(
+            "no error text",
+            not any(
+                s in text.lower()
+                for s in ("exhausted execution options", "error occurred")
+            ),
+        )
         links = await page.locator("a[href^='http']").all()
         ext = [a for a in links if BASE not in (await a.get_attribute("href") or "")]
         check("citation links >= 1", len(ext) >= 1, f"count={len(ext)}")
@@ -135,6 +149,7 @@ async def main() -> int:
         await browser.close()
 
     return 1 if not all(results) else 0
+
 
 sys.exit(asyncio.run(main()))
 ```

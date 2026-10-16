@@ -57,7 +57,9 @@ def _unload_stale_modules() -> None:
             continue
         if getattr(loaded, "__version__", None) == installed_version:
             continue
-        for name in [n for n in sys.modules if n == package or n.startswith(f"{package}.")]:
+        for name in [
+            n for n in sys.modules if n == package or n.startswith(f"{package}.")
+        ]:
             del sys.modules[name]
         # `from google import genai` would otherwise still return the old module set on the parent package.
         parent_name, _, child = package.rpartition(".")
@@ -132,6 +134,7 @@ from open_webui.utils.misc import pop_system_message
 # This block is skipped at runtime.
 if TYPE_CHECKING:
     from plugins.filters.gemini_manifold_companion import EventEmitter
+
     # Imports custom type definitions (TypedDicts) for static analysis purposes (mypy/pylance).
     from utils.manifold_types import *
 
@@ -1631,6 +1634,7 @@ class GeminiContentBuilder:
         )
         return text
 
+
 # region Valves
 
 _VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
@@ -1715,7 +1719,9 @@ def _format_valve_desc(text: str, default: Any = None, is_user: bool = False) ->
     return f"{text}\n\n**Default:** {formatted_default}{sep}"
 
 
-def _admin_field(name: str, default: Any = None, admin_section_start: bool = False) -> Any:
+def _admin_field(
+    name: str, default: Any = None, admin_section_start: bool = False
+) -> Any:
     """Helper to construct a Pydantic Field with default value and formatted admin description."""
     raw_desc = _VALVE_DESCRIPTIONS.get(name, "")
     desc = _format_valve_desc(raw_desc, default=default)
@@ -1815,7 +1821,12 @@ class _SharedValves(BaseModel):
                                 )
                         elif isinstance(val, str):
                             val_str = val.strip()
-                            if val_str.upper() not in {"MINIMAL", "LOW", "MEDIUM", "HIGH"}:
+                            if val_str.upper() not in {
+                                "MINIMAL",
+                                "LOW",
+                                "MEDIUM",
+                                "HIGH",
+                            }:
                                 try:
                                     num = int(val_str)
                                 except ValueError:
@@ -1905,10 +1916,11 @@ def _generate_user_valves(shared_cls: type[BaseModel]) -> type[BaseModel]:
 
     return create_model("UserValves", __base__=shared_cls, **fields)  # type: ignore[call-overload]
 
+
 # endregion Valves
 
-class Pipe:
 
+class Pipe:
     class Valves(_SharedValves):
         USER_MUST_PROVIDE_AUTH_CONFIG: bool = _admin_field(
             "USER_MUST_PROVIDE_AUTH_CONFIG", False
@@ -2147,7 +2159,9 @@ class Pipe:
         except Exception as e:
             raise GenaiApiError(f"{api} Genai client initialization failed: {e}") from e
 
-    def _get_user_client(self, options: ResolvedOptions, user_email: str) -> genai.Client:
+    def _get_user_client(
+        self, options: ResolvedOptions, user_email: str
+    ) -> genai.Client:
         user_whitelist = (
             options.AUTH_WHITELIST.split(",") if options.AUTH_WHITELIST else []
         )
@@ -4005,9 +4019,10 @@ class Pipe:
             vertex_available and vertex_toggled_on and bool(options.VERTEX_PROJECT)
         )
 
-        paid_toggle_available, paid_toggled_on = (
-            await self._get_toggleable_feature_status("gemini_paid_api", __metadata__)
-        )
+        (
+            paid_toggle_available,
+            paid_toggled_on,
+        ) = await self._get_toggleable_feature_status("gemini_paid_api", __metadata__)
 
         task_type = __metadata__.get("task")
         routing_strategy = options.TASK_MODEL_ROUTING if task_type else "match_main"
@@ -4232,6 +4247,7 @@ class Pipe:
 
     # endregion 1. Helper methods inside the Pipe class
 
+
 # region Option resolution
 
 OPTION_SYNONYMS: Final[dict[str, str]] = {
@@ -4248,8 +4264,7 @@ ADMIN_ONLY_VALVE_FIELDS: Final[set[str]] = (
 
 # Pre-computed case-insensitive lookup dictionaries
 _VALVE_FIELD_LOOKUP: Final[dict[str, str]] = {
-    field_name.lower(): field_name
-    for field_name in Pipe.Valves.model_fields.keys()
+    field_name.lower(): field_name for field_name in Pipe.Valves.model_fields.keys()
 }
 
 _SYNONYM_LOOKUP: Final[dict[str, str]] = {
@@ -4288,9 +4303,7 @@ class ResolvedOptions(Pipe.Valves):
     def get_custom_params(self) -> dict[str, Any]:
         """Returns extra parameters not defined in Pipe.Valves."""
         valve_fields = set(Pipe.Valves.model_fields.keys())
-        return {
-            k: v for k, v in self.model_dump().items() if k not in valve_fields
-        }
+        return {k: v for k, v in self.model_dump().items() if k not in valve_fields}
 
 
 def _resolve_options(
@@ -4321,26 +4334,17 @@ def _resolve_options(
 
     # Enforce admin authentication security rules
     user_whitelist = (
-        admin_valves.AUTH_WHITELIST.split(",")
-        if admin_valves.AUTH_WHITELIST
-        else []
+        admin_valves.AUTH_WHITELIST.split(",") if admin_valves.AUTH_WHITELIST else []
     )
-    if (
-        admin_valves.USER_MUST_PROVIDE_AUTH_CONFIG
-        and user_email not in user_whitelist
-    ):
+    if admin_valves.USER_MUST_PROVIDE_AUTH_CONFIG and user_email not in user_whitelist:
         log.info(
             f"User '{user_email}' is required to provide their own authentication credentials due to USER_MUST_PROVIDE_AUTH_CONFIG=True."
         )
         merged_data["GEMINI_FREE_API_KEY"] = (
-            getattr(user_valves, "GEMINI_FREE_API_KEY", None)
-            if user_valves
-            else None
+            getattr(user_valves, "GEMINI_FREE_API_KEY", None) if user_valves else None
         )
         merged_data["GEMINI_PAID_API_KEY"] = (
-            getattr(user_valves, "GEMINI_PAID_API_KEY", None)
-            if user_valves
-            else None
+            getattr(user_valves, "GEMINI_PAID_API_KEY", None) if user_valves else None
         )
         merged_data["VERTEX_PROJECT"] = None
         merged_data["USE_VERTEX_AI"] = False
@@ -4385,5 +4389,6 @@ def _resolve_options(
         merged_data[canonical_key] = val
 
     return ResolvedOptions(**merged_data)
+
 
 # endregion Option resolution

@@ -50,6 +50,7 @@ The `dev/` directory offers a convenient environment for developing and testing 
 
 ## Coding Conventions
 
+*   Format all Python code with [ruff](https://docs.astral.sh/ruff/format/) (`ruff format .`). This is the enforced formatting standard — please run it before committing rather than relying on other formatters (e.g. black or the IDE's default).
 *   Follow PEP 8 style guidelines for Python code.
 *   Write clear and concise code with meaningful variable and function names.
 *   Document your code with docstrings and comments.

@@ -72,7 +72,7 @@ The `plugins/archived/` directory contains old functions that are no longer acti
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. As this is a personal project, please be patient with response times.
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. Python code is formatted with [ruff](https://docs.astral.sh/ruff/format/) — please run `ruff format .` before committing. As this is a personal project, please be patient with response times.
 
 ## License
 

@@ -52,7 +52,6 @@ DETAILS_BLOCK_REGEX = re.compile(
 
 
 class Filter:
-
     class Valves(BaseModel):
         pass
 

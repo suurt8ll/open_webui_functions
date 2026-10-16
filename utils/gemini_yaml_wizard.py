@@ -60,7 +60,7 @@ def generate_yaml_entry(data):
         if up_to is None:
             up_to = "null"
         return f"""      - up_to_tokens: {up_to}
-        price_per_million: {tier['price_per_million']}"""
+        price_per_million: {tier["price_per_million"]}"""
 
     pricing_section = "  pricing:\n"
     if data["pricing"].get("free_tier"):
@@ -89,41 +89,41 @@ def generate_yaml_entry(data):
       aspect_ratios: [{", ".join(ar_quoted)}]"""
 
     entry = f"""
-{data['model_id']}:
-  description: "{data['description']}"
-  knowledge_cutoff: "{data['knowledge_cutoff']}"
-  latest_update: "{data['latest_update']}"
+{data["model_id"]}:
+  description: "{data["description"]}"
+  knowledge_cutoff: "{data["knowledge_cutoff"]}"
+  latest_update: "{data["latest_update"]}"
   supported_data_types:
-    inputs: {format_list(data['inputs'])}
-    outputs: {format_list(data['outputs'])}
+    inputs: {format_list(data["inputs"])}
+    outputs: {format_list(data["outputs"])}
   tokens:
-    input: {data['input_tokens']}
-    output: {data['output_tokens']}
+    input: {data["input_tokens"]}
+    output: {data["output_tokens"]}
   capabilities:
-    audio_generation: {str(data['caps']['audio_generation']).lower()}
-    batch_api: {str(data['caps']['batch_api']).lower()}
-    caching: {str(data['caps']['caching']).lower()}
-    code_execution: {str(data['caps']['code_execution']).lower()}
-    file_search: {str(data['caps']['file_search']).lower()}
-    function_calling: {str(data['caps']['function_calling']).lower()}
-    grounding_google_maps: {str(data['caps']['grounding_google_maps']).lower()}
+    audio_generation: {str(data["caps"]["audio_generation"]).lower()}
+    batch_api: {str(data["caps"]["batch_api"]).lower()}
+    caching: {str(data["caps"]["caching"]).lower()}
+    code_execution: {str(data["caps"]["code_execution"]).lower()}
+    file_search: {str(data["caps"]["file_search"]).lower()}
+    function_calling: {str(data["caps"]["function_calling"]).lower()}
+    grounding_google_maps: {str(data["caps"]["grounding_google_maps"]).lower()}
     {image_gen_yaml}
-    live_api: {str(data['caps']['live_api']).lower()}
-    search_grounding: {str(data['caps']['search_grounding']).lower()}
-    structured_outputs: {str(data['caps']['structured_outputs']).lower()}
-    thinking: {str(data['caps']['thinking']).lower()}
-    url_context: {str(data['caps']['url_context']).lower()}
+    live_api: {str(data["caps"]["live_api"]).lower()}
+    search_grounding: {str(data["caps"]["search_grounding"]).lower()}
+    structured_outputs: {str(data["caps"]["structured_outputs"]).lower()}
+    thinking: {str(data["caps"]["thinking"]).lower()}
+    url_context: {str(data["caps"]["url_context"]).lower()}
 {pricing_section}"""
 
     if data["pricing"].get("caching"):
         entry += f"""
     caching:
-{chr(10).join([format_pricing_tier(t) for t in data['pricing']['caching']])}"""
+{chr(10).join([format_pricing_tier(t) for t in data["pricing"]["caching"]])}"""
 
     if data["pricing"].get("image_output"):
         entry += f"""
     image_output:
-{chr(10).join([format_pricing_tier(t) for t in data['pricing']['image_output']])}"""
+{chr(10).join([format_pricing_tier(t) for t in data["pricing"]["image_output"]])}"""
 
     return entry + "\n"
 

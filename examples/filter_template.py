@@ -21,7 +21,6 @@ if TYPE_CHECKING:
 
 
 class Filter:
-
     class Valves(BaseModel):
         EXAMPLE_STRING: str = Field(
             default="", title="Admin String", description="String configurable by admin"

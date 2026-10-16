@@ -284,12 +284,14 @@ class VeniceAPIClient:
 
         return await self._request_image("/image/upscale", payload)
 
-    def _derive_dimensions_from_aspect_ratio(self, aspect_ratio: str) -> tuple[int, int]:
+    def _derive_dimensions_from_aspect_ratio(
+        self, aspect_ratio: str
+    ) -> tuple[int, int]:
         """
-            Converts an aspect ratio string (e.g. '16:9') into pixel dimensions
-            with the longer side fixed at 1280. Used for models that only accept
-            raw width/height but the user configured an aspect ratio.
-            """
+        Converts an aspect ratio string (e.g. '16:9') into pixel dimensions
+        with the longer side fixed at 1280. Used for models that only accept
+        raw width/height but the user configured an aspect ratio.
+        """
         try:
             w_str, h_str = aspect_ratio.split(":")
             ratio_w, ratio_h = int(w_str), int(h_str)
@@ -297,9 +299,9 @@ class VeniceAPIClient:
                 raise ValueError
         except (ValueError, AttributeError):
             log.warning(
-                    f"Could not parse aspect ratio '{aspect_ratio}' for dimension derivation. "
-                    f"Falling back to 1:1 (1280x1280)."
-                )
+                f"Could not parse aspect ratio '{aspect_ratio}' for dimension derivation. "
+                f"Falling back to 1:1 (1280x1280)."
+            )
             return 1280, 1280
 
         base = 1280
@@ -532,7 +534,9 @@ class VeniceAPIClient:
         )
         return payload
 
-    async def _request_image(self, endpoint: str, payload: dict[str, Any]) -> list[bytes]:
+    async def _request_image(
+        self, endpoint: str, payload: dict[str, Any]
+    ) -> list[bytes]:
         """
         Executes raw POST requests and simplifies data streams. Unifies both API JSON outputs
         (extracting base64 image strings) and direct image binary streams into clean raw bytes.
@@ -836,7 +840,7 @@ class Pipe:
         emitter = EventEmitter(__event_emitter__, verbosity=options.EMISSION_VERBOSITY)
 
         if "error" in __metadata__["model"]["id"]:
-            error_msg = f'There has been an error during model retrieval phase: {str(__metadata__["model"])}'
+            error_msg = f"There has been an error during model retrieval phase: {str(__metadata__['model'])}"
             raise RuntimeError(error_msg)
 
         if not options.VENICE_API_TOKEN:
@@ -964,16 +968,22 @@ class Pipe:
                 )
             else:
                 assert isinstance(model_spec, VeniceImageModel)
-                image_bytes_list = await client.generate_image(model_spec, prompt, params)
+                image_bytes_list = await client.generate_image(
+                    model_spec, prompt, params
+                )
         except VeniceAPIError as e:
             emitter.emit_status("Image generation failed", done=True)
             await emitter.shutdown()
             raise e
 
         num_images = len(image_bytes_list)
-        log.info(f"Image request completed successfully! ({num_images} image(s) generated)")
+        log.info(
+            f"Image request completed successfully! ({num_images} image(s) generated)"
+        )
         if num_images > 1:
-            emitter.emit_status(f"Image generation successful ({num_images} images)", done=True)
+            emitter.emit_status(
+                f"Image generation successful ({num_images} images)", done=True
+            )
         else:
             emitter.emit_status("Image generation successful", done=True)
 
@@ -996,12 +1006,16 @@ class Pipe:
                     __request__,
                 )
                 uploaded_urls.append(url)
-            response = "\n\n".join(f"![Generated Image]({url})" for url in uploaded_urls)
+            response = "\n\n".join(
+                f"![Generated Image]({url})" for url in uploaded_urls
+            )
         else:
             parts = []
             for img_bytes in image_bytes_list:
                 base64_image = base64.b64encode(img_bytes).decode("utf-8")
-                parts.append(f"![Generated Image](data:image/png;base64,{base64_image})")
+                parts.append(
+                    f"![Generated Image](data:image/png;base64,{base64_image})"
+                )
             response = "\n\n".join(parts)
         await emitter.shutdown()
         return response

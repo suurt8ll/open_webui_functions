@@ -16,7 +16,6 @@ if TYPE_CHECKING:
 
 
 class Filter:
-
     def __init__(self):
         print(f"[{__name__}] Function has been initialized.")
 

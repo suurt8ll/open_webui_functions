@@ -26,7 +26,6 @@ SEARCH_FILTER_ID = "grounding_with_google_search"
 
 
 class Pipe:
-
     class Valves(BaseModel):
         USE_GROUNDING_SEARCH: bool = Field(
             default=False,

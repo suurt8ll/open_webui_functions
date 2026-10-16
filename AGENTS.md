@@ -64,7 +64,7 @@ If you find a better agent-friendly development loop (e.g. more automated verifi
 
 ## Style & formatting
 
-- Use **ruff** for linting and formatting so that hand edits and agent edits stay consistent. (`pip install ruff` into `.venv`; there is no committed config yet — default ruleset is fine, or propose one.)
+- Use **ruff** for linting and formatting so that hand edits and agent edits stay consistent. Run `.venv/bin/ruff format .` before committing; the whole repo is formatted with ruff's default style, including Python code blocks inside Markdown docs. (No committed config yet — default ruleset applies, or propose one.)
 - PEP 8, clear names, docstrings and comments where they add value.
 
 ## Autonomy expectations

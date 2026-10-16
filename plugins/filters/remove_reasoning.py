@@ -13,7 +13,6 @@ import inspect
 
 
 class Filter:
-
     def __init__(self):
         self.toggle = True  # Makes the filter toggleable in the front-end.
         # Icon from https://icon-sets.iconify.design/mdi/brain/
