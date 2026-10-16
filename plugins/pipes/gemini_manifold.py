@@ -3322,9 +3322,6 @@ class Pipe:
                 yield {"usage": usage_data}
 
             if not error_occurred:
-                # 'data: [DONE]' should be the last thing yielded in a successful stream
-                # to signify the protocol-level end of the OpenAI-compatible stream.
-                yield "data: [DONE]"
                 log.info("Response processing finished successfully!")
 
                 # We manually upsert custom metadata to the database because Open WebUI
