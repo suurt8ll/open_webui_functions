@@ -4301,11 +4301,10 @@ def _resolve_options(
     metadata: "Metadata",
 ) -> ResolvedOptions:
     """
-    Hierarchically resolves configuration options from 4 priority sources:
-    1. Admin Valves (Lowest priority)
-    2. User Valves
-    3. Model Page Advanced Params
-    4. Chat Side-Panel Advanced Params (Highest priority)
+    Open WebUI (v0.12+) has already merged all parameter sources into `body`
+    by the time the pipe runs (global defaults < model page params < chat params,
+    with body-level keys winning over model-side writes), so anything unknown in
+    `body` is simply adopted as an option.
 
     Admin-only options cannot be overridden by user-level sources.
     Option keys and synonyms are normalized case-insensitively.
@@ -4346,8 +4345,10 @@ def _resolve_options(
         merged_data["VERTEX_PROJECT"] = None
         merged_data["USE_VERTEX_AI"] = False
 
-    # TODO: does it make more sense for uservalves to overwrite model params?
-    # Priority 3: Model Page Advanced Params
+    # Priority 3: Anything that the backend merged into the body is treated as
+    # an option override. Since Open WebUI v0.12 the backend itself resolves
+    # the priority between admin defaults, model page params and chat params
+    # before the pipe runs, so no per-source distinction is needed here.
     known_body_keys = {
         "stream",
         "model",
@@ -4355,44 +4356,33 @@ def _resolve_options(
         "files",
         "options",
         "stream_options",
+        "features",
+        "metadata",
+        "params",
+        "tool_ids",
+        "tools",
+        "tool_choice",
+        "variables",
+        "skill_ids",
+        "terminal_id",
+        "chat_id",
     }
-    model_params = {
-        k: v for k, v in body.items() if k not in known_body_keys
-    }
+    body_options = {k: v for k, v in body.items() if k not in known_body_keys}
     if isinstance(body.get("options"), dict):
-        for opt_k, opt_v in body["options"].items(): # type: ignore[reportTypedDictNotRequiredAccess]
-            if opt_k not in model_params:
-                model_params[opt_k] = opt_v
+        for opt_k, opt_v in body["options"].items():  # type: ignore[reportTypedDictNotRequiredAccess]
+            if opt_k not in body_options:
+                body_options[opt_k] = opt_v
 
-    for raw_key, val in model_params.items():
+    for raw_key, val in body_options.items():
         if val is None or val == "":
             continue
         canonical_key = canonicalize_option_key(raw_key)
         if canonical_key in ADMIN_ONLY_VALVE_FIELDS:
             log.warning(
-                f"Model parameter '{raw_key}' attempts to override admin-only valve '{canonical_key}'. Ignoring override."
+                f"Body parameter '{raw_key}' attempts to override admin-only valve '{canonical_key}'. Ignoring override."
             )
             continue
         merged_data[canonical_key] = val
-
-    # Priority 4: Chat Side-Panel Advanced Params (Skipped for task models)
-    if not metadata.get("task"):
-        chat_params = metadata.get("chat_control_params", {})
-        if isinstance(chat_params, dict):
-            for raw_key, val in chat_params.items():
-                if val is None or val == "":
-                    continue
-                canonical_key = canonicalize_option_key(raw_key)
-                if canonical_key in ADMIN_ONLY_VALVE_FIELDS:
-                    log.warning(
-                        f"Chat parameter '{raw_key}' attempts to override admin-only valve '{canonical_key}'. Ignoring override."
-                    )
-                    continue
-                merged_data[canonical_key] = val
-    else:
-        log.debug(
-            f"Task model detected ('{metadata.get('task')}'). Chat side-panel parameters ignored."
-        )
 
     return ResolvedOptions(**merged_data)
 
