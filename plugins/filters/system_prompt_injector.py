@@ -26,7 +26,7 @@ version: 0.8.0
 # IMPORTANT: Disable "Rich Text Input for Chat" in Open WebUI settings for this plugin to work correctly.
 # See https://github.com/open-webui/open-webui/issues/9759 for more.
 
-import datetime
+import datetime as dt
 import inspect
 import json
 import re
@@ -75,7 +75,7 @@ class Filter:
 
     def _log(self, message: str):
         """Helper method for standardized logging."""
-        timestamp = datetime.datetime.now().isoformat()
+        timestamp = dt.datetime.now().isoformat()
         caller_name = inspect.stack()[1].function
         print(f'[{timestamp}] [{__name__}.{caller_name}] {message}')
 

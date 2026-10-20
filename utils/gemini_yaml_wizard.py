@@ -1,4 +1,4 @@
-import datetime
+import datetime as dt
 import os
 import sys
 from typing import Any
@@ -133,7 +133,7 @@ def main():
     model_id = get_input('Model ID (e.g., gemini-3-pro)')
     description = get_input('Description')
 
-    today = datetime.date.today()
+    today = dt.date.today()
     knowledge_cutoff = get_input('Knowledge Cutoff (YYYY-MM)', default=f'{today.year}-01')
     latest_update = get_input('Latest Update (YYYY-MM)', default=f'{today.year}-{today.month:02d}')
 

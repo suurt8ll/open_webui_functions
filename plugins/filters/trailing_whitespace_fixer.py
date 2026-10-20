@@ -9,7 +9,7 @@ license: MIT
 version: 1.0.0
 """
 
-import datetime
+import datetime as dt
 import inspect
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
@@ -32,7 +32,7 @@ class Filter:
 
     def _log(self, message: str):
         """Helper method for logging with timestamp and caller info."""
-        timestamp = datetime.datetime.now().isoformat()
+        timestamp = dt.datetime.now().isoformat()
         caller_name = inspect.stack()[1].function
         print(f'[{timestamp}] [{__name__}.{caller_name}] {message}')
 

@@ -75,6 +75,7 @@ _unload_stale_modules()
 import asyncio
 import base64
 import copy
+import datetime as dt
 import difflib
 import fnmatch
 import io
@@ -84,7 +85,6 @@ import re
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
-from datetime import UTC, datetime
 from functools import cache
 from typing import (
     TYPE_CHECKING,
@@ -504,12 +504,12 @@ class FilesAPIManager:
 
         return content_hash
 
-    def _calculate_ttl(self, expiration_time: datetime | None) -> float | None:
+    def _calculate_ttl(self, expiration_time: dt.datetime | None) -> float | None:
         """Calculates the TTL in seconds from an expiration datetime."""
         if not expiration_time:
             return None
 
-        now_utc = datetime.now(UTC)
+        now_utc = dt.datetime.now(dt.UTC)
         if expiration_time <= now_utc:
             return 0
 

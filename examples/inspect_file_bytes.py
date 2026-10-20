@@ -11,7 +11,7 @@ requirements:
 """
 
 import base64
-import datetime
+import datetime as dt
 import inspect
 import json
 import os
@@ -59,7 +59,7 @@ class LeanLogger:
         return data
 
     def log(self, message: str, data: Any | None = None, level: str = 'INFO'):
-        timestamp = datetime.datetime.now().isoformat()
+        timestamp = dt.datetime.now().isoformat()
         caller_name = inspect.stack()[2].function
         print(f'[{timestamp}] [{level}] [{__name__}.{caller_name}] {message}')
         if data:

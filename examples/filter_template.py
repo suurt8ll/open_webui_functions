@@ -8,7 +8,7 @@ funding_url: https://github.com/suurt8ll/open_webui_functions
 version: 0.0.0
 """
 
-import datetime
+import datetime as dt
 import inspect
 import json
 from collections.abc import Awaitable, Callable
@@ -39,7 +39,7 @@ class Filter:
         self._log('Function has been initialized!')
 
     def _log(self, message: str):
-        timestamp = datetime.datetime.now().isoformat()
+        timestamp = dt.datetime.now().isoformat()
         caller_name = inspect.stack()[1].function
         print(f'[{timestamp}] [{__name__}.{caller_name}] {message}')
 
