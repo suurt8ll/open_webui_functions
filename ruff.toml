@@ -1,0 +1,68 @@
+# Ruff configuration for this repository.
+#
+# Deliberately mirrors the ruff settings of the vendored Open WebUI source
+# (`submodules/open-webui/pyproject.toml`, [tool.ruff] section): this repo
+# exists to build OWUI plugins, so sharing the rule selection, line length and
+# quote style keeps plugin code stylistically identical to upstream.
+# Anything not set below follows ruff's own defaults.
+#
+# Upstream reference: submodules/open-webui/pyproject.toml
+# Docs: https://docs.astral.sh/ruff/configuration/
+
+# --- General ---
+line-length = 120
+
+# OWUI gets target-version = "py311" implicitly via requires-python = ">= 3.11".
+# This repo has no requires-python of its own (an ancestor-less ruff.toml
+# defaults to py39), so set it explicitly to match upstream.
+target-version = "py311"
+
+# The vendored Open WebUI source (the `open_webui` symlink into
+# `submodules/open-webui/`) is upstream code we never touch — exclude it so
+# `ruff check .` / `ruff format .` only report issues that are ours to fix.
+# (.venv, caches and other scratch dirs are covered by .gitignore + ruff's
+# default excludes.)
+#
+# `plugins/archived/` is dead code kept for reference only (see AGENTS.md);
+# it is never developed on or shipped, so don't lint or format it.
+extend-exclude = ["open_webui", "submodules", "plugins/archived"]
+
+# --- Formatting (`ruff format`) ---
+[format]
+quote-style = "single"
+# Explicitly false because it is mentioned in upstream's config, but note it
+# is also ruff's default.
+docstring-code-format = false
+
+# --- Linting (`ruff check`) ---
+[lint]
+# Same rule selection as upstream.
+select = [
+  "E",    # pycodestyle errors
+  "F",    # pyflakes
+  "W",    # pycodestyle warnings
+  "I",    # isort
+  "UP",   # pyupgrade
+  "C90",  # mccabe
+  "Q",    # flake8-quotes
+  "ICN",  # flake8-import-conventions
+]
+
+# Mirror of upstream's plugin configs (same values as submodules/open-webui):
+flake8-import-conventions.banned-from = ["ast", "datetime"]
+flake8-import-conventions.aliases = { datetime = "dt" }
+flake8-quotes.inline-quotes = "single"
+mccabe.max-complexity = 10
+# Upstream sets this as well. Inert while no pydocstyle (D) rules are
+# selected; kept for parity with the OWUI config.
+pydocstyle.convention = "google"
+
+# --- Deliberate deviation from upstream parity ---
+# Upstream OWUI has no ignores for any selected rule (see the comments above);
+# this is the repo's single documented carve-out, kept as tight as possible.
+[lint.per-file-ignores]
+# tests/test_gemini_manifold.py installs `MagicMock` stubs into `sys.modules`
+# before importing the plugins under test, so the plugins' `open_webui.*`
+# imports bind to the mocks. Module-level imports there are intentionally
+# sequenced after that setup; flagging them would be pure noise.
+"tests/**" = ["E402"]

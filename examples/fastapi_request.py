@@ -9,12 +9,16 @@ version: 0.0.0
 """
 
 import json
+from typing import TYPE_CHECKING, Any
+
 from fastapi import Request
 from pydantic import BaseModel
-from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from utils.manifold_types import *  # My personal types in a separate file for more robustness.
+    # My personal types in a separate file for more robustness.
+    from utils.manifold_types import (
+        Body,
+    )
 
 
 class Filter:
@@ -23,18 +27,18 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
-        self._log(f"Function has been initialized.", "__init__")
+        self._log('Function has been initialized.', '__init__')
 
-    def inlet(self, body: "Body", **kwargs) -> "Body":
+    def inlet(self, body: 'Body', **kwargs) -> 'Body':
         """This allows modifying the input LLM model gets."""
 
-        self._log("Original Request Body:", "inlet")
+        self._log('Original Request Body:', 'inlet')
         print(json.dumps(body, indent=2, default=str))
 
         # body["files"] = []
-        body["messages"][-1]["content"] = "This was injected by Filter inlet method."
+        body['messages'][-1]['content'] = 'This was injected by Filter inlet method.'
 
-        self._log("Modified Request Body:", "inlet")
+        self._log('Modified Request Body:', 'inlet')
         print(json.dumps(body, indent=2, default=str))
 
         return body
@@ -45,31 +49,31 @@ class Filter:
         # print(json.dumps(event, indent=2, default=str))
         return event
 
-    async def outlet(self, body: "Body", __request__: Request, **kwargs) -> "Body":
+    async def outlet(self, body: 'Body', __request__: Request, **kwargs) -> 'Body':
         """This allows modifying the LLM final output."""
 
-        self._log("__request__.state._state:", "outlet")
+        self._log('__request__.state._state:', 'outlet')
         print(json.dumps(__request__.state._state, indent=2, default=str))
 
-        self._log("__request__.app.state._state:", "outlet")
+        self._log('__request__.app.state._state:', 'outlet')
         print(json.dumps(__request__.app.state._state, indent=2, default=str))
 
-        self._log("Original Response Body:", "outlet")
+        self._log('Original Response Body:', 'outlet')
         print(json.dumps(body, indent=2, default=str))
 
-        body["messages"][-1]["content"] = "This was injected by Filter outlet method."
+        body['messages'][-1]['content'] = 'This was injected by Filter outlet method.'
 
-        self._log("Modified Response Body:", "outlet")
+        self._log('Modified Response Body:', 'outlet')
         print(json.dumps(body, indent=2, default=str))
 
         return body
 
     # region ----- Helper methods inside the Pipe class -----
 
-    def _log(self, msg: str, method_name: str = ""):
+    def _log(self, msg: str, method_name: str = ''):
         """Simple helper method for more informative logging."""
         if method_name:
-            method_name = f" | {method_name}"
-        print(f"{__name__}{method_name} | {msg}")
+            method_name = f' | {method_name}'
+        print(f'{__name__}{method_name} | {msg}')
 
     # endregion

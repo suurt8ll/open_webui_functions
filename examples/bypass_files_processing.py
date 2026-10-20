@@ -9,29 +9,32 @@ version: 0.0.0
 """
 
 import json
-from typing import Any, Awaitable, Callable, TYPE_CHECKING
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from utils.manifold_types import *  # My personal types in a separate file for more robustness.
+    # My personal types in a separate file for more robustness.
+    from utils.manifold_types import (
+        Body,
+        Event,
+    )
 
 
 class Filter:
     def __init__(self):
-        print(f"[{__name__}] Function has been initialized.")
+        print(f'[{__name__}] Function has been initialized.')
 
-    def inlet(
-        self, body: "Body", __event_emitter__: Callable[["Event"], Awaitable[None]]
-    ) -> "Body":
+    def inlet(self, body: 'Body', __event_emitter__: Callable[['Event'], Awaitable[None]]) -> 'Body':
 
-        print(f"[{__name__}] --- Inlet Filter ---")
-        print(f"[{__name__}] Original Request Body:")
+        print(f'[{__name__}] --- Inlet Filter ---')
+        print(f'[{__name__}] Original Request Body:')
         print(json.dumps(body, indent=2, default=str))
 
-        print(f"[{__name__}] Setting body.files to empty list.")
+        print(f'[{__name__}] Setting body.files to empty list.')
         # This bypasses backend's RAG completely.
-        body["files"] = []
+        body['files'] = []
 
-        print(f"[{__name__}] Modified Request Body (before sending to LLM):")
+        print(f'[{__name__}] Modified Request Body (before sending to LLM):')
         print(json.dumps(body, indent=2, default=str))
 
         return body
@@ -39,11 +42,9 @@ class Filter:
     async def stream(self, event: dict[str, Any]) -> dict[str, Any]:
         return event
 
-    async def outlet(
-        self, body: "Body", __event_emitter__: Callable[["Event"], Awaitable[None]]
-    ) -> "Body":
+    async def outlet(self, body: 'Body', __event_emitter__: Callable[['Event'], Awaitable[None]]) -> 'Body':
 
-        print(f"[{__name__}] --- Outlet Filter ---")
-        print(f"[{__name__}] Response Body:")
+        print(f'[{__name__}] --- Outlet Filter ---')
+        print(f'[{__name__}] Response Body:')
         print(json.dumps(body, indent=2, default=str))
         return body

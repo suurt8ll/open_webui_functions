@@ -1,4 +1,5 @@
-from typing import Any, NotRequired, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
+
 from google.genai import types
 
 
@@ -49,7 +50,7 @@ class FileAttachmentTD(TypedDict):
 class SourceSource(TypedDict):
     docs: NotRequired[list[dict]]
     name: str | None  # the search query used
-    type: NotRequired[Literal["web_search", "file"]]
+    type: NotRequired[Literal['web_search', 'file']]
     file: NotRequired[FileAttachmentTD]
     urls: NotRequired[list[str]]
 
@@ -81,12 +82,12 @@ class ErrorData(TypedDict):
 
 
 class NotificationEventData(TypedDict):
-    type: Literal["info", "success", "warning", "error"]
+    type: Literal['info', 'success', 'warning', 'error']
     content: str
 
 
 class NotificationEvent(TypedDict):
-    type: Literal["notification"]
+    type: Literal['notification']
     data: NotificationEventData
 
 
@@ -99,7 +100,7 @@ class ChatCompletionEventData(TypedDict):
 
 
 class ChatCompletionEvent(TypedDict):
-    type: Literal["chat:completion"]
+    type: Literal['chat:completion']
     data: ChatCompletionEventData
 
 
@@ -112,11 +113,11 @@ class StatusEventData(TypedDict):
     # Specific actions found in StatusItem.svelte
     action: NotRequired[
         Literal[
-            "web_search",
-            "knowledge_search",
-            "queries_generated",
-            "web_search_queries_generated",
-            "sources_retrieved",
+            'web_search',
+            'knowledge_search',
+            'queries_generated',
+            'web_search_queries_generated',
+            'sources_retrieved',
         ]
     ]
     description: NotRequired[str]
@@ -138,7 +139,7 @@ class StatusEventData(TypedDict):
 
 
 class StatusEvent(TypedDict):
-    type: Literal["status"]
+    type: Literal['status']
     data: StatusEventData
 
 
@@ -150,7 +151,7 @@ class SourceData(TypedDict):
 
 class CitationEvent(TypedDict):
     # Backend get_event_emitter handles both "source" and "citation" types
-    type: Literal["source", "citation"]
+    type: Literal['source', 'citation']
     data: SourceData
 
 
@@ -183,9 +184,7 @@ class OllamaDetails(TypedDict):
     size: int
     digest: str
     details: ModelDetails
-    urls: list[
-        int
-    ]  # Example shows [0], type might be more complex? List[Any] is safer if unsure.
+    urls: list[int]  # Example shows [0], type might be more complex? List[Any] is safer if unsure.
 
 
 # Nested types for `MetadataModel.info`
@@ -262,7 +261,7 @@ class ModelFilter(TypedDict):
 class ModelPipe(TypedDict):
     """Represents the pipe information for a model."""
 
-    type: Literal["pipe"]
+    type: Literal['pipe']
 
 
 class MetadataModel(TypedDict):
@@ -270,7 +269,7 @@ class MetadataModel(TypedDict):
 
     id: str
     name: str
-    object: Literal["model"]
+    object: Literal['model']
     created: int  # Unix timestamp
     owned_by: str
     actions: list[Any]
@@ -310,7 +309,7 @@ class MetadataParams(TypedDict):
     stream_delta_chunk_size: int | None
     reasoning_tags: Any | None
     compact_token_threshold: NotRequired[int | None]
-    function_calling: Literal["default", "native"]
+    function_calling: Literal['default', 'native']
 
 
 class Metadata(TypedDict):
@@ -326,9 +325,7 @@ class Metadata(TypedDict):
     tool_servers: list[Any]
     files: list[FileAttachmentTD] | None
     features: Features | None
-    variables: dict[
-        str, str
-    ]  # Keys are variable names (e.g., "{{USER_NAME}}"), values are strings
+    variables: dict[str, str]  # Keys are variable names (e.g., "{{USER_NAME}}"), values are strings
     chat_variables: NotRequired[dict[str, Any]]
     model: MetadataModel
     direct: bool
@@ -369,7 +366,7 @@ class Metadata(TypedDict):
 class TextContent(TypedDict):
     """Represents text content within a message."""
 
-    type: Literal["text"]
+    type: Literal['text']
     text: str
 
 
@@ -382,7 +379,7 @@ class ImageURL(TypedDict):
 class ImageContent(TypedDict):
     """Represents image content within a message."""
 
-    type: Literal["image_url"]
+    type: Literal['image_url']
     image_url: ImageURL
 
 
@@ -392,14 +389,14 @@ Content = TextContent | ImageContent  # Union of possible content types
 class OutputTextContent(TypedDict):
     """Represents output text content blocks within model outputs."""
 
-    type: Literal["output_text", "text"]
+    type: Literal['output_text', 'text']
     text: str
 
 
 class ReasoningOutputItem(TypedDict):
     """Represents reasoning / thinking output blocks."""
 
-    type: Literal["reasoning"]
+    type: Literal['reasoning']
     id: NotRequired[str]
     status: NotRequired[str]
     start_tag: NotRequired[str]
@@ -415,10 +412,10 @@ class ReasoningOutputItem(TypedDict):
 class MessageOutputItem(TypedDict):
     """Represents message output blocks."""
 
-    type: Literal["message"]
+    type: Literal['message']
     id: NotRequired[str]
     status: NotRequired[str]
-    role: NotRequired[Literal["assistant", "user", "system"]]
+    role: NotRequired[Literal['assistant', 'user', 'system']]
     content: list[OutputTextContent]
 
 
@@ -428,7 +425,7 @@ OutputItem = ReasoningOutputItem | MessageOutputItem
 class UserMessage(TypedDict):
     """Represents a message from the user."""
 
-    role: Literal["user"]
+    role: Literal['user']
     id: NotRequired[str]
     content: str | list[Content]
     timestamp: NotRequired[int]
@@ -438,7 +435,7 @@ class UserMessage(TypedDict):
 class AssistantMessage(TypedDict):
     """Represents a message from the assistant."""
 
-    role: Literal["assistant"]
+    role: Literal['assistant']
     id: NotRequired[str]
     content: str  # I've never seen a non-string assistant message.
     timestamp: NotRequired[int]
@@ -459,7 +456,7 @@ class AssistantMessage(TypedDict):
 class SystemMessage(TypedDict):
     """Represents a system message."""
 
-    role: Literal["system"]
+    role: Literal['system']
     content: str
 
 
@@ -516,12 +513,8 @@ class ChatMessageTD(TypedDict):
     model: NotRequired[str]  # e.g. "associate_messages_to_files" for assistant
     modelName: NotRequired[str]  # e.g. "Associate Messages to Files"
     modelIdx: NotRequired[int]
-    userContext: NotRequired[
-        Any | None
-    ]  # Can be null if present, or not present at all
-    sources: NotRequired[
-        list[Source]
-    ]  # Present in history.messages for assistant, not in top-level messages list
+    userContext: NotRequired[Any | None]  # Can be null if present, or not present at all
+    sources: NotRequired[list[Source]]  # Present in history.messages for assistant, not in top-level messages list
     statusHistory: NotRequired[list[StatusEventData]]  # assistant messages only
     usage: NotRequired[dict[str, Any]]  # assistant messages only
 
@@ -559,7 +552,7 @@ class UserData(TypedDict):
     id: str
     email: str
     name: str
-    role: Literal["admin", "user", "pending"]
+    role: Literal['admin', 'user', 'pending']
     valves: NotRequired[Any]  # object of type UserValves
 
 

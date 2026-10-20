@@ -71,80 +71,70 @@ search → send → wait → assert. Three full passes were run; the skeleton:
 import asyncio, re, sys
 from playwright.async_api import async_playwright
 
-BASE = "http://127.0.0.1:8084"
-EMAIL, PASSWORD = "e2e@test.local", "..."  # test account
-MODEL_LABEL = "gemini-3.5-flash-lite"
-PROMPT = (
-    "What are the top headlines on Hacker News right now? Cite the sources you used."
-)
-SHOTS = "e2e_shots"  # keep screenshots next to the script so they persist
+BASE = 'http://127.0.0.1:8084'
+EMAIL, PASSWORD = 'e2e@test.local', '...'  # test account
+MODEL_LABEL = 'gemini-3.5-flash-lite'
+PROMPT = 'What are the top headlines on Hacker News right now? Cite the sources you used.'
+SHOTS = 'e2e_shots'  # keep screenshots next to the script so they persist
 
 
 async def main() -> int:
     results = []
 
-    def check(name, ok, detail=""):
+    def check(name, ok, detail=''):
         results.append(ok)
-        print(
-            f"[{'PASS' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else "")
-        )
+        print(f'[{"PASS" if ok else "FAIL"}] {name}' + (f' — {detail}' if detail else ''))
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page(viewport={"width": 1440, "height": 900})
+        page = await browser.new_page(viewport={'width': 1440, 'height': 900})
 
         # 1. login — submit via role/name, not placeholder text
-        await page.goto(f"{BASE}/auth", wait_until="networkidle")
-        await page.locator("#email").fill(EMAIL)
-        await page.locator("#password").fill(PASSWORD)
-        await page.get_by_role("button", name="Sign in").click()
-        await page.wait_for_url(re.compile(r".*/"), timeout=20000)
+        await page.goto(f'{BASE}/auth', wait_until='networkidle')
+        await page.locator('#email').fill(EMAIL)
+        await page.locator('#password').fill(PASSWORD)
+        await page.get_by_role('button', name='Sign in').click()
+        await page.wait_for_url(re.compile(r'.*/'), timeout=20000)
 
         # 2. model picker
-        model_btn = page.locator("#model-selector-model-button")
-        await model_btn.wait_for(state="visible", timeout=20000)
-        label = await model_btn.get_attribute("aria-label") or ""
-        if MODEL_LABEL not in label.lower().replace(" ", "-"):
+        model_btn = page.locator('#model-selector-model-button')
+        await model_btn.wait_for(state='visible', timeout=20000)
+        label = await model_btn.get_attribute('aria-label') or ''
+        if MODEL_LABEL not in label.lower().replace(' ', '-'):
             await model_btn.click()
             await page.get_by_text(MODEL_LABEL, exact=True).first.click()
-        check("model selected", MODEL_LABEL in label.lower().replace(" ", "-"), label)
+        check('model selected', MODEL_LABEL in label.lower().replace(' ', '-'), label)
 
         # 3. Web Search toggle lives in the integrations ("+") menu
-        await page.locator("#integration-menu-button").click()
-        ws = page.get_by_role("button", name=re.compile("web search", re.I)).first
-        await ws.wait_for(state="visible", timeout=10000)
+        await page.locator('#integration-menu-button').click()
+        ws = page.get_by_role('button', name=re.compile('web search', re.I)).first
+        await ws.wait_for(state='visible', timeout=10000)
         await ws.click()
-        await page.keyboard.press("Escape")  # dismiss the menu
+        await page.keyboard.press('Escape')  # dismiss the menu
 
         # 4. send
-        await page.locator("#chat-input").click()
-        await page.locator("#chat-input").fill(PROMPT)
-        await page.get_by_role("button", name=re.compile("^send", re.I)).first.click()
+        await page.locator('#chat-input').click()
+        await page.locator('#chat-input').fill(PROMPT)
+        await page.get_by_role('button', name=re.compile('^send', re.I)).first.click()
 
         # 5. wait for streaming to finish (stop button disappears)
         for _ in range(120):
-            if (
-                await page.get_by_role("button", name=re.compile("stop", re.I)).count()
-                == 0
-            ):
+            if await page.get_by_role('button', name=re.compile('stop', re.I)).count() == 0:
                 break
             await page.wait_for_timeout(1000)
         await page.wait_for_timeout(3000)
-        await page.screenshot(path=f"{SHOTS}/response.png", full_page=True)
+        await page.screenshot(path=f'{SHOTS}/response.png', full_page=True)
 
         # 6. assertions
-        text = re.sub(r"\s+", " ", await page.locator("body").inner_text())
-        check("response non-empty", len(text) > 200, f"len={len(text)}")
+        text = re.sub(r'\s+', ' ', await page.locator('body').inner_text())
+        check('response non-empty', len(text) > 200, f'len={len(text)}')
         check(
-            "no error text",
-            not any(
-                s in text.lower()
-                for s in ("exhausted execution options", "error occurred")
-            ),
+            'no error text',
+            not any(s in text.lower() for s in ('exhausted execution options', 'error occurred')),
         )
         links = await page.locator("a[href^='http']").all()
-        ext = [a for a in links if BASE not in (await a.get_attribute("href") or "")]
-        check("citation links >= 1", len(ext) >= 1, f"count={len(ext)}")
+        ext = [a for a in links if BASE not in (await a.get_attribute('href') or '')]
+        check('citation links >= 1', len(ext) >= 1, f'count={len(ext)}')
 
         await browser.close()
 
