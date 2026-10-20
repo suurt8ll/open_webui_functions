@@ -12,7 +12,8 @@ version: 1.1.0
 import copy
 import json
 import sys
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
 import pydantic_core
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -22,8 +23,8 @@ if TYPE_CHECKING:
 
 
 def _create_plugin_filter(target_module: str):
-    def filter_func(record: "Record") -> bool:
-        return _module_matches(record["name"], target_module)
+    def filter_func(record: 'Record') -> bool:
+        return _module_matches(record['name'], target_module)
 
     filter_func.target_module = target_module  # type: ignore
     filter_func.manager_version = MANAGER_VERSION  # type: ignore
@@ -44,7 +45,7 @@ def _module_matches(record_name: str | None, target_module: str) -> bool:
         return True
     suffix = record_name[len(target_module) :]
     # OWUI >= 0.12 suffix is `uuid4().hex`: exactly 32 lowercase hex chars.
-    if not suffix.startswith("_") or len(suffix) != 33:
+    if not suffix.startswith('_') or len(suffix) != 33:
         return False
     hash_part = suffix[1:]
     try:
@@ -57,28 +58,26 @@ def _module_matches(record_name: str | None, target_module: str) -> bool:
 # Bumped alongside the frontmatter `version`. Managed handlers carry a stamp of
 # this value so that updating the plugin recreates stale handlers instead of
 # silently reusing filters from the previous version.
-MANAGER_VERSION = "1.1.0"
+MANAGER_VERSION = '1.1.0'
 
 
 class Pipe:
     class Valves(BaseModel):
         FUNCTIONS_LOG_LEVELS: str = Field(
-            default="{}",
-            description="JSON object mapping function IDs to Loguru log levels (e.g. TRACE, DEBUG, INFO, WARNING, ERROR).",
+            default='{}',
+            description='JSON object mapping function IDs to Loguru log levels (e.g. TRACE, DEBUG, INFO, WARNING, ERROR).',
         )
 
     def __init__(self):
         self.valves = self.Valves()
-        logger.success("Function has been initialized.")
+        logger.success('Function has been initialized.')
 
     def _is_flat_dict(self, data: Any) -> bool:
         if not isinstance(data, dict):
             return False
         return not any(isinstance(value, (dict, list)) for value in data.values())
 
-    def _truncate_long_strings(
-        self, data: Any, max_len: int, truncation_marker: str, truncation_enabled: bool
-    ) -> Any:
+    def _truncate_long_strings(self, data: Any, max_len: int, truncation_marker: str, truncation_enabled: bool) -> Any:
         if not truncation_enabled or max_len <= len(truncation_marker):
             if isinstance(data, (dict, list)):
                 return copy.deepcopy(data)
@@ -90,33 +89,26 @@ class Pipe:
             return data
         elif isinstance(data, dict):
             return {
-                k: self._truncate_long_strings(
-                    v, max_len, truncation_marker, truncation_enabled
-                )
+                k: self._truncate_long_strings(v, max_len, truncation_marker, truncation_enabled)
                 for k, v in data.items()
             }
         elif isinstance(data, list):
-            return [
-                self._truncate_long_strings(
-                    item, max_len, truncation_marker, truncation_enabled
-                )
-                for item in data
-            ]
+            return [self._truncate_long_strings(item, max_len, truncation_marker, truncation_enabled) for item in data]
         else:
             return data
 
-    def plugin_stdout_format(self, record: "Record") -> str:
-        LOG_OPTIONS_PREFIX = "_log_"
-        TRUNCATION_ENABLED_KEY = f"{LOG_OPTIONS_PREFIX}truncation_enabled"
-        MAX_LENGTH_KEY = f"{LOG_OPTIONS_PREFIX}max_length"
-        TRUNCATION_MARKER_KEY = f"{LOG_OPTIONS_PREFIX}truncation_marker"
-        EXCLUDE_NONE_KEY = f"{LOG_OPTIONS_PREFIX}exclude_none"
-        DATA_KEY = "payload"
+    def plugin_stdout_format(self, record: 'Record') -> str:
+        LOG_OPTIONS_PREFIX = '_log_'
+        TRUNCATION_ENABLED_KEY = f'{LOG_OPTIONS_PREFIX}truncation_enabled'
+        MAX_LENGTH_KEY = f'{LOG_OPTIONS_PREFIX}max_length'
+        TRUNCATION_MARKER_KEY = f'{LOG_OPTIONS_PREFIX}truncation_marker'
+        EXCLUDE_NONE_KEY = f'{LOG_OPTIONS_PREFIX}exclude_none'
+        DATA_KEY = 'payload'
 
-        original_extra = record["extra"]
+        original_extra = record['extra']
         data_to_process = original_extra.get(DATA_KEY)
 
-        serialized_data_json = ""
+        serialized_data_json = ''
         if data_to_process is not None:
             try:
                 exclude_none = original_extra.get(EXCLUDE_NONE_KEY, True)
@@ -126,7 +118,7 @@ class Pipe:
 
                 truncation_enabled = original_extra.get(TRUNCATION_ENABLED_KEY, True)
                 max_length = original_extra.get(MAX_LENGTH_KEY, 256)
-                truncation_marker = original_extra.get(TRUNCATION_MARKER_KEY, "[...]")
+                truncation_marker = original_extra.get(TRUNCATION_MARKER_KEY, '[...]')
 
                 if MAX_LENGTH_KEY in original_extra:
                     truncation_enabled = True
@@ -138,31 +130,27 @@ class Pipe:
                     truncation_enabled,
                 )
 
-                if self._is_flat_dict(truncated_data) and not isinstance(
-                    truncated_data, list
-                ):
-                    json_string = json.dumps(
-                        truncated_data, separators=(",", ":"), default=str
-                    )
-                    serialized_data_json = " - " + json_string
+                if self._is_flat_dict(truncated_data) and not isinstance(truncated_data, list):
+                    json_string = json.dumps(truncated_data, separators=(',', ':'), default=str)
+                    serialized_data_json = ' - ' + json_string
                 else:
                     json_string = json.dumps(truncated_data, indent=2, default=str)
-                    serialized_data_json = "\n" + json_string
+                    serialized_data_json = '\n' + json_string
 
             except (TypeError, ValueError) as e:
-                serialized_data_json = f" - {{Serialization Error: {e}}}"
+                serialized_data_json = f' - {{Serialization Error: {e}}}'
             except Exception as e:
-                serialized_data_json = f" - {{Processing Error: {e}}}"
+                serialized_data_json = f' - {{Processing Error: {e}}}'
 
-        record["extra"]["_plugin_serialized_data"] = serialized_data_json
+        record['extra']['_plugin_serialized_data'] = serialized_data_json
 
         base_template = (
-            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-            "<level>{level: <8}</level> | "
-            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-            "<level>{message}</level>"
-            "{extra[_plugin_serialized_data]}\n"
-            "{exception}"
+            '<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | '
+            '<level>{level: <8}</level> | '
+            '<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - '
+            '<level>{message}</level>'
+            '{extra[_plugin_serialized_data]}\n'
+            '{exception}'
         )
         return base_template.rstrip()
 
@@ -173,12 +161,10 @@ class Pipe:
         try:
             config = json.loads(self.valves.FUNCTIONS_LOG_LEVELS)
             if not isinstance(config, dict):
-                logger.error(
-                    "FUNCTIONS_LOG_LEVELS must be a JSON object mapping function IDs to log levels."
-                )
+                logger.error('FUNCTIONS_LOG_LEVELS must be a JSON object mapping function IDs to log levels.')
                 return
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse FUNCTIONS_LOG_LEVELS JSON: {e}")
+            logger.error(f'Failed to parse FUNCTIONS_LOG_LEVELS JSON: {e}')
             return
 
         target_levels: dict[str, str] = {}
@@ -190,36 +176,32 @@ class Pipe:
             if not clean_id:
                 continue
 
-            module_name = (
-                clean_id if clean_id.startswith("function_") else f"function_{clean_id}"
-            )
+            module_name = clean_id if clean_id.startswith('function_') else f'function_{clean_id}'
             level_name_upper = level_name.upper().strip()
 
             try:
                 logger.level(level_name_upper)
                 target_levels[module_name] = level_name_upper
             except ValueError:
-                logger.error(
-                    f"Invalid log level '{level_name}' configured for function '{func_id}'."
-                )
+                logger.error(f"Invalid log level '{level_name}' configured for function '{func_id}'.")
 
         handlers: dict[int, Any] = logger._core.handlers  # type: ignore
         active_managed_modules: set[str] = set()
 
         for handler_id, handler in list(handlers.items()):
             existing_filter = handler._filter
-            target_module = getattr(existing_filter, "target_module", None)
+            target_module = getattr(existing_filter, 'target_module', None)
 
             if target_module is not None:
                 desired_level = target_levels.get(target_module)
 
                 # Recreate handlers injected by a different version of this
                 # plugin (e.g. filters that predate the module name fix).
-                if getattr(existing_filter, "manager_version", None) != MANAGER_VERSION:
+                if getattr(existing_filter, 'manager_version', None) != MANAGER_VERSION:
                     try:
                         logger.remove(handler_id)
                         logger.info(
-                            f"Removed outdated Loguru handler {handler_id} for module "
+                            f'Removed outdated Loguru handler {handler_id} for module '
                             f"'{target_module}' (manager version mismatch)."
                         )
                     except ValueError:
@@ -234,9 +216,7 @@ class Pipe:
 
                 try:
                     logger.remove(handler_id)
-                    logger.info(
-                        f"Removed Loguru handler {handler_id} for module '{target_module}'."
-                    )
+                    logger.info(f"Removed Loguru handler {handler_id} for module '{target_module}'.")
                 except ValueError:
                     pass
 
@@ -249,9 +229,7 @@ class Pipe:
                     format=self.plugin_stdout_format,
                     filter=plugin_filter,
                 )
-                logger.success(
-                    f"Added Loguru handler for module '{module_name}' with level '{level_name}'."
-                )
+                logger.success(f"Added Loguru handler for module '{module_name}' with level '{level_name}'.")
 
     async def pipes(self) -> list[dict]:
         self._sync_log_handlers()

@@ -10,16 +10,13 @@ version: 0.0.0
 requirements:
 """
 
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterator
 from typing import (
-    Any,
-    AsyncGenerator,
-    Awaitable,
-    Generator,
-    Iterator,
-    Callable,
-    Literal,
     TYPE_CHECKING,
+    Any,
+    Literal,
 )
+
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
@@ -29,64 +26,54 @@ if TYPE_CHECKING:
 
 class Pipe:
     class Valves(BaseModel):
-        LOG_LEVEL: Literal[
-            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
-        ] = Field(
-            default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+        LOG_LEVEL: Literal['TRACE', 'DEBUG', 'INFO', 'SUCCESS', 'WARNING', 'ERROR', 'CRITICAL'] = Field(
+            default='INFO',
+            description='Select logging level. Use `docker logs -f open-webui` to view logs.',
         )
 
     def __init__(self):
         self.valves = self.Valves()
-        print("[citations_test] Function has been initialized.")
+        print('[citations_test] Function has been initialized.')
 
     async def pipe(
         self,
         body: dict[str, Any],
-        __event_emitter__: Callable[["Event"], Awaitable[None]],
-    ) -> (
-        str
-        | dict[str, Any]
-        | StreamingResponse
-        | Iterator
-        | AsyncGenerator
-        | Generator
-        | None
-    ):
+        __event_emitter__: Callable[['Event'], Awaitable[None]],
+    ) -> str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator | None:
 
         self.__event_emitter__ = __event_emitter__
 
-        sources: list["Source"] = [
+        sources: list[Source] = [
             {
-                "source": {"name": "example search query"},
-                "document": ["", ""],
-                "metadata": [
-                    {"source": "https://example1.com/source1"},
-                    {"source": "https://subdomain.example2.com/source2"},
+                'source': {'name': 'example search query'},
+                'document': ['', ''],
+                'metadata': [
+                    {'source': 'https://example1.com/source1'},
+                    {'source': 'https://subdomain.example2.com/source2'},
                 ],
             },
             {
-                "source": {"name": "example search query2"},
-                "document": [
-                    "This is an example document coming from source3 in second query.",
-                    "This is another example document coming from source4 in second query.",
+                'source': {'name': 'example search query2'},
+                'document': [
+                    'This is an example document coming from source3 in second query.',
+                    'This is another example document coming from source4 in second query.',
                 ],
-                "metadata": [
-                    {"title": "source3", "source": "https://example3.com/source3"},
+                'metadata': [
+                    {'title': 'source3', 'source': 'https://example3.com/source3'},
                     {
-                        "title": "source4",
-                        "source": "https://example4.com/source4",
+                        'title': 'source4',
+                        'source': 'https://example4.com/source4',
                     },
                 ],
             },
         ]
 
-        sources_test: "ChatCompletionEvent" = {
-            "type": "chat:completion",
-            "data": {
-                "content": "This is an example response [1][2]. This sentence has citations from the second query [3][4].",
-                "done": True,
-                "sources": sources,
+        sources_test: ChatCompletionEvent = {
+            'type': 'chat:completion',
+            'data': {
+                'content': 'This is an example response [1][2]. This sentence has citations from the second query [3][4].',
+                'done': True,
+                'sources': sources,
             },
         }
         await __event_emitter__(sources_test)

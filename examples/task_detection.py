@@ -11,9 +11,10 @@ requirements:
 """
 
 from typing import (
-    Any,
     TYPE_CHECKING,
+    Any,
 )
+
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
@@ -26,16 +27,16 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
-        print(f"{[__name__]} Function has been initialized!")
+        print(f'{[__name__]} Function has been initialized!')
 
     async def pipe(self, body: dict[str, Any], __task__: str, **kwargs) -> str:
 
-        if __task__ == "title_generation":
-            print(f"{[__name__]} Detected title generation task!")
+        if __task__ == 'title_generation':
+            print(f'{[__name__]} Detected title generation task!')
             return '{"title": "Example Title"}'
 
-        if __task__ == "tags_generation":
-            print(f"{[__name__]} Detected tag generation task!")
+        if __task__ == 'tags_generation':
+            print(f'{[__name__]} Detected tag generation task!')
             return '{"tags": ["tag1", "tag2", "tag3"]}'
 
-        return "This model is used for regular chat."
+        return 'This model is used for regular chat.'
