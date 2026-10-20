@@ -8,8 +8,18 @@ funding_url: https://github.com/suurt8ll/open_webui_functions
 version: 0.8.0
 """
 
+import datetime as dt
+import inspect
+import json
+import re
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, cast
+
+from pydantic import BaseModel
+
+from open_webui.models.functions import Functions
+
 # The injection must follow this format (without triple quotes).
-# Temperature is not the only adjustable parameter, many others can be changed.
 """
 <details type="prompt">
 <summary>{{prompt_title}}</summary>
@@ -25,17 +35,6 @@ version: 0.8.0
 
 # IMPORTANT: Disable "Rich Text Input for Chat" in Open WebUI settings for this plugin to work correctly.
 # See https://github.com/open-webui/open-webui/issues/9759 for more.
-
-import datetime as dt
-import inspect
-import json
-import re
-from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any, cast
-
-from pydantic import BaseModel
-
-from open_webui.models.functions import Functions
 
 if TYPE_CHECKING:
     # My personal types in a separate file for more robustness.

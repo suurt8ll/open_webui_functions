@@ -12,6 +12,53 @@ requirements: google-genai==2.31.0
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import copy
+import datetime as dt
+import difflib
+import fnmatch
+import importlib.metadata
+import io
+import json
+import mimetypes
+import re
+import sys
+import time
+import uuid
+from collections.abc import AsyncGenerator, AsyncIterator
+from functools import cache
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Final,
+    Literal,
+    cast,
+    get_args,
+    get_origin,
+)
+from urllib.parse import parse_qs, urlparse
+
+import aiofiles
+import pydantic_core
+import xxhash
+from aiocache import cached
+from aiocache.backends.memory import SimpleMemoryCache
+from aiocache.base import BaseCache
+from aiocache.serializers import NullSerializer
+from fastapi import FastAPI, Request
+from fastapi.datastructures import State
+from loguru import logger
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    create_model,
+    field_validator,
+)
+
 # I change these only when I make a release to avoid PR merge conflicts.
 # If you are making a PR then please do not change these values.
 VERSION = '2.1.0'
@@ -27,9 +74,6 @@ RECOMMENDED_COMPANION_VERSION = '2.1.0'
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API and Vertex AI.
 # Be sure to check out my GitHub repository for more information! Contributions, questions and suggestions are very welcome.
-
-import importlib.metadata
-import sys
 
 
 def _unload_stale_modules() -> None:
@@ -69,64 +113,27 @@ def _unload_stale_modules() -> None:
         importlib.invalidate_caches()
 
 
-# Must run before `google.genai` is imported.
+# Must run before the `google.*` and `open_webui.*` imports below: those modules
+# (or their transitive dependencies) may be stale in `sys.modules` after Open
+# WebUI pip-installs this plugin's frontmatter `requirements` into the running
+# server. See `_unload_stale_modules` above.
 _unload_stale_modules()
 
-import asyncio
-import base64
-import copy
-import datetime as dt
-import difflib
-import fnmatch
-import io
-import json
-import mimetypes
-import re
-import time
-import uuid
-from collections.abc import AsyncGenerator, AsyncIterator
-from functools import cache
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Final,
-    Literal,
-    cast,
-    get_args,
-    get_origin,
-)
-from urllib.parse import parse_qs, urlparse
+# These imports are intentionally below `_unload_stale_modules()` (E402 exempted
+# inline): the `google.*` modules must only be imported after the stale-module
+# purge, and the `open_webui.*` imports can transitively import `google.*`
+# themselves (e.g. the storage provider imports `google.cloud.storage`).
+from google import genai  # noqa: E402
+from google.api_core import exceptions  # noqa: E402
+from google.cloud import storage  # noqa: E402
+from google.genai import errors as genai_errors  # noqa: E402
+from google.genai import types  # noqa: E402
 
-import aiofiles
-import pydantic_core
-import xxhash
-from aiocache import cached
-from aiocache.backends.memory import SimpleMemoryCache
-from aiocache.base import BaseCache
-from aiocache.serializers import NullSerializer
-from fastapi import FastAPI, Request
-from fastapi.datastructures import State
-from google import genai
-from google.api_core import exceptions
-from google.cloud import storage
-from google.genai import errors as genai_errors
-from google.genai import types
-from loguru import logger
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    StrictInt,
-    StrictStr,
-    create_model,
-    field_validator,
-)
-
-from open_webui.models.chats import Chats
-from open_webui.models.files import FileForm, Files
-from open_webui.models.functions import Functions
-from open_webui.storage.provider import Storage
-from open_webui.utils.misc import pop_system_message
+from open_webui.models.chats import Chats  # noqa: E402
+from open_webui.models.files import FileForm, Files  # noqa: E402
+from open_webui.models.functions import Functions  # noqa: E402
+from open_webui.storage.provider import Storage  # noqa: E402
+from open_webui.utils.misc import pop_system_message  # noqa: E402
 
 # This block is skipped at runtime.
 if TYPE_CHECKING:

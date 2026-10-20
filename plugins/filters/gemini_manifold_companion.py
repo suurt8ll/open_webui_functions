@@ -9,15 +9,6 @@ license: MIT
 version: 2.1.0
 """
 
-VERSION = '2.1.0'
-
-# This filter can detect that a feature like web search or code execution is enabled in the front-end,
-# set the feature back to False so Open WebUI does not run it's own logic and then
-# pass custom values to "Gemini Manifold google_genai" that signal which feature was enabled and intercepted.
-
-# FIXME: Add `from __future__ import annotations` at the top of this file (repo
-# convention, see AGENTS.md). Until then the file relies on string annotations.
-
 import asyncio
 import functools
 import importlib.metadata
@@ -33,6 +24,15 @@ from fastapi import Request
 from fastapi.datastructures import State
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, create_model
+
+VERSION = '2.1.0'
+
+# This filter can detect that a feature like web search or code execution is enabled in the front-end,
+# set the feature back to False so Open WebUI does not run it's own logic and then
+# pass custom values to "Gemini Manifold google_genai" that signal which feature was enabled and intercepted.
+
+# FIXME: Add `from __future__ import annotations` at the top of this file (repo
+# convention, see AGENTS.md). Until then the file relies on string annotations.
 
 
 def _unload_stale_modules() -> None:
@@ -72,10 +72,11 @@ def _unload_stale_modules() -> None:
         importlib.invalidate_caches()
 
 
-# Must run before `google.genai` is imported.
+# Must run before `google.genai` is imported. The import below is intentionally
+# after module-level code, so E402 is exempted inline.
 _unload_stale_modules()
 
-from google.genai import types
+from google.genai import types  # noqa: E402
 
 if TYPE_CHECKING:
     # My personal types in a separate file for more robustness.

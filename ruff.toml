@@ -56,3 +56,13 @@ mccabe.max-complexity = 10
 # Upstream sets this as well. Inert while no pydocstyle (D) rules are
 # selected; kept for parity with the OWUI config.
 pydocstyle.convention = "google"
+
+# --- Deliberate deviation from upstream parity ---
+# Upstream OWUI has no ignores for any selected rule (see the comments above);
+# this is the repo's single documented carve-out, kept as tight as possible.
+[lint.per-file-ignores]
+# tests/test_gemini_manifold.py installs `MagicMock` stubs into `sys.modules`
+# before importing the plugins under test, so the plugins' `open_webui.*`
+# imports bind to the mocks. Module-level imports there are intentionally
+# sequenced after that setup; flagging them would be pure noise.
+"tests/**" = ["E402"]
