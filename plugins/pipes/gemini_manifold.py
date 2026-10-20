@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 2.1.0
-requirements: google-genai==2.14.0
+requirements: google-genai==2.31.0
 """
 
 from __future__ import annotations
