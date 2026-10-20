@@ -64,7 +64,8 @@ If you find a better agent-friendly development loop (e.g. more automated verifi
 
 ## Style & formatting
 
-- Use **ruff** for linting and formatting so that hand edits and agent edits stay consistent. Run `.venv/bin/ruff format .` before committing; the whole repo is formatted with ruff's default style, including Python code blocks inside Markdown docs. (No committed config yet — default ruleset applies, or propose one.)
+- Use **ruff** for linting and formatting so that hand edits and agent edits stay consistent. Run `.venv/bin/ruff format .` before committing.
+- Ruff is configured via the repo-root `ruff.toml`, which deliberately **mirrors the Open WebUI codebase's own settings** (`submodules/open-webui/pyproject.toml`): line length 120, single quotes, and the upstream rule selection (`E`, `F`, `W`, `I`, `UP`, `C90`, `Q`, `ICN`) with matching plugin configs (`mccabe` complexity 10, `flake8-import-conventions`, `flake8-quotes`). Keep this parity when bumping or extending the config unless there's a good reason not to.
 - PEP 8, clear names, docstrings and comments where they add value.
 
 ## Autonomy expectations
