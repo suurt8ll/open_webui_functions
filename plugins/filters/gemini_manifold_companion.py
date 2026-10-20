@@ -78,7 +78,21 @@ _unload_stale_modules()
 from google.genai import types
 
 if TYPE_CHECKING:
-    from utils.manifold_types import *  # My personal types in a separate file for more robustness.
+    # My personal types in a separate file for more robustness.
+    from utils.manifold_types import (
+        Body,
+        ChatCompletionEvent,
+        CitationEvent,
+        Event,
+        Features,
+        Metadata,
+        NotificationEvent,
+        Source,
+        SourceMetadata,
+        StatusEvent,
+        TextContent,
+        UserData,
+    )
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)

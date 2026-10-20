@@ -39,7 +39,15 @@ from open_webui.models.files import FileForm, Files
 from open_webui.storage.provider import Storage
 
 if TYPE_CHECKING:
-    from utils.manifold_types import *  # My personal types in a separate file for more robustness.
+    # My personal types in a separate file for more robustness.
+    from utils.manifold_types import (
+        Body,
+        ChatCompletionEvent,
+        Event,
+        Metadata,
+        StatusEvent,
+        UserData,
+    )
 
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main logger.

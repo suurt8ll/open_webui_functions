@@ -13,7 +13,11 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from utils.manifold_types import *  # My personal types in a separate file for more robustness.
+    # My personal types in a separate file for more robustness.
+    from utils.manifold_types import (
+        Body,
+        Event,
+    )
 
 
 class Filter:

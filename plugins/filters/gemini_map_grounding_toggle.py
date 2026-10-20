@@ -16,7 +16,10 @@ from pydantic import BaseModel
 # This block is skipped at runtime.
 if TYPE_CHECKING:
     # Imports custom type definitions (TypedDicts) for static analysis purposes (mypy/pylance).
-    from utils.manifold_types import *
+    from utils.manifold_types import (
+        Body,
+        Features,
+    )
 
 
 class Filter:

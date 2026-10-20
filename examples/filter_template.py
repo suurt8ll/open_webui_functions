@@ -18,7 +18,13 @@ from fastapi import Request
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
-    from utils.manifold_types import *  # My personal types in a separate file for more robustness.
+    # My personal types in a separate file for more robustness.
+    from utils.manifold_types import (
+        Body,
+        Event,
+        Metadata,
+        UserData,
+    )
 
 
 class Filter:

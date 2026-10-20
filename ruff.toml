@@ -22,7 +22,10 @@ target-version = "py311"
 # `ruff check .` / `ruff format .` only report issues that are ours to fix.
 # (.venv, caches and other scratch dirs are covered by .gitignore + ruff's
 # default excludes.)
-extend-exclude = ["open_webui", "submodules"]
+#
+# `plugins/archived/` is dead code kept for reference only (see AGENTS.md);
+# it is never developed on or shipped, so don't lint or format it.
+extend-exclude = ["open_webui", "submodules", "plugins/archived"]
 
 # --- Formatting (`ruff format`) ---
 [format]

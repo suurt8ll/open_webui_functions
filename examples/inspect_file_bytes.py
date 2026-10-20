@@ -28,7 +28,15 @@ from open_webui.models.files import Files
 from open_webui.storage.provider import Storage
 
 if TYPE_CHECKING:
-    from utils.manifold_types import *  # My personal types
+    # My personal types
+    from utils.manifold_types import (
+        Body,
+        ChatObjectDataTD,
+        Event,
+        FileAttachmentTD,
+        Metadata,
+        UserData,
+    )
 
 
 class LeanLogger:

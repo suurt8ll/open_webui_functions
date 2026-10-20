@@ -133,7 +133,23 @@ if TYPE_CHECKING:
     from plugins.filters.gemini_manifold_companion import EventEmitter
 
     # Imports custom type definitions (TypedDicts) for static analysis purposes (mypy/pylance).
-    from utils.manifold_types import *
+    from utils.manifold_types import (
+        AssistantMessage,
+        Body,
+        ChatMessageTD,
+        ChatObjectDataTD,
+        Content,
+        Features,
+        FileAttachmentTD,
+        ImageContent,
+        Message,
+        Metadata,
+        ModelData,
+        Source,
+        TextContent,
+        UserData,
+        UserMessage,
+    )
 
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)

@@ -18,7 +18,12 @@ from fastapi import Request
 
 if TYPE_CHECKING:
     # This ensures type hints are available for development without causing runtime errors.
-    from utils.manifold_types import *
+    from utils.manifold_types import (
+        Body,
+        Event,
+        Metadata,
+        UserData,
+    )
 
 
 class Filter:
