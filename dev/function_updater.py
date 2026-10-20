@@ -250,7 +250,8 @@ class OwuiApiClient:
         except aiohttp.ClientResponseError as e:
             if e.status in {400, 404}:
                 logger.warning(
-                    f"Function '{function_id}' not found or failed to update (Status: {e.status}). Attempting to create it."
+                    f"Function '{function_id}' not found or failed to update (Status: {e.status})."
+                    ' Attempting to create it.'
                 )
                 try:
                     await self._create_function(filepath, function_id, function_name, description, code_content)

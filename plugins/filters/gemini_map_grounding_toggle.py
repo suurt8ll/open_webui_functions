@@ -31,7 +31,7 @@ class Filter:
         # Makes the filter toggleable in the front-end.
         self.toggle = True
         # Icon from https://icon-sets.iconify.design/line-md/map-marker/
-        self.icon = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0Ij48Y2lyY2xlIGN4PSIxMiIgY3k9IjkiIHI9IjIuNSIgZmlsbD0iY3VycmVudENvbG9yIi8+PHBhdGggZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIgc3Ryb2tlLXdpZHRoPSIyIiBkPSJNMTIgMjAuNWMwIDAgLTYgLTcgLTYgLTExLjVjMCAtMy4zMSAyLjY5IC02IDYgLTZjMy4zMSAwIDYgMi42OSA2IDZjMCA0LjUgLTYgMTEuNSAtNiAxMS41WiIvPjwvc3ZnPg=='
+        self.icon = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0Ij48Y2lyY2xlIGN4PSIxMiIgY3k9IjkiIHI9IjIuNSIgZmlsbD0iY3VycmVudENvbG9yIi8+PHBhdGggZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIgc3Ryb2tlLXdpZHRoPSIyIiBkPSJNMTIgMjAuNWMwIDAgLTYgLTcgLTYgLTExLjVjMCAtMy4zMSAyLjY5IC02IDYgLTZjMy4zMSAwIDYgMi42OSA2IDZjMCA0LjUgLTYgMTEuNSAtNiAxMS41WiIvPjwvc3ZnPg=='  # noqa: E501 — base64 SVG data URI, a data blob; wrapping it would make icon updates error-prone.
 
     async def inlet(
         self,

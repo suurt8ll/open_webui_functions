@@ -65,7 +65,9 @@ class Pipe:
     class Valves(BaseModel):
         FUNCTIONS_LOG_LEVELS: str = Field(
             default='{}',
-            description='JSON object mapping function IDs to Loguru log levels (e.g. TRACE, DEBUG, INFO, WARNING, ERROR).',
+            description=(
+                'JSON object mapping function IDs to Loguru log levels (e.g. TRACE, DEBUG, INFO, WARNING, ERROR).'
+            ),
         )
 
     def __init__(self):

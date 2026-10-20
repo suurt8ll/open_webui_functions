@@ -1,7 +1,7 @@
 """
 title: Inspect File Bytes
 id: inspect_file_bytes
-description: Logs all pipe parameters, the chat DB object, and detailed info (including raw byte size) for every file in the prompt.
+description: Logs all pipe parameters, the chat DB object, and detailed info per file (with raw byte size).
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions

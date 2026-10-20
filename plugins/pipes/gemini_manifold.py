@@ -1,7 +1,7 @@
 """
 title: Gemini Manifold google_genai
 id: gemini_manifold_google_genai
-description: Manifold function for Gemini Developer API and Vertex AI. Uses the newer google-genai SDK. Aims to support as many features from it as possible.
+description: Manifold for Gemini Developer API + Vertex AI. Uses the newer google-genai SDK; broad feature support.
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
@@ -73,7 +73,8 @@ RECOMMENDED_COMPANION_VERSION = '2.1.0'
 
 
 # This is a helper function that provides a manifold for Google's Gemini Studio API and Vertex AI.
-# Be sure to check out my GitHub repository for more information! Contributions, questions and suggestions are very welcome.
+# Be sure to check out my GitHub repository for more information!
+# Contributions, questions and suggestions are very welcome.
 
 
 def _unload_stale_modules() -> None:
@@ -463,7 +464,8 @@ class FilesAPIManager:
                     )
                 else:
                     log.exception(
-                        f'An unhandled client error (code: {e.code}) occurred during stateless recovery for {deterministic_name}.'
+                        f'An unhandled client error (code: {e.code}) occurred during stateless '
+                        f'recovery for {deterministic_name}.'
                     )
                     self.event_emitter.emit_toast(
                         f'API error for file: {e.code}. Please check permissions.',
@@ -1109,7 +1111,10 @@ class GeminiContentBuilder:
         # If YouTube parsing is disabled, the regex will only find markdown image links,
         # leaving YouTube URLs to be treated as plain text.
         markdown_part = r'!\[.*?\]\(([^)]+)\)'  # Group 1: Markdown URI
-        youtube_part = r'(https?://(?:(?:www|music)\.)?youtube\.com/(?:watch\?v=|shorts/|live/)[^\s)]+|https?://youtu\.be/[^\s)]+)'  # Group 2: YouTube URL
+        # Group 2: YouTube URL
+        youtube_part = r'(https?://(?:(?:www|music)\.)?youtube\.com/(?:watch\?v=|shorts/|live/)[^\s)]+'
+        youtube_part += r'|https?://youtu\.be/[^\s)]+)'
+        # (Original single regex split into two `+=` halves to fit the line limit; pattern is identical.)
         if self.options.PARSE_YOUTUBE_URLS:
             pattern = re.compile(f'{markdown_part}|{youtube_part}')
             process_youtube = True
@@ -1348,7 +1353,8 @@ class GeminiContentBuilder:
                         fps = calculated_fps
                     else:
                         log.warning(
-                            f"Interval '{raw_interval}' results in FPS '{calculated_fps}' which is outside the valid range (0.0, 24.0]. Ignoring."
+                            f"Interval '{raw_interval}' results in FPS '{calculated_fps}'"
+                            ' which is outside the valid range (0.0, 24.0]. Ignoring.'
                         )
 
             # Fall back to `fps` param if not set by `interval`.
@@ -1553,7 +1559,8 @@ _VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
         'Setting this to `True` prevents non-whitelisted users from using Vertex AI.'
     ),
     'AUTH_WHITELIST': (
-        'Comma-separated list of user email addresses allowed to bypass `USER_MUST_PROVIDE_AUTH_CONFIG` and use default system credentials.'
+        'Comma-separated list of user email addresses allowed to bypass `USER_MUST_PROVIDE_AUTH_CONFIG`'
+        ' and use default system credentials.'
     ),
     'GEMINI_API_BASE_URL': 'Custom base URL for calling the Gemini API.',
     # Vertex AI
@@ -1565,7 +1572,8 @@ _VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
     'VERTEX_LOCATION': 'Google Cloud region/location for Vertex AI (e.g., `global`, `us-central1`).',
     # Routing & Fallback
     'ENABLE_FREE_TIER_FALLBACK': (
-        'Automatically switch to the Paid API if a Free API request fails due to quota limits (`429`) or model overload (`503`).\n\n'
+        'Automatically switch to the Paid API if a Free API request fails due to quota limits (`429`)'
+        ' or model overload (`503`).\n\n'
         '*Requires both Free and Paid API keys to be configured.*'
     ),
     'TASK_MODEL_ROUTING': (
@@ -1584,12 +1592,18 @@ _VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
         'Comma-separated list of blacklisted model names.\n\n'
         'Supports `fnmatch` wildcard patterns: `*`, `?`, `[seq]`, `[!seq]`.'
     ),
-    'CACHE_MODELS': 'Whether to cache available models on startup and refresh only when whitelist or blacklist rules change.',
+    'CACHE_MODELS': (
+        'Whether to cache available models on startup and refresh only when whitelist or blacklist rules change.'
+    ),
     # Features & Execution Parameters
     'THINKING_CONFIG_RULES': (
-        'Thinking parameter configuration. Can be an `int` (budget), a level `str` (`MINIMAL`, `LOW`, `MEDIUM`, `HIGH`), `None`, or a JSON string mapping model name regex patterns to budget (`int`) or level (`str`).\n\n'
-        'When using a JSON string mapping, **key order matters:** the first matching regex pattern is used, so place more specific patterns before broader catch-all patterns.\n\n'
-        'For details on backend defaults and model support, see [Google Cloud Thinking Docs](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/thinking#budget).'
+        'Thinking parameter configuration. Can be an `int` (budget), a level `str`'
+        ' (`MINIMAL`, `LOW`, `MEDIUM`, `HIGH`), `None`,'
+        ' or a JSON string mapping model name regex patterns to budget (`int`) or level (`str`).\n\n'
+        'When using a JSON string mapping, **key order matters:** the first matching regex pattern is used,'
+        ' so place more specific patterns before broader catch-all patterns.\n\n'
+        'For details on backend defaults and model support, see [Google Cloud Thinking Docs]'
+        '(https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/thinking#budget).'
     ),
     'SHOW_THINKING_SUMMARY': 'Whether to display the thinking process summary in responses (Gemini 2.5 and 3 models).',
     'USE_FILES_API': (
@@ -1600,7 +1614,9 @@ _VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
         'Whether to parse YouTube video URLs from user messages and provide content as context.\n\n'
         'If disabled, YouTube links are treated as plain text.'
     ),
-    'USE_ENTERPRISE_SEARCH': 'Enable Enterprise Search tool allowing models to fetch and ground content from specified web URLs.',
+    'USE_ENTERPRISE_SEARCH': (
+        'Enable Enterprise Search tool allowing models to fetch and ground content from specified web URLs.'
+    ),
     'MAPS_GROUNDING_COORDINATES': (
         'Latitude and longitude coordinates for location-aware Google Maps grounding.\n\n'
         'Expected format: `latitude,longitude` (e.g., `40.7128,-74.0060`).'
@@ -1611,7 +1627,8 @@ _VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
     ),
     'IMAGE_ASPECT_RATIO': (
         'Aspect ratio for image generation.\n\n'
-        "If set to `None`, Google's backend uses its default value (matching aspect ratio for image editing, or `1:1` otherwise)."
+        "If set to `None`, Google's backend uses its default value (matching aspect ratio for image editing,"
+        ' or `1:1` otherwise).'
     ),
 }
 
@@ -1893,7 +1910,8 @@ class Pipe:
             # We disable YouTube parsing for task models to minimize latency and token costs,
             # as simple tasks like title or tag generation do not require video context.
             options.PARSE_YOUTUBE_URLS = False
-            # TODO: disable tools. for now I assume that model will know to not use them even if enabled, but if that's not the case then this needs to be addressed.
+            # TODO: disable tools. for now I assume that model will know to not use them even if enabled,
+            # but if that's not the case then this needs to be addressed.
             # TODO: use the structured outputs feature to ensure a valid json at all times?
 
         execution_order = await self._determine_execution_order(
@@ -2038,7 +2056,8 @@ class Pipe:
             if not options.GEMINI_FREE_API_KEY and not options.GEMINI_PAID_API_KEY:
                 error_msg = (
                     'User must provide their own authentication configuration. '
-                    'Please set GEMINI_FREE_API_KEY or GEMINI_PAID_API_KEY in UserValves, model parameters or chat parameters.'
+                    'Please set GEMINI_FREE_API_KEY or GEMINI_PAID_API_KEY in UserValves,'
+                    ' model parameters or chat parameters.'
                 )
                 raise ValueError(error_msg)
         try:
@@ -2155,7 +2174,8 @@ class Pipe:
                             combined_models_dict[model_id] = model
                         else:
                             log.info(
-                                f"Duplicate model ID '{model_id}' from Vertex AI already sourced from Gemini API. Keeping Gemini API version."
+                                f"Duplicate model ID '{model_id}' from Vertex AI already sourced from"
+                                ' Gemini API. Keeping Gemini API version.'
                             )
                 else:
                     log.trace(f'Vertex AI model without a name encountered: {model.display_name or "N/A"}')
@@ -2170,7 +2190,8 @@ class Pipe:
 
             if not all_raw_models and (gemini_models_list or vertex_models_list):
                 log.warning(
-                    'Models were fetched but resulted in an empty list after de-duplication, possibly due to missing names or empty/duplicate IDs.'
+                    'Models were fetched but resulted in an empty list after de-duplication,'
+                    ' possibly due to missing names or empty/duplicate IDs.'
                 )
 
             if not all_raw_models and not gemini_models_list and not vertex_models_list:
@@ -2198,14 +2219,16 @@ class Pipe:
 
                 if not all_raw_models:
                     raise GenaiApiError(
-                        f'No models retrieved from {client_source_name}. This could be due to an API error, network issue, or no models being available.'
+                        f'No models retrieved from {client_source_name}. This could be due to an'
+                        ' API error, network issue, or no models being available.'
                     )
 
             except GenaiApiError as e:
                 raise GenaiApiError(f'Failed to get models from {client_source_name}: {e}') from e
             except Exception as e:
                 log.error(
-                    f'An unexpected error occurred while configuring client or fetching models from {client_source_name}: {e}',
+                    f'An unexpected error occurred while configuring client or fetching models'
+                    f' from {client_source_name}: {e}',
                     exc_info=True,
                 )
                 raise GenaiApiError(
@@ -2230,7 +2253,8 @@ class Pipe:
                 generative_models.append(model)
             else:
                 log.trace(
-                    f"Model '{model.name}' (ID: {self._strip_api_prefix(model.name)}) skipped, not generative (actions: {actions})."
+                    f"Model '{model.name}' (ID: {self._strip_api_prefix(model.name)}) skipped,"
+                    f' not generative (actions: {actions}).'
                 )
 
         if not generative_models:
@@ -2253,7 +2277,8 @@ class Pipe:
 
             if not stripped_name:
                 log.warning(
-                    f"Model '{model.name}' (display: {model.display_name}) resulted in an empty ID after stripping. Skipping."
+                    f"Model '{model.name}' (display: {model.display_name}) resulted in an empty ID"
+                    ' after stripping. Skipping.'
                 )
                 continue
 
@@ -2270,11 +2295,13 @@ class Pipe:
                 )
             else:
                 log.trace(
-                    f"Model ID '{stripped_name}' filtered out by whitelist/blacklist. Whitelist match: {passes_whitelist}, Blacklist pass: {passes_blacklist}"
+                    f"Model ID '{stripped_name}' filtered out by whitelist/blacklist. "
+                    f'Whitelist match: {passes_whitelist}, Blacklist pass: {passes_blacklist}'
                 )
 
         log.info(
-            f'Filtered {len(generative_models)} generative models down to {len(filtered_models_data)} models based on white/blacklists.'
+            f'Filtered {len(generative_models)} generative models down to {len(filtered_models_data)}'
+            ' models based on white/blacklists.'
         )
         return filtered_models_data
 
@@ -2393,7 +2420,8 @@ class Pipe:
 
     @classmethod
     def _resolve_thinking_config(cls, rules_val: int | str | None, model_id: str) -> tuple[int | None, str | None]:
-        """Evaluates THINKING_CONFIG_RULES (int, level str, or JSON regex dict) against model_id to determine default budget/level."""
+        """Evaluates THINKING_CONFIG_RULES (int, level str, or JSON regex dict) against model_id
+        to determine default budget/level."""
         if rules_val is None:
             return None, None
 
@@ -2410,7 +2438,8 @@ class Pipe:
                 model_version = cls._parse_gemini_version(model_id)
                 if model_version < 3.0:
                     log.warning(
-                        f"Model '{model_id}' (version {model_version}) is older than Gemini 3 and does not support thinking_level. "
+                        f"Model '{model_id}' (version {model_version}) is older than Gemini 3"
+                        ' and does not support thinking_level. '
                         f"Specified level '{level}'. Falling back to API default."
                     )
                     return None, None
@@ -2465,8 +2494,10 @@ class Pipe:
                     return budget_hits[0], None
                 elif level_hits:
                     log.warning(
-                        f"Model '{model_id}' (version {model_version}) is older than Gemini 3 and does not support thinking_level. "
-                        f"Regex hit specified level '{level_hits[0]}', but no budget rule hit. Falling back to API default."
+                        f"Model '{model_id}' (version {model_version}) is older than Gemini 3"
+                        ' and does not support thinking_level. '
+                        f"Regex hit specified level '{level_hits[0]}',"
+                        ' but no budget rule hit. Falling back to API default.'
                     )
                     return None, None
             else:
@@ -2506,7 +2537,8 @@ class Pipe:
         log.debug(f"Model '{model_id}' is classified as a reasoning model: {bool(is_thinking_model)}. ")
 
         if is_thinking_model:
-            # Resolved THINKING_CONFIG_RULES from options hierarchy (Valves -> User Valves -> Model Params -> Chat Params)
+            # Resolved THINKING_CONFIG_RULES from options hierarchy
+            # (Valves -> User Valves -> Model Params -> Chat Params)
             chosen_budget, chosen_level = self._resolve_thinking_config(options.THINKING_CONFIG_RULES, model_id)
             log.info(f"Resolved thinking config for model '{model_id}': budget={chosen_budget}, level={chosen_level}")
 
@@ -2662,7 +2694,8 @@ class Pipe:
                     gen_content_conf.tools.append(types.Tool(url_context=types.UrlContext()))
             else:
                 log.warning(
-                    f'URL context tool is enabled, but model {model_id} does not support it (see capabilities.url_context in gemini_models.yaml). Skipping.'
+                    f'URL context tool is enabled, but model {model_id} does not support it'
+                    ' (see capabilities.url_context in gemini_models.yaml). Skipping.'
                 )
 
         # Determine if Google Maps grounding should be enabled.
@@ -2969,7 +3002,8 @@ class Pipe:
                     # Handle thought titles and transitions between reasoning and normal content.
                     if part.thought:
                         if not in_think:
-                            # TODO: emit an status indicating that reasoning has started. include budget or level if set.
+                            # TODO: emit an status indicating that reasoning has started.
+                            # include budget or level if set.
                             in_think = True
 
                         # Attempt to extract a title from any text within a thought part.
@@ -3986,7 +4020,8 @@ def _resolve_options(
     user_whitelist = admin_valves.AUTH_WHITELIST.split(',') if admin_valves.AUTH_WHITELIST else []
     if admin_valves.USER_MUST_PROVIDE_AUTH_CONFIG and user_email not in user_whitelist:
         log.info(
-            f"User '{user_email}' is required to provide their own authentication credentials due to USER_MUST_PROVIDE_AUTH_CONFIG=True."
+            f"User '{user_email}' is required to provide their own authentication credentials"
+            ' due to USER_MUST_PROVIDE_AUTH_CONFIG=True.'
         )
         merged_data['GEMINI_FREE_API_KEY'] = getattr(user_valves, 'GEMINI_FREE_API_KEY', None) if user_valves else None
         merged_data['GEMINI_PAID_API_KEY'] = getattr(user_valves, 'GEMINI_PAID_API_KEY', None) if user_valves else None
@@ -4027,7 +4062,8 @@ def _resolve_options(
         canonical_key = canonicalize_option_key(raw_key)
         if canonical_key in ADMIN_ONLY_VALVE_FIELDS:
             log.warning(
-                f"Body parameter '{raw_key}' attempts to override admin-only valve '{canonical_key}'. Ignoring override."
+                f"Body parameter '{raw_key}' attempts to override admin-only valve"
+                f" '{canonical_key}'. Ignoring override."
             )
             continue
         merged_data[canonical_key] = val

@@ -1,6 +1,6 @@
 """
 title: Trailing Whitespace Fixer
-description: Fixes a glitch where extraneous trailing whitespace is added to user messages, cleaning up the entire conversation history before it reaches the LLM.
+description: Fixes a glitch where extraneous trailing whitespace pollutes user messages and the chat history.
 id: trailing_whitespace_fixer
 author: suurt8ll
 author_url: https://github.com/suurt8ll

@@ -285,7 +285,8 @@ _VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
         '*Note: Temporary chats (`local`) cannot bypass RAG and will fallback to default RAG.*'
     ),
     'MODEL_CONFIG_PATH': (
-        'Publicly accessible URL (`http://` or `https://`) to the YAML file containing model definitions and capabilities.'
+        'Publicly accessible URL (`http://` or `https://`) to the YAML file'
+        ' containing model definitions and capabilities.'
     ),
     'URL_RESOLVE_TIMEOUT': ('Timeout in seconds for resolving grounding source web URLs.'),
     'URL_RESOLVE_MAX_RETRIES': ('Maximum number of retry attempts to resolve grounding URLs before giving up.'),
@@ -466,7 +467,8 @@ class Filter:
             code_execution_enabled = features.get('code_interpreter', False)
             if code_execution_enabled:
                 log.info(
-                    'Code interpreter feature is enabled, disabling it and adding custom feature called google_code_execution.'
+                    'Code interpreter feature is enabled, disabling it'
+                    ' and adding custom feature called google_code_execution.'
                 )
                 # Disable code_interpreter
                 features['code_interpreter'] = False
@@ -515,7 +517,8 @@ class Filter:
         __event_emitter__: Callable[['Event'], Awaitable[None]],
         __user__: 'UserData',
     ) -> 'Body':
-        """Modifies the complete response payload after it's received from the LLM. Operates on the final `body` dictionary."""
+        """Modifies the complete response payload after it's received from the LLM.
+        Operates on the final `body` dictionary."""
 
         log.debug('outlet method has been called.')
 
@@ -565,7 +568,8 @@ class Filter:
         )
         if not event_emitter:
             log.debug(
-                "No event emitter found in state for this request. Companion filter's inlet did not run? Event emissions will be disabled for this request."
+                "No event emitter found in state for this request. Companion filter's inlet did not run?"
+                ' Event emissions will be disabled for this request.'
             )
             # TODO: any better way how to do this that does not require a dummy empty emitter?
             event_emitter = app_state._state.get('gemini_dummy_event_emitter')
@@ -637,7 +641,10 @@ class Filter:
                 )
                 event_emitter.emit_status('This response was grounded with a Google tool', done=True)
             else:
-                msg = "Grounding metadata was found but it's missing grounding supports or chunks. The response is likely not grounded."
+                msg = (
+                    "Grounding metadata was found but it's missing grounding supports or chunks."
+                    ' The response is likely not grounded.'
+                )
                 log.info(msg)
                 event_emitter.emit_status(msg, done=True)
         else:
@@ -713,7 +720,8 @@ class Filter:
                         log.warning(
                             f'Support segment end_index ({end_pos}) is out of bounds for the processable content '
                             f'(length {len(modified_content_bytes)} bytes after potential thought stripping). '
-                            f"Content (first 50 chars): '{content_for_citation_processing[:50]}...'. Skipping this support. Support: {support}"
+                            f"Content (first 50 chars): '{content_for_citation_processing[:50]}...'."
+                            f' Skipping this support. Support: {support}'
                         )
                         continue
                     citation_markers = ''.join(f'[{index + 1}]' for index in indices)
@@ -1288,7 +1296,8 @@ def _resolve_options(
             canonical_key = canonicalize_option_key(raw_key)
             if canonical_key in ADMIN_ONLY_VALVE_FIELDS:
                 log.warning(
-                    f"Body parameter '{raw_key}' attempts to override admin-only valve '{canonical_key}'. Ignoring override."
+                    f"Body parameter '{raw_key}' attempts to override admin-only valve"
+                    f" '{canonical_key}'. Ignoring override."
                 )
                 continue
             merged_data[canonical_key] = val

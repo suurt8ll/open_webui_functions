@@ -145,19 +145,27 @@ class Pipe:
 
         Below is a list of all injectable parameters, their types, and descriptions.
 
-        - `body: dict`: The raw OpenAI-compatible request body. Includes `model`, `messages`, `stream`, etc. Guaranteed to be present.
-        - `__user__: dict`: A dictionary representing the current user (`UserModel`). Also contains a `valves` key with an instance of your `UserValves` class. Guaranteed.
-        - `__tools__: dict[str, dict]`: A dictionary mapping available tool function names to their definitions. Guaranteed.
-        - `__request__: Request`: The raw FastAPI/Starlette request object. Gives access to headers, client IP, etc. Guaranteed.
+        - `body: dict`: The raw OpenAI-compatible request body. Includes `model`, `messages`, `stream`, etc.
+          Guaranteed to be present.
+        - `__user__: dict`: A dictionary representing the current user (`UserModel`). Also contains a `valves` key
+          with an instance of your `UserValves` class. Guaranteed.
+        - `__tools__: dict[str, dict]`: A dictionary mapping available tool function names to their definitions.
+          Guaranteed.
+        - `__request__: Request`: The raw FastAPI/Starlette request object. Gives access to headers, client IP, etc.
+          Guaranteed.
         - `__metadata__: dict`: A dictionary containing various metadata from the request. Guaranteed.
         - `__files__: list | None`: A list of file objects attached to the user's message. Can be `None`.
         - `__chat_id__: str | None`: The unique identifier for the current chat session.
         - `__session_id__: str | None`: The unique identifier for the user's browser session.
         - `__message_id__: str | None`: The unique identifier for the current message being processed.
-        - `__task__: str | None`: Identifies an internal system task (e.g., "title_generation"). `None` during normal chats.
-        - `__task_body__: dict | None`: The original request body associated with the `__task__`. `None` during normal chats.
-        - `__event_emitter__: Callable[[dict], Awaitable[None]] | None`: An async function to "fire-and-forget" an event to the UI.
-        - `__event_call__: Callable[[dict], Awaitable[Any]] | None`: An async function to send an event to the UI and wait for a response.
+        - `__task__: str | None`: Identifies an internal system task (e.g., "title_generation").
+          `None` during normal chats.
+        - `__task_body__: dict | None`: The original request body associated with the `__task__`.
+          `None` during normal chats.
+        - `__event_emitter__: Callable[[dict], Awaitable[None]] | None`: An async function to "fire-and-forget"
+          an event to the UI.
+        - `__event_call__: Callable[[dict], Awaitable[Any]] | None`: An async function to send an event to the UI and
+          wait for a response.
 
         --- ADVANCED UI INTERACTION: EVENT EMITTER & CALLER ---
 
