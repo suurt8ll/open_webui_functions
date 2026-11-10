@@ -50,18 +50,17 @@ funding_url: https://github.com/sponsors/your-username
 #
 
 # Imports should come AFTER the documentation.
-from collections.abc import Iterator, AsyncGenerator, Generator, Callable, Awaitable
-from pydantic import BaseModel, Field
+from collections.abc import AsyncGenerator, Generator, Iterator
 
 # You may need to import Request for type hinting `__request__`
 from fastapi import Request
+from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
 # --- Importing from the Open WebUI Backend ---
 # You can import and use modules directly from the Open WebUI backend.
 # These are just examples; explore the backend codebase for more.
 from open_webui.utils.misc import get_last_user_message
-from open_webui.models.users import UserModel
 
 
 class Pipe:
@@ -74,9 +73,9 @@ class Pipe:
         """Defines admin-only settings for the pipe."""
 
         api_key: str = Field(
-            default="",
-            title="API Key",
-            description="An API key for an external service.",
+            default='',
+            title='API Key',
+            description='An API key for an external service.',
         )
 
     class UserValves(BaseModel):
@@ -93,9 +92,9 @@ class Pipe:
         """
 
         language: str = Field(
-            default="en-US",
-            title="Output Language",
-            description="The language for the response.",
+            default='en-US',
+            title='Output Language',
+            description='The language for the response.',
         )
 
     def __init__(self) -> None:
@@ -117,8 +116,8 @@ class Pipe:
     async def pipes(self) -> list[dict]:
         # You could fetch this list from an external API, a config file, etc.
         return [
-            {"id": "dynamic_tool_1", "name": "Dynamic Tool 1"},
-            {"id": "dynamic_tool_2", "name": "Dynamic Tool 2"},
+            {'id': 'dynamic_tool_1', 'name': 'Dynamic Tool 1'},
+            {'id': 'dynamic_tool_2', 'name': 'Dynamic Tool 2'},
         ]
 
     async def pipe(
@@ -130,15 +129,7 @@ class Pipe:
         __chat_id__: str | None = None,
         __request__: Request | None = None,
         __tools__: dict[str, dict] | None = None,
-    ) -> (
-        str
-        | dict
-        | BaseModel
-        | StreamingResponse
-        | Generator
-        | AsyncGenerator
-        | Iterator
-    ):
+    ) -> str | dict | BaseModel | StreamingResponse | Generator | AsyncGenerator | Iterator:
         """
         This is the main entry point for the pipe's logic. It is called on every request.
         This method can be `async def` (as shown) or a regular `def`.
@@ -154,19 +145,27 @@ class Pipe:
 
         Below is a list of all injectable parameters, their types, and descriptions.
 
-        - `body: dict`: The raw OpenAI-compatible request body. Includes `model`, `messages`, `stream`, etc. Guaranteed to be present.
-        - `__user__: dict`: A dictionary representing the current user (`UserModel`). Also contains a `valves` key with an instance of your `UserValves` class. Guaranteed.
-        - `__tools__: dict[str, dict]`: A dictionary mapping available tool function names to their definitions. Guaranteed.
-        - `__request__: Request`: The raw FastAPI/Starlette request object. Gives access to headers, client IP, etc. Guaranteed.
+        - `body: dict`: The raw OpenAI-compatible request body. Includes `model`, `messages`, `stream`, etc.
+          Guaranteed to be present.
+        - `__user__: dict`: A dictionary representing the current user (`UserModel`). Also contains a `valves` key
+          with an instance of your `UserValves` class. Guaranteed.
+        - `__tools__: dict[str, dict]`: A dictionary mapping available tool function names to their definitions.
+          Guaranteed.
+        - `__request__: Request`: The raw FastAPI/Starlette request object. Gives access to headers, client IP, etc.
+          Guaranteed.
         - `__metadata__: dict`: A dictionary containing various metadata from the request. Guaranteed.
         - `__files__: list | None`: A list of file objects attached to the user's message. Can be `None`.
         - `__chat_id__: str | None`: The unique identifier for the current chat session.
         - `__session_id__: str | None`: The unique identifier for the user's browser session.
         - `__message_id__: str | None`: The unique identifier for the current message being processed.
-        - `__task__: str | None`: Identifies an internal system task (e.g., "title_generation"). `None` during normal chats.
-        - `__task_body__: dict | None`: The original request body associated with the `__task__`. `None` during normal chats.
-        - `__event_emitter__: Callable[[dict], Awaitable[None]] | None`: An async function to "fire-and-forget" an event to the UI.
-        - `__event_call__: Callable[[dict], Awaitable[Any]] | None`: An async function to send an event to the UI and wait for a response.
+        - `__task__: str | None`: Identifies an internal system task (e.g., "title_generation").
+          `None` during normal chats.
+        - `__task_body__: dict | None`: The original request body associated with the `__task__`.
+          `None` during normal chats.
+        - `__event_emitter__: Callable[[dict], Awaitable[None]] | None`: An async function to "fire-and-forget"
+          an event to the UI.
+        - `__event_call__: Callable[[dict], Awaitable[Any]] | None`: An async function to send an event to the UI and
+          wait for a response.
 
         --- ADVANCED UI INTERACTION: EVENT EMITTER & CALLER ---
 
@@ -238,33 +237,31 @@ class Pipe:
         """
 
         # Use the improted utility function to get the last user message.
-        user_message = get_last_user_message(body["messages"])
+        user_message = get_last_user_message(body['messages'])
 
         # Access user settings (safe to access `__user__` directly)
-        user_valves: Pipe.UserValves = __user__.get("valves", self.UserValves())
+        user_valves: Pipe.UserValves = __user__.get('valves', self.UserValves())
         user_lang = user_valves.language
 
         # Access files (must handle the None case)
         # A robust way to handle this is to default to an empty list.
         files = __files__ or []
-        file_info = f"{len(files)} file(s) attached."
+        file_info = f'{len(files)} file(s) attached.'
 
         # Access chat_id (must check for None)
-        chat_id_info = (
-            f"Chat ID: {__chat_id__}" if __chat_id__ else "No Chat ID provided."
-        )
+        chat_id_info = f'Chat ID: {__chat_id__}' if __chat_id__ else 'No Chat ID provided.'
 
         # Access tools
         tools = __tools__ or {}
-        tool_info = f"{len(tools)} tool(s) available."
+        tool_info = f'{len(tools)} tool(s) available.'
 
-        if body.get("stream", False):
+        if body.get('stream', False):
 
             async def stream_generator():
-                yield f"Streaming for user: {__user__.get('name', 'Anonymous')}.\n"
-                yield f"{chat_id_info}\n"
-                yield f"{file_info}\n"
-                yield f"{tool_info}\n"
+                yield f'Streaming for user: {__user__.get("name", "Anonymous")}.\n'
+                yield f'{chat_id_info}\n'
+                yield f'{file_info}\n'
+                yield f'{tool_info}\n'
                 yield f"Processing message in '{user_lang}': '{user_message}'.\n"
 
             return stream_generator()
@@ -272,9 +269,9 @@ class Pipe:
             # For non-streaming, you can return a simple string or a dictionary.
             # The backend will wrap it in the appropriate OpenAI-compatible format.
             return (
-                f"Completed for user: {__user__.get('name', 'Anonymous')}.\n"
-                f"{chat_id_info}\n"
-                f"{file_info}\n"
-                f"{tool_info}\n"
+                f'Completed for user: {__user__.get("name", "Anonymous")}.\n'
+                f'{chat_id_info}\n'
+                f'{file_info}\n'
+                f'{tool_info}\n'
                 f"Processed message in '{user_lang}': '{user_message}'."
             )

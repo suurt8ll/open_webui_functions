@@ -1,4 +1,9 @@
-.env
+# Ignore all environment files
+.env*
+# Except the example templates
+!.env.example
+!.env.*.example
+
 .venv/
 .vscode/
 **/__pycache__/
@@ -6,3 +11,12 @@ dev/.dev_state/
 docs/.obsidian/
 docs/knowledge_for_llms/
 .pytest_cache/
+
+# Pi Agent harness / sandbox stuff
+.pi/
+.pi-fluid/
+.uv-python/
+.uv-cache/
+
+# E2E script screenshots (scratch, see dev/E2E.md)
+e2e_shots/

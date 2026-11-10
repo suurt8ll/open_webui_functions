@@ -1,7 +1,9 @@
-google-genai==1.65.0
-fastapi==0.118.0
-loguru==0.7.3
-
+# Development environment requirements only. This repo's tooling (tests, dev scripts)
+# installs from this file; the plugin code itself declares its runtime dependencies in
+# the OWUI frontmatter of each .py file (e.g. `requirements: google-genai==2.31.0`).
+google-genai==2.31.0
+fastapi
+loguru
 pytest
 pytest-asyncio
 pydantic
@@ -13,3 +15,4 @@ xxhash
 google-cloud-storage
 google-api-core
 pyyaml
+watchfiles
