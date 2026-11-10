@@ -7,9 +7,7 @@
 
 gemini-4-carbon:
   description: "Our most capable reasoning model, built for complex software engineering, mathematical and scientific problem solving, high factual accuracy, autonomous multi-step agents, and long decode up to 1M tokens."
-  # knowledge_cutoff and pricing are not listed on the model page; add them from
-  # https://ai.google.dev/gemini-api/docs/pricing#gemini-4-carbon once confirmed.
-  # Until then, cost is reported as 0 and the model is treated as paid-only (no free tier) for API routing.
+  # knowledge_cutoff is not listed on the model page; add it once published.
   latest_update: "2026-11"
   supported_data_types:
     inputs: [Text, Image, Video, Audio, PDF]
@@ -31,6 +29,18 @@ gemini-4-carbon:
     structured_outputs: true
     thinking: true # Thinking levels: low, medium, high.
     url_context: true
+  # Not available on the Free tier. Standard paid-tier prices, valid through 2026-11-30.
+  # Starting 2026-12-01 they double: input 4.00, output 20.00, caching 0.20.
+  pricing:
+    input:
+      - up_to_tokens: null
+        price_per_million: 2.00
+    output:
+      - up_to_tokens: null
+        price_per_million: 10.00
+    caching:
+      - up_to_tokens: null
+        price_per_million: 0.10
 
 gemini-3.1-flash-image-preview:
   description: "Designed for speed and efficiency, the Gemini 3.1 Flash Image generation model is effective for quick, interactive responses and high throughput."
