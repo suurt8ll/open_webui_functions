@@ -32,7 +32,6 @@ gemini-4-hydrogen:
     search_grounding: true
     structured_outputs: true
     # Supported thinking levels: LOW, MEDIUM, HIGH, XHIGH.
-    # XHIGH is not yet in google-genai's ThinkingLevel enum, so this pipe cannot request it.
     thinking: true
     url_context: true
   pricing:
