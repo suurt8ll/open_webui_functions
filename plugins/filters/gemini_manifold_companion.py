@@ -40,7 +40,7 @@ def _unload_stale_modules() -> None:
     Open WebUI pip installs frontmatter `requirements` into the already running server, which can replace
     packages on disk while their old versions are still in `sys.modules`. Importing `google.genai` would then
     mix modules from both versions and fail, e.g. with `cannot import name 'OP_BINARY' from 'websockets.frames'`
-    (`google-genai` requires `websockets<17`, so pip downgrades it) or with
+    (`google-genai` requires `websockets<18`, so pip may downgrade it) or with
     `module 'google.genai.types' has no attribute ...` (`google-genai` itself got upgraded).
     Dropping the stale modules makes the import load a consistent set of modules from disk.
     Code that already imported the old modules (e.g. uvicorn) keeps its own references to them.

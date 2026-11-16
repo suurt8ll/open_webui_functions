@@ -1,7 +1,7 @@
 # Development environment requirements only. This repo's tooling (tests, dev scripts)
 # installs from this file; the plugin code itself declares its runtime dependencies in
-# the OWUI frontmatter of each .py file (e.g. `requirements: google-genai==2.31.0`).
-google-genai==2.31.0
+# the OWUI frontmatter of each .py file (e.g. `requirements: google-genai==3.3.0`).
+google-genai==3.3.0
 fastapi
 loguru
 pytest

@@ -153,7 +153,7 @@ def test_pipe_initialization_with_api_key_prefers_free(mock_pipe_valves_data):
 
             MockedGenAIClientConstructor.assert_called_once_with(
                 api_key=ADMIN_FREE_KEY,  # Should prefer the free key
-                http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
+                http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL, api_version='v1beta'),
             )
         finally:
             Pipe._get_or_create_genai_client.cache_clear()
@@ -209,7 +209,7 @@ def test_client_creation_uses_available_gemini_api_key(pipe_instance_fixture, ke
 
     MockedGenAIClientConstructor.assert_called_once_with(
         api_key=expected_key,
-        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
+        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL, api_version='v1beta'),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
@@ -254,7 +254,7 @@ def test_client_creation_falls_back_to_gemini_api_with_warning(pipe_instance_fix
 
     MockedGenAIClientConstructor.assert_called_once_with(
         api_key='fallback_free_key',  # Should fall back to the free key
-        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
+        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL, api_version='v1beta'),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
@@ -307,7 +307,7 @@ def test_user_must_auth_user_provides_gemini_key_uses_user_creds(pipe_instance_f
 
     MockedGenAIClientConstructor.assert_called_once_with(
         api_key=USER_FREE_KEY,
-        http_options=gemini_types.HttpOptions(base_url=USER_GEMINI_BASE_URL),
+        http_options=gemini_types.HttpOptions(base_url=USER_GEMINI_BASE_URL, api_version='v1beta'),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
@@ -374,7 +374,7 @@ def test_user_must_auth_user_tries_vertex_with_user_gemini_key_falls_back(
 
     MockedGenAIClientConstructor.assert_called_once_with(
         api_key=USER_FREE_KEY,  # Should prefer user's free key for fallback
-        http_options=gemini_types.HttpOptions(base_url=USER_GEMINI_BASE_URL),
+        http_options=gemini_types.HttpOptions(base_url=USER_GEMINI_BASE_URL, api_version='v1beta'),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
@@ -401,7 +401,7 @@ def test_whitelist_user_no_uservalves_uses_admin_gemini_config(pipe_instance_fix
 
     MockedGenAIClientConstructor.assert_called_once_with(
         api_key=ADMIN_FREE_KEY,
-        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
+        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL, api_version='v1beta'),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
@@ -453,7 +453,7 @@ def test_whitelist_user_provides_own_gemini_key_overrides_admin(pipe_instance_fi
 
     MockedGenAIClientConstructor.assert_called_once_with(
         api_key=USER_PAID_KEY,
-        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
+        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL, api_version='v1beta'),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
@@ -484,7 +484,7 @@ def test_user_opts_out_of_admin_vertex_to_user_gemini(pipe_instance_fixture):
 
     MockedGenAIClientConstructor.assert_called_once_with(
         api_key=USER_FREE_KEY,
-        http_options=gemini_types.HttpOptions(base_url=USER_GEMINI_BASE_URL),
+        http_options=gemini_types.HttpOptions(base_url=USER_GEMINI_BASE_URL, api_version='v1beta'),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
@@ -996,6 +996,35 @@ def test_companion_admin_only_fields_empty(companion_filter_fixture):
 
 
 # endregion Test companion filter `_resolve_options`
+
+
+# region Test THINKING_CONFIG_RULES thinking levels
+
+
+@pytest.mark.parametrize('level', ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH', 'XHIGH', 'xhigh'])
+def test_thinking_config_rules_accepts_every_sdk_level(level):
+    """Every level name the SDK knows is accepted as a plain value and inside a regex rule."""
+    assert Pipe.Valves(THINKING_CONFIG_RULES=level).THINKING_CONFIG_RULES == level
+    rules = f'{{"gemini-4-hydrogen": "{level}"}}'
+    assert Pipe.Valves(THINKING_CONFIG_RULES=rules).THINKING_CONFIG_RULES == rules
+    assert level.upper() in gemini_types.ThinkingLevel.__members__
+
+
+@pytest.mark.parametrize('rules', ['XXHIGH', '{"gemini-4-hydrogen": "XXHIGH"}'])
+def test_thinking_config_rules_rejects_unknown_level(rules):
+    with pytest.raises(ValueError):
+        Pipe.Valves(THINKING_CONFIG_RULES=rules)
+
+
+@pytest.mark.parametrize('rules', ['XHIGH', '{"gemini-4-hydrogen": "xhigh", ".*": "LOW"}'])
+def test_resolve_thinking_config_xhigh(rules):
+    """XHIGH resolves to a thinking level that maps onto the SDK enum."""
+    budget, level = Pipe._resolve_thinking_config(rules, 'gemini-4-hydrogen')
+    assert (budget, level) == (None, 'XHIGH')
+    assert gemini_types.ThinkingConfig(thinking_level=gemini_types.ThinkingLevel[level]).thinking_level == 'XHIGH'
+
+
+# endregion Test THINKING_CONFIG_RULES thinking levels
 
 
 def teardown_module(module):

@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 2.1.0
-requirements: google-genai==2.31.0
+requirements: google-genai==3.3.0
 """
 
 from __future__ import annotations
@@ -82,7 +82,7 @@ def _unload_stale_modules() -> None:
     Open WebUI pip installs frontmatter `requirements` into the already running server, which can replace
     packages on disk while their old versions are still in `sys.modules`. Importing `google.genai` would then
     mix modules from both versions and fail, e.g. with `cannot import name 'OP_BINARY' from 'websockets.frames'`
-    (`google-genai` requires `websockets<17`, so pip downgrades it) or with
+    (`google-genai` requires `websockets<18`, so pip may downgrade it) or with
     `module 'google.genai.types' has no attribute ...` (`google-genai` itself got upgraded).
     Dropping the stale modules makes the import load a consistent set of modules from disk.
     Code that already imported the old modules (e.g. uvicorn) keeps its own references to them.
@@ -1550,6 +1550,10 @@ class GeminiContentBuilder:
 
 # region Valves
 
+# Thinking level names accepted in THINKING_CONFIG_RULES. Keep in sync with
+# `types.ThinkingLevel` (minus THINKING_LEVEL_UNSPECIFIED). XHIGH needs google-genai>=3.3.0.
+_THINKING_LEVELS: Final[tuple[str, ...]] = ('MINIMAL', 'LOW', 'MEDIUM', 'HIGH', 'XHIGH')
+
 _VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
     # Auth & API Keys
     'GEMINI_FREE_API_KEY': 'Free Gemini Developer API key.',
@@ -1598,7 +1602,7 @@ _VALVE_DESCRIPTIONS: Final[dict[str, str]] = {
     # Features & Execution Parameters
     'THINKING_CONFIG_RULES': (
         'Thinking parameter configuration. Can be an `int` (budget), a level `str`'
-        ' (`MINIMAL`, `LOW`, `MEDIUM`, `HIGH`), `None`,'
+        ' (`MINIMAL`, `LOW`, `MEDIUM`, `HIGH`, `XHIGH`), `None`,'
         ' or a JSON string mapping model name regex patterns to budget (`int`) or level (`str`).\n\n'
         'When using a JSON string mapping, **key order matters:** the first matching regex pattern is used,'
         ' so place more specific patterns before broader catch-all patterns.\n\n'
@@ -1714,7 +1718,7 @@ class _SharedValves(BaseModel):
             if not s:
                 return v
 
-            if s.upper() in {'MINIMAL', 'LOW', 'MEDIUM', 'HIGH'}:
+            if s.upper() in _THINKING_LEVELS:
                 return v
 
             try:
@@ -1733,19 +1737,14 @@ class _SharedValves(BaseModel):
                                 raise ValueError(f"Budget for pattern '{key}' must be -1 or greater.")
                         elif isinstance(val, str):
                             val_str = val.strip()
-                            if val_str.upper() not in {
-                                'MINIMAL',
-                                'LOW',
-                                'MEDIUM',
-                                'HIGH',
-                            }:
+                            if val_str.upper() not in _THINKING_LEVELS:
                                 try:
                                     num = int(val_str)
                                 except ValueError:
                                     raise ValueError(
                                         f"Value for pattern '{key}' must be an int (>= -1), "
                                         f'numeric string (>= -1), or level string '
-                                        f'(MINIMAL/LOW/MEDIUM/HIGH). Got: {val!r}'
+                                        f'({"/".join(_THINKING_LEVELS)}). Got: {val!r}'
                                     ) from None
                                 if num < -1:
                                     raise ValueError(f"Budget for pattern '{key}' must be -1 or greater.")
@@ -1762,7 +1761,7 @@ class _SharedValves(BaseModel):
                 val_int = int(s)
             except ValueError:
                 raise ValueError(
-                    f'THINKING_CONFIG_RULES must be an int (>= -1), level str (MINIMAL, LOW, MEDIUM, HIGH), '
+                    f'THINKING_CONFIG_RULES must be an int (>= -1), level str ({", ".join(_THINKING_LEVELS)}), '
                     f'a valid JSON object mapping regex patterns to int/str, or None. Got: {v!r}'
                 ) from None
             if val_int < -1:
@@ -2035,7 +2034,9 @@ class Pipe:
             # which is handled by the initial check or the SDK.
             kwargs = {
                 'api_key': api_key,
-                'http_options': types.HttpOptions(base_url=base_url),
+                # google-genai>=3.0.0 defaults the Developer API to `v1`. Pin `v1beta` so the pipe keeps the
+                # endpoints it was built against; e.g. the `gemini-*-latest` model aliases only exist on `v1beta`.
+                'http_options': types.HttpOptions(base_url=base_url, api_version='v1beta'),
             }
             api = 'Gemini Developer API'
 
@@ -2433,7 +2434,7 @@ class Pipe:
             if not s:
                 return None, None
 
-            if s.upper() in {'MINIMAL', 'LOW', 'MEDIUM', 'HIGH'}:
+            if s.upper() in _THINKING_LEVELS:
                 level = s.upper()
                 model_version = cls._parse_gemini_version(model_id)
                 if model_version < 3.0:
@@ -2481,7 +2482,7 @@ class Pipe:
                     budget_hits.append(val)
                 elif isinstance(val, str):
                     v_str = val.strip()
-                    if v_str.upper() in {'MINIMAL', 'LOW', 'MEDIUM', 'HIGH'}:
+                    if v_str.upper() in _THINKING_LEVELS:
                         level_hits.append(v_str.upper())
                     else:
                         try:
