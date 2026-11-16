@@ -6,6 +6,47 @@
 
 
 
+gemini-4-hydrogen:
+  description: "Brings cutting-edge intelligence to everyone, with speed and efficiency for everyday coding and agentic workflows, featuring a unified 1M-token context window and long decode up to 1M tokens."
+  # knowledge_cutoff: not published by Google.
+  latest_update: "2026-11"
+  supported_data_types:
+    inputs: [Text, Image, Video, Audio, PDF]
+    outputs: [Text]
+  tokens:
+    # Context window is a unified input + output limit.
+    input: 1048576
+    # Default synchronous limit. Up to 1048576 with long decode (not used by this pipe).
+    output: 65536
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    # Implicit caching only. Explicit caching (cachedContents) is not supported.
+    caching: true
+    code_execution: true
+    file_search: true
+    function_calling: true
+    grounding_google_maps: true
+    image_generation: false
+    live_api: false
+    search_grounding: true
+    structured_outputs: true
+    # Supported thinking levels: LOW, MEDIUM, HIGH, XHIGH.
+    thinking: true
+    url_context: true
+  pricing:
+    free_tier: true
+    excluded_features: [search_grounding, grounding_google_maps]
+    input:
+      - up_to_tokens: null
+        price_per_million: 1.50
+    output:
+      - up_to_tokens: null
+        price_per_million: 7.50
+    caching:
+      - up_to_tokens: null
+        price_per_million: 0.075
+
 gemini-4-carbon:
   description: "Our most capable reasoning model, built for complex software engineering, mathematical and scientific problem solving, high factual accuracy, autonomous multi-step agents, and long decode up to 1M tokens."
   # knowledge_cutoff: not published by Google.
